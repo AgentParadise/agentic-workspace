@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -130,6 +131,10 @@ class WorkspaceDockerProvider(BaseProvider):
         else:
             workspace_dir = Path(tempfile.mkdtemp(prefix=f"agentic-ws-{short_id}-"))
         workspace_dir.mkdir(parents=True, exist_ok=True)
+        # The hardened container has no DAC override capability and images may
+        # run as a UID different from the host caller. The random per-workspace
+        # directory is therefore writable by the container identity.
+        os.chmod(workspace_dir, 0o777)
 
         # Determine host path for Docker volume mount
         # When running Docker-in-Docker, container path != host path
