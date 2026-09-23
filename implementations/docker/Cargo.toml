@@ -1,6 +1,6 @@
 [package]
-name = "agentic-workspace-local"
-description = "Explicitly insecure local filesystem workspace provider for tests"
+name = "agentic-workspace-docker"
+description = "Docker isolated workspace provider"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -11,5 +11,4 @@ agentic-workspace-core = { path = "../../crates/workspace-core" }
 
 [dev-dependencies]
 agentic-workspace-conformance = { path = "../../crates/workspace-conformance" }
-serde_json.workspace = true
 tempfile.workspace = true

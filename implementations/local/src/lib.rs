@@ -2,15 +2,13 @@
 
 use agentic_workspace_core::{
     Artifact, CommandSpec, ExecutionResult, LaunchManifest, SecurityProfile, WorkspaceError,
-    WorkspaceHandle, WorkspaceProvider, validate_identifier, validate_relative_path,
+    WorkspaceHandle, WorkspaceProvider, execute_process, materialize_file, validate_identifier,
+    validate_relative_path,
 };
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
+use std::process::Command;
 use std::time::Duration;
-use wait_timeout::ChildExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeMode {
@@ -93,6 +91,7 @@ impl WorkspaceProvider for LocalProvider {
             id: manifest.execution_id.clone(),
             root,
             working_directory,
+            provider_reference: None,
         })
     }
 
@@ -114,21 +113,7 @@ impl WorkspaceProvider for LocalProvider {
             .iter()
             .chain(manifest.content.context_files.iter())
         {
-            validate_relative_path(&input.destination)?;
-            let destination = handle.root.join(&input.destination);
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent).map_err(|error| Self::io(parent, error))?;
-                self.validate_existing_path(parent)?;
-            }
-            fs::copy(&input.source, &destination).map_err(|error| Self::io(&destination, error))?;
-            if input.read_only {
-                let mut permissions = fs::metadata(&destination)
-                    .map_err(|error| Self::io(&destination, error))?
-                    .permissions();
-                permissions.set_readonly(true);
-                fs::set_permissions(&destination, permissions)
-                    .map_err(|error| Self::io(&destination, error))?;
-            }
+            materialize_file(&handle.root, input)?;
         }
         Ok(())
     }
@@ -141,54 +126,12 @@ impl WorkspaceProvider for LocalProvider {
     ) -> Result<ExecutionResult, WorkspaceError> {
         self.validate_handle(handle)?;
         self.validate_existing_path(&handle.working_directory)?;
-        let mut child = Command::new(&command.program)
+        let mut process = Command::new(&command.program);
+        process
             .args(&command.arguments)
             .envs(&command.environment)
-            .current_dir(&handle.working_directory)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| Self::io(&handle.working_directory, error))?;
-        let mut stdout = child.stdout.take().expect("stdout configured as piped");
-        let mut stderr = child.stderr.take().expect("stderr configured as piped");
-        let stdout_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let stderr_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).map(|_| bytes)
-        });
-
-        let status = child
-            .wait_timeout(timeout)
-            .map_err(|error| Self::io(&handle.working_directory, error))?;
-        let timed_out = status.is_none();
-        let status = match status {
-            Some(status) => status,
-            None => {
-                child
-                    .kill()
-                    .map_err(|error| Self::io(&handle.working_directory, error))?;
-                child
-                    .wait()
-                    .map_err(|error| Self::io(&handle.working_directory, error))?
-            }
-        };
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| WorkspaceError::Unsupported("stdout reader panicked".into()))?
-            .map_err(|error| Self::io(&handle.working_directory, error))?;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| WorkspaceError::Unsupported("stderr reader panicked".into()))?
-            .map_err(|error| Self::io(&handle.working_directory, error))?;
-        Ok(ExecutionResult {
-            exit_code: status.code(),
-            stdout,
-            stderr,
-            timed_out,
-        })
+            .current_dir(&handle.working_directory);
+        execute_process(&mut process, timeout, handle.working_directory.clone())
     }
 
     fn collect(
@@ -327,10 +270,33 @@ mod tests {
             id: "forged".into(),
             root: outside.path().join("forged"),
             working_directory: outside.path().join("forged/work"),
+            provider_reference: None,
         };
         assert!(matches!(
             provider.destroy(&handle),
             Err(WorkspaceError::InvalidHandle(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passes_shared_functional_conformance() {
+        use agentic_workspace_conformance::{assert_basic_lifecycle, minimal_manifest};
+
+        let root = tempfile::tempdir().unwrap();
+        let provider =
+            LocalProvider::enable_insecure(root.path(), RuntimeMode::Test, true).unwrap();
+        let manifest = minimal_manifest("local-conformance", SecurityProfile::InsecureLocal);
+        assert_basic_lifecycle(
+            &provider,
+            &manifest,
+            CommandSpec {
+                program: "sh".into(),
+                arguments: vec!["-c".into(), "printf 'conformant\\n' > artifact.txt".into()],
+                environment: BTreeMap::new(),
+            },
+            "work/artifact.txt",
+        )
+        .unwrap();
     }
 }

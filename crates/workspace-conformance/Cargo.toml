@@ -1,0 +1,10 @@
+[package]
+name = "agentic-workspace-conformance"
+description = "Shared functional conformance assertions for workspace providers"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+agentic-workspace-core = { path = "../workspace-core" }

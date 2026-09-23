@@ -1,10 +1,15 @@
 //! Provider-neutral workspace lifecycle contracts.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
 use thiserror::Error;
+use wait_timeout::ChildExt;
 
 pub const MANIFEST_SCHEMA: &str = "apss.workspace-launch/v1";
 
@@ -167,6 +172,20 @@ impl LaunchManifest {
         validate_identifier(&self.execution_id)?;
         validate_relative_path(&self.workspace.working_directory)?;
         validate_relative_path(&self.transcript.destination)?;
+        for repository in &self.content.repositories {
+            validate_relative_path(&repository.destination)?;
+        }
+        for input in self
+            .content
+            .inputs
+            .iter()
+            .chain(self.content.context_files.iter())
+        {
+            validate_relative_path(&input.destination)?;
+        }
+        for artifact in &self.outputs.artifacts {
+            validate_relative_path(artifact)?;
+        }
         if self.execution_id.trim().is_empty()
             || self.agent.harness.trim().is_empty()
             || self.agent.prompt.trim().is_empty()
@@ -180,7 +199,38 @@ impl LaunchManifest {
                 "timeout_seconds must be greater than zero".into(),
             ));
         }
+        reject_duplicates(
+            self.skills.iter().map(|skill| skill.name.as_str()),
+            "skill names",
+        )?;
+        reject_duplicates(self.capabilities.iter().map(String::as_str), "capabilities")?;
+        reject_duplicates(self.tools.allow.iter().map(String::as_str), "allowed tools")?;
+        reject_duplicates(self.tools.deny.iter().map(String::as_str), "denied tools")?;
+        if self
+            .tools
+            .allow
+            .iter()
+            .any(|tool| self.tools.deny.contains(tool))
+        {
+            return Err(WorkspaceError::InvalidManifest(
+                "a tool cannot be both allowed and denied".into(),
+            ));
+        }
         Ok(())
+    }
+}
+
+fn reject_duplicates<'a>(
+    values: impl Iterator<Item = &'a str>,
+    label: &str,
+) -> Result<(), WorkspaceError> {
+    let mut seen = std::collections::BTreeSet::new();
+    if values.into_iter().all(|value| seen.insert(value)) {
+        Ok(())
+    } else {
+        Err(WorkspaceError::InvalidManifest(format!(
+            "{label} must be unique"
+        )))
     }
 }
 
@@ -216,11 +266,70 @@ pub fn validate_relative_path(path: &str) -> Result<(), WorkspaceError> {
     }
 }
 
+pub fn materialize_file(root: &std::path::Path, input: &FileInput) -> Result<(), WorkspaceError> {
+    validate_relative_path(&input.destination)?;
+    let canonical_root = std::fs::canonicalize(root).map_err(|source| WorkspaceError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let destination = root.join(&input.destination);
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| WorkspaceError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let canonical_parent =
+            std::fs::canonicalize(parent).map_err(|source| WorkspaceError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        if !canonical_parent.starts_with(&canonical_root) {
+            return Err(WorkspaceError::InvalidHandle(canonical_parent));
+        }
+    }
+    let source_path = std::path::Path::new(&input.source);
+    let bytes = std::fs::read(source_path).map_err(|source| WorkspaceError::Io {
+        path: source_path.to_path_buf(),
+        source,
+    })?;
+    if let Some(expected) = &input.sha256 {
+        let actual = format!("{:x}", Sha256::digest(&bytes));
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(WorkspaceError::DigestMismatch {
+                path: source_path.to_path_buf(),
+                expected: expected.clone(),
+                actual,
+            });
+        }
+    }
+    std::fs::write(&destination, bytes).map_err(|source| WorkspaceError::Io {
+        path: destination.clone(),
+        source,
+    })?;
+    if input.read_only {
+        let mut permissions = std::fs::metadata(&destination)
+            .map_err(|source| WorkspaceError::Io {
+                path: destination.clone(),
+                source,
+            })?
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&destination, permissions).map_err(|source| {
+            WorkspaceError::Io {
+                path: destination,
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceHandle {
     pub id: String,
     pub root: PathBuf,
     pub working_directory: PathBuf,
+    pub provider_reference: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +376,72 @@ pub trait WorkspaceProvider {
     fn destroy(&self, handle: &WorkspaceHandle) -> Result<(), WorkspaceError>;
 }
 
+pub fn execute_process(
+    command: &mut Command,
+    timeout: Duration,
+    context: PathBuf,
+) -> Result<ExecutionResult, WorkspaceError> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| WorkspaceError::Io {
+            path: context.clone(),
+            source,
+        })?;
+    let mut stdout = child.stdout.take().expect("stdout configured as piped");
+    let mut stderr = child.stderr.take().expect("stderr configured as piped");
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+
+    let status = child
+        .wait_timeout(timeout)
+        .map_err(|source| WorkspaceError::Io {
+            path: context.clone(),
+            source,
+        })?;
+    let timed_out = status.is_none();
+    let status = match status {
+        Some(status) => status,
+        None => {
+            child.kill().map_err(|source| WorkspaceError::Io {
+                path: context.clone(),
+                source,
+            })?;
+            child.wait().map_err(|source| WorkspaceError::Io {
+                path: context.clone(),
+                source,
+            })?
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| WorkspaceError::ProcessReader("stdout"))?
+        .map_err(|source| WorkspaceError::Io {
+            path: context.clone(),
+            source,
+        })?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| WorkspaceError::ProcessReader("stderr"))?
+        .map_err(|source| WorkspaceError::Io {
+            path: context,
+            source,
+        })?;
+    Ok(ExecutionResult {
+        exit_code: status.code(),
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
     #[error("invalid launch manifest: {0}")]
@@ -281,6 +456,18 @@ pub enum WorkspaceError {
     InvalidHandle(PathBuf),
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+    #[error("{0} process reader panicked")]
+    ProcessReader(&'static str),
+    #[error("provider command {operation} failed: {stderr}")]
+    ProviderCommand { operation: String, stderr: String },
+    #[error("digest mismatch for {path}: expected {expected}, got {actual}")]
+    DigestMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("conformance failure: {0}")]
+    Conformance(String),
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,
