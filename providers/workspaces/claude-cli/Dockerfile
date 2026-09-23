@@ -108,7 +108,8 @@ RUN claude --version && codex --version
 
 # Install the skills CLI globally via npm. Pin exact version deliberately.
 ARG SKILLS_CLI_VERSION
-RUN npm install -g skills@${SKILLS_CLI_VERSION}
+RUN npm install -g skills@${SKILLS_CLI_VERSION} \
+    && test "$(skills --version)" = "${SKILLS_CLI_VERSION}"
 
 # =============================================================================
 # LSP: Language Servers for code intelligence

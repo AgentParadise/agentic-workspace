@@ -73,7 +73,7 @@ RUN npm install -g \
     && claude --version \
     && codex --version \
     && gemini --version \
-    && skills --version
+    && test "$(skills --version)" = "${SKILLS_CLI_VERSION}"
 
 # Non-root user. node:22-slim ships node:node uid/gid 1000; rename to
 # agent for parity with the claude-cli provider's user model.
