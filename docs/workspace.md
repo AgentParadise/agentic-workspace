@@ -156,7 +156,8 @@ uv run scripts/build-provider.py claude-cli
 
 The local build tags `agentic-workspace-claude-cli:latest` plus a version
 tag matching the bundled Claude CLI release. That is the local build only.
-CI publishes a different, larger tag set from a different branch: see
+CI publishes signed multi-architecture images only from protected semantic
+version tags: see
 [`docs/release-process.md`](release-process.md).
 
 ## Pointers

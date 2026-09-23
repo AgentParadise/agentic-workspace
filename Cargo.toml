@@ -5,6 +5,7 @@ members = [
   "implementations/docker",
   "implementations/local",
 ]
+exclude = [".apss/build"]
 resolver = "2"
 
 [workspace.package]
@@ -20,3 +21,4 @@ thiserror = "2"
 tempfile = "3"
 wait-timeout = "0.2"
 sha2 = "0.10"
+apss-workspace-standard = { git = "https://github.com/AgentParadise/agent-paradise-standards-system", rev = "18d55b231e7d06b509386b2599f925195b63ba0c", package = "apss-v1-0006-workspace" }

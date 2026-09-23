@@ -11,7 +11,9 @@ use std::time::Duration;
 use thiserror::Error;
 use wait_timeout::ChildExt;
 
-pub const MANIFEST_SCHEMA: &str = "apss.workspace-launch/v1";
+pub const APSS_WORKSPACE_STANDARD_ID: &str = apss_workspace_standard::ID;
+pub const APSS_WORKSPACE_STANDARD_VERSION: &str = apss_workspace_standard::VERSION;
+pub const MANIFEST_SCHEMA: &str = apss_workspace_standard::MANIFEST_SCHEMA;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,12 +165,17 @@ const fn default_timeout() -> u64 {
 
 impl LaunchManifest {
     pub fn validate_boundary(&self) -> Result<(), WorkspaceError> {
-        if self.schema != MANIFEST_SCHEMA {
-            return Err(WorkspaceError::InvalidManifest(format!(
-                "unsupported schema {}",
-                self.schema
-            )));
-        }
+        let standard_manifest: apss_workspace_standard::LaunchManifest = serde_json::from_value(
+            serde_json::to_value(self)
+                .map_err(|error| WorkspaceError::InvalidManifest(error.to_string()))?,
+        )
+        .map_err(|error| WorkspaceError::InvalidManifest(error.to_string()))?;
+        standard_manifest.validate().map_err(|error| {
+            WorkspaceError::InvalidManifest(format!(
+                "{APSS_WORKSPACE_STANDARD_ID} v{APSS_WORKSPACE_STANDARD_VERSION}: {error}"
+            ))
+        })?;
+
         validate_identifier(&self.execution_id)?;
         validate_relative_path(&self.workspace.working_directory)?;
         validate_relative_path(&self.transcript.destination)?;

@@ -5,13 +5,18 @@ implementations. Future E2B, SBX, and VPS providers plug into the same port.
 
 ## Status
 
-- APSS contract: `EXP-V1-0006`, version `0.1.0`
+- APSS contract: `EXP-V1-0006`, version `0.1.0`, pinned at an immutable APSS commit
 - Local: insecure test implementation in Rust
 - Docker: Rust isolated adapter plus history-preserved runtime, images, and Python compatibility provider
 - Syntropic137 migration: not yet cut over
 
 Local is never a security boundary. It requires explicit opt-in and refuses
 production mode. Docker remains the isolated implementation used by Syntropic.
+
+`workspace-core` compiles against the APSS Workspace experiment and delegates
+manifest semantic validation to it before applying provider-boundary checks.
+`APSS.yaml`, `apss.lock`, and `Cargo.lock` record the project declaration,
+standard version, and immutable source commit.
 
 ## Layout
 

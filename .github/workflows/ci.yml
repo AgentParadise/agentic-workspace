@@ -28,8 +28,12 @@ jobs:
       - run: cargo test --workspace
       - name: Verify APSS pin
         run: |
+          grep -F 'id: EXP-V1-0006' APSS.yaml
+          grep -F 'version: "=0.1.0"' APSS.yaml
           grep -F 'id = "EXP-V1-0006"' apss.lock
           grep -F 'version = "0.1.0"' apss.lock
+          grep -F 'rev=18d55b231e7d06b509386b2599f925195b63ba0c#18d55b231e7d06b509386b2599f925195b63ba0c' Cargo.lock
+          cargo tree -p agentic-workspace-core | grep -F 'apss-v1-0006-workspace v0.1.0'
 
   rust-test:
     strategy:
