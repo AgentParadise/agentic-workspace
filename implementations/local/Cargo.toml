@@ -1,0 +1,15 @@
+[package]
+name = "agentic-workspace-local"
+description = "Explicitly insecure local filesystem workspace provider for tests"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+agentic-workspace-core = { path = "../../crates/workspace-core" }
+wait-timeout.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

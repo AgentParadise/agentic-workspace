@@ -1,0 +1,12 @@
+[package]
+name = "agentic-workspace-core"
+description = "Provider-neutral contracts for agent workspaces"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,16 @@
+schema: apss.project/v1
+
+project:
+  name: agentic-workspace
+  apss_version: v1
+
+standards:
+  workspace:
+    id: EXP-V1-0006
+    version: "=0.1.0"
+
+tool:
+  bin_dir: .apss/bin
+  offline: false
+  hooks:
+    pre_commit: false

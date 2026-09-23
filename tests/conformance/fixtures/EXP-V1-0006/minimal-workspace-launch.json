@@ -1,0 +1,60 @@
+{
+  "schema": "apss.workspace-launch/v1",
+  "execution_id": "exec-01JQWORKSPACE",
+  "workspace": {
+    "working_directory": "repos/example",
+    "security_profile": "insecure-local",
+    "provider_hint": "local"
+  },
+  "content": {
+    "repositories": [
+      {
+        "url": "https://github.com/example/example.git",
+        "revision": "0123456789abcdef0123456789abcdef01234567",
+        "destination": "repos/example"
+      }
+    ],
+    "inputs": [],
+    "context_files": []
+  },
+  "agent": {
+    "harness": "codex",
+    "model": "gpt-5",
+    "prompt": "Inspect the repository and report its architecture.",
+    "arguments": []
+  },
+  "skills": [
+    {
+      "name": "review",
+      "source": "AgentParadise/agentic-skills",
+      "revision": "v0.1.0",
+      "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  ],
+  "tools": {
+    "allow": ["Read", "Glob", "Grep"],
+    "deny": ["Write"],
+    "sandbox": "read-only"
+  },
+  "capabilities": ["filesystem", "session-capture"],
+  "transcript": {
+    "session_id": "session-01JQWORKSPACE",
+    "source_format": "codex-jsonl",
+    "destination": "artifacts/output/session-envelope.json",
+    "required": true
+  },
+  "outputs": {
+    "artifacts": ["artifacts/output/**"],
+    "collect_logs": true
+  },
+  "limits": {
+    "timeout_seconds": 900,
+    "memory_mb": 4096,
+    "cpu_millis": 2000,
+    "disk_mb": 10240
+  },
+  "metadata": {
+    "workflow_id": "architecture-review",
+    "phase_id": "inspect"
+  }
+}
