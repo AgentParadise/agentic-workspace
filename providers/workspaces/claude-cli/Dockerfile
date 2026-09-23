@@ -42,6 +42,8 @@ ARG CLAUDE_CLI_VERSION=2.1.126
 # Codex CLI is installed alongside claude so a phase's primary agent can
 # delegate one-shot to the other harness (opt-in via agent.allow_delegation).
 ARG CODEX_CLI_VERSION=0.144.6
+# Keep this aligned with Agentic Skills' validated installer contract.
+ARG SKILLS_CLI_VERSION=1.7.0
 
 # =============================================================================
 # Stage 1: Node.js base with system dependencies
@@ -105,7 +107,8 @@ RUN npm install -g @openai/codex@${CODEX_CLI_VERSION}
 RUN claude --version && codex --version
 
 # Install the skills CLI globally via npm. Pin exact version deliberately.
-RUN npm install -g skills@1.5.14
+ARG SKILLS_CLI_VERSION
+RUN npm install -g skills@${SKILLS_CLI_VERSION}
 
 # =============================================================================
 # LSP: Language Servers for code intelligence

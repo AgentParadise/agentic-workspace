@@ -36,6 +36,8 @@
 # Both harnesses are pinned; bump deliberately.
 ARG CLAUDE_CLI_VERSION=2.1.250
 ARG CODEX_CLI_VERSION=0.150.1
+# Keep this aligned with Agentic Skills' validated installer contract.
+ARG SKILLS_CLI_VERSION=1.7.0
 # The `just` command runner. Pinned like the harnesses above; `latest` would
 # silently change between builds. Bump deliberately, and update the two
 # SHA256 pins in the install layer at the same time - they are per-version.
@@ -164,7 +166,8 @@ RUN npm install -g @openai/codex@${CODEX_CLI_VERSION}
 RUN claude --version && codex --version
 
 # Install the skills CLI globally via npm. Pin exact version deliberately.
-RUN npm install -g skills@1.5.14
+ARG SKILLS_CLI_VERSION
+RUN npm install -g skills@${SKILLS_CLI_VERSION}
 
 # =============================================================================
 # RTK: bash output compression (ADR-056)

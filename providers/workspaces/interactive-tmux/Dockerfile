@@ -34,6 +34,8 @@ ARG CLAUDE_CLI_VERSION=2.1.126
 ARG CODEX_CLI_VERSION=0.139.0
 # Latest at hypothesis commit time; LSB-class CLI, no per-version probe yet.
 ARG GEMINI_CLI_VERSION=latest
+# Keep this aligned with Agentic Skills' validated installer contract.
+ARG SKILLS_CLI_VERSION=1.7.0
 
 FROM node:22-slim
 
@@ -62,11 +64,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG CLAUDE_CLI_VERSION
 ARG CODEX_CLI_VERSION
 ARG GEMINI_CLI_VERSION
+ARG SKILLS_CLI_VERSION
 RUN npm install -g \
         @anthropic-ai/claude-code@${CLAUDE_CLI_VERSION} \
         @openai/codex@${CODEX_CLI_VERSION} \
         @google/gemini-cli@${GEMINI_CLI_VERSION} \
-        skills@1.5.14 \
+        skills@${SKILLS_CLI_VERSION} \
     && claude --version \
     && codex --version \
     && gemini --version \
