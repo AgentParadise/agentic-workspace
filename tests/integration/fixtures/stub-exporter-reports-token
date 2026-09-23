@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -eu
+if [ "${1:-}" = "--version" ]; then
+    echo "SeshMagicSessionExporter 0.0.0-stub"
+    exit 0
+fi
+__report="/spool/.stub-exporter-token-report"
+if [ -n "${SESSIONS_WRITE_TOKEN:-}" ]; then
+    echo "STUB_EXPORTER_TOKEN=present" > "${__report}"
+else
+    echo "STUB_EXPORTER_TOKEN=absent" > "${__report}"
+fi
+echo "run: discovered=1 skipped_unchanged=0 uploaded=1 accepted=1 duplicate=0 rejected=0 skipped_oversize=0 failed=0"
+exit 0

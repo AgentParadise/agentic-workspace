@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Preflight for the nofinalize test capability. Always passes.
+set -eu
+if [ "${1:-}" = "--json" ]; then
+    printf '{"capability":"nofinalize","passed":true,"checks":[]}\n'
+fi
+exit 0

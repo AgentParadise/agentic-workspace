@@ -1,0 +1,141 @@
+name: Release Workspace Images
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: agentparadise
+
+jobs:
+  integration-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: uv run scripts/build-provider.py claude-cli
+      - run: uv run scripts/build-provider.py omni-agent
+      - name: Run entrypoint integration suite
+        working-directory: lib/python/agentic_isolation
+        run: |
+          uv sync --locked --all-extras
+          uv run python -m pytest ../../../tests/integration -q
+
+  publish:
+    name: Publish ${{ matrix.image }}
+    needs: [integration-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: claude-cli
+            image: agentic-workspace-claude-cli
+          - provider: omni-agent
+            image: omni-agent-workspace
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Stage build context
+        run: uv run scripts/build-provider.py ${{ matrix.provider }} --stage-only
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          platforms: linux/amd64,linux/arm64
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Read provider version
+        id: version
+        env:
+          PROVIDER: ${{ matrix.provider }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="$(sed -n 's/^version: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "providers/workspaces/${PROVIDER}/manifest.yaml")"
+          test -n "$version"
+          case "$RELEASE_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "invalid release tag: $RELEASE_TAG" >&2; exit 1 ;;
+          esac
+          echo "provider_version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.release_tag }}
+            type=raw,value=${{ steps.version.outputs.provider_version }}
+            type=raw,value=latest
+            type=sha,prefix=
+          labels: |
+            org.opencontainers.image.source=https://github.com/AgentParadise/agentic-workspace
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.release_tag }}
+            agentic.provider=${{ matrix.provider }}
+            agentic.provider.version=${{ steps.version.outputs.provider_version }}
+            agentic.image.channel=release
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: matrix.provider == 'omni-agent'
+      - name: Verify pinned session exporter input
+        if: matrix.provider == 'omni-agent'
+        run: |
+          ref="$(grep -oE 'ghcr\.io/agentparadise/agentic-session-exporter@sha256:[0-9a-f]{64}' build/omni-agent/Dockerfile | head -1)"
+          test -n "$ref"
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/AgentParadise/agentic-session-exporter/\.github/workflows/.+@refs/(tags|heads)/.+$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$ref" >/dev/null
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        id: build
+        with:
+          context: build/${{ matrix.provider }}
+          file: build/${{ matrix.provider }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign and verify immutable digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.image }}
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          cosign verify \
+            --certificate-identity "https://github.com/AgentParadise/agentic-workspace/.github/workflows/release-images.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE}@${DIGEST}" >/dev/null
+          {
+            echo "### $IMAGE"
+            echo "Digest: \`${DIGEST}\`"
+            echo "Identity: \`https://github.com/AgentParadise/agentic-workspace/.github/workflows/release-images.yml@${GITHUB_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

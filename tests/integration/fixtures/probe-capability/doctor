@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Preflight for the generic lifecycle probe.
+set -eu
+if [ "${1:-}" = "--json" ]; then
+    printf '{"capability":"probe","passed":true,"checks":[]}\n'
+fi
+exit 0
