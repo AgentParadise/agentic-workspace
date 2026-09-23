@@ -327,7 +327,7 @@ def test_doctor_binary_json_output():
 
 HINDSIGHT_PLUGIN_SRC = os.getenv(
     "HINDSIGHT_PLUGIN_SRC",
-    "/Users/private-person/Code/AgentParadise/agentic-memory/lib/hindsight/hindsight-integrations/claude-code",
+    "../agentic-memory/lib/hindsight/hindsight-integrations/claude-code",
 )
 
 
