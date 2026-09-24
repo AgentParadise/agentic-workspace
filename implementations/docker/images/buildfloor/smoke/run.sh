@@ -48,6 +48,9 @@ grep -qx 'BUILDFLOOR SMOKE PASS' "$log" || { echo "== FAIL: no pass marker" >&2;
 #    container before the shared entrypoint or the command runs.
 planted="$(mktemp -d)"
 trap 'rm -f "$log"; rm -rf "$planted"' EXIT
+# mktemp -d is mode 700 and owned by the host user; uid 1000 in the container
+# must be able to see the symlink, or the run fails for the wrong reason.
+chmod 755 "$planted"
 ln -s /tmp "${planted}/.tools"
 set +e
 neg_out="$(docker run "${common[@]}" -v "${planted}:/workspace" "$image" \
