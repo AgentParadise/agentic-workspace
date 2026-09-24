@@ -5,3 +5,6 @@ edition = "2021"
 publish = false
 
 [dependencies]
+
+# Standalone: never part of the repository workspace it sits inside.
+[workspace]
