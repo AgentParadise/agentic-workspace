@@ -300,7 +300,7 @@ pub fn materialize_file(root: &std::path::Path, input: &FileInput) -> Result<(),
         source,
     })?;
     if let Some(expected) = &input.sha256 {
-        let actual = format!("{:x}", Sha256::digest(&bytes));
+        let actual = lower_hex(&Sha256::digest(&bytes));
         if !actual.eq_ignore_ascii_case(expected) {
             return Err(WorkspaceError::DigestMismatch {
                 path: source_path.to_path_buf(),
@@ -481,4 +481,15 @@ pub enum WorkspaceError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Lowercase hex encoding. sha2 0.11 digests no longer implement `LowerHex`.
+fn lower_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    out
 }

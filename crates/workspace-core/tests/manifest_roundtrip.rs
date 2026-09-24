@@ -68,3 +68,21 @@ fn file_hydration_verifies_digest_before_writing() {
     ));
     assert!(!root.path().join("inputs/value.txt").exists());
 }
+
+#[test]
+fn file_hydration_accepts_matching_lowercase_hex_digest() {
+    let source = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"hello").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let input = FileInput {
+        source: source.path().display().to_string(),
+        destination: "inputs/value.txt".into(),
+        read_only: false,
+        sha256: Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".into()),
+    };
+    materialize_file(root.path(), &input).unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("inputs/value.txt")).unwrap(),
+        b"hello"
+    );
+}
