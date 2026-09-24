@@ -129,5 +129,5 @@ health:
 labels:
   org.opencontainers.image.title: "Agentic Workspace - Claude CLI"
   org.opencontainers.image.description: "Claude CLI with native OTel support"
-  org.opencontainers.image.vendor: "Agentic Primitives"
-  org.opencontainers.image.source: "https://github.com/agentparadise/agentic-primitives"
+  org.opencontainers.image.vendor: "Agentic Workspace"
+  org.opencontainers.image.source: "https://github.com/AgentParadise/agentic-workspace"
