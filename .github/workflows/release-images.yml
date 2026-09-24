@@ -276,13 +276,14 @@ jobs:
         run: .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > "$RUNNER_TEMP/tags.txt"
       # Pinning a digest fixes the bytes; the signature says who published
       # them. Verified before the build so an unverified input never ships.
+      # Identity: the exporter's release.yml on a semver tag only (v0.5.0 today).
       - name: Verify pinned session exporter input
         run: |
           set -euo pipefail
           ref="$(grep -oE 'ghcr\.io/agentparadise/agentic-session-exporter@sha256:[0-9a-f]{64}' build/omni-agent/Dockerfile | head -1)"
           [ -n "$ref" ] || { echo "::error::no pinned exporter digest in the Dockerfile"; exit 1; }
           cosign verify \
-            --certificate-identity-regexp '^https://github\.com/AgentParadise/agentic-session-exporter/\.github/workflows/.+@refs/(tags|heads)/.+$' \
+            --certificate-identity-regexp '^https://github\.com/AgentParadise/agentic-session-exporter/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
             --certificate-oidc-issuer "$OIDC_ISSUER" \
             "$ref" > /dev/null
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
