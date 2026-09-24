@@ -182,6 +182,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Plan tags (before build; fails on an existing sha tag)
+        env:
+          MANIFEST_VERSION: ${{ steps.version.outputs.manifest_version }}
+          REPO_VERSION: ${{ needs.plan.outputs.repo_version }}
+        run: .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > "$RUNNER_TEMP/tags.txt"
       # Pushed untagged by digest; tagged only after signing and verification.
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         id: build
@@ -213,17 +218,14 @@ jobs:
       - name: Tag signed digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          MANIFEST_VERSION: ${{ steps.version.outputs.manifest_version }}
-          REPO_VERSION: ${{ needs.plan.outputs.repo_version }}
         run: |
           set -euo pipefail
-          .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > tags.txt
           while read -r tag; do
             docker buildx imagetools create --tag "$tag" "${IMAGE}@${DIGEST}"
             got="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)"
             [ "$got" = "$DIGEST" ] || { echo "::error::$tag resolves to $got, not $DIGEST"; exit 1; }
             echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
-          done < tags.txt
+          done < "$RUNNER_TEMP/tags.txt"
 
   publish-omni:
     name: Publish omni-agent
@@ -267,6 +269,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Plan tags (before build; fails on an existing sha tag)
+        env:
+          MANIFEST_VERSION: ${{ steps.version.outputs.manifest_version }}
+          REPO_VERSION: ${{ needs.plan.outputs.repo_version }}
+        run: .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > "$RUNNER_TEMP/tags.txt"
       # Pinning a digest fixes the bytes; the signature says who published
       # them. Verified before the build so an unverified input never ships.
       - name: Verify pinned session exporter input
@@ -308,17 +315,14 @@ jobs:
       - name: Tag signed digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          MANIFEST_VERSION: ${{ steps.version.outputs.manifest_version }}
-          REPO_VERSION: ${{ needs.plan.outputs.repo_version }}
         run: |
           set -euo pipefail
-          .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > tags.txt
           while read -r tag; do
             docker buildx imagetools create --tag "$tag" "${IMAGE}@${DIGEST}"
             got="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)"
             [ "$got" = "$DIGEST" ] || { echo "::error::$tag resolves to $got, not $DIGEST"; exit 1; }
             echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
-          done < tags.txt
+          done < "$RUNNER_TEMP/tags.txt"
 
   publish-buildfloor:
     name: Publish buildfloor
@@ -363,6 +367,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Plan tags (before build; fails on an existing sha tag)
+        env:
+          MANIFEST_VERSION: ${{ steps.version.outputs.manifest_version }}
+          REPO_VERSION: ${{ needs.plan.outputs.repo_version }}
+        run: .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > "$RUNNER_TEMP/tags.txt"
       # The base must be the omni this run signed, checked against the same
       # exact identity consumers use, before anything is built on it.
       - name: Verify omni base digest
@@ -420,15 +429,12 @@ jobs:
       - name: Tag signed digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          MANIFEST_VERSION: ${{ steps.version.outputs.manifest_version }}
-          REPO_VERSION: ${{ needs.plan.outputs.repo_version }}
         run: |
           set -euo pipefail
-          .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > tags.txt
           while read -r tag; do
             docker buildx imagetools create --tag "$tag" "${IMAGE}@${DIGEST}"
             got="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)"
             [ "$got" = "$DIGEST" ] || { echo "::error::$tag resolves to $got, not $DIGEST"; exit 1; }
             echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
-          done < tags.txt
+          done < "$RUNNER_TEMP/tags.txt"
           echo "- base: \`${OMNI_REF}\`" >> "$GITHUB_STEP_SUMMARY"

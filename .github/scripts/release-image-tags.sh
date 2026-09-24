@@ -3,7 +3,9 @@
 #
 # Usage: release-image-tags.sh IMAGE MANIFEST_VERSION REPO_VERSION COMMIT_SHA
 #
-#   <commit sha>        always; names the exact source commit
+#   <commit sha>        always; the run FAILS if it already exists, because a
+#                       rebuild of one commit is not byte-identical and a sha
+#                       tag must never move
 #   <manifest version>  only if that tag does not exist yet
 #   v<repo version>     only if that tag does not exist yet
 #
@@ -39,6 +41,12 @@ tag_exists() {
   exit 1
 }
 
+# Run BEFORE the build, so a rerun of an already-published commit stops before
+# pushing or signing anything.
+if tag_exists "$sha"; then
+  echo "::error::${image}:${sha} already exists; a sha tag is immutable. Land a new commit on release to publish again." >&2
+  exit 1
+fi
 tags=("${image}:${sha}")
 for t in "$manifest_version" "v${repo_version}"; do
   if tag_exists "$t"; then
