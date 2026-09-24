@@ -1,141 +1,434 @@
+# =============================================================================
+# Release Workspace Images: build, gate, sign and publish to GHCR
+# =============================================================================
+#
+# TRUST ROOT. Images are published and signed ONLY by a push to the protected
+# `release` branch (PR-only from main, required checks, no force push). The
+# signing identity consumers pin is therefore exactly:
+#
+#   https://github.com/AgentParadise/agentic-workspace/.github/workflows/release-images.yml@refs/heads/release
+#
+# Nothing else publishes: not main, not tags, not pull requests, not a
+# `release` event and not workflow_dispatch. A release event or a tag can be
+# created against any ref and would bypass the PR gate on `release`. Renaming
+# or moving this file changes the identity and breaks every consumer.
+#
+# CHANNELS.
+#   push to release  -> integration gate, then publish + sign all three images
+#   pull request     -> integration gate + amd64 buildfloor smoke; nothing
+#                       pushed, nothing signed
+#   push to main     -> not a trigger; main never publishes (no :edge channel)
+#
+# IMAGES (ghcr.io/agentparadise/...).
+#   agentic-workspace-claude       (claude-cli; agentic-workspace-claude-cli is AP's package)
+#   agentic-workspace-omni-agent
+#   agentic-workspace-buildfloor   FROM the omni digest pushed in THIS run
+#
+# ORDER. claude-cli and omni publish in parallel after the gate. buildfloor
+# waits for omni, verifies omni's signature, builds FROM that exact digest,
+# pushes untagged by digest, runs the compile smoke on amd64 and arm64 against
+# that digest, and only then signs and tags it. What was tested is byte for
+# byte what is tagged.
+#
+# TAGS. <commit sha> always; <manifest version> and v<repo version> (from
+# Cargo.toml [workspace.package]) only the first time they are published.
+# Never `latest`. See .github/scripts/release-image-tags.sh.
+#
+# Every published digest gets: BuildKit SBOM + max-mode provenance, a keyless
+# cosign signature over the index (which covers the attestation manifests),
+# and a cosign verify against the exact identity above before it is tagged.
+# =============================================================================
+
 name: Release Workspace Images
 
 on:
   push:
-    tags: ["v*"]
+    branches: [release]
+  pull_request:
+    branches: [main, release]
+    paths:
+      - "implementations/docker/images/**"
+      - "workspace/**"
+      - "plugins/**"
+      - "lib/python/**"
+      - "scripts/build-provider.py"
+      - "tests/integration/**"
+      - ".github/workflows/release-images.yml"
+      - ".github/actions/sign-and-verify-image/**"
+      - ".github/scripts/release-image-tags.sh"
 
 permissions:
   contents: read
 
 concurrency:
   group: release-images-${{ github.ref }}
-  cancel-in-progress: false
+  # Never cancel a publishing run halfway through signing.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
   IMAGE_OWNER: agentparadise
+  SIGNER_IDENTITY: https://github.com/AgentParadise/agentic-workspace/.github/workflows/release-images.yml@refs/heads/release
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
-  integration-gate:
+  plan:
+    name: Plan
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      channel: ${{ steps.plan.outputs.channel }}
+      repo_version: ${{ steps.plan.outputs.repo_version }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Decide channel
+        id: plan
+        # Every value arrives through env and is read as "$VAR": git allows
+        # shell metacharacters in branch names, so github.ref is data, not code.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          publish=false
+          channel=none
+          if [[ "$EVENT_NAME" == "push" && "$GIT_REF" == "refs/heads/release" ]]; then
+            publish=true
+            channel=release
+          fi
+          repo_version="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p;}' Cargo.toml | head -1)"
+          [[ "$repo_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Cargo.toml [workspace.package] version is not X.Y.Z: '$repo_version'"; exit 1; }
+          {
+            echo "publish=$publish"
+            echo "channel=$channel"
+            echo "repo_version=$repo_version"
+          } >> "$GITHUB_OUTPUT"
+          echo "channel=$channel publish=$publish repo_version=$repo_version"
+
+  integration-gate:
+    name: Integration Gate
+    needs: [plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      # Single-arch local builds, loaded into the daemon under the tags the
+      # tests resolve by default. Nothing is pushed.
       - run: uv run scripts/build-provider.py claude-cli
       - run: uv run scripts/build-provider.py omni-agent
+      # FROM the omni just built (the manifest's local OMNI_IMAGE default).
+      - run: uv run scripts/build-provider.py buildfloor
       - name: Run entrypoint integration suite
         working-directory: lib/python/agentic_isolation
         run: |
           uv sync --locked --all-extras
           uv run python -m pytest ../../../tests/integration -q
+      - name: Buildfloor keeps the omni capability-runtime contract
+        working-directory: lib/python/agentic_isolation
+        env:
+          AGENTIC_OMNI_IMAGE: agentic-workspace-buildfloor:latest
+        run: uv run python -m pytest ../../../tests/integration -q -k omni
+      - name: Buildfloor compile smoke (native amd64)
+        run: implementations/docker/images/buildfloor/smoke/run.sh agentic-workspace-buildfloor:latest
 
-  publish:
-    name: Publish ${{ matrix.image }}
-    needs: [integration-gate]
+  publish-claude-cli:
+    name: Publish claude-cli
+    needs: [plan, integration-gate]
+    if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
       id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - provider: claude-cli
-            image: agentic-workspace-claude-cli
-          - provider: omni-agent
-            image: omni-agent-workspace
+    env:
+      PROVIDER: claude-cli
+      IMAGE: ghcr.io/agentparadise/agentic-workspace-claude
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          fetch-depth: 0
+          persist-credentials: false
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Stage build context
-        run: uv run scripts/build-provider.py ${{ matrix.provider }} --stage-only
+      - run: uv run scripts/build-provider.py "$PROVIDER" --stage-only
+      - name: Read manifest version
+        id: version
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^version: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "implementations/docker/images/${PROVIDER}/manifest.yaml")"
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad manifest version: '$v'"; exit 1; }
+          echo "manifest_version=$v" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
         with:
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ env.PLATFORMS }}
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Read provider version
-        id: version
-        env:
-          PROVIDER: ${{ matrix.provider }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          version="$(sed -n 's/^version: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "implementations/docker/images/${PROVIDER}/manifest.yaml")"
-          test -n "$version"
-          case "$RELEASE_TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "invalid release tag: $RELEASE_TAG" >&2; exit 1 ;;
-          esac
-          echo "provider_version=$version" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        id: meta
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.image }}
-          tags: |
-            type=raw,value=${{ steps.version.outputs.release_tag }}
-            type=raw,value=${{ steps.version.outputs.provider_version }}
-            type=raw,value=latest
-            type=sha,prefix=
-          labels: |
-            org.opencontainers.image.source=https://github.com/AgentParadise/agentic-workspace
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.version.outputs.release_tag }}
-            agentic.provider=${{ matrix.provider }}
-            agentic.provider.version=${{ steps.version.outputs.provider_version }}
-            agentic.image.channel=release
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        if: matrix.provider == 'omni-agent'
-      - name: Verify pinned session exporter input
-        if: matrix.provider == 'omni-agent'
-        run: |
-          ref="$(grep -oE 'ghcr\.io/agentparadise/agentic-session-exporter@sha256:[0-9a-f]{64}' build/omni-agent/Dockerfile | head -1)"
-          test -n "$ref"
-          cosign verify \
-            --certificate-identity-regexp '^https://github\.com/AgentParadise/agentic-session-exporter/\.github/workflows/.+@refs/(tags|heads)/.+$' \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "$ref" >/dev/null
+      # Pushed untagged by digest; tagged only after signing and verification.
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         id: build
         with:
-          context: build/${{ matrix.provider }}
-          file: build/${{ matrix.provider }}/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          context: build/${{ env.PROVIDER }}
+          file: build/${{ env.PROVIDER }}/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=agentic-workspace-claude
+            org.opencontainers.image.vendor=Agentic Workspace
+            org.opencontainers.image.source=https://github.com/AgentParadise/agentic-workspace
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.manifest_version }}
+            agentic.provider=${{ env.PROVIDER }}
+            agentic.provider.version=${{ steps.version.outputs.manifest_version }}
+            agentic.repo.version=${{ needs.plan.outputs.repo_version }}
+            agentic.image.channel=${{ needs.plan.outputs.channel }}
+          cache-from: type=gha,scope=${{ env.PROVIDER }}
+          cache-to: type=gha,scope=${{ env.PROVIDER }},mode=max
           provenance: mode=max
           sbom: true
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Sign and verify immutable digest
+      - uses: ./.github/actions/sign-and-verify-image
+        with:
+          image: ${{ env.IMAGE }}
+          digest: ${{ steps.build.outputs.digest }}
+          identity: ${{ env.SIGNER_IDENTITY }}
+          issuer: ${{ env.OIDC_ISSUER }}
+      - name: Tag signed digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.image }}
+          MANIFEST_VERSION: ${{ steps.version.outputs.manifest_version }}
+          REPO_VERSION: ${{ needs.plan.outputs.repo_version }}
         run: |
-          cosign sign --yes "${IMAGE}@${DIGEST}"
+          set -euo pipefail
+          .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > tags.txt
+          while read -r tag; do
+            docker buildx imagetools create --tag "$tag" "${IMAGE}@${DIGEST}"
+            got="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)"
+            [ "$got" = "$DIGEST" ] || { echo "::error::$tag resolves to $got, not $DIGEST"; exit 1; }
+            echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          done < tags.txt
+
+  publish-omni:
+    name: Publish omni-agent
+    needs: [plan, integration-gate]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      PROVIDER: omni-agent
+      IMAGE: ghcr.io/agentparadise/agentic-workspace-omni-agent
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      manifest_version: ${{ steps.version.outputs.manifest_version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: uv run scripts/build-provider.py "$PROVIDER" --stage-only
+      - name: Read manifest version
+        id: version
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^version: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "implementations/docker/images/${PROVIDER}/manifest.yaml")"
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad manifest version: '$v'"; exit 1; }
+          echo "manifest_version=$v" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          platforms: ${{ env.PLATFORMS }}
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      # Pinning a digest fixes the bytes; the signature says who published
+      # them. Verified before the build so an unverified input never ships.
+      - name: Verify pinned session exporter input
+        run: |
+          set -euo pipefail
+          ref="$(grep -oE 'ghcr\.io/agentparadise/agentic-session-exporter@sha256:[0-9a-f]{64}' build/omni-agent/Dockerfile | head -1)"
+          [ -n "$ref" ] || { echo "::error::no pinned exporter digest in the Dockerfile"; exit 1; }
           cosign verify \
-            --certificate-identity "https://github.com/AgentParadise/agentic-workspace/.github/workflows/release-images.yml@${GITHUB_REF}" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "${IMAGE}@${DIGEST}" >/dev/null
-          {
-            echo "### $IMAGE"
-            echo "Digest: \`${DIGEST}\`"
-            echo "Identity: \`https://github.com/AgentParadise/agentic-workspace/.github/workflows/release-images.yml@${GITHUB_REF}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+            --certificate-identity-regexp '^https://github\.com/AgentParadise/agentic-session-exporter/\.github/workflows/.+@refs/(tags|heads)/.+$' \
+            --certificate-oidc-issuer "$OIDC_ISSUER" \
+            "$ref" > /dev/null
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        id: build
+        with:
+          context: build/${{ env.PROVIDER }}
+          file: build/${{ env.PROVIDER }}/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=agentic-workspace-omni-agent
+            org.opencontainers.image.vendor=Agentic Workspace
+            org.opencontainers.image.source=https://github.com/AgentParadise/agentic-workspace
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.manifest_version }}
+            agentic.provider=${{ env.PROVIDER }}
+            agentic.provider.version=${{ steps.version.outputs.manifest_version }}
+            agentic.repo.version=${{ needs.plan.outputs.repo_version }}
+            agentic.image.channel=${{ needs.plan.outputs.channel }}
+          cache-from: type=gha,scope=${{ env.PROVIDER }}
+          cache-to: type=gha,scope=${{ env.PROVIDER }},mode=max
+          provenance: mode=max
+          sbom: true
+      - uses: ./.github/actions/sign-and-verify-image
+        with:
+          image: ${{ env.IMAGE }}
+          digest: ${{ steps.build.outputs.digest }}
+          identity: ${{ env.SIGNER_IDENTITY }}
+          issuer: ${{ env.OIDC_ISSUER }}
+      - name: Tag signed digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          MANIFEST_VERSION: ${{ steps.version.outputs.manifest_version }}
+          REPO_VERSION: ${{ needs.plan.outputs.repo_version }}
+        run: |
+          set -euo pipefail
+          .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > tags.txt
+          while read -r tag; do
+            docker buildx imagetools create --tag "$tag" "${IMAGE}@${DIGEST}"
+            got="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)"
+            [ "$got" = "$DIGEST" ] || { echo "::error::$tag resolves to $got, not $DIGEST"; exit 1; }
+            echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          done < tags.txt
+
+  publish-buildfloor:
+    name: Publish buildfloor
+    needs: [plan, publish-omni]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      PROVIDER: buildfloor
+      IMAGE: ghcr.io/agentparadise/agentic-workspace-buildfloor
+      OMNI_REF: ghcr.io/agentparadise/agentic-workspace-omni-agent@${{ needs.publish-omni.outputs.digest }}
+      OMNI_VERSION: ${{ needs.publish-omni.outputs.manifest_version }}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: uv run scripts/build-provider.py "$PROVIDER" --stage-only
+      - name: Read manifest version
+        id: version
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^version: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "implementations/docker/images/${PROVIDER}/manifest.yaml")"
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad manifest version: '$v'"; exit 1; }
+          echo "manifest_version=$v" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          platforms: ${{ env.PLATFORMS }}
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      # The base must be the omni this run signed, checked against the same
+      # exact identity consumers use, before anything is built on it.
+      - name: Verify omni base digest
+        run: |
+          set -euo pipefail
+          [[ "$OMNI_REF" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "::error::omni base is not a digest: $OMNI_REF"; exit 1; }
+          cosign verify \
+            --certificate-identity "$SIGNER_IDENTITY" \
+            --certificate-oidc-issuer "$OIDC_ISSUER" \
+            "$OMNI_REF" > /dev/null
+          echo "OK: building FROM $OMNI_REF"
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        id: build
+        with:
+          context: build/${{ env.PROVIDER }}
+          file: build/${{ env.PROVIDER }}/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            OMNI_IMAGE=${{ env.OMNI_REF }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=agentic-workspace-buildfloor
+            org.opencontainers.image.vendor=Agentic Workspace
+            org.opencontainers.image.source=https://github.com/AgentParadise/agentic-workspace
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.manifest_version }}
+            org.opencontainers.image.base.name=${{ env.OMNI_REF }}
+            org.opencontainers.image.base.digest=${{ needs.publish-omni.outputs.digest }}
+            agentic.provider=${{ env.PROVIDER }}
+            agentic.provider.version=${{ steps.version.outputs.manifest_version }}
+            agentic.base.omni.version=${{ env.OMNI_VERSION }}
+            agentic.repo.version=${{ needs.plan.outputs.repo_version }}
+            agentic.image.channel=${{ needs.plan.outputs.channel }}
+          cache-from: type=gha,scope=${{ env.PROVIDER }}
+          cache-to: type=gha,scope=${{ env.PROVIDER }},mode=max
+          provenance: mode=max
+          sbom: true
+      # The gate: compile smoke on both arches against the pushed, still
+      # untagged and unsigned digest. A failure here leaves an orphan digest
+      # no tag or signature points at.
+      - name: Compile smoke (linux/amd64)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: implementations/docker/images/buildfloor/smoke/run.sh "${IMAGE}@${DIGEST}" linux/amd64
+      - name: Compile smoke (linux/arm64, QEMU)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: implementations/docker/images/buildfloor/smoke/run.sh "${IMAGE}@${DIGEST}" linux/arm64
+      - uses: ./.github/actions/sign-and-verify-image
+        with:
+          image: ${{ env.IMAGE }}
+          digest: ${{ steps.build.outputs.digest }}
+          identity: ${{ env.SIGNER_IDENTITY }}
+          issuer: ${{ env.OIDC_ISSUER }}
+      - name: Tag signed digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          MANIFEST_VERSION: ${{ steps.version.outputs.manifest_version }}
+          REPO_VERSION: ${{ needs.plan.outputs.repo_version }}
+        run: |
+          set -euo pipefail
+          .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > tags.txt
+          while read -r tag; do
+            docker buildx imagetools create --tag "$tag" "${IMAGE}@${DIGEST}"
+            got="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)"
+            [ "$got" = "$DIGEST" ] || { echo "::error::$tag resolves to $got, not $DIGEST"; exit 1; }
+            echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          done < tags.txt
+          echo "- base: \`${OMNI_REF}\`" >> "$GITHUB_STEP_SUMMARY"

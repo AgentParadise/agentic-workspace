@@ -1,0 +1,71 @@
+name: Sign and verify image
+description: >-
+  Keyless-sign one pushed image digest, verify the signature against the exact
+  release identity, and prove the digest carries BuildKit SBOM and provenance
+  attestations. A composite action runs inside the calling job, so the OIDC
+  identity stays release-images.yml, not this file.
+
+inputs:
+  image:
+    description: Fully qualified image name without tag or digest.
+    required: true
+  digest:
+    description: sha256:... digest of the pushed index.
+    required: true
+  identity:
+    description: Exact certificate identity cosign must see.
+    required: true
+  issuer:
+    description: OIDC issuer.
+    required: true
+  platforms:
+    description: Space-separated platforms that must each carry an SBOM and provenance.
+    required: false
+    default: linux/amd64 linux/arm64
+
+runs:
+  using: composite
+  steps:
+    - name: Sign and verify
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        DIGEST: ${{ inputs.digest }}
+        IDENTITY: ${{ inputs.identity }}
+        ISSUER: ${{ inputs.issuer }}
+        PLATFORMS: ${{ inputs.platforms }}
+      run: |
+        set -euo pipefail
+        [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest: $DIGEST"; exit 1; }
+        ref="${IMAGE}@${DIGEST}"
+
+        cosign sign --yes "$ref"
+        cosign verify \
+          --certificate-identity "$IDENTITY" \
+          --certificate-oidc-issuer "$ISSUER" \
+          "$ref" > /dev/null
+        echo "OK: signature verified for $ref"
+
+        # The signature covers the index digest, and the index references the
+        # attestation manifests, so the SBOM and provenance are covered too.
+        # Fail if BuildKit did not attach them.
+        sbom="$(docker buildx imagetools inspect "$ref" --format '{{ json .SBOM }}')"
+        prov="$(docker buildx imagetools inspect "$ref" --format '{{ json .Provenance }}')"
+        for platform in $PLATFORMS; do
+          jq -e --arg p "$platform" '.[$p].SPDX != null' <<<"$sbom" > /dev/null \
+            || { echo "::error::SBOM attestation missing for $platform on $ref"; exit 1; }
+          jq -e --arg p "$platform" '.[$p].SLSA != null' <<<"$prov" > /dev/null \
+            || { echo "::error::provenance attestation missing for $platform on $ref"; exit 1; }
+        done
+        echo "OK: SBOM and provenance attestations present on $ref"
+
+        {
+          echo "### ${IMAGE}"
+          echo ""
+          echo "- Digest: \`${DIGEST}\`"
+          echo "- Identity: \`${IDENTITY}\`"
+          echo ""
+          echo '```bash'
+          echo "cosign verify --certificate-identity '${IDENTITY}' --certificate-oidc-issuer '${ISSUER}' ${ref}"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
