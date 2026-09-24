@@ -16,7 +16,7 @@ Usage:
     uv run scripts/build-provider.py claude-cli --no-cache
 
 The build process:
-1. Reads manifest.yaml from providers/workspaces/<provider>/
+1. Reads manifest.yaml from implementations/docker/images/<provider>/
 2. Creates staged build context in build/<provider>/
 3. Copies Dockerfile, plugins, and builds Python wheels
 4. Runs docker build with the staged context
@@ -33,9 +33,9 @@ from pathlib import Path
 
 import yaml
 
-# Paths relative to agentic-primitives root
+# Paths relative to the Agentic Workspace root
 ROOT = Path(__file__).parent.parent
-PROVIDERS_DIR = ROOT / "providers" / "workspaces"
+IMAGES_DIR = ROOT / "implementations" / "docker" / "images"
 PLUGINS_DIR = ROOT / "plugins"
 WORKSPACE_DIR = ROOT / "workspace"
 PYTHON_PACKAGES_DIR = ROOT / "lib" / "python"
@@ -44,7 +44,7 @@ BUILD_DIR = ROOT / "build"
 
 def load_manifest(provider: str) -> dict:
     """Load and validate provider manifest."""
-    manifest_path = PROVIDERS_DIR / provider / "manifest.yaml"
+    manifest_path = IMAGES_DIR / provider / "manifest.yaml"
     if not manifest_path.exists():
         print(f"❌ Provider manifest not found: {manifest_path}")
         sys.exit(1)
@@ -55,7 +55,7 @@ def load_manifest(provider: str) -> dict:
 
 def stage_dockerfile(provider: str, build_context: Path) -> None:
     """Copy Dockerfile to build context."""
-    src = PROVIDERS_DIR / provider / "Dockerfile"
+    src = IMAGES_DIR / provider / "Dockerfile"
     dst = build_context / "Dockerfile"
     shutil.copy2(src, dst)
     print("  ✓ Dockerfile")
@@ -101,7 +101,7 @@ def stage_scripts(provider: str, build_context: Path) -> None:
     Copies the entire scripts/ tree so subdirectories like git-hooks/ are
     available to the Dockerfile via `COPY scripts/git-hooks/ ...`.
     """
-    scripts_src = PROVIDERS_DIR / provider / "scripts"
+    scripts_src = IMAGES_DIR / provider / "scripts"
     if not scripts_src.exists():
         return  # No scripts directory
 

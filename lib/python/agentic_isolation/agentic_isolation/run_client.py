@@ -7,7 +7,7 @@ sole responsibilities are:
 1. Mirror the wire contract (`AgentRunSpec` / `AgentRunResult` / `AgentRunEvent`)
    as strict Pydantic v2 models whose field names match the Rust serde names
    exactly. See the authoritative source at
-   ``providers/workspaces/interactive-tmux/driver-rs/src/run/contract.rs`` and
+   ``implementations/docker/interactive-tmux/driver-rs/src/run/contract.rs`` and
    the generated JSON schema under ``.../driver-rs/docs/contract/``.
 2. Spawn ``itmux run`` in JSON mode, stream the stdout event JSONL, parse each
    line into a typed :data:`AgentRunEvent`, and return the terminal

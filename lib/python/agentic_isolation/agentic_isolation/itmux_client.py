@@ -1,6 +1,6 @@
 """Typed Python client for the `itmux` Rust subprocess.
 
-`itmux` (`providers/workspaces/interactive-tmux/driver-rs`) is the Rust
+`itmux` (`implementations/docker/interactive-tmux/driver-rs`) is the Rust
 port of the interactive-tmux workspace driver. It exposes six subcommands
 (`start`, `send`, `await`, `capture`, `exec`, `stop`) and emits JSON on
 stdout. This module shells out to the compiled binary and parses its
@@ -29,8 +29,8 @@ _ITMUX_BIN_NAME = "itmux"
 
 # Relative path (from the agentic-primitives repo root) to the compiled
 # Rust binary, mirroring the crate layout under
-# `providers/workspaces/interactive-tmux/driver-rs`.
-_REPO_RELATIVE_BIN = Path("providers/workspaces/interactive-tmux/driver-rs/target/release/itmux")
+# `implementations/docker/interactive-tmux/driver-rs`.
+_REPO_RELATIVE_BIN = Path("implementations/docker/interactive-tmux/driver-rs/target/release/itmux")
 
 
 class AgentStartupStatus(BaseModel):
@@ -150,7 +150,7 @@ def resolve_itmux_bin(*, repo_root: Path | None = None) -> str:
     Resolution order:
     1. `$AGENTIC_ITMUX_BIN` environment variable (if set, used verbatim).
     2. The compiled binary at
-       `providers/workspaces/interactive-tmux/driver-rs/target/release/itmux`
+       `implementations/docker/interactive-tmux/driver-rs/target/release/itmux`
        relative to `repo_root` (defaults to this file's repo root:
        `lib/python/agentic_isolation/agentic_isolation/itmux_client.py`
        -> repo root is four parents up).

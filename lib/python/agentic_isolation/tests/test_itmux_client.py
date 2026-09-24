@@ -490,7 +490,7 @@ class TestBinaryResolution:
 
         monkeypatch.delenv("AGENTIC_ITMUX_BIN", raising=False)
         repo_bin_dir = pathlib.Path(str(tmp_path)) / (
-            "providers/workspaces/interactive-tmux/driver-rs/target/release"
+            "implementations/docker/interactive-tmux/driver-rs/target/release"
         )
         repo_bin_dir.mkdir(parents=True)
         repo_bin = repo_bin_dir / "itmux"

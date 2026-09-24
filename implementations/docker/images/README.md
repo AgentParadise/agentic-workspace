@@ -1,13 +1,14 @@
-# Workspace Provider Images
+# Docker Workspace Images
 
 Pre-configured Docker images for running AI agents in isolated environments.
 
-## Available Providers
+## Available Images
 
-| Provider | Description | OTel Support |
+| Image | Description | OTel Support |
 |----------|-------------|--------------|
 | `claude-cli` | Claude CLI with native OpenTelemetry (drives `claude -p` from the orchestrator) | ✅ Native |
 | `interactive-tmux` | Claude + Codex + Gemini interactive CLIs in one tmux session, driven from host via `docker exec tmux send-keys`/`capture-pane`. Built for Max-plan subscription billing where `-p` is unavailable. See [provider README](./interactive-tmux/README.md) and `EXP-05-interactive-tmux-provider.md` in the private `AgentParadise/experiments` archive, under `agentic-primitives/2026-06-15--tmux-workspace--lab-reports/`. | ❌ (interactive TUIs do not emit the stream-json events `-p` mode produces; see provider README for the planned event-capture arc) |
+| `omni-agent` | Claude and Codex on the shared capability runtime | ✅ |
 | `base` | Minimal secure base (no agent) | N/A |
 
 ## Building Images
@@ -28,17 +29,11 @@ uv run scripts/build-provider.py claude-cli --no-cache
 uv run scripts/build-provider.py claude-cli --stage-only
 ```
 
-Or use just:
-
-```bash
-just build-provider claude-cli
-```
-
 ## How It Works
 
 The build process:
 
-1. **Reads manifest** - `providers/workspaces/<provider>/manifest.yaml`
+1. **Reads manifest** - `implementations/docker/images/<image>/manifest.yaml`
 2. **Stages build context** - Creates `build/<provider>/` with:
    - Dockerfile
    - Plugins (from `plugins/`, per manifest `plugins.include`)
@@ -46,7 +41,7 @@ The build process:
 3. **Builds Docker image** - Self-contained, reproducible
 
 ```
-providers/workspaces/claude-cli/
+implementations/docker/images/claude-cli/
 ├── Dockerfile          # Image definition
 └── manifest.yaml       # Build configuration
 
@@ -87,9 +82,9 @@ security:
   no_setuid: true
 ```
 
-## Adding a New Provider
+## Adding a New Image
 
-1. Create directory: `providers/workspaces/<name>/`
+1. Create directory: `implementations/docker/images/<name>/`
 2. Add `Dockerfile` with your agent runtime
 3. Add `manifest.yaml` with configuration
 4. Build: `uv run scripts/build-provider.py <name>`

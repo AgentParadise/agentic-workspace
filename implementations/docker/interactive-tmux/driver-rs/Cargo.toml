@@ -51,3 +51,7 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# This driver has its own lockfile and release lifecycle, separate from the
+# APSS workspace adapter crate above it.
+[workspace]

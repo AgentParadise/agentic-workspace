@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 
-# The driver lives at providers/workspaces/interactive-tmux/driver/
+# The driver lives at implementations/docker/interactive-tmux/driver/
 # interactive_tmux.py — not a packaged module yet. Locate and import it
 # the same way the InteractiveTmuxProvider adapter does (walking up from
 # this test file, since the test sits inside the isolation package tree).
@@ -30,8 +30,8 @@ def _load_driver_module():
     for ancestor in here.parents:
         candidate = (
             ancestor
-            / "providers"
-            / "workspaces"
+            / "implementations"
+            / "docker"
             / "interactive-tmux"
             / "driver"
             / "interactive_tmux.py"

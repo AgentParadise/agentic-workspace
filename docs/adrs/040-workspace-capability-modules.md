@@ -578,7 +578,7 @@ only. Its harness-specific setup sits on the unconditional path:
 |---|---|---|
 | `workspace/entrypoint.sh:33-64` | Section 1 writes `~/.claude/settings.json`, enabling three Claude Code plugin identifiers. Verified to run with **no guard of any kind**: no capability, provider, or harness condition anywhere around it. | Unconditional. Debt. M3. |
 | `workspace/entrypoint.sh:66-91` | Section 2 scans `/opt/agentic/plugins/` for `.claude-plugin/plugin.json` and builds `--plugin-dir` flags (`:74-88`), described at `:71-72` as flags "for the orchestrator to append when invoking claude CLI". Runs for every provider. | Unconditional. Debt. M3. |
-| `workspace/entrypoint.sh:113-115` | Comments the first git-hooks source as "owned by the claude-cli provider itself", baked in from `providers/workspaces/claude-cli/scripts/git-hooks/`. | **Accurate, no change needed.** That directory correctly stayed behind in the provider. A provider-specific dependency documented as such, not a stale path. |
+| `workspace/entrypoint.sh:113-115` | Comments the first git-hooks source as "owned by the claude-cli image itself", baked in from `implementations/docker/images/claude-cli/scripts/git-hooks/` (formerly `providers/workspaces/claude-cli/scripts/git-hooks/`). | **Accurate.** The image-specific hooks stay with the Claude image. |
 
 The consequence, stated plainly: **a second image staging this tree today is
 handed Claude's configuration whether or not it runs Claude.** Not a

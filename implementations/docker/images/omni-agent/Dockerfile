@@ -6,7 +6,7 @@
 #     This Dockerfile expects a staged build context, not the raw repo.
 #
 # This is the SECOND implementation of the ADR-040 section 12 image contract.
-# It is derived from providers/workspaces/claude-cli/Dockerfile by SUBTRACTION,
+# It is derived from implementations/docker/images/claude-cli/Dockerfile by SUBTRACTION,
 # and the four things section 12 obliges it to do are the four things it does:
 #   1. ENTRYPOINT is the shared workspace/entrypoint.sh, unforked.
 #   2. /opt/agentic/capabilities/ is populated from the staged shared tree.

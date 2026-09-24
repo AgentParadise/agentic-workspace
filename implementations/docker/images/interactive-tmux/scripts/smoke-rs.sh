@@ -8,7 +8,7 @@
 # transcripts to runs/smoke-rs-<agent>.txt alongside this script.
 #
 # Usage:
-#   bash providers/workspaces/interactive-tmux/scripts/smoke-rs.sh
+#   bash implementations/docker/images/interactive-tmux/scripts/smoke-rs.sh
 #
 # Pre-reqs:
 #   - Image agentic-workspace-interactive-tmux:latest built
@@ -19,7 +19,8 @@
 set -euo pipefail
 
 PROVIDER_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-DRIVER_RS_DIR="$PROVIDER_DIR/driver-rs"
+DOCKER_DIR="$(cd "$PROVIDER_DIR/../.." && pwd)"
+DRIVER_RS_DIR="$DOCKER_DIR/interactive-tmux/driver-rs"
 RUNS_DIR="$PROVIDER_DIR/runs"
 mkdir -p "$RUNS_DIR"
 

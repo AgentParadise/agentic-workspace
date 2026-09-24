@@ -1,7 +1,7 @@
 """Integration tests for the workspace's prepare-commit-msg hook.
 
 The hook lives at:
-    providers/workspaces/claude-cli/scripts/git-hooks/prepare-commit-msg
+    implementations/docker/images/claude-cli/scripts/git-hooks/prepare-commit-msg
 
 It is shipped *with the workspace image* (not as a Claude Code plugin).
 The entrypoint composes it into the runtime git hooks directory at

@@ -358,7 +358,7 @@ class SessionRecorder:
             # Use standard fixtures directory
             output_dir = (
                 Path(__file__).parent.parent.parent.parent
-                / "providers/workspaces/claude-cli/fixtures/recordings"
+                / "implementations/docker/images/claude-cli/fixtures/recordings"
             )
         else:
             output_dir = Path(output_dir)

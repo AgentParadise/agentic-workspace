@@ -54,7 +54,7 @@ class AwaitResult(Protocol):
 
     This is a *structural* Protocol, not a concrete dataclass. The
     interactive-tmux driver defines its own `AwaitResult` dataclass
-    (`providers/workspaces/interactive-tmux/driver/interactive_tmux.py`)
+    (`implementations/docker/interactive-tmux/driver/interactive_tmux.py`)
     and that real object is what `interactive_session().await_completion()`
     actually returns. Declaring this as a Protocol (rather than a duplicate
     dataclass) means `isinstance(driver_result, AwaitResult)` is True at

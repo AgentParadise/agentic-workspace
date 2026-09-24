@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Interactive-tmux workspace entrypoint.
 #
-# Intentionally minimal compared to providers/workspaces/claude-cli's
+# Intentionally minimal compared to implementations/docker/images/claude-cli's
 # entrypoint. The interactive provider's lifecycle is host-driven; the
 # host driver orchestrates tmux sessions and CLI startup via
 # `docker exec`. The entrypoint's only job is to:

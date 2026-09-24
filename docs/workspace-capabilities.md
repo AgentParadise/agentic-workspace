@@ -563,8 +563,8 @@ its job where they asked.
 
 Add the name to `AGENTIC_CAPABILITIES` in the `ENV` block of **every**
 Dockerfile that hosts capabilities. Two do today,
-`providers/workspaces/claude-cli/Dockerfile` and
-`providers/workspaces/omni-agent/Dockerfile`, and they must agree:
+`implementations/docker/images/claude-cli/Dockerfile` and
+`implementations/docker/images/omni-agent/Dockerfile`, and they must agree:
 
 ```dockerfile
 AGENTIC_CAPABILITIES="memory session-store" \

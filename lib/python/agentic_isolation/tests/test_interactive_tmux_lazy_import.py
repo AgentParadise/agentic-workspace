@@ -1,6 +1,6 @@
 """Lazy-loading tests for the interactive-tmux provider.
 
-The driver (providers/workspaces/interactive-tmux/driver/interactive_tmux.py)
+The driver (implementations/docker/interactive-tmux/driver/interactive_tmux.py)
 is NOT packaged inside the agentic-isolation wheel: pyproject only ships the
 `agentic_isolation` package. Importing `agentic_isolation` (or any of its
 provider modules) must therefore never load the driver; only constructing or

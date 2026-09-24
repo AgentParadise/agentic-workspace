@@ -159,7 +159,7 @@ fi
 # Two contributing sources, composed into a single runtime directory:
 #   1. /opt/agentic/git-hooks/                          — workspace-shipped
 #      hooks. Owned by the claude-cli provider itself (this dir is baked in
-#      by the Dockerfile from providers/workspaces/claude-cli/scripts/git-hooks/).
+#      by the Dockerfile from implementations/docker/images/claude-cli/scripts/git-hooks/).
 #      Currently: prepare-commit-msg for operator Co-authored-by attribution
 #      (driven by SYN_OPERATOR_NAME / SYN_OPERATOR_EMAIL env vars; no-op when
 #      either is unset).

@@ -7,7 +7,7 @@ the existing `claude-cli` provider; neither replaces the other.
 
 ## Why it exists
 
-`providers/workspaces/claude-cli` drives Claude in non-interactive (`-p`)
+`implementations/docker/images/claude-cli` drives Claude in non-interactive (`-p`)
 mode, which is leaving the Max plan in ~5 days. The interactive transport
 (tmux pane + host-side `docker exec`) was validated in EXP-01..04 of this
 repo's experiment series and survives on the subscription plan. This
@@ -28,7 +28,7 @@ matching the pinned `CLAUDE_CLI_VERSION` in the Dockerfile).
 
 ## Host-side driver
 
-`driver/interactive_tmux.py` is a single-file Python 3.11+ driver (stdlib
+[`driver/interactive_tmux.py`](../../interactive-tmux/driver/interactive_tmux.py) is a single-file Python 3.11+ driver (stdlib
 only) exposing five primitives that hide the per-agent quirks:
 
 ```python
@@ -54,45 +54,42 @@ ws.stop()
 
 The driver is a single file, not a package on PyPI and not exposed via
 `pyproject.toml` yet. `from interactive_tmux import …` only resolves if
-`providers/workspaces/interactive-tmux/driver/` is on `sys.path`. Pick one:
+`implementations/docker/interactive-tmux/driver/` is on `sys.path`. Pick one:
 
 ```bash
 # Option A — set PYTHONPATH for the run (recommended for ad-hoc scripts):
-PYTHONPATH=providers/workspaces/interactive-tmux/driver python3 my_script.py
+PYTHONPATH=implementations/docker/interactive-tmux/driver python3 my_script.py
 ```
 
 ```python
 # Option B — prepend at the top of your script (works from any cwd):
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(
-    "providers/workspaces/interactive-tmux/driver"
+    "implementations/docker/interactive-tmux/driver"
 ).resolve()))
 from interactive_tmux import InteractiveTmuxWorkspace
 ```
 
-Consumers outside this repo (e.g. Syntropic137) should vendor
-`driver/interactive_tmux.py` or import it by absolute path until a wheel
+Consumers outside this repo (e.g. Syntropic137) should reference
+`implementations/docker/interactive-tmux/driver/interactive_tmux.py` by absolute path until a wheel
 ships.
 
 ### CLI shim
 
-A CLI shim is bundled for shell-script consumers. **The shim paths below
-are relative to `providers/workspaces/interactive-tmux/` — `cd` there
-first**, or substitute the absolute path to `driver/interactive_tmux.py`:
+A CLI shim is bundled for shell-script consumers. Run it from the repository root:
 
 ```bash
-cd providers/workspaces/interactive-tmux/
-python3 driver/interactive_tmux.py start  --name w1
-python3 driver/interactive_tmux.py send   --name w1 --agent gemini --text "..."
-python3 driver/interactive_tmux.py await  --name w1 --agent gemini --timeout 60
-python3 driver/interactive_tmux.py capture --name w1 --agent gemini
-python3 driver/interactive_tmux.py stop   --name w1
+uv run python implementations/docker/interactive-tmux/driver/interactive_tmux.py start  --name w1
+uv run python implementations/docker/interactive-tmux/driver/interactive_tmux.py send   --name w1 --agent gemini --text "..."
+uv run python implementations/docker/interactive-tmux/driver/interactive_tmux.py await  --name w1 --agent gemini --timeout 60
+uv run python implementations/docker/interactive-tmux/driver/interactive_tmux.py capture --name w1 --agent gemini
+uv run python implementations/docker/interactive-tmux/driver/interactive_tmux.py stop   --name w1
 ```
 
 ## Rust driver (alternative implementation)
 
 A parity-faithful Rust port of the driver lives at
-[`driver-rs/`](driver-rs/) and ships as a single static binary `itmux`.
+[`driver-rs/`](../../interactive-tmux/driver-rs/) and ships as a single static binary `itmux`.
 The protocol, per-agent matrix, structured-result shape, and on-disk
 workspace registry (`/tmp/interactive-tmux-workspaces/<name>.json`) are
 byte-compatible with the Python driver, so a Rust `start` round-trips
@@ -106,7 +103,7 @@ readiness predicates, same `AwaitResult` JSON shape.
 
 ```bash
 # Build (release):
-cd providers/workspaces/interactive-tmux/driver-rs/
+cd implementations/docker/interactive-tmux/driver-rs/
 cargo build --release
 # Binary path (honours CARGO_TARGET_DIR if set):
 ls target/release/itmux
@@ -130,7 +127,7 @@ land at `runs/smoke-rs-<agent>.txt` so you can diff against the
 Python smoke's outputs.
 
 Implementation notes and the full per-agent matrix encoding live at
-[`driver-rs/README.md`](driver-rs/README.md).
+[`driver-rs/README.md`](../../interactive-tmux/driver-rs/README.md).
 
 ## Per-agent matrix (encoded in the driver — callers should not need this)
 
@@ -273,7 +270,7 @@ is the only mechanism that actually loads plugins.
 
 ```bash
 export ITMUX_CLAUDE_PLUGIN_DIRS=/opt/skills:/opt/observability
-python3 driver/interactive_tmux.py start --name w1
+uv run python implementations/docker/interactive-tmux/driver/interactive_tmux.py start --name w1
 # launches: claude --plugin-dir /opt/skills --plugin-dir /opt/observability
 ```
 
@@ -318,7 +315,7 @@ here so consumers don't have to read the script first):
 Then:
 
 ```bash
-bash providers/workspaces/interactive-tmux/scripts/smoke.sh
+bash implementations/docker/images/interactive-tmux/scripts/smoke.sh
 ```
 
 Starts a workspace, sends one echo-token prompt per agent, captures the

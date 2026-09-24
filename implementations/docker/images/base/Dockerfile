@@ -2,7 +2,7 @@
 # Minimal, security-hardened base for building workspace images
 #
 # Build (from agentic-primitives root):
-#   docker build -t agentic-base:latest -f providers/workspaces/base/Dockerfile .
+#   docker build -t agentic-base:latest -f implementations/docker/images/base/Dockerfile .
 #
 # Features:
 #   - Minimal Debian slim base

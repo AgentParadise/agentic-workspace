@@ -14,7 +14,8 @@
 set -euo pipefail
 
 PROVIDER_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-DRIVER="$PROVIDER_DIR/driver/interactive_tmux.py"
+DOCKER_DIR="$(cd "$PROVIDER_DIR/../.." && pwd)"
+DRIVER="$DOCKER_DIR/interactive-tmux/driver/interactive_tmux.py"
 RUNS_DIR="$PROVIDER_DIR/runs"
 mkdir -p "$RUNS_DIR"
 

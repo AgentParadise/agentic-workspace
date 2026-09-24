@@ -55,7 +55,7 @@ def _load_driver_module() -> Any:
     """Locate `interactive_tmux.py` and import it as a module.
 
     The driver is a single-file Python module living at
-    `providers/workspaces/interactive-tmux/driver/interactive_tmux.py`. It
+    `implementations/docker/interactive-tmux/driver/interactive_tmux.py`. It
     isn't on PyPI yet (m1 from the EXP-06 docs validation tracks that). We
     look for it in:
       1. an already-imported `interactive_tmux` (caller pre-staged sys.path)
@@ -74,13 +74,13 @@ def _load_driver_module() -> Any:
             )
     else:
         # this file: …/agentic_isolation/providers/interactive_tmux/__init__.py
-        # driver:    …/providers/workspaces/interactive-tmux/driver/interactive_tmux.py
+        # driver:    …/implementations/docker/interactive-tmux/driver/interactive_tmux.py
         here = Path(__file__).resolve()
         for ancestor in here.parents:
             candidate = (
                 ancestor
-                / "providers"
-                / "workspaces"
+                / "implementations"
+                / "docker"
                 / "interactive-tmux"
                 / "driver"
                 / "interactive_tmux.py"
@@ -92,7 +92,7 @@ def _load_driver_module() -> Any:
             raise ImportError(
                 "Could not locate interactive_tmux.py driver. Set "
                 "$AGENTIC_INTERACTIVE_TMUX_DRIVER to the absolute path or "
-                "ensure the providers/workspaces/interactive-tmux/driver/ "
+                "ensure the implementations/docker/interactive-tmux/driver/ "
                 "directory is reachable from this module's path."
             )
 

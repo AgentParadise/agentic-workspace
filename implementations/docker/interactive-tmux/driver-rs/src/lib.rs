@@ -1,6 +1,6 @@
 //! Host-side driver for the `interactive-tmux` workspace provider — Rust port.
 //!
-//! This crate is a parity port of `providers/workspaces/interactive-tmux/driver/
+//! This crate is a parity port of `implementations/docker/interactive-tmux/driver/
 //! interactive_tmux.py`. The protocol, per-agent matrix (EXP-01..04, EXP-05a,
 //! `ANALYTICS.md` §4, archived in the private `AgentParadise/experiments`
 //! repository under `agentic-primitives/2026-06-15--tmux-workspace--lab-reports/`),

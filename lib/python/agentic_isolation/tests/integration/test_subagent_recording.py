@@ -14,11 +14,12 @@ from pathlib import Path
 from agentic_isolation.providers.claude_cli.event_parser import EventParser
 from agentic_isolation.providers.claude_cli.types import EventType
 
-# Path to recording fixture (relative to agentic-primitives root)
+# Path to recording fixture (relative to Agentic Workspace root)
 RECORDING_PATH = (
     Path(__file__).parent.parent.parent.parent.parent.parent
-    / "providers"
-    / "workspaces"
+    / "implementations"
+    / "docker"
+    / "images"
     / "claude-cli"
     / "fixtures"
     / "recordings"

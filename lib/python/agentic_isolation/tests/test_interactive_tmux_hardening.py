@@ -27,8 +27,8 @@ def _load_driver_module():
     for ancestor in here.parents:
         candidate = (
             ancestor
-            / "providers"
-            / "workspaces"
+            / "implementations"
+            / "docker"
             / "interactive-tmux"
             / "driver"
             / "interactive_tmux.py"

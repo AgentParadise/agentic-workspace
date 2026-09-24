@@ -23,8 +23,9 @@ standard version, and immutable source commit.
 ```text
 crates/workspace-core/       provider-neutral types and port
 implementations/local/       insecure filesystem and process adapter
-implementations/docker/      Rust Docker adapter and migration boundary
-providers/workspaces/        preserved Docker image definitions
+implementations/docker/      Rust Docker adapter, image definitions, and tmux drivers
+implementations/docker/images/          Dockerfiles, manifests, fixtures
+implementations/docker/interactive-tmux/ host-side Python and Rust drivers
 workspace/                   shared image runtime and capabilities
 lib/python/                  compatibility packages
 plugins/                     frozen Claude image compatibility snapshot

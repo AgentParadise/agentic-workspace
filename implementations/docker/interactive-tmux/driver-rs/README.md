@@ -27,7 +27,7 @@ round-trips with a Python `stop` and vice versa.
 ## Build & install
 
 ```bash
-cd providers/workspaces/interactive-tmux/driver-rs/
+cd implementations/docker/interactive-tmux/driver-rs/
 cargo build --release
 # Binary at target/release/itmux (~2.4 MB)
 ```
@@ -96,7 +96,7 @@ Three test files, 25 tests total — none require a docker daemon:
 workspace through `itmux`. Auto-builds the release binary on first run.
 
 ```bash
-bash providers/workspaces/interactive-tmux/scripts/smoke-rs.sh
+bash implementations/docker/images/interactive-tmux/scripts/smoke-rs.sh
 # Expected: [smoke-rs] ALL PASS (3/3 agents)
 ```
 

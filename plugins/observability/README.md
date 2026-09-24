@@ -91,7 +91,7 @@ Codex MCP config example:
 [mcp_servers.agentic-langfuse]
 command = "uv"
 args = ["run", "--script", "/path/to/agentic-primitives/plugins/observability/mcp/langfuse_server.py"]
-env = { ITMUX_BIN = "/path/to/agentic-primitives/providers/workspaces/interactive-tmux/driver-rs/target/release/itmux" }
+env = { ITMUX_BIN = "/path/to/agentic-primitives/implementations/docker/interactive-tmux/driver-rs/target/release/itmux" }
 ```
 
 ## Event sources and ownership

@@ -85,7 +85,7 @@ def get_recordings_dir() -> Path:
     # Navigate from agentic_events/fixtures.py to repo root:
     # fixtures.py -> agentic_events -> agentic_events -> python -> lib -> repo_root
     repo_root = Path(__file__).parent.parent.parent.parent.parent
-    return repo_root / "providers/workspaces/claude-cli/fixtures/recordings"
+    return repo_root / "implementations/docker/images/claude-cli/fixtures/recordings"
 
 
 def list_recordings(include_directories: bool = True) -> list[Path]:

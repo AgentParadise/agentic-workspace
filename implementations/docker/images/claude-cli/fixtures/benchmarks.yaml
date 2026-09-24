@@ -5,7 +5,7 @@
 #   ./scripts/run_benchmark.sh context-window-growth
 #
 #   # Or manually:
-#   cd providers/workspaces/claude-cli
+#   cd implementations/docker/images/claude-cli
 #   TASK="context-window-growth" \
 #   PROMPT="$(yq '.benchmarks["context-window-growth"].prompt' fixtures/benchmarks.yaml)" \
 #   docker compose -f docker-compose.record.yaml up

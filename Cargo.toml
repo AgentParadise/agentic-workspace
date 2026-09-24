@@ -5,7 +5,7 @@ members = [
   "implementations/docker",
   "implementations/local",
 ]
-exclude = [".apss/build"]
+exclude = [".apss/build", "implementations/docker/interactive-tmux/driver-rs"]
 resolver = "2"
 
 [workspace.package]

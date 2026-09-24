@@ -75,7 +75,7 @@ jobs:
           PROVIDER: ${{ matrix.provider }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          version="$(sed -n 's/^version: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "providers/workspaces/${PROVIDER}/manifest.yaml")"
+          version="$(sed -n 's/^version: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "implementations/docker/images/${PROVIDER}/manifest.yaml")"
           test -n "$version"
           case "$RELEASE_TAG" in
             v[0-9]*.[0-9]*.[0-9]*) ;;

@@ -12,7 +12,7 @@ for every `AGENTIC_SESSION_STORE_*` variable this capability reads).
 
 **This changed.** The omni-agent image now ships
 `apss-session-exporter`, pinned by digest and cosign-verified before the build
-(see `providers/workspaces/omni-agent/Dockerfile`).
+(see `implementations/docker/images/omni-agent/Dockerfile`).
 
 What made that legitimate was the exporter becoming a PUBLIC reference client
 of APS-V1-0004 in its own repository, rather than a binary extracted from a

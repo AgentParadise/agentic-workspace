@@ -22,7 +22,7 @@ API is still reachable on top of the protocol adapter — this is the
 
 Run:
   PYTHONPATH=lib/python/agentic_isolation \\
-    python3 providers/workspaces/interactive-tmux/scripts/smoke_provider_adapter.py
+    python3 implementations/docker/images/interactive-tmux/scripts/smoke_provider_adapter.py
 
 Pre-reqs are the same as scripts/smoke.sh (image built; ~/.claude /
 ~/.codex / ~/.gemini authed on host).
@@ -41,9 +41,9 @@ from pathlib import Path
 def _add_paths() -> None:
     """Make the agentic_isolation module + driver importable in-place."""
     here = Path(__file__).resolve()
-    repo = here.parents[4]
+    repo = here.parents[5]
     sys.path.insert(0, str(repo / "lib" / "python" / "agentic_isolation"))
-    sys.path.insert(0, str(repo / "providers" / "workspaces" / "interactive-tmux" / "driver"))
+    sys.path.insert(0, str(repo / "implementations" / "docker" / "interactive-tmux" / "driver"))
 
 
 _add_paths()

@@ -41,7 +41,7 @@ def __getattr__(name: str) -> Any:
     """Lazy export for providers with optional external dependencies.
 
     `InteractiveTmuxProvider` depends on the repo-root single-file driver
-    (providers/workspaces/interactive-tmux/driver/interactive_tmux.py),
+    (implementations/docker/interactive-tmux/driver/interactive_tmux.py),
     which is NOT shipped inside the agentic-isolation wheel. Importing it
     eagerly would break `import agentic_isolation` for every installed
     consumer, so it is resolved on first attribute access instead.

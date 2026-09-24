@@ -17,7 +17,7 @@ before running the orchestrator's CMD.
 
 The runtime itself is harness-neutral and lives at the repository root in
 [`workspace/`](../workspace/): `entrypoint.sh` plus `capabilities/`. It used
-to live under `providers/workspaces/claude-cli/`. A provider image stages
+to live under `implementations/docker/images/claude-cli/`. A provider image stages
 that tree at build time (`stage_workspace_runtime()` in
 `scripts/build-provider.py`) and `COPY`s it to `/opt/agentic/entrypoint.sh`
 and `/opt/agentic/capabilities/`. Two provider images do so today,
