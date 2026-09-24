@@ -34,8 +34,8 @@
 # Global build args (declared before any FROM so all stages can inherit).
 # Stages that need these must re-declare `ARG <name>` without a default.
 # Both harnesses are pinned; bump deliberately.
-ARG CLAUDE_CLI_VERSION=2.1.250
-ARG CODEX_CLI_VERSION=0.150.1
+ARG CLAUDE_CLI_VERSION=2.1.281
+ARG CODEX_CLI_VERSION=0.156.1
 # Keep this aligned with Agentic Skills' validated installer contract.
 ARG SKILLS_CLI_VERSION=1.7.0
 # The `just` command runner. Pinned like the harnesses above; `latest` would
@@ -262,6 +262,7 @@ COPY packages/*.whl /tmp/packages/
 # agentic_memory and agentic_session_store are what the two capability
 # doctors exec; pyjwt is required for MCP authentication.
 RUN uv pip install --no-cache /tmp/packages/*.whl pyjwt \
+    && ln -s /opt/venv/bin/syn-delegate /usr/local/bin/syn-delegate \
     && rm -rf /tmp/packages
 
 # =============================================================================
