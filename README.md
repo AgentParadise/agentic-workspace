@@ -1,5 +1,4 @@
-<p align="center"><img src="assets/agent-paradise.png" alt="Agent Paradise palm-tree mark" width="72"></p>
-<p align="center"><img src="assets/banner.svg" alt="Agentic Workspace by Agent Paradise" width="960"></p>
+<p align="center"><img src="assets/banner.png" alt="Agentic Workspace by Agent Paradise, with the circuit-palm mark" width="960"></p>
 
 # Agentic Workspace
 
