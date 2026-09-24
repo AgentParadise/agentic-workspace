@@ -1,4 +1,11 @@
+<p align="center"><img src="assets/agent-paradise.png" alt="Agent Paradise palm-tree mark" width="72"></p>
+<p align="center"><img src="assets/banner.svg" alt="Agentic Workspace by Agent Paradise" width="960"></p>
+
 # Agentic Workspace
+
+[![CI](https://github.com/AgentParadise/agentic-workspace/actions/workflows/ci.yml/badge.svg)](https://github.com/AgentParadise/agentic-workspace/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-0D3F49.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-workspace-0D3F49.svg)](#documentation)
 
 A provider-neutral agent workspace contract with Local and Docker
 implementations. Future E2B, SBX, and VPS providers plug into the same port.
@@ -13,10 +20,18 @@ implementations. Future E2B, SBX, and VPS providers plug into the same port.
 Local is never a security boundary. It requires explicit opt-in and refuses
 production mode. Docker remains the isolated implementation used by Syntropic.
 
+[Architecture](#layout) · [Documentation](#documentation) · [Validation](#validate)
+
 `workspace-core` compiles against the APSS Workspace experiment and delegates
 manifest semantic validation to it before applying provider-boundary checks.
 `APSS.yaml`, `apss.lock`, and `Cargo.lock` record the project declaration,
 standard version, and immutable source commit.
+
+## Documentation
+
+- [APSS declaration](APSS.yaml) and [resolved standard pin](apss.lock)
+- [Conformance coverage](tests/conformance/COVERAGE.md) and [known discrepancies](tests/conformance/DISCREPANCIES.md)
+- [Docker implementation](implementations/docker) and [Local implementation](implementations/local)
 
 ## Layout
 
