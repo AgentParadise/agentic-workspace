@@ -14,7 +14,7 @@ An unsupported harness returns no capability rather than a guessed identity.
 ## Format anchors
 
 The workspace currently pins Claude Code 2.1.281 and Codex 0.156.1 in
-`providers/workspaces/omni-agent/Dockerfile`. Extraction uses these mechanisms:
+`implementations/docker/images/omni-agent/Dockerfile`. Extraction uses these mechanisms:
 
 - Claude: `sessionId` for root context; `agentId` with `isSidechain` for a
   child's native `agent-<id>` identity; unique `Agent`/`Task` tool-use and
@@ -28,7 +28,7 @@ The workspace currently pins Claude Code 2.1.281 and Codex 0.156.1 in
   `forked_from_ordinal_exclusive` and `runtime_workspace_roots`; the fields
   this reader uses are unchanged.
 
-`tests/test_native_evidence.py` uses content-free structural fixtures for these
+`lib/python/agentic_isolation/tests/test_native_evidence.py` uses content-free structural fixtures for these
 mechanisms, including depth three, missing bodies, duplicate calls, conflicting
 identities, copied fork history, and malformed headers. Claude shapes were
 reproduced from the local lineage experiment described in Syntropic137 #1398;
