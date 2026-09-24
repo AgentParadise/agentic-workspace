@@ -123,6 +123,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     tree \
     procps \
+    make \
     gnupg \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
@@ -159,16 +160,21 @@ RUN uv python install 3.12.13 \
 
 # Both harnesses, each pinned via the global ARGs above. Neither is "the"
 # agent in this image: a caller selects one per invocation.
+# Clear npm's download cache in each install layer so it does not ship in the
+# final image. A later cleanup layer would leave the cached bytes underneath.
 ARG CLAUDE_CLI_VERSION
-RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CLI_VERSION} \
+    && npm cache clean --force
 ARG CODEX_CLI_VERSION
-RUN npm install -g @openai/codex@${CODEX_CLI_VERSION}
+RUN npm install -g @openai/codex@${CODEX_CLI_VERSION} \
+    && npm cache clean --force
 RUN claude --version && codex --version
 
 # Install the skills CLI globally via npm. Pin exact version deliberately.
 ARG SKILLS_CLI_VERSION
 RUN npm install -g skills@${SKILLS_CLI_VERSION} \
-    && test "$(skills --version)" = "${SKILLS_CLI_VERSION}"
+    && test "$(skills --version)" = "${SKILLS_CLI_VERSION}" \
+    && npm cache clean --force
 
 # =============================================================================
 # RTK: bash output compression (ADR-056)
@@ -550,7 +556,7 @@ RUN chmod -R 755 /opt/agentic/plugins \
 # Verify core installations (before security hardening).
 # Both harnesses are verified: an omni image with one working harness is a
 # broken omni image, not a degraded one.
-RUN claude --version && codex --version && python3 --version && node --version && uv --version && gh --version && just --version
+RUN claude --version && codex --version && python3 --version && node --version && uv --version && gh --version && just --version && make --version
 
 # Verify the capability runtime the image claims to host: both doctors must
 # be importable from the venv this image ships.

@@ -5,10 +5,10 @@ ObservabilityEvents. Handles the tool_use_id → tool_name mapping
 that Claude CLI doesn't provide in tool_result events.
 
 Subagent Tracking:
-- Detects Task tool usage as SUBAGENT_STARTED
-- Tracks concurrent subagents by their Task tool_use_id
+- Detects Task and Agent tool usage as SUBAGENT_STARTED
+- Tracks concurrent subagents by their tool_use_id
 - Tags events with parent_tool_use_id for correlation
-- Emits SUBAGENT_STOPPED when Task tool_result is received
+- Emits SUBAGENT_STOPPED when their tool_result is received
 """
 
 from __future__ import annotations
@@ -27,6 +27,14 @@ from agentic_isolation.providers.claude_cli.types import (
 )
 
 logger = logging.getLogger(__name__)
+SUBAGENT_TOOL_NAMES = frozenset({"Task", "Agent"})
+STREAM_HANDLERS = {
+    "system": "_handle_system",
+    "assistant": "_handle_assistant",
+    "user": "_handle_user",
+    "result": "_handle_result",
+}
+KNOWN_STREAM_EVENT_TYPES = frozenset(STREAM_HANDLERS)
 
 
 @dataclass
@@ -36,8 +44,8 @@ class SubagentState:
     Used to correlate events and calculate duration when the subagent stops.
     """
 
-    tool_use_id: str  # The Task tool_use_id (unique identifier)
-    name: str  # Subagent name from Task input
+    tool_use_id: str  # The spawning tool_use_id (unique identifier)
+    name: str  # Subagent name from tool input
     started_at: datetime
     tools_used: dict[str, int] = field(default_factory=dict)  # {tool_name: count}
 
@@ -53,10 +61,10 @@ class EventParser:
     tool_result events with the missing tool name.
 
     Subagent Tracking:
-    - Detects `tool_use.name == "Task"` as subagent start
+    - Detects `tool_use.name` of `Task` or `Agent` as subagent start
     - Tracks concurrent subagents in `_active_subagents` dict
     - Correlates events via `parent_tool_use_id` field
-    - Emits SUBAGENT_STOPPED when Task tool_result is received
+    - Emits SUBAGENT_STOPPED when the matching tool_result is received
 
     Usage:
         parser = EventParser(session_id="session-123")
@@ -79,7 +87,7 @@ class EventParser:
         # Tool name cache: tool_use_id → tool_name
         self._tool_names: dict[str, str] = {}
 
-        # Active subagents: Task tool_use_id → SubagentState
+        # Active subagents: spawning tool_use_id → SubagentState
         self._active_subagents: dict[str, SubagentState] = {}
 
         # Completed subagent names (for summary)
@@ -159,17 +167,11 @@ class EventParser:
         timestamp = self._parse_timestamp(raw)
         self._event_count += 1
 
-        handlers: dict[str, Any] = {
-            "system": self._handle_system,
-            "assistant": self._handle_assistant,
-            "user": self._handle_user,
-            "result": self._handle_result,
-        }
-
-        handler = handlers.get(event_type)
-        if handler is None:
+        handler_name = STREAM_HANDLERS.get(event_type)
+        if handler_name is None:
             return []
 
+        handler = getattr(self, handler_name)
         result = handler(raw, timestamp)
         if isinstance(result, list):
             return result
@@ -196,9 +198,9 @@ class EventParser:
         return datetime.now(UTC)
 
     def _extract_subagent_name(self, tool_input: dict[str, Any]) -> str:
-        """Extract subagent name from Task tool input.
+        """Extract subagent name from Task or Agent tool input.
 
-        Task tool input may contain:
+        The tool input may contain:
         - description: Short description of the task
         - prompt: The actual prompt given to the subagent
 
@@ -271,9 +273,10 @@ class EventParser:
             subagent = self._active_subagents[parent_tool_use_id]
             subagent.tools_used[tool_name] = subagent.tools_used.get(tool_name, 0) + 1
 
-        if tool_name == "Task":
+        if tool_name in SUBAGENT_TOOL_NAMES:
             return self._start_subagent(
                 tool_use_id,
+                tool_name,
                 tool_input,
                 raw,
                 timestamp,
@@ -294,6 +297,7 @@ class EventParser:
     def _start_subagent(
         self,
         tool_use_id: str,
+        tool_name: str,
         tool_input: dict[str, Any],
         raw: dict[str, Any],
         timestamp: datetime,
@@ -314,7 +318,7 @@ class EventParser:
             session_id=self.session_id,
             timestamp=timestamp,
             raw_event=raw,
-            tool_name="Task",
+            tool_name=tool_name,
             tool_use_id=tool_use_id,
             tool_input=tool_input,
             agent_name=subagent_name,
@@ -328,7 +332,7 @@ class EventParser:
         """Handle assistant message events.
 
         These contain tool_use items that we need to cache for later enrichment.
-        Also detects Task tool usage for subagent tracking.
+        Also detects Task and Agent tool usage for subagent tracking.
 
         IMPORTANT: Assistant messages may contain BOTH:
         - message.usage (token counts for this turn)
@@ -359,7 +363,7 @@ class EventParser:
         """Handle user message events (contains tool_result).
 
         Enriches tool_result with tool_name from cache.
-        Detects Task tool_result as subagent completion.
+        Detects subagent tool_result as subagent completion.
         """
         events: list[ObservabilityEvent] = []
         message = raw.get("message", {})
@@ -379,7 +383,7 @@ class EventParser:
                 # Enrich with cached tool name
                 tool_name = self._tool_names.get(tool_use_id, "unknown")
 
-                # Check if this is a Task completion (subagent stopped)
+                # Check if this is a subagent completion.
                 if tool_use_id in self._active_subagents:
                     subagent = self._active_subagents.pop(tool_use_id)
                     duration_ms = int((timestamp - subagent.started_at).total_seconds() * 1000)

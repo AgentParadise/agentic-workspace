@@ -186,8 +186,14 @@ class WorkspaceDockerProvider(BaseProvider):
             stdout, stderr = await proc.communicate()
 
             if proc.returncode != 0:
-                error_msg = stderr.decode().strip() if stderr else "Unknown error"
-                raise RuntimeError(f"Failed to create container: {error_msg}")
+                detail = stderr.decode(errors="replace").strip()
+                if not detail:
+                    detail = stdout.decode(errors="replace").strip()
+                if not detail:
+                    detail = "no output on stderr or stdout"
+                raise RuntimeError(
+                    f"Failed to create container: {detail} (docker create exited {proc.returncode})"
+                )
 
             container_id = stdout.decode().strip()
 

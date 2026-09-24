@@ -1,6 +1,9 @@
 """Tests for Claude CLI event parser."""
 
+import json
 from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from agentic_isolation.providers.claude_cli.event_parser import EventParser
 from agentic_isolation.providers.claude_cli.types import EventType
@@ -177,6 +180,50 @@ class TestEventParser:
 
 class TestSubagentTracking:
     """Tests for subagent lifecycle tracking."""
+
+    @pytest.mark.parametrize("tool_name", ["Task", "Agent"])
+    def test_subagent_tool_lifecycle_preserves_actual_name(self, tool_name: str) -> None:
+        parser = EventParser(session_id="test-session")
+        started = parser.parse_line(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "spawn_1",
+                                "name": tool_name,
+                                "input": {"description": "Inspect repository"},
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+        start = get_event_by_type(started, EventType.SUBAGENT_STARTED)
+        assert start is not None
+        assert start.tool_name == tool_name
+        assert parser.get_active_subagent_count() == 1
+
+        stopped = parser.parse_line(
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "spawn_1", "is_error": False}
+                        ]
+                    },
+                }
+            )
+        )
+        stop = get_event_by_type(stopped, EventType.SUBAGENT_STOPPED)
+        assert stop is not None
+        assert stop.tool_name == tool_name
+        assert stop.agent_name == "Inspect repository"
+        assert parser.get_active_subagent_count() == 0
+        assert parser.get_summary().subagent_count == 1
 
     def test_task_tool_emits_subagent_started(self) -> None:
         """Task tool usage should emit SUBAGENT_STARTED event."""

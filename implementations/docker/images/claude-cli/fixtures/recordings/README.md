@@ -80,6 +80,25 @@ The `SessionPlayer` automatically migrates old formats to current schema.
 
 ## How to Create a Recording
 
+### Check a fresh CLI capture
+
+Capture a `claude -p` run with `--output-format stream-json --verbose` that uses
+at least one tool. From `lib/python/agentic_isolation`, run:
+
+```bash
+uv run python scripts/claude_cli_canary.py /path/to/capture.jsonl
+uv run python scripts/claude_cli_canary.py --live
+```
+
+For a capture that invokes a subagent, add `--require-subagent`. The checker
+requires all four token fields in assistant and final usage, the result's
+cost/duration/turn fields, an explicit `is_error` boolean on each tool result,
+and matching subagent start and stop events. `--live` runs a bounded read-only
+subagent probe and requires a working Claude login. The checker exits with
+status 1 when the CLI stream no longer satisfies these parser assumptions.
+Older recordings in this directory may predate these fields, so use a fresh
+capture to check a current CLI release.
+
 ### Option 1: Using SessionRecorder in code
 
 ```python

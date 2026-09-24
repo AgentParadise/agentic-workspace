@@ -70,9 +70,9 @@ class ObservabilityEvent:
     success: bool | None = None
 
     # Subagent-specific fields (set for subagent events)
-    parent_tool_use_id: str | None = None  # Links tool to spawning Task
-    agent_name: str | None = None  # Subagent name from Task input
-    subagent_tool_use_id: str | None = None  # The Task tool_use_id
+    parent_tool_use_id: str | None = None  # Links tool to spawning subagent
+    agent_name: str | None = None  # Subagent name from tool input
+    subagent_tool_use_id: str | None = None  # The spawning tool_use_id
     duration_ms: int | None = None  # Subagent execution duration
     tools_used: dict[str, int] | None = None  # Tools used by subagent: {tool_name: count}
 
