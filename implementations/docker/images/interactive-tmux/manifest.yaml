@@ -126,5 +126,5 @@ health:
 labels:
   org.opencontainers.image.title: "Agentic Workspace — Interactive tmux (claude/codex/gemini)"
   org.opencontainers.image.description: "Interactive multi-agent workspace driven from host over tmux"
-  org.opencontainers.image.vendor: "Agentic Primitives"
-  org.opencontainers.image.source: "https://github.com/agentparadise/agentic-primitives"
+  org.opencontainers.image.vendor: "Agentic Workspace"
+  org.opencontainers.image.source: "https://github.com/AgentParadise/agentic-workspace"

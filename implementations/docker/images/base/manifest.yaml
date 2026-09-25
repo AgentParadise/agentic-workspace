@@ -59,4 +59,4 @@ health:
 labels:
   org.opencontainers.image.title: "Agentic Base"
   org.opencontainers.image.description: "Minimal secure base for workspace images"
-  org.opencontainers.image.vendor: "Agentic Primitives"
+  org.opencontainers.image.vendor: "Agentic Workspace"

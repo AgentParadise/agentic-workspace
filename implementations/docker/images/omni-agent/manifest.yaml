@@ -128,5 +128,5 @@ health:
 labels:
   org.opencontainers.image.title: "Agentic Workspace - Omni Agent"
   org.opencontainers.image.description: "Multi-harness workspace (claude + codex) on the shared capability runtime"
-  org.opencontainers.image.vendor: "Agentic Primitives"
-  org.opencontainers.image.source: "https://github.com/agentparadise/agentic-primitives"
+  org.opencontainers.image.vendor: "Agentic Workspace"
+  org.opencontainers.image.source: "https://github.com/AgentParadise/agentic-workspace"

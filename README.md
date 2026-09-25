@@ -1,5 +1,4 @@
-<p align="center"><img src="assets/agent-paradise.png" alt="Agent Paradise palm-tree mark" width="72"></p>
-<p align="center"><img src="assets/banner.svg" alt="Agentic Workspace by Agent Paradise" width="960"></p>
+<p align="center"><img src="assets/banner.png" alt="Agentic Workspace by Agent Paradise, with the circuit-palm mark" width="960"></p>
 
 # Agentic Workspace
 
@@ -7,47 +6,84 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-0D3F49.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-workspace-0D3F49.svg)](#documentation)
 
-A provider-neutral agent workspace contract with Local and Docker
-implementations. Future E2B, SBX, and VPS providers plug into the same port.
+Isolated workspaces for running AI coding agents (Claude Code, Codex) behind
+one provider-neutral contract.
 
-## Status
+An orchestrator asks for a workspace, stages context and credentials into it,
+runs an agent, and tears it down. This repository defines that contract in
+Rust and ships two implementations of it, plus the signed Docker images the
+Docker implementation runs. It is being extracted as the workspace layer
+for [Syntropic137](https://github.com/syntropic137/syntropic137); Syntropic137
+has not cut over to it yet.
 
-- APSS contract: `EXP-V1-0006`, version `0.1.0`, pinned at an immutable APSS commit
-- Local: insecure test implementation in Rust
-- Docker: Rust isolated adapter plus history-preserved runtime, images, and Python compatibility provider
-- Syntropic137 migration: not yet cut over
+[Architecture](#what-is-here) · [Images](#images) · [Documentation](#documentation) · [Develop](#develop)
 
-Local is never a security boundary. It requires explicit opt-in and refuses
-production mode. Docker remains the isolated implementation used by Syntropic.
+## What is here
 
-[Architecture](#layout) · [Documentation](#documentation) · [Validation](#validate)
+| Part | What it is |
+|------|------------|
+| `crates/workspace-core` | Provider-neutral types and the workspace port. Compiles against the APSS workspace standard (`EXP-V1-0006`) and delegates manifest validation to it. |
+| `crates/workspace-conformance` | Shared functional conformance assertions every implementation runs. |
+| `implementations/docker` | The isolated implementation: Rust Docker adapter, image definitions, and host-side tmux drivers. Fails closed on isolation and credential policy. |
+| `implementations/local` | Filesystem and process adapter for tests. **Not a security boundary**: it needs explicit opt-in and refuses production mode. |
+| `workspace/` | The runtime baked into every image: entrypoint and opt-in capability modules. |
+| `lib/python/` | Python compatibility packages for existing consumers. |
+| `plugins/` | Frozen Claude plugin snapshot baked into images. See [`plugins/COMPATIBILITY.md`](plugins/COMPATIBILITY.md). |
 
-`workspace-core` compiles against the APSS Workspace experiment and delegates
-manifest semantic validation to it before applying provider-boundary checks.
-`APSS.yaml`, `apss.lock`, and `Cargo.lock` record the project declaration,
-standard version, and immutable source commit.
+Other providers (E2B, SBX, VPS) are planned to plug into the same port. They
+do not exist yet.
 
-## Documentation
+`APSS.yaml`, `apss.lock` and `Cargo.lock` pin the standard version and the
+immutable commit it is built from.
 
-- [APSS declaration](APSS.yaml) and [resolved standard pin](apss.lock)
-- [Conformance coverage](tests/conformance/COVERAGE.md) and [known discrepancies](tests/conformance/DISCREPANCIES.md)
-- [Docker implementation](implementations/docker) and [Local implementation](implementations/local)
+## Images
 
-## Layout
+| Image | Published as | Contents |
+|-------|--------------|----------|
+| `claude-cli` | `ghcr.io/agentparadise/agentic-workspace-claude` | Claude Code CLI with native OpenTelemetry, plus Codex as a delegation target |
+| `omni-agent` | `ghcr.io/agentparadise/agentic-workspace-omni-agent` | Claude Code and Codex on the shared capability runtime |
+| `buildfloor` | `ghcr.io/agentparadise/agentic-workspace-buildfloor` | `omni-agent` plus a native build floor (compiler toolchain, rustup, pnpm, bun) for repositories that compile code |
+| `interactive-tmux` | not published | Interactive CLIs in one tmux session, driven from the host |
+| `base` | not published | Minimal base image with no agent |
 
-```text
-crates/workspace-core/       provider-neutral types and port
-implementations/local/       insecure filesystem and process adapter
-implementations/docker/      Rust Docker adapter, image definitions, and tmux drivers
-implementations/docker/images/          Dockerfiles, manifests, fixtures
-implementations/docker/interactive-tmux/ host-side Python and Rust drivers
-workspace/                   shared image runtime and capabilities
-lib/python/                  compatibility packages
-plugins/                     frozen Claude image compatibility snapshot
-tests/conformance/           requirement coverage and fixtures
+Details and build options: [`implementations/docker/images/README.md`](implementations/docker/images/README.md).
+
+### Using the published images
+
+Images are published only from the protected `release` branch by
+[`release-images.yml`](.github/workflows/release-images.yml), as
+multi-architecture images (amd64, arm64). Each digest carries a keyless
+Sigstore signature plus BuildKit SBOM and provenance attestations.
+`buildfloor` is built FROM the exact `omni-agent` digest of the same run and
+passes a compile smoke test on both architectures before it is signed. There
+is no `latest` tag.
+
+1. Pin by digest, never by tag.
+2. Verify the signature against the release workflow identity:
+
+   ```bash
+   cosign verify \
+     --certificate-identity \
+       'https://github.com/AgentParadise/agentic-workspace/.github/workflows/release-images.yml@refs/heads/release' \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+     ghcr.io/agentparadise/agentic-workspace-omni-agent@sha256:<digest>
+   ```
+
+3. Only then promote the digest into your deployment.
+
+Tags, labels and the release procedure are in [`docs/RELEASE.md`](docs/RELEASE.md).
+
+### Building locally
+
+```bash
+uv run scripts/build-provider.py claude-cli              # build
+uv run scripts/build-provider.py claude-cli --stage-only # stage the build context only
 ```
 
-## Validate
+## Develop
+
+Requires a Rust toolchain (see `rust-toolchain.toml`), [uv](https://docs.astral.sh/uv/)
+for Python, and Docker for the Docker conformance suite.
 
 ```bash
 cargo fmt --all --check
@@ -56,9 +92,22 @@ cargo test --workspace
 REQUIRE_DOCKER_CONFORMANCE=1 cargo test -p agentic-workspace-docker --test conformance
 ```
 
-Python compatibility packages are tested with `uv run pytest` from each
-package directory. Docker build contexts can be staged with:
+Python packages are tested with `uv run pytest` from each directory under
+`lib/python/`.
 
-```bash
-uv run scripts/build-provider.py claude-cli --stage-only
-```
+## Documentation
+
+- [`docs/workspace.md`](docs/workspace.md): what a workspace does and exposes
+- [`docs/workspace-capabilities.md`](docs/workspace-capabilities.md): opt-in capability modules
+- [`docs/adrs/`](docs/adrs/): design decisions
+- [`docs/RELEASE.md`](docs/RELEASE.md): release and image verification
+- [APSS declaration](APSS.yaml) and [resolved standard pin](apss.lock)
+- [Conformance coverage](tests/conformance/COVERAGE.md) and [known discrepancies](tests/conformance/DISCREPANCIES.md)
+
+## Security
+
+Report vulnerabilities privately, as described in [`SECURITY.md`](SECURITY.md).
+
+## License
+
+[MIT](LICENSE)

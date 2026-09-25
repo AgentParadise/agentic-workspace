@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # release too: the main -> release PR must pass the same required checks.
+    branches: [main, release]
   workflow_dispatch:
 
 permissions:
@@ -96,6 +97,14 @@ jobs:
           ! grep -R -E 'skills@[0-9]+\.[0-9]+\.[0-9]+' implementations/docker/images/*/Dockerfile
       - run: uv run scripts/build-provider.py claude-cli --stage-only
       - run: uv run scripts/build-provider.py omni-agent --stage-only
+      - run: uv run scripts/build-provider.py buildfloor --stage-only
+      - name: Lint buildfloor and release scripts
+        run: |
+          shellcheck \
+            implementations/docker/images/buildfloor/scripts/buildfloor-entrypoint.sh \
+            implementations/docker/images/buildfloor/smoke/run.sh \
+            implementations/docker/images/buildfloor/smoke/inside.sh \
+            .github/scripts/release-image-tags.sh
 
   docker-conformance:
     runs-on: ubuntu-latest

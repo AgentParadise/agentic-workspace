@@ -247,6 +247,6 @@ async with IsolatedWorkspace.create(config) as ws:
 ## References
 
 - ADR-026: OTel-First Observability (never written; no such ADR exists in this repository)
-- ADR-025: Universal Agent Integration Layer (never written under that name; the 025 slot is [ADR-025: Just Task Runner](025-just-task-runner.md))
+- ADR-025: Universal Agent Integration Layer (never written under that name; the 025 slot is [ADR-025: Just Task Runner](https://github.com/AgentParadise/agentic-primitives/blob/main/docs/adrs/025-just-task-runner.md))
 - [Docker Security Best Practices](https://docs.docker.com/engine/security/)
 - [Claude CLI Documentation](https://docs.anthropic.com/en/docs/claude-code)

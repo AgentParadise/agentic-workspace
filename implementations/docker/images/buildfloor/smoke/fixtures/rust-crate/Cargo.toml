@@ -1,0 +1,10 @@
+[package]
+name = "buildfloor-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+# Standalone: never part of the repository workspace it sits inside.
+[workspace]

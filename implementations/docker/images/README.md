@@ -9,7 +9,21 @@ Pre-configured Docker images for running AI agents in isolated environments.
 | `claude-cli` | Claude CLI with native OpenTelemetry (drives `claude -p` from the orchestrator) | ✅ Native |
 | `interactive-tmux` | Claude + Codex + Gemini interactive CLIs in one tmux session, driven from host via `docker exec tmux send-keys`/`capture-pane`. Built for Max-plan subscription billing where `-p` is unavailable. See [provider README](./interactive-tmux/README.md) and `EXP-05-interactive-tmux-provider.md` in the private `AgentParadise/experiments` archive, under `agentic-primitives/2026-06-15--tmux-workspace--lab-reports/`. | ❌ (interactive TUIs do not emit the stream-json events `-p` mode produces; see provider README for the planned event-capture arc) |
 | `omni-agent` | Claude and Codex on the shared capability runtime | ✅ |
+| `buildfloor` | `omni-agent` plus a native build floor: build-essential, pkg-config, unzip, rustup (no toolchain; the repo's `rust-toolchain.toml` installs one on first use), pnpm via corepack, bun. Tool homes live under `/workspace/.tools`, cargo jobs follow the CPU quota. Built FROM an omni digest; compile smoke in [`buildfloor/smoke/`](./buildfloor/smoke/run.sh). | ✅ (inherited) |
 | `base` | Minimal secure base (no agent) | N/A |
+
+## Published Images
+
+Release builds are published only from the protected `release` branch, signed
+with cosign, and never tagged `latest`. See [`docs/RELEASE.md`](../../../docs/RELEASE.md).
+
+| Image | GHCR package |
+|---|---|
+| `claude-cli` | `ghcr.io/agentparadise/agentic-workspace-claude` |
+| `omni-agent` | `ghcr.io/agentparadise/agentic-workspace-omni-agent` |
+| `buildfloor` | `ghcr.io/agentparadise/agentic-workspace-buildfloor` |
+
+`interactive-tmux` and `base` are not published.
 
 ## Building Images
 
@@ -98,7 +112,7 @@ All workspace images include:
 - **Read-only plugins directory**
 - **Health checks**
 
-See [ADR-027: Provider-Based Workspace Images](../../docs/adrs/027-provider-workspace-images.md)
+See [ADR-027: Provider-Based Workspace Images](../../../docs/adrs/027-provider-workspace-images.md)
 
 ## Modern Tooling
 

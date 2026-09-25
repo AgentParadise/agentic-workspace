@@ -17,3 +17,5 @@ Provider-neutral agent workspace contracts and implementations.
 
 Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace`, and the affected Python package tests before committing.
+
+- Never commit absolute home paths or real infrastructure hostnames. See [docs/PII-HYGIENE.md](docs/PII-HYGIENE.md).

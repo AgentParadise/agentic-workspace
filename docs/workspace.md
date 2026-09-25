@@ -2,7 +2,7 @@
 
 The workspace is the isolation + observability boundary between an
 orchestrator and the AI agent it runs. Every Claude task spawned by
-[agentic-domain-runner](https://gitea.example.com/HomeLab/agentic-domain-runner),
+agentic-domain-runner (a private homelab runner),
 every Syntropic137 workflow phase, every future Codex / Gemini job runs
 inside one of these.
 
@@ -144,21 +144,16 @@ daemon share a filesystem. The inject path works against any daemon
 ## Building the workspace image
 
 ```bash
-# Canonical:
-just build-workspace-claude-cli
+uv run scripts/build-provider.py claude-cli
 
 # Any provider:
-just build-provider omni-agent
-
-# Or via the script directly:
-uv run scripts/build-provider.py claude-cli
+uv run scripts/build-provider.py omni-agent
 ```
 
 The local build tags `agentic-workspace-claude-cli:latest` plus a version
 tag matching the bundled Claude CLI release. That is the local build only.
-CI publishes signed multi-architecture images only from protected semantic
-version tags: see
-[`docs/release-process.md`](release-process.md).
+CI publishes signed multi-architecture images only from the protected
+`release` branch, and never tags `latest`: see [`docs/RELEASE.md`](RELEASE.md).
 
 ## Pointers
 
@@ -167,4 +162,3 @@ version tags: see
 - **Entrypoint script (source of truth for behavior):** [`workspace/entrypoint.sh`](../workspace/entrypoint.sh)
 - **Python helper:** [`lib/python/agentic_isolation/agentic_isolation/workspace_files.py`](../lib/python/agentic_isolation/agentic_isolation/workspace_files.py)
 - **Integration tests:** [`tests/integration/test_entrypoint_workspace_injection.py`](../tests/integration/test_entrypoint_workspace_injection.py)
-- **Sibling spec (consumer side, runner):** [agentic-domain-runner per-domain context injection design](https://gitea.example.com/HomeLab/agentic-domain-runner/src/branch/main/docs/superpowers/specs/2026-05-12-per-domain-context-injection-design.md)

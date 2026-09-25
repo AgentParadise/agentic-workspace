@@ -219,10 +219,31 @@ def extract_cli_version(build_context: Path) -> str | None:
     return None
 
 
+def resolve_build_args(manifest: dict, overrides: list[str]) -> dict[str, str]:
+    """Merge manifest `image.args` defaults with `--build-arg KEY=VALUE` overrides.
+
+    Every existing manifest declares `args: {}`, so for those images this
+    returns an empty dict and the docker command is unchanged. The buildfloor
+    image uses it for OMNI_IMAGE: a local default for developer builds, which
+    CI overrides with the exact omni digest of the same release run.
+    """
+    args: dict[str, str] = {
+        str(k): str(v) for k, v in (manifest.get("image", {}).get("args") or {}).items()
+    }
+    for item in overrides:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            print(f"❌ --build-arg must be KEY=VALUE, got: {item!r}")
+            sys.exit(1)
+        args[key] = value
+    return args
+
+
 def docker_build(
     build_context: Path,
     tag: str,
     no_cache: bool = False,
+    build_args: dict[str, str] | None = None,
 ) -> None:
     """Run docker build with commit label for cache invalidation.
 
@@ -232,6 +253,8 @@ def docker_build(
     commit = get_git_commit()
     # Build args/flags first, context path "." last (docker build requires this order)
     cmd = ["docker", "build", "-t", tag, "--label", f"agentic.commit={commit}"]
+    for key, value in (build_args or {}).items():
+        cmd.extend(["--build-arg", f"{key}={value}"])
 
     # Add version-specific tag (e.g., agentic-workspace-claude-cli:2.1.76)
     cli_version = extract_cli_version(build_context)
@@ -268,6 +291,13 @@ def main():
     parser.add_argument("--tag", help="Custom image tag")
     parser.add_argument("--no-cache", action="store_true", help="Build without cache")
     parser.add_argument("--stage-only", action="store_true", help="Only stage files, don't build")
+    parser.add_argument(
+        "--build-arg",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Docker build arg; overrides the manifest's image.args default (repeatable)",
+    )
     args = parser.parse_args()
 
     provider = args.provider
@@ -301,7 +331,7 @@ def main():
         return
 
     # Build image
-    docker_build(build_context, tag, args.no_cache)
+    docker_build(build_context, tag, args.no_cache, resolve_build_args(manifest, args.build_arg))
 
 
 if __name__ == "__main__":
