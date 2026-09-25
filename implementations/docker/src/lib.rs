@@ -22,6 +22,33 @@ pub const CODEX_SANDBOX_SECCOMP_PROFILE: &str = include_str!(
 );
 pub const CODEX_SANDBOX_SECCOMP_FILE_NAME: &str = "codex-sandbox.json";
 
+/// Docker's docker-default AppArmor profile with `deny mount,` replaced by
+/// the mounts bubblewrap performs. Paired with the seccomp profile on hosts
+/// where Docker uses AppArmor. Single source shared with the Python package;
+/// provenance in its `apparmor/README.md`.
+pub const CODEX_SANDBOX_APPARMOR_PROFILE: &str = include_str!(
+    "../../../lib/python/agentic_isolation/agentic_isolation/apparmor/agentic-codex-sandbox"
+);
+pub const CODEX_SANDBOX_APPARMOR_PROFILE_NAME: &str = "agentic-codex-sandbox";
+const APPARMOR_POLICY_PROFILES: &str = "/sys/kernel/security/apparmor/policy/profiles";
+
+/// Whether `profile` is loaded in this kernel. `None` when this host cannot
+/// tell (securityfs absent or unreadable, for example a remote daemon).
+pub fn apparmor_profile_loaded(policy_profiles: &Path, profile: &str) -> Option<bool> {
+    let entries = fs::read_dir(policy_profiles).ok()?;
+    Some(entries.flatten().any(|entry| {
+        fs::read_to_string(entry.path().join("name")).is_ok_and(|name| name.trim() == profile)
+    }))
+}
+
+fn apparmor_not_loaded(profile: &str, file: &Path) -> WorkspaceError {
+    WorkspaceError::Unsupported(format!(
+        "AppArmor is active on the Docker host but profile {profile} is not loaded; \
+         load it on the Docker host with `sudo apparmor_parser -r {}` and retry",
+        file.display()
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkPolicy {
     None,
@@ -35,6 +62,8 @@ pub struct DockerProvider {
     network: NetworkPolicy,
     docker: PathBuf,
     seccomp_profile: Option<PathBuf>,
+    apparmor_profile: Option<String>,
+    apparmor_profile_file: Option<PathBuf>,
 }
 
 impl DockerProvider {
@@ -52,6 +81,8 @@ impl DockerProvider {
             network,
             docker: PathBuf::from("docker"),
             seccomp_profile: None,
+            apparmor_profile: None,
+            apparmor_profile_file: None,
         })
     }
 
@@ -75,20 +106,67 @@ impl DockerProvider {
         Ok(self)
     }
 
-    /// Opt in to [`CODEX_SANDBOX_SECCOMP_PROFILE`] for workspaces that can run
-    /// Codex. Writes the profile into `directory`, which the caller owns and
-    /// which must not be writable by workspace code. Only for Codex-capable
-    /// workspaces; everything else keeps Docker's default profile.
-    pub fn with_codex_sandbox_seccomp(
+    /// Opt in to the Codex sandbox for workspaces that can run Codex: the
+    /// [`CODEX_SANDBOX_SECCOMP_PROFILE`] and, when the Docker daemon uses
+    /// AppArmor, the loaded [`CODEX_SANDBOX_APPARMOR_PROFILE_NAME`] profile.
+    /// Writes both profile files into `directory`, which the caller owns and
+    /// workspace code cannot write. Fails closed if AppArmor is active and the
+    /// profile is not loaded. Everything else keeps Docker's defaults.
+    pub fn with_codex_sandbox(self, directory: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
+        let apparmor_active = self.docker_apparmor_active()?;
+        self.with_codex_sandbox_policy(
+            directory,
+            apparmor_active,
+            Path::new(APPARMOR_POLICY_PROFILES),
+        )
+    }
+
+    fn with_codex_sandbox_policy(
         self,
         directory: impl AsRef<Path>,
+        apparmor_active: bool,
+        policy_profiles: &Path,
     ) -> Result<Self, WorkspaceError> {
         let directory = directory.as_ref();
         fs::create_dir_all(directory).map_err(|source| Self::io(directory, source))?;
-        let path = directory.join(CODEX_SANDBOX_SECCOMP_FILE_NAME);
-        fs::write(&path, CODEX_SANDBOX_SECCOMP_PROFILE)
-            .map_err(|source| Self::io(&path, source))?;
-        self.with_seccomp_profile(path)
+        let seccomp = directory.join(CODEX_SANDBOX_SECCOMP_FILE_NAME);
+        fs::write(&seccomp, CODEX_SANDBOX_SECCOMP_PROFILE)
+            .map_err(|source| Self::io(&seccomp, source))?;
+        let apparmor = directory.join(CODEX_SANDBOX_APPARMOR_PROFILE_NAME);
+        fs::write(&apparmor, CODEX_SANDBOX_APPARMOR_PROFILE)
+            .map_err(|source| Self::io(&apparmor, source))?;
+        let mut provider = self.with_seccomp_profile(seccomp)?;
+        if apparmor_active {
+            if apparmor_profile_loaded(policy_profiles, CODEX_SANDBOX_APPARMOR_PROFILE_NAME)
+                == Some(false)
+            {
+                return Err(apparmor_not_loaded(
+                    CODEX_SANDBOX_APPARMOR_PROFILE_NAME,
+                    &apparmor,
+                ));
+            }
+            provider.apparmor_profile = Some(CODEX_SANDBOX_APPARMOR_PROFILE_NAME.into());
+            provider.apparmor_profile_file = Some(apparmor);
+        }
+        Ok(provider)
+    }
+
+    /// Whether the Docker daemon confines containers with AppArmor. Asks the
+    /// daemon, so it is right for remote hosts; Docker Desktop reports none.
+    fn docker_apparmor_active(&self) -> Result<bool, WorkspaceError> {
+        let result = self.require_success(
+            "docker info",
+            &[
+                "info".into(),
+                "--format".into(),
+                "{{json .SecurityOptions}}".into(),
+            ],
+        )?;
+        Ok(String::from_utf8_lossy(&result.stdout).contains("name=apparmor"))
+    }
+
+    pub fn apparmor_profile(&self) -> Option<&str> {
+        self.apparmor_profile.as_deref()
     }
 
     pub fn seccomp_profile(&self) -> Option<&Path> {
@@ -102,6 +180,9 @@ impl DockerProvider {
         ];
         if let Some(profile) = &self.seccomp_profile {
             arguments.push(format!("--security-opt=seccomp={}", profile.display()));
+        }
+        if let Some(profile) = &self.apparmor_profile {
+            arguments.push(format!("--security-opt=apparmor={profile}"));
         }
         arguments.extend([
             "--read-only".into(),
@@ -246,6 +327,13 @@ impl WorkspaceProvider for DockerProvider {
 
         if let Err(error) = self.require_success("docker run", &arguments) {
             let _ = fs::remove_dir_all(&root);
+            if let (WorkspaceError::ProviderCommand { stderr, .. }, Some(profile), Some(file)) =
+                (&error, &self.apparmor_profile, &self.apparmor_profile_file)
+            {
+                if stderr.contains("apparmor failed to apply profile") {
+                    return Err(apparmor_not_loaded(profile, file));
+                }
+            }
             return Err(error);
         }
         Ok(WorkspaceHandle {
@@ -380,7 +468,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plain = provider(dir.path()).security_arguments();
         let codex = provider(dir.path())
-            .with_codex_sandbox_seccomp(dir.path().join("seccomp"))
+            .with_codex_sandbox_policy(dir.path().join("profiles"), false, dir.path())
             .unwrap();
         let profile = codex.seccomp_profile().unwrap().to_path_buf();
         assert_eq!(
@@ -402,6 +490,93 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(rest, plain);
+    }
+
+    fn policy_dir(root: &Path, loaded: &[&str]) -> PathBuf {
+        let policy = root.join("policy");
+        for (index, name) in loaded.iter().enumerate() {
+            let entry = policy.join(format!("{name}.{index}"));
+            fs::create_dir_all(&entry).unwrap();
+            fs::write(entry.join("name"), format!("{name}\n")).unwrap();
+        }
+        fs::create_dir_all(&policy).unwrap();
+        policy
+    }
+
+    #[test]
+    fn apparmor_host_with_loaded_profile_applies_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = policy_dir(dir.path(), &["docker-default", "agentic-codex-sandbox"]);
+        let codex = provider(dir.path())
+            .with_codex_sandbox_policy(dir.path().join("profiles"), true, &policy)
+            .unwrap();
+        assert_eq!(codex.apparmor_profile(), Some("agentic-codex-sandbox"));
+        let arguments = codex.security_arguments();
+        assert!(arguments.contains(&"--security-opt=apparmor=agentic-codex-sandbox".to_owned()));
+        assert!(
+            arguments
+                .iter()
+                .any(|a| a.starts_with("--security-opt=seccomp="))
+        );
+        assert!(arguments.contains(&"--cap-drop=ALL".to_owned()));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("profiles/agentic-codex-sandbox")).unwrap(),
+            CODEX_SANDBOX_APPARMOR_PROFILE
+        );
+    }
+
+    #[test]
+    fn apparmor_host_without_loaded_profile_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = policy_dir(dir.path(), &["docker-default"]);
+        let error = provider(dir.path())
+            .with_codex_sandbox_policy(dir.path().join("profiles"), true, &policy)
+            .unwrap_err();
+        assert!(error.to_string().contains("apparmor_parser -r"), "{error}");
+    }
+
+    #[test]
+    fn apparmor_unknown_load_state_still_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = provider(dir.path())
+            .with_codex_sandbox_policy(
+                dir.path().join("profiles"),
+                true,
+                &dir.path().join("absent"),
+            )
+            .unwrap();
+        assert_eq!(codex.apparmor_profile(), Some("agentic-codex-sandbox"));
+    }
+
+    #[test]
+    fn no_apparmor_option_without_apparmor() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = provider(dir.path())
+            .with_codex_sandbox_policy(dir.path().join("profiles"), false, dir.path())
+            .unwrap();
+        assert_eq!(codex.apparmor_profile(), None);
+        assert!(
+            !codex
+                .security_arguments()
+                .iter()
+                .any(|a| a.contains("apparmor"))
+        );
+    }
+
+    #[test]
+    fn embedded_apparmor_profile_only_replaces_deny_mount() {
+        let rules: Vec<&str> = CODEX_SANDBOX_APPARMOR_PROFILE
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or("").trim())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert!(!rules.contains(&"deny mount,"));
+        assert!(!rules.contains(&"mount,"));
+        assert!(!rules.contains(&"userns,"));
+        assert!(rules.contains(
+            &"profile agentic-codex-sandbox flags=(attach_disconnected,mediate_deleted) {"
+        ));
+        assert!(rules.contains(&"deny /sys/kernel/security/** rwklx,"));
     }
 
     #[test]

@@ -128,18 +128,27 @@ fn user_namespace_probe(provider: &DockerProvider, id: &str) -> (bool, String) {
         .args([
             "inspect",
             "--format",
-            "{{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}} {{.HostConfig.ReadonlyRootfs}}",
+            "{{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}} {{.HostConfig.ReadonlyRootfs}} apparmor={{.AppArmorProfile}}",
             &container,
         ])
         .output()
         .unwrap();
     assert!(inspection.status.success());
+    // What bubblewrap does first: a user and mount namespace, then make `/`
+    // a slave. The seccomp profile gates the first, AppArmor (on AppArmor
+    // hosts) the second.
     let unshare = provider
         .execute(
             &handle,
             &CommandSpec {
                 program: "unshare".into(),
-                arguments: vec!["-Um".into(), "true".into()],
+                arguments: vec![
+                    "-U".into(),
+                    "-m".into(),
+                    "--propagation".into(),
+                    "slave".into(),
+                    "true".into(),
+                ],
                 environment: BTreeMap::new(),
             },
             Duration::from_secs(10),
@@ -171,7 +180,7 @@ fn codex_sandbox_seccomp_allows_user_namespaces_and_keeps_hardening() {
 
     let codex = DockerProvider::new(root.path(), "python:3.12-slim", NetworkPolicy::None)
         .unwrap()
-        .with_codex_sandbox_seccomp(profiles.path())
+        .with_codex_sandbox(profiles.path())
         .unwrap();
     let (allowed, inspection) = user_namespace_probe(&codex, "docker-codex-seccomp");
     assert!(
@@ -181,5 +190,12 @@ fn codex_sandbox_seccomp_allows_user_namespaces_and_keeps_hardening() {
     assert!(inspection.starts_with("[\"ALL\"] "), "{inspection}");
     assert!(inspection.contains("no-new-privileges"), "{inspection}");
     assert!(inspection.contains("seccomp="), "{inspection}");
-    assert!(inspection.ends_with(" true"), "{inspection}");
+    assert!(inspection.contains(" true apparmor="), "{inspection}");
+    match codex.apparmor_profile() {
+        Some(profile) => assert!(
+            inspection.ends_with(&format!("apparmor={profile}")),
+            "{inspection}"
+        ),
+        None => assert!(!inspection.contains("apparmor=agentic"), "{inspection}"),
+    }
 }
