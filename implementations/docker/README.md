@@ -21,7 +21,11 @@ with it get `codex-sandbox.json` (Docker's default seccomp profile plus
 `clone`/`unshare` for the user, mount, pid, net and ipc namespaces, and
 `mount`, `umount2`, `pivot_root`) and, on AppArmor hosts, the AppArmor profile
 `agentic-codex-sandbox` (docker-default with `deny mount,` replaced by only the
-mounts bubblewrap performs). Images without it keep Docker's defaults.
+mounts bubblewrap performs). Images without it keep Docker's defaults, so an
+image must carry the label to run Codex sandboxed (an unlabelled one fails
+closed at `syn-delegate`'s probe). The container is started by the inspected
+image ID, never the tag, so a retag cannot change which image the label
+decision applied to.
 `with_codex_sandbox(dir)` / `without_codex_sandbox()` assert the expectation;
 a contradiction with the label is refused before anything is created.
 The AppArmor profile must be loaded on the Docker host with

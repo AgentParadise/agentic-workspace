@@ -43,10 +43,10 @@ async def test_failed_create_reports_output_and_exit_code(
     provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
 
-    async def plain_image(_image: str) -> bool:
-        return False
+    async def plain_image(_image: str) -> tuple[str, dict[str, str]]:
+        return "sha256:" + "0" * 64, {}
 
-    monkeypatch.setattr(provider, "_image_codex_capable", plain_image)
+    monkeypatch.setattr(provider, "_inspect_image", plain_image)
     monkeypatch.setattr(provider, "_ensure_network", noop)
     monkeypatch.setattr(provider, "_cleanup_container", noop)
 

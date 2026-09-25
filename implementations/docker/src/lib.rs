@@ -142,14 +142,18 @@ impl DockerProvider {
         }
     }
 
-    /// Labels baked into the image; pulls it once if it is not local. Fails
-    /// closed: a policy cannot be derived from labels that cannot be read.
-    fn image_codex_capable(&self) -> Result<bool, WorkspaceError> {
+    /// The immutable image ID and whether that image declares Codex; pulls
+    /// once if absent. Provisioning launches by this ID, so the label that
+    /// decided the policy belongs to exactly the image that runs, even if the
+    /// tag moves in between. Fails closed on anything unreadable.
+    fn inspect_image(&self) -> Result<(String, bool), WorkspaceError> {
         let inspect: Vec<String> = vec![
             "image".into(),
             "inspect".into(),
             "--format".into(),
-            format!("{{{{index .Config.Labels \"{CODEX_IMAGE_LABEL}\"}}}}"),
+            // `json .Config`, not `.Config.Labels`: some Docker versions omit
+            // the Labels key entirely for unlabelled images.
+            "{{.Id}} {{json .Config}}".into(),
             self.image.clone(),
         ];
         let first = self.docker_result(&inspect)?;
@@ -159,8 +163,22 @@ impl DockerProvider {
             let _ = self.docker_result(&["pull".into(), "--quiet".into(), self.image.clone()]);
             self.require_success("docker image inspect", &inspect)?
         };
-        let value = String::from_utf8_lossy(&result.stdout).trim().to_owned();
-        Ok(!value.is_empty() && value != "<no value>")
+        let output = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+        let unreadable = || WorkspaceError::ProviderCommand {
+            operation: "docker image inspect".into(),
+            stderr: format!("unreadable inspect output for {}", self.image),
+        };
+        let (id, config) = output.split_once(' ').ok_or_else(unreadable)?;
+        if !id.starts_with("sha256:") || id.len() != 71 {
+            return Err(unreadable());
+        }
+        let config: serde_json::Value = serde_json::from_str(config).map_err(|_| unreadable())?;
+        let capable = config
+            .get("Labels")
+            .and_then(|labels| labels.get(CODEX_IMAGE_LABEL))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        Ok((id.to_owned(), capable))
     }
 
     /// Write the profiles and settle AppArmor for one provision. Nothing is
@@ -334,7 +352,8 @@ impl WorkspaceProvider for DockerProvider {
         }
         // The Codex sandbox policy follows the image's own declaration and is
         // settled before anything is created, so a mismatch leaves nothing.
-        let codex = if Self::resolve_codex(self.codex_sandbox, self.image_codex_capable()?)? {
+        let (image_id, codex_capable) = self.inspect_image()?;
+        let codex = if Self::resolve_codex(self.codex_sandbox, codex_capable)? {
             Some(self.codex_policy()?)
         } else {
             None
@@ -378,7 +397,8 @@ impl WorkspaceProvider for DockerProvider {
         if let Some(cpu_millis) = manifest.limits.cpu_millis {
             arguments.push(format!("--cpus={}", f64::from(cpu_millis) / 1000.0));
         }
-        arguments.push(self.image.clone());
+        // The inspected image, not whatever the tag points at now.
+        arguments.push(image_id);
         arguments.extend(["sleep".into(), "infinity".into()]);
 
         if let Err(error) = self.require_success("docker run", &arguments) {
@@ -570,7 +590,7 @@ mod tests {
             format!(
                 "#!/bin/sh\n\
                  case \"$1 $2\" in\n\
-                 \"image inspect\") printf '%s\\n' '{label}';;\n\
+                 \"image inspect\") n=$(cat '{d}/inspects' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{d}/inspects'; printf 'sha256:%064d %s\\n' $n '{label}';;\n\
                  \"pull --quiet\") exit 1;;\n\
                  \"info --format\") [ -e '{d}/info-fail' ] && {{ echo daemon down >&2; exit 1; }}; printf '%s\\n' '{info}';;\n\
                  run*) printf '%s\\n' \"$@\" > '{d}/run-args'; echo id;;\n\
@@ -586,7 +606,14 @@ mod tests {
 
     #[cfg(unix)]
     fn provider(dir: &Path, label: &str, info: &str) -> DockerProvider {
-        let docker = fake_docker(dir, label, info);
+        // `docker image inspect` prints `.Config` as JSON; an unlabelled
+        // image may omit Labels entirely.
+        let config = if label == "<no value>" {
+            "{}".to_owned()
+        } else {
+            format!("{{\"Labels\":{{\"{CODEX_IMAGE_LABEL}\":\"{label}\"}}}}")
+        };
+        let docker = fake_docker(dir, &config, info);
         DockerProvider::new(dir.join("root"), "image", NetworkPolicy::None)
             .unwrap()
             .with_docker_binary(docker)
@@ -634,6 +661,27 @@ mod tests {
         );
         assert!(!args.iter().any(|a| a.contains("apparmor")));
         assert!(args.contains(&"--cap-drop=ALL".to_owned()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launches_the_inspected_image_id_not_the_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider(dir.path(), "0.156.1", "[]");
+        provider
+            .provision(&minimal_manifest("by-id", SecurityProfile::Isolated))
+            .unwrap();
+        // The fake moves the tag on every inspect; only one inspect happened,
+        // and the run used its ID.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("inspects"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        let args = run_args(dir.path());
+        assert!(!args.contains(&"image".to_owned()), "{args:?}");
+        assert!(args.contains(&format!("sha256:{:064}", 1)), "{args:?}");
     }
 
     #[cfg(unix)]
