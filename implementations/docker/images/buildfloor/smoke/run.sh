@@ -24,6 +24,49 @@ if [ -n "$platform" ]; then
   platform_args=(--platform "$platform")
 fi
 
+# When the reference is a multi-platform INDEX digest and a platform is asked
+# for, run the child manifest's own digest instead of the index digest.
+#
+# The classic overlay2 graphdriver stores one platform per image digest. Two
+# smokes over the same index digest therefore collide: the first pulls its
+# platform under that digest, the second tries to pull a different platform
+# under the same digest and docker refuses with
+#
+#     docker: cannot overwrite digest sha256:...
+#
+# which reads like a corrupt image and is really a store limitation. The
+# containerd snapshotter holds several platforms per digest, so this never
+# reproduces on a developer machine that has it enabled - only in CI.
+#
+# Resolving the child digest keeps the test honest: each child manifest is a
+# member of the index that gets signed and tagged, so what is tested is still
+# part of what ships. --platform is left in place; it agrees with the resolved
+# manifest and still selects QEMU emulation.
+if [ -n "$platform" ] && [[ "$image" == *"@sha256:"* ]]; then
+  repo="${image%@*}"
+  if child="$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}' 2>/dev/null \
+      | jq -er --arg p "$platform" '
+          (.manifests // [])
+          | map(select(
+              .platform
+              and (.platform.os + "/" + .platform.architecture) == $p
+              and (.platform.os != "unknown")
+            ))
+          | if length == 1 then .[0].digest
+            else error("expected exactly one \($p) manifest, found \(length)")
+            end
+        ')"; then
+    echo "== resolved ${platform} manifest ${child} from index ${image##*@}"
+    image="${repo}@${child}"
+  else
+    # Not an index, or the platform is absent from it. Leave the reference
+    # alone: a single-platform digest has no conflict to avoid, and a genuinely
+    # missing platform must fail in docker run with a clear message rather than
+    # be silently skipped here.
+    echo "== no distinct ${platform} manifest to resolve; using ${image} as given" >&2
+  fi
+fi
+
 common=(
   --rm
   "${platform_args[@]+"${platform_args[@]}"}"
