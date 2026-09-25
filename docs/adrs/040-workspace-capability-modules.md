@@ -17,7 +17,7 @@ tags: [workspace, capabilities, contracts, claude-cli, session-store, memory, li
 - Created: 2026-08-12
 - Updated: 2026-08-14
 - Author(s): NeuralEmpowerment
-- Supersedes: [ADR-036](036-memory-primitive-and-doctor.md) in *mechanism*.
+- Supersedes: [ADR-036](https://github.com/AgentParadise/agentic-primitives/blob/main/docs/adrs/036-memory-primitive-and-doctor.md) in *mechanism*.
   ADR-036's reasoning about opt-in and loud failure is retained and still
   binding; only its memory-specific plumbing is replaced by the generic
   module system described here.
@@ -968,7 +968,7 @@ gained the public `Env` and `CAPABILITY` symbols and the
 
 ## References
 
-- [ADR-036: Memory Primitive and Doctor](036-memory-primitive-and-doctor.md) - superseded in mechanism, retained for reasoning
+- [ADR-036: Memory Primitive and Doctor](https://github.com/AgentParadise/agentic-primitives/blob/main/docs/adrs/036-memory-primitive-and-doctor.md) - superseded in mechanism, retained for reasoning
 - [ADR-035: Workspace Injection Contract](035-workspace-injection-contract.md) - the env-var and entrypoint-section conventions this ADR extends
 - [ADR-033: Plugin-Native Workspace Images](033-plugin-native-workspace-images.md)
 - [ADR-027: Provider-Based Workspace Images](027-provider-workspace-images.md)

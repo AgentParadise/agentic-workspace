@@ -591,12 +591,13 @@ names is a major bump, as the 1.3.0 to 2.0.0 move on `claude-cli` was
 (1.2.0 was the last released version; the intermediate 1.3.0 never
 shipped).
 
-The bump is not optional for a published provider: `_check-version.yml`
-fails a release PR when a provider's own directory or any shared path
-(`workspace/`, `plugins/`, `lib/python/`, `scripts/build-provider.py`)
-changed without its manifest version moving. A capability lives under
-`workspace/`, so it trips that rule for every published provider. See
-[`docs/release-process.md`](release-process.md).
+The bump is not optional for a published provider: a change to a
+provider's own directory or any shared path (`workspace/`, `plugins/`,
+`lib/python/`, `scripts/build-provider.py`) must move its manifest version.
+A capability lives under `workspace/`, so it needs a bump for every
+published provider. Agentic Primitives enforced this with a
+`_check-version.yml` CI gate; this repository does not carry that gate yet,
+so reviewers check it by hand. See [`docs/RELEASE.md`](RELEASE.md).
 
 ---
 
@@ -683,7 +684,7 @@ natural host-side half. Start there.
 ## References
 
 - [ADR-040: Workspace Capability Modules](adrs/040-workspace-capability-modules.md)
-- [ADR-036: Memory Primitive and Doctor](adrs/036-memory-primitive-and-doctor.md)
+- [ADR-036: Memory Primitive and Doctor](https://github.com/AgentParadise/agentic-primitives/blob/main/docs/adrs/036-memory-primitive-and-doctor.md)
 - [ADR-035: Workspace Injection Contract](adrs/035-workspace-injection-contract.md)
 - EXP-08: Workspace capability capture lifecycle. Cited throughout for the
   measurements behind sections 6, 8 and 9 of ADR-040. The `experiments/`

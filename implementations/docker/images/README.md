@@ -112,7 +112,7 @@ All workspace images include:
 - **Read-only plugins directory**
 - **Health checks**
 
-See [ADR-027: Provider-Based Workspace Images](../../docs/adrs/027-provider-workspace-images.md)
+See [ADR-027: Provider-Based Workspace Images](../../../docs/adrs/027-provider-workspace-images.md)
 
 ## Modern Tooling
 

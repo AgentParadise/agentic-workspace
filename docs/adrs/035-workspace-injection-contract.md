@@ -22,9 +22,9 @@ tags: [workspace, isolation, contracts, agentic-isolation, claude-cli]
 Multiple orchestrators run AI agents inside the
 `agentic-workspace-claude-cli` image:
 
-- [agentic-domain-runner](https://gitea.example.com/HomeLab/agentic-domain-runner)
+- agentic-domain-runner (private)
   — homelab Rust service, one workspace per task.
-- [Syntropic137](https://github.com/AgentParadise/syntropic137) — Python
+- [Syntropic137](https://github.com/syntropic137/syntropic137) — Python
   platform, one workspace per workflow phase.
 - Future Codex / Gemini wrappers.
 
@@ -46,7 +46,7 @@ divergence become harder to walk back. Agents experience subtly
 different workspaces depending on which orchestrator launched them.
 
 There's also growing pressure from the agentic-domain-runner's
-[per-domain context injection design](https://gitea.example.com/HomeLab/agentic-domain-runner/src/branch/main/docs/superpowers/specs/2026-05-12-per-domain-context-injection-design.md):
+per-domain context injection design (private):
 its runner-side implementation already speaks an `AGENTIC_DOMAIN_*` (later
 renamed to `AGENTIC_WORKSPACE_*`) env-var dialect against a
 `/etc/agentic/workspace/` bind-mount path, but the workspace image hasn't
@@ -219,7 +219,7 @@ contract supports both via the entrypoint's read of `/etc/agentic/workspace/`
   discovery (entrypoint section 2) is unchanged; per-workspace plugins
   append to the same variable.
 - **Pre-existing LSP test bug** surfaced during Phase B
-  ([docs/issues/closed/001](../issues/closed/001-lsp-entrypoint-test-stdout-pollution.md))
+  ([docs/issues/closed/001](https://github.com/AgentParadise/agentic-primitives/blob/main/docs/issues/closed/001-lsp-entrypoint-test-stdout-pollution.md))
   — not caused by this work but discovered alongside.
 
 ## Implementation Notes
@@ -242,14 +242,11 @@ which is no longer in the repository. Five phases:
 
 **Breaking changes:** orchestrators still using `AGENTIC_DOMAIN_*` env vars
 or `/etc/agentic/domain/` paths break at the next image bump. Migration
-is a one-line sed (captured in agentic-domain-runner's Phase A commit
-`d7e0516`).
+is a one-line sed over the env var names and paths above.
 
 **Build:**
 
 ```bash
-just build-workspace-claude-cli
-# or
 uv run scripts/build-provider.py claude-cli
 ```
 
@@ -259,8 +256,8 @@ uv run scripts/build-provider.py claude-cli
   and `docs/superpowers/plans/2026-05-12-workspace-injection-contract.md`. Neither
   is in the repository any more; this ADR and `docs/workspace.md` are what remain.
 - Canonical doc: [`docs/workspace.md`](../workspace.md)
-- Sibling spec (runner / consumer side):
-  [agentic-domain-runner per-domain context injection](https://gitea.example.com/HomeLab/agentic-domain-runner/src/branch/main/docs/superpowers/specs/2026-05-12-per-domain-context-injection-design.md)
+- Sibling spec (runner / consumer side): agentic-domain-runner per-domain
+  context injection design (private repository, not linked)
 - [Claude subagents](https://code.claude.com/docs/en/sub-agents.md) — the
   replacement mechanism for per-workspace tool restrictions
 - ADR-027: Provider Workspace Images — the precedent ADR for per-provider

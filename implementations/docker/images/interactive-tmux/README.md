@@ -19,8 +19,6 @@ Same convention as every other provider in this repo:
 
 ```bash
 uv run scripts/build-provider.py interactive-tmux
-# or
-just build-provider interactive-tmux
 ```
 
 Produces `agentic-workspace-interactive-tmux:latest` (and a version tag
