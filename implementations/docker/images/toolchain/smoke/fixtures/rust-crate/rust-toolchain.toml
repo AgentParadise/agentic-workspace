@@ -1,4 +1,4 @@
-# Exercises the buildfloor contract: rustup ships with NO toolchain, and the
+# Exercises the toolchain contract: rustup ships with NO toolchain, and the
 # repository's own pin is installed on first use into /workspace/.tools/rustup.
 [toolchain]
 channel = "1.90.0"

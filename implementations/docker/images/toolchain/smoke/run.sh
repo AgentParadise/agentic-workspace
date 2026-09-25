@@ -1,7 +1,7 @@
 #!/bin/bash
-# Buildfloor compile smoke test.
+# Toolchain compile smoke test.
 #
-# Usage: implementations/docker/images/buildfloor/smoke/run.sh IMAGE [PLATFORM]
+# Usage: implementations/docker/images/toolchain/smoke/run.sh IMAGE [PLATFORM]
 #   IMAGE     local tag or registry reference (tag or @sha256 digest)
 #   PLATFORM  optional, e.g. linux/arm64 (runs under QEMU on an amd64 host)
 #
@@ -11,7 +11,7 @@
 #     installs on first use,
 #   - pnpm install through corepack with a hash-pinned packageManager,
 #   - bun run a TypeScript entry that imports the installed package,
-# and that the buildfloor entrypoint wrapper fails closed on a planted
+# and that the toolchain entrypoint wrapper fails closed on a planted
 # /workspace/.tools symlink. Needs network (toolchain, pnpm, npm registry).
 set -euo pipefail
 
@@ -74,18 +74,18 @@ common=(
   --tmpfs "/home/agent:rw,exec,nosuid,size=128m,uid=1000,gid=1000"
 )
 
-echo "== buildfloor smoke: ${image} ${platform:-native}"
+echo "== toolchain smoke: ${image} ${platform:-native}"
 
 # 1. Positive path: compile, install, run.
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 if ! docker run "${common[@]}" \
-    -v "${here}:/opt/buildfloor-smoke:ro" \
-    "$image" bash /opt/buildfloor-smoke/inside.sh 2>&1 | tee "$log"; then
+    -v "${here}:/opt/toolchain-smoke:ro" \
+    "$image" bash /opt/toolchain-smoke/inside.sh 2>&1 | tee "$log"; then
   echo "== FAIL: smoke container exited non-zero" >&2
   exit 1
 fi
-grep -qx 'BUILDFLOOR SMOKE PASS' "$log" || { echo "== FAIL: no pass marker" >&2; exit 1; }
+grep -qx 'TOOLCHAIN SMOKE PASS' "$log" || { echo "== FAIL: no pass marker" >&2; exit 1; }
 
 # 2. Negative path: a planted /workspace/.tools symlink must stop the
 #    container before the shared entrypoint or the command runs.
@@ -108,4 +108,4 @@ if [ "$neg_rc" -eq 0 ] || grep -q COMMAND_RAN <<<"$neg_out" \
 fi
 echo "[smoke] planted /workspace/.tools symlink refused (rc=${neg_rc})"
 
-echo "== buildfloor smoke PASS: ${image} ${platform:-native}"
+echo "== toolchain smoke PASS: ${image} ${platform:-native}"

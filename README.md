@@ -42,7 +42,7 @@ immutable commit it is built from.
 |-------|--------------|----------|
 | `claude-cli` | `ghcr.io/agentparadise/agentic-workspace-claude` | Claude Code CLI with native OpenTelemetry, plus Codex as a delegation target |
 | `omni-agent` | `ghcr.io/agentparadise/agentic-workspace-omni-agent` | Claude Code and Codex on the shared capability runtime |
-| `buildfloor` | `ghcr.io/agentparadise/agentic-workspace-buildfloor` | `omni-agent` plus a native build floor (compiler toolchain, rustup, pnpm, bun) for repositories that compile code |
+| `toolchain` | `ghcr.io/agentparadise/agentic-workspace-toolchain` | `omni-agent` plus a native toolchain (compiler toolchain, rustup, pnpm, bun) for repositories that compile code |
 | `interactive-tmux` | not published | Interactive CLIs in one tmux session, driven from the host |
 | `base` | not published | Minimal base image with no agent |
 
@@ -54,7 +54,7 @@ Images are published only from the protected `release` branch by
 [`release-images.yml`](.github/workflows/release-images.yml), as
 multi-architecture images (amd64, arm64). Each digest carries a keyless
 Sigstore signature plus BuildKit SBOM and provenance attestations.
-`buildfloor` is built FROM the exact `omni-agent` digest of the same run and
+`toolchain` is built FROM the exact `omni-agent` digest of the same run and
 passes a compile smoke test on both architectures before it is signed. There
 is no `latest` tag.
 
