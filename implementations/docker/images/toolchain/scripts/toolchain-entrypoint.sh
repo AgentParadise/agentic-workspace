@@ -1,9 +1,9 @@
 #!/bin/bash
 # =============================================================================
-# Buildfloor entrypoint wrapper
+# Toolchain entrypoint wrapper
 # =============================================================================
 #
-# Runs ONLY in the buildfloor image, before the shared workspace entrypoint,
+# Runs ONLY in the toolchain image, before the shared workspace entrypoint,
 # then execs it with the original arguments. The shared
 # /opt/agentic/entrypoint.sh (workspace/entrypoint.sh) is not modified, so
 # omni-agent and claude-cli behave exactly as they did.
@@ -43,7 +43,7 @@ _unsafe_tool_path() {
     [ -L "$1" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }
 }
 if _unsafe_tool_path "$TOOL_HOMES_ROOT"; then
-    echo "[buildfloor-entrypoint] refusing unsafe tool-home root (symlink or non-directory): $TOOL_HOMES_ROOT" >&2
+    echo "[toolchain-entrypoint] refusing unsafe tool-home root (symlink or non-directory): $TOOL_HOMES_ROOT" >&2
     exit 1
 fi
 mkdir -p "$TOOL_HOMES_ROOT"
@@ -76,7 +76,7 @@ for link in \
     rel="${link%%:*}"
     target="${TOOL_HOMES_ROOT}/${link##*:}"
     if _unsafe_tool_path "$target"; then
-        echo "[buildfloor-entrypoint] refusing unsafe tool-home target (symlink or non-directory): $target" >&2
+        echo "[toolchain-entrypoint] refusing unsafe tool-home target (symlink or non-directory): $target" >&2
         exit 1
     fi
     mkdir -p "$target"
@@ -129,7 +129,7 @@ if [ ! -e "$_cargo_config" ] && [ ! -L "$_cargo_config" ]; then
         _jobs=$(( (_quota + _period - 1) / _period ))
     fi
     if [ -n "$_jobs" ] && [ "$_jobs" -ge 1 ] 2>/dev/null; then
-        printf '# Written by the buildfloor entrypoint: jobs sized to the container CPU quota.\n[build]\njobs = %s\n' "$_jobs" > "$_cargo_config"
+        printf '# Written by the toolchain entrypoint: jobs sized to the container CPU quota.\n[build]\njobs = %s\n' "$_jobs" > "$_cargo_config"
     fi
     unset _jobs _quota _period
 fi
