@@ -12,10 +12,10 @@ use std::time::Duration;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Docker's default seccomp profile (docker-v29.8.0) plus one rule allowing
-/// `clone` (namespace flags), `unshare`, `mount`, `umount2` and `pivot_root`,
-/// so a harness that sandboxes itself with bubblewrap (Codex) can create a
-/// user namespace. Capabilities stay dropped. Single source shared with the
+/// Docker's default seccomp profile (docker-v29.8.0) plus `clone`/`unshare`
+/// for the user, mount, pid, net and ipc namespaces only, and `mount`,
+/// `umount2`, `pivot_root`, so a harness that sandboxes itself with
+/// bubblewrap (Codex) can build its namespaces. Capabilities stay dropped. Single source shared with the
 /// Python package; provenance in its `seccomp/README.md`.
 pub const CODEX_SANDBOX_SECCOMP_PROFILE: &str = include_str!(
     "../../../lib/python/agentic_isolation/agentic_isolation/seccomp/codex-sandbox.json"
@@ -55,15 +55,31 @@ pub enum NetworkPolicy {
     Bridge(String),
 }
 
+/// Image label that declares a workspace image can run Codex. The provider
+/// reads it at provision and derives the Codex sandbox policy from it.
+pub const CODEX_IMAGE_LABEL: &str = "agentic.codex_cli_version";
+/// Where profiles are written when no directory is configured: beside the
+/// execution roots, never inside one (an execution with this id is refused).
+const DEFAULT_PROFILE_DIR: &str = ".agentic-codex-sandbox";
+
+/// The Codex sandbox policy materialized for one provision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexPolicy {
+    seccomp: PathBuf,
+    apparmor: Option<String>,
+    apparmor_file: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct DockerProvider {
     root: PathBuf,
     image: String,
     network: NetworkPolicy,
     docker: PathBuf,
-    seccomp_profile: Option<PathBuf>,
-    apparmor_profile: Option<String>,
-    apparmor_profile_file: Option<PathBuf>,
+    /// None derives the policy from the image label; Some must agree with it.
+    codex_sandbox: Option<bool>,
+    codex_profile_dir: Option<PathBuf>,
+    apparmor_policy_profiles: PathBuf,
 }
 
 impl DockerProvider {
@@ -80,9 +96,9 @@ impl DockerProvider {
             image: image.into(),
             network,
             docker: PathBuf::from("docker"),
-            seccomp_profile: None,
-            apparmor_profile: None,
-            apparmor_profile_file: None,
+            codex_sandbox: None,
+            codex_profile_dir: None,
+            apparmor_policy_profiles: PathBuf::from(APPARMOR_POLICY_PROFILES),
         })
     }
 
@@ -91,64 +107,97 @@ impl DockerProvider {
         self
     }
 
-    /// Run containers with this seccomp profile instead of Docker's default.
-    /// The file is read by the docker CLI on this host, so it must exist here.
-    pub fn with_seccomp_profile(
-        mut self,
-        profile: impl Into<PathBuf>,
-    ) -> Result<Self, WorkspaceError> {
-        let profile = profile.into();
-        let canonical = fs::canonicalize(&profile).map_err(|source| Self::io(&profile, source))?;
-        if !canonical.is_file() {
-            return Err(WorkspaceError::UnsafePath(canonical.display().to_string()));
+    /// Assert the image can run Codex and write the Codex sandbox profiles into
+    /// `directory` (owned by the caller, not writable by workspace code). The
+    /// policy itself always follows the image's [`CODEX_IMAGE_LABEL`]:
+    /// provisioning an image without it is refused.
+    pub fn with_codex_sandbox(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.codex_sandbox = Some(true);
+        self.codex_profile_dir = Some(directory.into());
+        self
+    }
+
+    /// Assert the image cannot run Codex; provisioning one that declares
+    /// [`CODEX_IMAGE_LABEL`] is refused.
+    pub fn without_codex_sandbox(mut self) -> Self {
+        self.codex_sandbox = Some(false);
+        self
+    }
+
+    /// Where to write the profiles when the policy is derived from the image.
+    pub fn with_codex_profile_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.codex_profile_dir = Some(directory.into());
+        self
+    }
+
+    fn resolve_codex(requested: Option<bool>, capable: bool) -> Result<bool, WorkspaceError> {
+        match (requested, capable) {
+            (Some(true), false) => Err(WorkspaceError::InvalidManifest(format!(
+                "the Codex sandbox was requested but the image has no {CODEX_IMAGE_LABEL} label"
+            ))),
+            (Some(false), true) => Err(WorkspaceError::InvalidManifest(format!(
+                "the image declares {CODEX_IMAGE_LABEL}, so it must run with the Codex sandbox policy"
+            ))),
+            _ => Ok(capable),
         }
-        self.seccomp_profile = Some(canonical);
-        Ok(self)
     }
 
-    /// Opt in to the Codex sandbox for workspaces that can run Codex: the
-    /// [`CODEX_SANDBOX_SECCOMP_PROFILE`] and, when the Docker daemon uses
-    /// AppArmor, the loaded [`CODEX_SANDBOX_APPARMOR_PROFILE_NAME`] profile.
-    /// Writes both profile files into `directory`, which the caller owns and
-    /// workspace code cannot write. Fails closed if AppArmor is active and the
-    /// profile is not loaded. Everything else keeps Docker's defaults.
-    pub fn with_codex_sandbox(self, directory: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
-        let apparmor_active = self.docker_apparmor_active()?;
-        self.with_codex_sandbox_policy(
-            directory,
-            apparmor_active,
-            Path::new(APPARMOR_POLICY_PROFILES),
-        )
+    /// Labels baked into the image; pulls it once if it is not local. Fails
+    /// closed: a policy cannot be derived from labels that cannot be read.
+    fn image_codex_capable(&self) -> Result<bool, WorkspaceError> {
+        let inspect: Vec<String> = vec![
+            "image".into(),
+            "inspect".into(),
+            "--format".into(),
+            format!("{{{{index .Config.Labels \"{CODEX_IMAGE_LABEL}\"}}}}"),
+            self.image.clone(),
+        ];
+        let first = self.docker_result(&inspect)?;
+        let result = if first.exit_code == Some(0) && !first.timed_out {
+            first
+        } else {
+            let _ = self.docker_result(&["pull".into(), "--quiet".into(), self.image.clone()]);
+            self.require_success("docker image inspect", &inspect)?
+        };
+        let value = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+        Ok(!value.is_empty() && value != "<no value>")
     }
 
-    fn with_codex_sandbox_policy(
-        self,
-        directory: impl AsRef<Path>,
-        apparmor_active: bool,
-        policy_profiles: &Path,
-    ) -> Result<Self, WorkspaceError> {
-        let directory = directory.as_ref();
-        fs::create_dir_all(directory).map_err(|source| Self::io(directory, source))?;
+    /// Write the profiles and settle AppArmor for one provision. Nothing is
+    /// cached: a failed daemon query fails this provision, never downgrades.
+    fn codex_policy(&self) -> Result<CodexPolicy, WorkspaceError> {
+        let directory = self
+            .codex_profile_dir
+            .clone()
+            .unwrap_or_else(|| self.root.join(DEFAULT_PROFILE_DIR));
+        fs::create_dir_all(&directory).map_err(|source| Self::io(&directory, source))?;
         let seccomp = directory.join(CODEX_SANDBOX_SECCOMP_FILE_NAME);
         fs::write(&seccomp, CODEX_SANDBOX_SECCOMP_PROFILE)
             .map_err(|source| Self::io(&seccomp, source))?;
-        let apparmor = directory.join(CODEX_SANDBOX_APPARMOR_PROFILE_NAME);
-        fs::write(&apparmor, CODEX_SANDBOX_APPARMOR_PROFILE)
-            .map_err(|source| Self::io(&apparmor, source))?;
-        let mut provider = self.with_seccomp_profile(seccomp)?;
-        if apparmor_active {
-            if apparmor_profile_loaded(policy_profiles, CODEX_SANDBOX_APPARMOR_PROFILE_NAME)
-                == Some(false)
+        let apparmor_file = directory.join(CODEX_SANDBOX_APPARMOR_PROFILE_NAME);
+        fs::write(&apparmor_file, CODEX_SANDBOX_APPARMOR_PROFILE)
+            .map_err(|source| Self::io(&apparmor_file, source))?;
+        let seccomp = fs::canonicalize(&seccomp).map_err(|source| Self::io(&seccomp, source))?;
+        let apparmor = if self.docker_apparmor_active()? {
+            if apparmor_profile_loaded(
+                &self.apparmor_policy_profiles,
+                CODEX_SANDBOX_APPARMOR_PROFILE_NAME,
+            ) == Some(false)
             {
                 return Err(apparmor_not_loaded(
                     CODEX_SANDBOX_APPARMOR_PROFILE_NAME,
-                    &apparmor,
+                    &apparmor_file,
                 ));
             }
-            provider.apparmor_profile = Some(CODEX_SANDBOX_APPARMOR_PROFILE_NAME.into());
-            provider.apparmor_profile_file = Some(apparmor);
-        }
-        Ok(provider)
+            Some(CODEX_SANDBOX_APPARMOR_PROFILE_NAME.to_owned())
+        } else {
+            None
+        };
+        Ok(CodexPolicy {
+            seccomp,
+            apparmor,
+            apparmor_file,
+        })
     }
 
     /// Whether the Docker daemon confines containers with AppArmor. Asks the
@@ -165,24 +214,19 @@ impl DockerProvider {
         Ok(String::from_utf8_lossy(&result.stdout).contains("name=apparmor"))
     }
 
-    pub fn apparmor_profile(&self) -> Option<&str> {
-        self.apparmor_profile.as_deref()
-    }
-
-    pub fn seccomp_profile(&self) -> Option<&Path> {
-        self.seccomp_profile.as_deref()
-    }
-
-    fn security_arguments(&self) -> Vec<String> {
+    fn security_arguments(codex: Option<&CodexPolicy>) -> Vec<String> {
         let mut arguments = vec![
             "--cap-drop=ALL".into(),
             "--security-opt=no-new-privileges".into(),
         ];
-        if let Some(profile) = &self.seccomp_profile {
-            arguments.push(format!("--security-opt=seccomp={}", profile.display()));
-        }
-        if let Some(profile) = &self.apparmor_profile {
-            arguments.push(format!("--security-opt=apparmor={profile}"));
+        if let Some(policy) = codex {
+            arguments.push(format!(
+                "--security-opt=seccomp={}",
+                policy.seccomp.display()
+            ));
+            if let Some(profile) = &policy.apparmor {
+                arguments.push(format!("--security-opt=apparmor={profile}"));
+            }
         }
         arguments.extend([
             "--read-only".into(),
@@ -283,6 +327,18 @@ impl WorkspaceProvider for DockerProvider {
                 "Docker requires security_profile=isolated".into(),
             ));
         }
+        if manifest.execution_id == DEFAULT_PROFILE_DIR {
+            return Err(WorkspaceError::InvalidManifest(format!(
+                "execution id {DEFAULT_PROFILE_DIR} is reserved"
+            )));
+        }
+        // The Codex sandbox policy follows the image's own declaration and is
+        // settled before anything is created, so a mismatch leaves nothing.
+        let codex = if Self::resolve_codex(self.codex_sandbox, self.image_codex_capable()?)? {
+            Some(self.codex_policy()?)
+        } else {
+            None
+        };
 
         let root = self.root.join(&manifest.execution_id);
         let working_directory = root.join(&manifest.workspace.working_directory);
@@ -303,7 +359,7 @@ impl WorkspaceProvider for DockerProvider {
             "--detach".into(),
             format!("--name={container}"),
         ];
-        arguments.extend(self.security_arguments());
+        arguments.extend(Self::security_arguments(codex.as_ref()));
         arguments.extend([
             format!("--volume={}:/workspace:rw", root.display()),
             format!(
@@ -327,11 +383,12 @@ impl WorkspaceProvider for DockerProvider {
 
         if let Err(error) = self.require_success("docker run", &arguments) {
             let _ = fs::remove_dir_all(&root);
-            if let (WorkspaceError::ProviderCommand { stderr, .. }, Some(profile), Some(file)) =
-                (&error, &self.apparmor_profile, &self.apparmor_profile_file)
+            if let (WorkspaceError::ProviderCommand { stderr, .. }, Some(policy)) = (&error, &codex)
             {
-                if stderr.contains("apparmor failed to apply profile") {
-                    return Err(apparmor_not_loaded(profile, file));
+                if let Some(profile) = &policy.apparmor {
+                    if stderr.contains("apparmor failed to apply profile") {
+                        return Err(apparmor_not_loaded(profile, &policy.apparmor_file));
+                    }
                 }
             }
             return Err(error);
@@ -437,22 +494,12 @@ impl WorkspaceProvider for DockerProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn provider(root: &Path) -> DockerProvider {
-        DockerProvider::new(root.join("root"), "image", NetworkPolicy::None).unwrap()
-    }
+    use agentic_workspace_conformance::minimal_manifest;
 
     #[test]
     fn default_keeps_docker_default_seccomp() {
-        let dir = tempfile::tempdir().unwrap();
-        let arguments = provider(dir.path()).security_arguments();
-        assert!(
-            !arguments
-                .iter()
-                .any(|a| a.starts_with("--security-opt=seccomp"))
-        );
         assert_eq!(
-            arguments,
+            DockerProvider::security_arguments(None),
             [
                 "--cap-drop=ALL",
                 "--security-opt=no-new-privileges",
@@ -464,107 +511,39 @@ mod tests {
     }
 
     #[test]
-    fn codex_sandbox_adds_only_the_profile() {
-        let dir = tempfile::tempdir().unwrap();
-        let plain = provider(dir.path()).security_arguments();
-        let codex = provider(dir.path())
-            .with_codex_sandbox_policy(dir.path().join("profiles"), false, dir.path())
-            .unwrap();
-        let profile = codex.seccomp_profile().unwrap().to_path_buf();
+    fn codex_policy_adds_only_its_profiles() {
+        let policy = CodexPolicy {
+            seccomp: PathBuf::from("/p/codex-sandbox.json"),
+            apparmor: Some(CODEX_SANDBOX_APPARMOR_PROFILE_NAME.into()),
+            apparmor_file: PathBuf::from("/p/agentic-codex-sandbox"),
+        };
+        let arguments = DockerProvider::security_arguments(Some(&policy));
+        let (added, rest): (Vec<_>, Vec<_>) = arguments.into_iter().partition(|a| {
+            a.starts_with("--security-opt=seccomp") || a.starts_with("--security-opt=apparmor")
+        });
         assert_eq!(
-            fs::read_to_string(&profile).unwrap(),
-            CODEX_SANDBOX_SECCOMP_PROFILE
+            added,
+            [
+                "--security-opt=seccomp=/p/codex-sandbox.json",
+                "--security-opt=apparmor=agentic-codex-sandbox",
+            ]
         );
-        let arguments = codex.security_arguments();
-        let seccomp: Vec<_> = arguments
-            .iter()
-            .filter(|a| a.starts_with("--security-opt=seccomp"))
-            .collect();
-        assert_eq!(
-            seccomp,
-            [&format!("--security-opt=seccomp={}", profile.display())]
-        );
-        let rest: Vec<_> = arguments
-            .iter()
-            .filter(|a| !a.starts_with("--security-opt=seccomp"))
-            .cloned()
-            .collect();
-        assert_eq!(rest, plain);
-    }
-
-    fn policy_dir(root: &Path, loaded: &[&str]) -> PathBuf {
-        let policy = root.join("policy");
-        for (index, name) in loaded.iter().enumerate() {
-            let entry = policy.join(format!("{name}.{index}"));
-            fs::create_dir_all(&entry).unwrap();
-            fs::write(entry.join("name"), format!("{name}\n")).unwrap();
-        }
-        fs::create_dir_all(&policy).unwrap();
-        policy
+        assert_eq!(rest, DockerProvider::security_arguments(None));
     }
 
     #[test]
-    fn apparmor_host_with_loaded_profile_applies_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy = policy_dir(dir.path(), &["docker-default", "agentic-codex-sandbox"]);
-        let codex = provider(dir.path())
-            .with_codex_sandbox_policy(dir.path().join("profiles"), true, &policy)
-            .unwrap();
-        assert_eq!(codex.apparmor_profile(), Some("agentic-codex-sandbox"));
-        let arguments = codex.security_arguments();
-        assert!(arguments.contains(&"--security-opt=apparmor=agentic-codex-sandbox".to_owned()));
-        assert!(
-            arguments
-                .iter()
-                .any(|a| a.starts_with("--security-opt=seccomp="))
-        );
-        assert!(arguments.contains(&"--cap-drop=ALL".to_owned()));
-        assert_eq!(
-            fs::read_to_string(dir.path().join("profiles/agentic-codex-sandbox")).unwrap(),
-            CODEX_SANDBOX_APPARMOR_PROFILE
-        );
+    fn policy_resolution_matrix() {
+        assert!(DockerProvider::resolve_codex(None, true).unwrap());
+        assert!(!DockerProvider::resolve_codex(None, false).unwrap());
+        assert!(DockerProvider::resolve_codex(Some(true), true).unwrap());
+        assert!(!DockerProvider::resolve_codex(Some(false), false).unwrap());
+        assert!(DockerProvider::resolve_codex(Some(true), false).is_err());
+        assert!(DockerProvider::resolve_codex(Some(false), true).is_err());
     }
 
     #[test]
-    fn apparmor_host_without_loaded_profile_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy = policy_dir(dir.path(), &["docker-default"]);
-        let error = provider(dir.path())
-            .with_codex_sandbox_policy(dir.path().join("profiles"), true, &policy)
-            .unwrap_err();
-        assert!(error.to_string().contains("apparmor_parser -r"), "{error}");
-    }
-
-    #[test]
-    fn apparmor_unknown_load_state_still_applies() {
-        let dir = tempfile::tempdir().unwrap();
-        let codex = provider(dir.path())
-            .with_codex_sandbox_policy(
-                dir.path().join("profiles"),
-                true,
-                &dir.path().join("absent"),
-            )
-            .unwrap();
-        assert_eq!(codex.apparmor_profile(), Some("agentic-codex-sandbox"));
-    }
-
-    #[test]
-    fn no_apparmor_option_without_apparmor() {
-        let dir = tempfile::tempdir().unwrap();
-        let codex = provider(dir.path())
-            .with_codex_sandbox_policy(dir.path().join("profiles"), false, dir.path())
-            .unwrap();
-        assert_eq!(codex.apparmor_profile(), None);
-        assert!(
-            !codex
-                .security_arguments()
-                .iter()
-                .any(|a| a.contains("apparmor"))
-        );
-    }
-
-    #[test]
-    fn embedded_apparmor_profile_only_replaces_deny_mount() {
+    fn embedded_profiles_match_their_contract() {
+        assert!(CODEX_SANDBOX_SECCOMP_PROFILE.contains("SCMP_CMP_MASKED_EQ"));
         let rules: Vec<&str> = CODEX_SANDBOX_APPARMOR_PROFILE
             .lines()
             .map(|line| line.split('#').next().unwrap_or("").trim())
@@ -573,43 +552,210 @@ mod tests {
         assert!(!rules.contains(&"deny mount,"));
         assert!(!rules.contains(&"mount,"));
         assert!(!rules.contains(&"userns,"));
-        assert!(rules.contains(
-            &"profile agentic-codex-sandbox flags=(attach_disconnected,mediate_deleted) {"
-        ));
+        assert!(rules.contains(&"deny mount /**/docker.sock -> /**,"));
         assert!(rules.contains(&"deny /sys/kernel/security/** rwklx,"));
+        assert!(!rules.iter().any(|r| r.starts_with("mount")
+            && r.contains("rbind")
+            && r.ends_with("-> /newroot/{,**},")));
     }
 
+    /// A fake docker CLI: records `run` arguments, answers `image inspect`,
+    /// `info` from baked-in answers. `info` fails while `info-fail` exists.
+    #[cfg(unix)]
+    fn fake_docker(dir: &Path, label: &str, info: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("docker");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1 $2\" in\n\
+                 \"image inspect\") printf '%s\\n' '{label}';;\n\
+                 \"pull --quiet\") exit 1;;\n\
+                 \"info --format\") [ -e '{d}/info-fail' ] && {{ echo daemon down >&2; exit 1; }}; printf '%s\\n' '{info}';;\n\
+                 run*) printf '%s\\n' \"$@\" > '{d}/run-args'; echo id;;\n\
+                 *) exit 0;;\n\
+                 esac\n",
+                d = dir.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    fn provider(dir: &Path, label: &str, info: &str) -> DockerProvider {
+        let docker = fake_docker(dir, label, info);
+        DockerProvider::new(dir.join("root"), "image", NetworkPolicy::None)
+            .unwrap()
+            .with_docker_binary(docker)
+    }
+
+    #[cfg(unix)]
+    fn run_args(dir: &Path) -> Vec<String> {
+        fs::read_to_string(dir.join("run-args"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn loaded_policy(dir: &Path, names: &[&str]) -> PathBuf {
+        let policy = dir.join("policy");
+        fs::create_dir_all(&policy).unwrap();
+        for (index, name) in names.iter().enumerate() {
+            let entry = policy.join(format!("{name}.{index}"));
+            fs::create_dir_all(&entry).unwrap();
+            fs::write(entry.join("name"), format!("{name}\n")).unwrap();
+        }
+        policy
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn missing_profile_fails_closed() {
+    fn codex_image_derives_policy_through_provision() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(
-            provider(dir.path())
-                .with_seccomp_profile(dir.path().join("absent.json"))
-                .is_err()
+        let provider = provider(dir.path(), "0.156.1", "[\"name=seccomp\"]");
+        provider
+            .provision(&minimal_manifest("codex", SecurityProfile::Isolated))
+            .unwrap();
+        let args = run_args(dir.path());
+        let seccomp: Vec<_> = args
+            .iter()
+            .filter(|a| a.starts_with("--security-opt=seccomp="))
+            .collect();
+        assert_eq!(seccomp.len(), 1);
+        let file = seccomp[0].trim_start_matches("--security-opt=seccomp=");
+        assert_eq!(
+            fs::read_to_string(file).unwrap(),
+            CODEX_SANDBOX_SECCOMP_PROFILE
         );
+        assert!(!args.iter().any(|a| a.contains("apparmor")));
+        assert!(args.contains(&"--cap-drop=ALL".to_owned()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_image_keeps_docker_defaults_through_provision() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider(dir.path(), "<no value>", "[]");
+        provider
+            .provision(&minimal_manifest("plain", SecurityProfile::Isolated))
+            .unwrap();
         assert!(
-            provider(dir.path())
-                .with_seccomp_profile(dir.path())
+            !run_args(dir.path())
+                .iter()
+                .any(|a| a.contains("seccomp") || a.contains("apparmor"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mismatches_are_rejected_before_launch() {
+        for (label, explicit) in [("<no value>", true), ("0.156.1", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = provider(dir.path(), label, "[]");
+            let provider = if explicit {
+                provider.with_codex_sandbox(dir.path().join("profiles"))
+            } else {
+                provider.without_codex_sandbox()
+            };
+            let error = provider
+                .provision(&minimal_manifest("mismatch", SecurityProfile::Isolated))
+                .unwrap_err();
+            assert!(error.to_string().contains(CODEX_IMAGE_LABEL), "{error}");
+            assert!(!dir.path().join("run-args").exists());
+            assert!(!dir.path().join("root/mismatch").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apparmor_host_applies_the_loaded_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut provider = provider(dir.path(), "0.156.1", "[\"name=apparmor\"]");
+        provider.apparmor_policy_profiles = loaded_policy(
+            dir.path(),
+            &["docker-default", CODEX_SANDBOX_APPARMOR_PROFILE_NAME],
+        );
+        provider
+            .provision(&minimal_manifest("aa", SecurityProfile::Isolated))
+            .unwrap();
+        assert!(
+            run_args(dir.path())
+                .contains(&"--security-opt=apparmor=agentic-codex-sandbox".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apparmor_host_without_the_profile_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut provider = provider(dir.path(), "0.156.1", "[\"name=apparmor\"]");
+        provider.apparmor_policy_profiles = loaded_policy(dir.path(), &["docker-default"]);
+        let error = provider
+            .provision(&minimal_manifest("aa", SecurityProfile::Isolated))
+            .unwrap_err();
+        assert!(error.to_string().contains("apparmor_parser -r"), "{error}");
+        assert!(!dir.path().join("run-args").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_apparmor_detection_fails_then_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut provider = provider(dir.path(), "0.156.1", "[\"name=apparmor\"]");
+        provider.apparmor_policy_profiles =
+            loaded_policy(dir.path(), &[CODEX_SANDBOX_APPARMOR_PROFILE_NAME]);
+        fs::write(dir.path().join("info-fail"), "").unwrap();
+        let error = provider
+            .provision(&minimal_manifest("first", SecurityProfile::Isolated))
+            .unwrap_err();
+        assert!(error.to_string().contains("daemon down"), "{error}");
+        assert!(!dir.path().join("run-args").exists());
+        fs::remove_file(dir.path().join("info-fail")).unwrap();
+        provider
+            .provision(&minimal_manifest("second", SecurityProfile::Isolated))
+            .unwrap();
+        assert!(
+            run_args(dir.path())
+                .contains(&"--security-opt=apparmor=agentic-codex-sandbox".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_image_labels_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = dir.path().join("docker");
+        fs::write(&docker, "#!/bin/sh\nexit 1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let provider = DockerProvider::new(dir.path().join("root"), "image", NetworkPolicy::None)
+            .unwrap()
+            .with_docker_binary(docker);
+        assert!(
+            provider
+                .provision(&minimal_manifest("x", SecurityProfile::Isolated))
                 .is_err()
         );
     }
 
     #[test]
-    fn embedded_profile_adds_exactly_the_five_syscalls() {
-        let marker = "\"comment\": \"agentic-isolation:";
-        assert_eq!(CODEX_SANDBOX_SECCOMP_PROFILE.matches(marker).count(), 1);
-        let rule_start = CODEX_SANDBOX_SECCOMP_PROFILE
-            .rfind("\"names\"")
-            .expect("rule");
-        let rule = &CODEX_SANDBOX_SECCOMP_PROFILE[rule_start..];
-        for name in ["clone", "mount", "pivot_root", "umount2", "unshare"] {
-            assert!(rule.contains(&format!("\"{name}\"")), "{name} missing");
-        }
-        for name in ["setns", "clone3", "bpf"] {
-            assert!(!rule.contains(&format!("\"{name}\"")), "{name} added");
-        }
-        assert!(rule.contains("SCMP_ACT_ALLOW"));
-        assert!(!rule.contains("\"args\""));
-        assert!(CODEX_SANDBOX_SECCOMP_PROFILE.contains("\"defaultAction\": \"SCMP_ACT_ERRNO\""));
+    fn reserved_profile_directory_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider =
+            DockerProvider::new(dir.path().join("root"), "image", NetworkPolicy::None).unwrap();
+        let error = provider
+            .provision(&minimal_manifest(
+                DEFAULT_PROFILE_DIR,
+                SecurityProfile::Isolated,
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("reserved"), "{error}");
     }
 }
