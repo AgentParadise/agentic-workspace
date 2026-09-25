@@ -119,3 +119,67 @@ fn enforces_isolation_and_kills_timed_out_container() {
     provider.destroy(&handle).unwrap();
     provider.destroy(&handle).unwrap();
 }
+
+fn user_namespace_probe(provider: &DockerProvider, id: &str) -> (bool, String) {
+    let manifest = minimal_manifest(id, SecurityProfile::Isolated);
+    let handle = provider.provision(&manifest).unwrap();
+    let container = handle.provider_reference.clone().unwrap();
+    let inspection = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}} {{.HostConfig.ReadonlyRootfs}}",
+            &container,
+        ])
+        .output()
+        .unwrap();
+    assert!(inspection.status.success());
+    let unshare = provider
+        .execute(
+            &handle,
+            &CommandSpec {
+                program: "unshare".into(),
+                arguments: vec!["-Um".into(), "true".into()],
+                environment: BTreeMap::new(),
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    provider.destroy(&handle).unwrap();
+    (
+        unshare.exit_code == Some(0),
+        String::from_utf8_lossy(&inspection.stdout)
+            .trim()
+            .to_owned(),
+    )
+}
+
+#[test]
+fn codex_sandbox_seccomp_allows_user_namespaces_and_keeps_hardening() {
+    if !require_or_skip_docker() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let plain = DockerProvider::new(root.path(), "python:3.12-slim", NetworkPolicy::None).unwrap();
+    let (allowed, inspection) = user_namespace_probe(&plain, "docker-default-seccomp");
+    assert!(
+        !allowed,
+        "Docker's default profile must deny user namespaces"
+    );
+    assert!(!inspection.contains("seccomp="), "{inspection}");
+
+    let codex = DockerProvider::new(root.path(), "python:3.12-slim", NetworkPolicy::None)
+        .unwrap()
+        .with_codex_sandbox_seccomp(profiles.path())
+        .unwrap();
+    let (allowed, inspection) = user_namespace_probe(&codex, "docker-codex-seccomp");
+    assert!(
+        allowed,
+        "the Codex sandbox profile must allow user namespaces"
+    );
+    assert!(inspection.starts_with("[\"ALL\"] "), "{inspection}");
+    assert!(inspection.contains("no-new-privileges"), "{inspection}");
+    assert!(inspection.contains("seccomp="), "{inspection}");
+    assert!(inspection.ends_with(" true"), "{inspection}");
+}

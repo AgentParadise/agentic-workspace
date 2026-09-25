@@ -12,6 +12,16 @@ use std::time::Duration;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Docker's default seccomp profile (docker-v29.8.0) plus one rule allowing
+/// `clone` (namespace flags), `unshare`, `mount`, `umount2` and `pivot_root`,
+/// so a harness that sandboxes itself with bubblewrap (Codex) can create a
+/// user namespace. Capabilities stay dropped. Single source shared with the
+/// Python package; provenance in its `seccomp/README.md`.
+pub const CODEX_SANDBOX_SECCOMP_PROFILE: &str = include_str!(
+    "../../../lib/python/agentic_isolation/agentic_isolation/seccomp/codex-sandbox.json"
+);
+pub const CODEX_SANDBOX_SECCOMP_FILE_NAME: &str = "codex-sandbox.json";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkPolicy {
     None,
@@ -24,6 +34,7 @@ pub struct DockerProvider {
     image: String,
     network: NetworkPolicy,
     docker: PathBuf,
+    seccomp_profile: Option<PathBuf>,
 }
 
 impl DockerProvider {
@@ -40,12 +51,64 @@ impl DockerProvider {
             image: image.into(),
             network,
             docker: PathBuf::from("docker"),
+            seccomp_profile: None,
         })
     }
 
     pub fn with_docker_binary(mut self, docker: impl Into<PathBuf>) -> Self {
         self.docker = docker.into();
         self
+    }
+
+    /// Run containers with this seccomp profile instead of Docker's default.
+    /// The file is read by the docker CLI on this host, so it must exist here.
+    pub fn with_seccomp_profile(
+        mut self,
+        profile: impl Into<PathBuf>,
+    ) -> Result<Self, WorkspaceError> {
+        let profile = profile.into();
+        let canonical = fs::canonicalize(&profile).map_err(|source| Self::io(&profile, source))?;
+        if !canonical.is_file() {
+            return Err(WorkspaceError::UnsafePath(canonical.display().to_string()));
+        }
+        self.seccomp_profile = Some(canonical);
+        Ok(self)
+    }
+
+    /// Opt in to [`CODEX_SANDBOX_SECCOMP_PROFILE`] for workspaces that can run
+    /// Codex. Writes the profile into `directory`, which the caller owns and
+    /// which must not be writable by workspace code. Only for Codex-capable
+    /// workspaces; everything else keeps Docker's default profile.
+    pub fn with_codex_sandbox_seccomp(
+        self,
+        directory: impl AsRef<Path>,
+    ) -> Result<Self, WorkspaceError> {
+        let directory = directory.as_ref();
+        fs::create_dir_all(directory).map_err(|source| Self::io(directory, source))?;
+        let path = directory.join(CODEX_SANDBOX_SECCOMP_FILE_NAME);
+        fs::write(&path, CODEX_SANDBOX_SECCOMP_PROFILE)
+            .map_err(|source| Self::io(&path, source))?;
+        self.with_seccomp_profile(path)
+    }
+
+    pub fn seccomp_profile(&self) -> Option<&Path> {
+        self.seccomp_profile.as_deref()
+    }
+
+    fn security_arguments(&self) -> Vec<String> {
+        let mut arguments = vec![
+            "--cap-drop=ALL".into(),
+            "--security-opt=no-new-privileges".into(),
+        ];
+        if let Some(profile) = &self.seccomp_profile {
+            arguments.push(format!("--security-opt=seccomp={}", profile.display()));
+        }
+        arguments.extend([
+            "--read-only".into(),
+            "--pids-limit=256".into(),
+            "--tmpfs=/tmp:rw,noexec,nosuid,size=256m".into(),
+        ]);
+        arguments
     }
 
     fn io(path: &Path, source: std::io::Error) -> WorkspaceError {
@@ -158,18 +221,16 @@ impl WorkspaceProvider for DockerProvider {
             "run".into(),
             "--detach".into(),
             format!("--name={container}"),
-            "--cap-drop=ALL".into(),
-            "--security-opt=no-new-privileges".into(),
-            "--read-only".into(),
-            "--pids-limit=256".into(),
-            "--tmpfs=/tmp:rw,noexec,nosuid,size=256m".into(),
+        ];
+        arguments.extend(self.security_arguments());
+        arguments.extend([
             format!("--volume={}:/workspace:rw", root.display()),
             format!(
                 "--workdir=/workspace/{}",
                 manifest.workspace.working_directory
             ),
             format!("--label=agentic.workspace.id={}", manifest.execution_id),
-        ];
+        ]);
         match &self.network {
             NetworkPolicy::None => arguments.push("--network=none".into()),
             NetworkPolicy::Bridge(name) => arguments.push(format!("--network={name}")),
@@ -282,5 +343,98 @@ impl WorkspaceProvider for DockerProvider {
             fs::remove_dir_all(&handle.root).map_err(|source| Self::io(&handle.root, source))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(root: &Path) -> DockerProvider {
+        DockerProvider::new(root.join("root"), "image", NetworkPolicy::None).unwrap()
+    }
+
+    #[test]
+    fn default_keeps_docker_default_seccomp() {
+        let dir = tempfile::tempdir().unwrap();
+        let arguments = provider(dir.path()).security_arguments();
+        assert!(
+            !arguments
+                .iter()
+                .any(|a| a.starts_with("--security-opt=seccomp"))
+        );
+        assert_eq!(
+            arguments,
+            [
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--read-only",
+                "--pids-limit=256",
+                "--tmpfs=/tmp:rw,noexec,nosuid,size=256m",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_sandbox_adds_only_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = provider(dir.path()).security_arguments();
+        let codex = provider(dir.path())
+            .with_codex_sandbox_seccomp(dir.path().join("seccomp"))
+            .unwrap();
+        let profile = codex.seccomp_profile().unwrap().to_path_buf();
+        assert_eq!(
+            fs::read_to_string(&profile).unwrap(),
+            CODEX_SANDBOX_SECCOMP_PROFILE
+        );
+        let arguments = codex.security_arguments();
+        let seccomp: Vec<_> = arguments
+            .iter()
+            .filter(|a| a.starts_with("--security-opt=seccomp"))
+            .collect();
+        assert_eq!(
+            seccomp,
+            [&format!("--security-opt=seccomp={}", profile.display())]
+        );
+        let rest: Vec<_> = arguments
+            .iter()
+            .filter(|a| !a.starts_with("--security-opt=seccomp"))
+            .cloned()
+            .collect();
+        assert_eq!(rest, plain);
+    }
+
+    #[test]
+    fn missing_profile_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            provider(dir.path())
+                .with_seccomp_profile(dir.path().join("absent.json"))
+                .is_err()
+        );
+        assert!(
+            provider(dir.path())
+                .with_seccomp_profile(dir.path())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn embedded_profile_adds_exactly_the_five_syscalls() {
+        let marker = "\"comment\": \"agentic-isolation:";
+        assert_eq!(CODEX_SANDBOX_SECCOMP_PROFILE.matches(marker).count(), 1);
+        let rule_start = CODEX_SANDBOX_SECCOMP_PROFILE
+            .rfind("\"names\"")
+            .expect("rule");
+        let rule = &CODEX_SANDBOX_SECCOMP_PROFILE[rule_start..];
+        for name in ["clone", "mount", "pivot_root", "umount2", "unshare"] {
+            assert!(rule.contains(&format!("\"{name}\"")), "{name} missing");
+        }
+        for name in ["setns", "clone3", "bpf"] {
+            assert!(!rule.contains(&format!("\"{name}\"")), "{name} added");
+        }
+        assert!(rule.contains("SCMP_ACT_ALLOW"));
+        assert!(!rule.contains("\"args\""));
+        assert!(CODEX_SANDBOX_SECCOMP_PROFILE.contains("\"defaultAction\": \"SCMP_ACT_ERRNO\""));
     }
 }
