@@ -6,7 +6,7 @@
 |---|---|---|
 | `ghcr.io/agentparadise/agentic-workspace-claude` | `implementations/docker/images/claude-cli` | source |
 | `ghcr.io/agentparadise/agentic-workspace-omni-agent` | `implementations/docker/images/omni-agent` | source |
-| `ghcr.io/agentparadise/agentic-workspace-buildfloor` | `implementations/docker/images/buildfloor` | the omni-agent digest pushed in the same run |
+| `ghcr.io/agentparadise/agentic-workspace-toolchain` | `implementations/docker/images/toolchain` | the omni-agent digest pushed in the same run |
 
 These names are distinct from every Agentic Primitives package, so the two
 repositories never publish to one package. Note the claude-cli image is
@@ -29,7 +29,7 @@ cosign verify \
   --certificate-identity \
     'https://github.com/AgentParadise/agentic-workspace/.github/workflows/release-images.yml@refs/heads/release' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/agentparadise/agentic-workspace-buildfloor@sha256:REPLACE_ME
+  ghcr.io/agentparadise/agentic-workspace-toolchain@sha256:REPLACE_ME
 ```
 
 Renaming or moving the workflow file changes that identity and breaks every
@@ -44,11 +44,11 @@ consumer's verification.
    workflow's `Integration Gate` run on it; nothing is published.
 3. Merge it. The push to `release` runs:
    1. **Integration gate**: single-arch builds of all three images, the
-      entrypoint integration suite, and the amd64 buildfloor compile smoke.
+      entrypoint integration suite, and the amd64 toolchain compile smoke.
    2. **claude-cli** and **omni-agent** in parallel: multi-arch build, push
       untagged by digest with BuildKit SBOM + max-mode provenance, keyless
       cosign sign, verify against the identity above, then tag.
-   3. **buildfloor**, after omni: verify omni's signature, build FROM
+   3. **toolchain**, after omni: verify omni's signature, build FROM
       `agentic-workspace-omni-agent@<that digest>`, push untagged by digest,
       run the compile smoke (`cargo build` with a `rust-toolchain.toml` pin,
       `pnpm install`, `bun run`) on **linux/amd64 and linux/arm64** against
@@ -66,7 +66,7 @@ consumer's verification.
 - **No `latest`.** It is never published.
 
 Labels on every release image include `agentic.image.channel=release`,
-`org.opencontainers.image.revision=<commit>`, and for buildfloor
+`org.opencontainers.image.revision=<commit>`, and for toolchain
 `org.opencontainers.image.base.name` / `base.digest` naming the omni digest it
 was built on.
 
@@ -80,9 +80,9 @@ regex), then run the rollback proof against the previous digest.
 
 ```bash
 uv run scripts/build-provider.py omni-agent        # tags omni-agent-workspace:latest locally
-uv run scripts/build-provider.py buildfloor        # FROM omni-agent-workspace:latest
-uv run scripts/build-provider.py buildfloor --build-arg OMNI_IMAGE=<ref>   # any other base
-implementations/docker/images/buildfloor/smoke/run.sh agentic-workspace-buildfloor:latest
+uv run scripts/build-provider.py toolchain        # FROM omni-agent-workspace:latest
+uv run scripts/build-provider.py toolchain --build-arg OMNI_IMAGE=<ref>   # any other base
+implementations/docker/images/toolchain/smoke/run.sh agentic-workspace-toolchain:latest
 ```
 
 Local tags such as `:latest` exist only in your Docker daemon; they are what

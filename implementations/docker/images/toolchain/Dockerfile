@@ -1,11 +1,11 @@
 # check=skip=InvalidDefaultArgInFrom
 # =============================================================================
-# Buildfloor workspace image
+# Toolchain workspace image
 # =============================================================================
 #
-# omni-agent plus a native build floor. Everything omni ships (both harnesses,
+# omni-agent plus a native toolchain. Everything omni ships (both harnesses,
 # the capability runtime, plugins, security hardening) is inherited unchanged;
-# this file only adds build tools and a buildfloor-only entrypoint wrapper.
+# this file only adds build tools and a toolchain-only entrypoint wrapper.
 #
 # WHY A SEPARATE IMAGE. omni-agent deliberately ships no compiler (see its
 # Dockerfile header). Repositories that compile native code cannot run their
@@ -59,7 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # =============================================================================
 # A repository's own rust-toolchain.toml selects and installs its pinned
 # toolchain on first use, into RUSTUP_HOME under /workspace (see
-# scripts/buildfloor-entrypoint.sh). rustup-init comes by URL and checksum
+# scripts/toolchain-entrypoint.sh). rustup-init comes by URL and checksum
 # because a releases URL is not content-addressed: the SHA256 pins the bytes.
 #
 # rustup dispatches on argv[0], so cargo, rustc and friends are symlinks to the
@@ -124,18 +124,18 @@ RUN set -eux; \
 ENV BUN_RUNTIME_TRANSPILER_CACHE_PATH=0
 
 # =============================================================================
-# Buildfloor-only entrypoint wrapper
+# Toolchain-only entrypoint wrapper
 # =============================================================================
 # Redirects the tool homes that outgrow the $HOME tmpfs into /workspace/.tools
 # and sizes cargo's job count to the container CPU quota, then execs the
 # shared /opt/agentic/entrypoint.sh unchanged. Living in a wrapper (not in the
 # shared entrypoint) is what keeps omni-agent and claude-cli behaviour
 # byte-for-byte identical.
-COPY scripts/buildfloor-entrypoint.sh /opt/agentic/buildfloor-entrypoint.sh
-RUN chmod 755 /opt/agentic/buildfloor-entrypoint.sh \
-    && bash -n /opt/agentic/buildfloor-entrypoint.sh
+COPY scripts/toolchain-entrypoint.sh /opt/agentic/toolchain-entrypoint.sh
+RUN chmod 755 /opt/agentic/toolchain-entrypoint.sh \
+    && bash -n /opt/agentic/toolchain-entrypoint.sh
 
-# Verify everything omni verified still resolves, plus the build floor.
+# Verify everything omni verified still resolves, plus the toolchain.
 RUN claude --version && codex --version && python3 --version && node --version \
     && uv --version && gh --version && just --version && make --version \
     && cc --version && c++ --version && pkg-config --version \
@@ -148,9 +148,9 @@ RUN find / -path /usr/local -prune -o -path /proc -prune -o -perm /6000 -type f 
 USER agent
 WORKDIR /workspace
 
-LABEL agentic.buildfloor.rustup_version=${RUSTUP_VERSION} \
-      agentic.buildfloor.bun_version=${BUN_VERSION}
+LABEL agentic.toolchain.rustup_version=${RUSTUP_VERSION} \
+      agentic.toolchain.bun_version=${BUN_VERSION}
 
 # Setting ENTRYPOINT resets the inherited CMD, so both are restated.
-ENTRYPOINT ["/opt/agentic/buildfloor-entrypoint.sh"]
+ENTRYPOINT ["/opt/agentic/toolchain-entrypoint.sh"]
 CMD ["bash"]

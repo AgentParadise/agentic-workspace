@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "buildfloor-smoke"
+name = "toolchain-smoke"
 version = "0.1.0"

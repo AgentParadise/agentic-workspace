@@ -1,8 +1,8 @@
 #!/bin/bash
-# Runs INSIDE a buildfloor container, after the buildfloor entrypoint wrapper
+# Runs INSIDE a toolchain container, after the toolchain entrypoint wrapper
 # and the shared entrypoint. Driven by run.sh; do not call directly.
 #
-# Expects: fixtures read-only at /opt/buildfloor-smoke/fixtures, a 128 MB tmpfs
+# Expects: fixtures read-only at /opt/toolchain-smoke/fixtures, a 128 MB tmpfs
 # $HOME (as production runs it), and --cpus 2.
 set -euo pipefail
 
@@ -30,13 +30,13 @@ say "shared entrypoint ran after the wrapper"
 work=/workspace/smoke
 rm -rf "$work"
 mkdir -p "$work"
-cp -r /opt/buildfloor-smoke/fixtures/. "$work/"
+cp -r /opt/toolchain-smoke/fixtures/. "$work/"
 
 # --- cargo: toolchain from rust-toolchain.toml, link with cc ----------------
 cd "$work/rust-crate"
 cargo build --locked --quiet
-out="$(./target/debug/buildfloor-smoke)"
-[ "$out" = "buildfloor-smoke rust-ok 42" ] || fail "cargo binary printed '$out'"
+out="$(./target/debug/toolchain-smoke)"
+[ "$out" = "toolchain-smoke rust-ok 42" ] || fail "cargo binary printed '$out'"
 rustc --version | grep -q '^rustc 1\.90\.0 ' || fail "toolchain is not the pinned 1.90.0: $(rustc --version)"
 [ -d /workspace/.tools/rustup/toolchains ] || fail "toolchain did not land under /workspace/.tools/rustup"
 say "cargo build ok ($(rustc --version))"
@@ -51,7 +51,7 @@ say "pnpm install ok (pnpm $(pnpm --version))"
 
 # --- bun -------------------------------------------------------------------
 out="$(bun run index.ts)"
-[ "$out" = "buildfloor-smoke bun-ok 7200000" ] || fail "bun printed '$out'"
+[ "$out" = "toolchain-smoke bun-ok 7200000" ] || fail "bun printed '$out'"
 say "bun run ok (bun $(bun --version))"
 
 # --- $HOME tmpfs stayed small ----------------------------------------------
@@ -59,4 +59,4 @@ used_kb="$(du -sk "$HOME" | cut -f1)"
 [ "$used_kb" -lt 65536 ] || fail "\$HOME grew to ${used_kb} KB; tool homes leaked onto the tmpfs"
 say "\$HOME usage ${used_kb} KB"
 
-echo "BUILDFLOOR SMOKE PASS"
+echo "TOOLCHAIN SMOKE PASS"

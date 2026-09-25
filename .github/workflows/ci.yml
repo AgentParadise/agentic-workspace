@@ -108,13 +108,13 @@ jobs:
           ! grep -R -E 'skills@[0-9]+\.[0-9]+\.[0-9]+' implementations/docker/images/*/Dockerfile
       - run: uv run scripts/build-provider.py claude-cli --stage-only
       - run: uv run scripts/build-provider.py omni-agent --stage-only
-      - run: uv run scripts/build-provider.py buildfloor --stage-only
-      - name: Lint buildfloor and release scripts
+      - run: uv run scripts/build-provider.py toolchain --stage-only
+      - name: Lint toolchain and release scripts
         run: |
           shellcheck \
-            implementations/docker/images/buildfloor/scripts/buildfloor-entrypoint.sh \
-            implementations/docker/images/buildfloor/smoke/run.sh \
-            implementations/docker/images/buildfloor/smoke/inside.sh \
+            implementations/docker/images/toolchain/scripts/toolchain-entrypoint.sh \
+            implementations/docker/images/toolchain/smoke/run.sh \
+            implementations/docker/images/toolchain/smoke/inside.sh \
             .github/scripts/release-image-tags.sh
 
   docker-conformance:
