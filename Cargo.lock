@@ -28,6 +28,7 @@ version = "0.1.0"
 dependencies = [
  "agentic-workspace-conformance",
  "agentic-workspace-core",
+ "serde_json",
  "tempfile",
 ]
 

@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 agentic-workspace-core = { path = "../../crates/workspace-core" }
+serde_json.workspace = true
 
 [dev-dependencies]
 agentic-workspace-conformance = { path = "../../crates/workspace-conformance" }
