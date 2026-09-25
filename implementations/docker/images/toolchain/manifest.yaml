@@ -1,35 +1,35 @@
-# Buildfloor Workspace Provider Manifest
-# The omni-agent image plus a native build floor: a C toolchain, the rustup
+# Toolchain Workspace Provider Manifest
+# The omni-agent image plus a native toolchain: a C toolchain, the rustup
 # binary (no toolchain), pnpm through corepack, and bun. For repositories whose
 # own gates compile native code.
 #
 # See ADR-027: Provider-Based Workspace Images
 # See ADR-040 section 12: The workspace image contract
 
-name: buildfloor
+name: toolchain
 version: "1.0.0"
 description: >-
   omni-agent (claude + codex on the shared capability runtime) plus a native
-  build floor: build-essential, pkg-config, unzip, rustup (toolchain chosen by
+  toolchain: build-essential, pkg-config, unzip, rustup (toolchain chosen by
   the repository's rust-toolchain.toml), pnpm via corepack, and bun.
 
 # Built FROM the omni-agent image, never from source. The whole capability
 # runtime, harness set and plugin set are inherited unchanged. The build
 # script still stages its usual context, but the Dockerfile uses only scripts/.
-# The only runtime difference is scripts/buildfloor-entrypoint.sh, which runs
+# The only runtime difference is scripts/toolchain-entrypoint.sh, which runs
 # before the shared /opt/agentic/entrypoint.sh and then execs it.
 base:
   image: omni-agent
 
 image:
   dockerfile: ./Dockerfile
-  tag: agentic-workspace-buildfloor
+  tag: agentic-workspace-toolchain
   context: ../../..
   args:
     # Local developer default: the tag scripts/build-provider.py gives an
     # omni-agent build. The release workflow overrides this with the exact
     # ghcr.io/agentparadise/agentic-workspace-omni-agent@sha256:... digest it
-    # pushed earlier in the same run, so a published buildfloor always sits on
+    # pushed earlier in the same run, so a published toolchain always sits on
     # a signed, same-commit omni.
     OMNI_IMAGE: omni-agent-workspace:latest
 
@@ -85,7 +85,7 @@ health:
   retries: 2
 
 labels:
-  org.opencontainers.image.title: "Agentic Workspace - Buildfloor"
-  org.opencontainers.image.description: "omni-agent plus a native build floor (C toolchain, rustup, pnpm, bun)"
+  org.opencontainers.image.title: "Agentic Workspace - Toolchain"
+  org.opencontainers.image.description: "omni-agent plus a native toolchain (C toolchain, rustup, pnpm, bun)"
   org.opencontainers.image.vendor: "Agentic Workspace"
   org.opencontainers.image.source: "https://github.com/AgentParadise/agentic-workspace"

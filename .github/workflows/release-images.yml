@@ -15,16 +15,16 @@
 #
 # CHANNELS.
 #   push to release  -> integration gate, then publish + sign all three images
-#   pull request     -> integration gate + amd64 buildfloor smoke; nothing
+#   pull request     -> integration gate + amd64 toolchain smoke; nothing
 #                       pushed, nothing signed
 #   push to main     -> not a trigger; main never publishes (no :edge channel)
 #
 # IMAGES (ghcr.io/agentparadise/...).
 #   agentic-workspace-claude       (claude-cli; agentic-workspace-claude-cli is AP's package)
 #   agentic-workspace-omni-agent
-#   agentic-workspace-buildfloor   FROM the omni digest pushed in THIS run
+#   agentic-workspace-toolchain   FROM the omni digest pushed in THIS run
 #
-# ORDER. claude-cli and omni publish in parallel after the gate. buildfloor
+# ORDER. claude-cli and omni publish in parallel after the gate. toolchain
 # waits for omni, verifies omni's signature, builds FROM that exact digest,
 # pushes untagged by digest, runs the compile smoke on amd64 and arm64 against
 # that digest, and only then signs and tags it. What was tested is byte for
@@ -127,19 +127,25 @@ jobs:
       - run: uv run scripts/build-provider.py claude-cli
       - run: uv run scripts/build-provider.py omni-agent
       # FROM the omni just built (the manifest's local OMNI_IMAGE default).
-      - run: uv run scripts/build-provider.py buildfloor
+      - run: uv run scripts/build-provider.py toolchain
       - name: Run entrypoint integration suite
         working-directory: lib/python/agentic_isolation
         run: |
           uv sync --locked --all-extras
           uv run python -m pytest ../../../tests/integration -q
-      - name: Buildfloor keeps the omni capability-runtime contract
+      - name: Toolchain keeps the omni capability-runtime contract
         working-directory: lib/python/agentic_isolation
         env:
-          AGENTIC_OMNI_IMAGE: agentic-workspace-buildfloor:latest
+          AGENTIC_OMNI_IMAGE: agentic-workspace-toolchain:latest
         run: uv run python -m pytest ../../../tests/integration -q -k omni
-      - name: Buildfloor compile smoke (native amd64)
-        run: implementations/docker/images/buildfloor/smoke/run.sh agentic-workspace-buildfloor:latest
+      - name: Toolchain compile smoke (native amd64)
+        run: implementations/docker/images/toolchain/smoke/run.sh agentic-workspace-toolchain:latest
+      - name: Toolchain platform resolver test
+        # The smoke above uses a local tag with no platform, so the
+        # index -> child-manifest resolver in run.sh is never reached on
+        # this path. Without this step its first exercise is a push to
+        # release, where a mistake costs a failed publish.
+        run: implementations/docker/images/toolchain/smoke/test_platform_resolve.sh
 
   publish-claude-cli:
     name: Publish claude-cli
@@ -325,8 +331,8 @@ jobs:
             echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
           done < "$RUNNER_TEMP/tags.txt"
 
-  publish-buildfloor:
-    name: Publish buildfloor
+  publish-toolchain:
+    name: Publish toolchain
     needs: [plan, publish-omni]
     if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
@@ -336,8 +342,8 @@ jobs:
       packages: write
       id-token: write
     env:
-      PROVIDER: buildfloor
-      IMAGE: ghcr.io/agentparadise/agentic-workspace-buildfloor
+      PROVIDER: toolchain
+      IMAGE: ghcr.io/agentparadise/agentic-workspace-toolchain
       OMNI_REF: ghcr.io/agentparadise/agentic-workspace-omni-agent@${{ needs.publish-omni.outputs.digest }}
       OMNI_VERSION: ${{ needs.publish-omni.outputs.manifest_version }}
     outputs:
@@ -394,7 +400,7 @@ jobs:
             OMNI_IMAGE=${{ env.OMNI_REF }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: |
-            org.opencontainers.image.title=agentic-workspace-buildfloor
+            org.opencontainers.image.title=agentic-workspace-toolchain
             org.opencontainers.image.vendor=Agentic Workspace
             org.opencontainers.image.source=https://github.com/AgentParadise/agentic-workspace
             org.opencontainers.image.revision=${{ github.sha }}
@@ -416,11 +422,11 @@ jobs:
       - name: Compile smoke (linux/amd64)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: implementations/docker/images/buildfloor/smoke/run.sh "${IMAGE}@${DIGEST}" linux/amd64
+        run: implementations/docker/images/toolchain/smoke/run.sh "${IMAGE}@${DIGEST}" linux/amd64
       - name: Compile smoke (linux/arm64, QEMU)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: implementations/docker/images/buildfloor/smoke/run.sh "${IMAGE}@${DIGEST}" linux/arm64
+        run: implementations/docker/images/toolchain/smoke/run.sh "${IMAGE}@${DIGEST}" linux/arm64
       - uses: ./.github/actions/sign-and-verify-image
         with:
           image: ${{ env.IMAGE }}

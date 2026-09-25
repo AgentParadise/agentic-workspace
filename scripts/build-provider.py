@@ -223,7 +223,7 @@ def resolve_build_args(manifest: dict, overrides: list[str]) -> dict[str, str]:
     """Merge manifest `image.args` defaults with `--build-arg KEY=VALUE` overrides.
 
     Every existing manifest declares `args: {}`, so for those images this
-    returns an empty dict and the docker command is unchanged. The buildfloor
+    returns an empty dict and the docker command is unchanged. The toolchain
     image uses it for OMNI_IMAGE: a local default for developer builds, which
     CI overrides with the exact omni digest of the same release run.
     """
