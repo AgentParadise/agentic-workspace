@@ -158,6 +158,16 @@ RUN uv python install 3.12.13 \
     && uv venv --python 3.12.13 /opt/venv \
     && chmod -R a+rX /opt/uv /opt/venv
 
+# Login shells reset PATH in /etc/profile, dropping /opt/venv/bin. Codex runs
+# its shell tool with `bash -lc`, so a syn-delegate started from Codex handed
+# its child a PATH with no python3, and that child's capture hooks could not
+# run (syntropic137#1398). Keep the venv first for login shells too.
+RUN printf '%s\n' \
+      '# Keep the image venv on PATH for login shells (agentic-workspace).' \
+      'case ":$PATH:" in *":/opt/venv/bin:"*) ;; *) PATH="/opt/venv/bin:$PATH"; export PATH ;; esac' \
+      > /etc/profile.d/10-agentic-venv.sh \
+    && chmod 0644 /etc/profile.d/10-agentic-venv.sh
+
 # Both harnesses, each pinned via the global ARGs above. Neither is "the"
 # agent in this image: a caller selects one per invocation.
 # Clear npm's download cache in each install layer so it does not ship in the
@@ -169,6 +179,23 @@ ARG CODEX_CLI_VERSION
 RUN npm install -g @openai/codex@${CODEX_CLI_VERSION} \
     && npm cache clean --force
 RUN claude --version && codex --version
+
+# Harness launch wrappers (syntropic137#1398). Hook commands run through a
+# shell that reads BASH_ENV (bash) or ENV (interactive sh) before the command.
+# An agent-writable file there could exit before the native child capture
+# guard runs. Hooks inherit the harness process environment, which the agent
+# cannot change after launch, so every claude/codex started by name starts
+# without either variable. The npm symlinks are replaced by root-owned shims.
+RUN for bin in claude codex; do \
+      target="$(readlink -f "/usr/local/bin/${bin}")" \
+      && rm "/usr/local/bin/${bin}" \
+      && printf '%s\n' '#!/bin/sh' \
+           '# Harness launch wrapper: no shell startup file reaches capture hooks.' \
+           'unset BASH_ENV ENV' \
+           "exec ${target} \"\$@\"" > "/usr/local/bin/${bin}" \
+      && chmod 0755 "/usr/local/bin/${bin}" || exit 1; \
+    done \
+    && claude --version && codex --version
 
 # Install the skills CLI globally via npm. Pin exact version deliberately.
 ARG SKILLS_CLI_VERSION

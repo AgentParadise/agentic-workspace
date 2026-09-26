@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -21,6 +22,12 @@ def environment(tmp_path):
     binary.mkdir()
     # The fake codex answers `codex sandbox ...` with this exit status.
     (tmp_path / "probe-rc").write_text("0")
+    # syn-delegate probes that the delegate's capture hooks reach their guard
+    # with this PATH, so the recorder's interpreter must be on it.
+    python = binary / "python3"
+    python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    python.chmod(0o700)
+    (binary / "sleep").symlink_to(shutil.which("sleep"))
     return {
         **os.environ,
         "PATH": str(binary),
@@ -388,3 +395,28 @@ def test_sandbox_flag_is_codex_only(environment):
     )
     assert result.returncode == 2
     assert b"codex only" in result.stderr
+
+
+def test_child_environment_drops_agent_modifiable_startup_files(tmp_path) -> None:
+    from agentic_session_store.delegate import child_environment
+
+    rc = tmp_path / "rc"
+    rc.write_text("exit 0\n")
+    child = child_environment({"BASH_ENV": str(rc), "ENV": str(rc), "KEEP": "1"})
+    assert child == {"KEEP": "1"}
+
+
+def test_delegate_refuses_when_its_capture_hooks_cannot_run(environment, tmp_path):
+    """The delegate's own hooks need python3 on the child's PATH; without it a
+    native spawn inside the delegate would have no durable intent."""
+    _fake(environment, "raise SystemExit(0)\n")
+    (tmp_path / "bin/python3").unlink()
+    result = subprocess.run(
+        _command(), env=environment, capture_output=True, timeout=30, check=False
+    )
+    assert result.returncode == 70, result.stderr
+    intent = _journal(environment).page().changes[-1].intent
+    assert (intent.status, intent.reason) == (
+        "launch_failed",
+        "capture_hook_unreachable",
+    )
