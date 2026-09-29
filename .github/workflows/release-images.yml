@@ -282,7 +282,7 @@ jobs:
         run: .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > "$RUNNER_TEMP/tags.txt"
       # Pinning a digest fixes the bytes; the signature says who published
       # them. Verified before the build so an unverified input never ships.
-      # Identity: the exporter's release.yml on a semver tag only (v0.5.0 today).
+      # Identity: the exporter's release.yml on a semver tag only (v0.6.0 today).
       - name: Verify pinned session exporter input
         run: |
           set -euo pipefail
