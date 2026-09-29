@@ -158,6 +158,16 @@ RUN uv python install 3.12.13 \
     && uv venv --python 3.12.13 /opt/venv \
     && chmod -R a+rX /opt/uv /opt/venv
 
+# Login shells reset PATH in /etc/profile, dropping /opt/venv/bin. Codex runs
+# its shell tool with `bash -lc`, so a syn-delegate started from Codex handed
+# its child a PATH with no python3, and that child's capture hooks could not
+# run (syntropic137#1398). Keep the venv first for login shells too.
+RUN printf '%s\n' \
+      '# Keep the image venv on PATH for login shells (agentic-workspace).' \
+      'case ":$PATH:" in *":/opt/venv/bin:"*) ;; *) PATH="/opt/venv/bin:$PATH"; export PATH ;; esac' \
+      > /etc/profile.d/10-agentic-venv.sh \
+    && chmod 0644 /etc/profile.d/10-agentic-venv.sh
+
 # Both harnesses, each pinned via the global ARGs above. Neither is "the"
 # agent in this image: a caller selects one per invocation.
 # Clear npm's download cache in each install layer so it does not ship in the
@@ -169,6 +179,23 @@ ARG CODEX_CLI_VERSION
 RUN npm install -g @openai/codex@${CODEX_CLI_VERSION} \
     && npm cache clean --force
 RUN claude --version && codex --version
+
+# Harness launch wrappers (syntropic137#1398). Hook commands run through a
+# shell that reads BASH_ENV (bash) or ENV (interactive sh) before the command.
+# An agent-writable file there could exit before the native child capture
+# guard runs. Hooks inherit the harness process environment, which the agent
+# cannot change after launch, so every claude/codex started by name starts
+# without either variable. The npm symlinks are replaced by root-owned shims.
+RUN for bin in claude codex; do \
+      target="$(readlink -f "/usr/local/bin/${bin}")" \
+      && rm "/usr/local/bin/${bin}" \
+      && printf '%s\n' '#!/bin/sh' \
+           '# Harness launch wrapper: no shell startup file reaches capture hooks.' \
+           'unset BASH_ENV ENV' \
+           "exec ${target} \"\$@\"" > "/usr/local/bin/${bin}" \
+      && chmod 0755 "/usr/local/bin/${bin}" || exit 1; \
+    done \
+    && claude --version && codex --version
 
 # Install the skills CLI globally via npm. Pin exact version deliberately.
 ARG SKILLS_CLI_VERSION
@@ -386,6 +413,37 @@ COPY workspace/capabilities/ /opt/agentic/capabilities/
 # signature with cosign, and change it here in its own commit so a reviewer sees
 # exactly what moved.
 #
+# agentic-session-exporter v0.6.0, verified 2026-09-29:
+#   - index digest sha256:3bed7d12fa0529621787cf6ea7964f34218fe8f6ee72fad6309d2b86f0cd63f3
+#     (linux/amd64 manifest sha256:99bfd0f4a803acbef8145bc90385c534150a5f047ffd999c403b23a016d1e04e,
+#      linux/arm64 manifest sha256:eb51eab07f3e1baa778cf1a131a291eea1f11fb2ad029807c35332fb39f5082f)
+#   - cosign verified keyless; certificate subject is
+#     .github/workflows/release.yml@refs/tags/v0.6.0, source commit f4e9570
+#   - the release's SHA256SUMS verified with cosign verify-blob against the
+#     same tag identity (certificate recovered from its Rekor entry, since the
+#     release publishes the signature without it: exporter issue #29), and the
+#     binary copied out of THIS index matches it on each architecture:
+#       amd64 apss-session-exporter sha256 1ee6a4307d19d8dc253e993f0e5ed3575a726a6c961391e806557663178346d1
+#       arm64 apss-session-exporter sha256 b5a429608c2459d50221df7be7005da23f103e27c45ec9a5f9800dccf969fc11
+#   - pulled and run out of this exact index digest on BOTH linux/amd64 and
+#     linux/arm64; each reports
+#     "apss-session-exporter 0.6.0 (APS-V1-0004 SCS 1.0)"
+#   - the two binaries differ in size (11367672 on amd64, 10894176 on arm64)
+#   - /apss-session-exporter and /apss-session-reconstitute are both present at
+#     mode 0755. Only the exporter is copied out; see the closing note below.
+#
+# WHY THIS BUMP. v0.6.0 adds durable local capture: --spool-only, --spool-list
+# and --spool-read (plus qualified capture and inventory outbox modes). This
+# repository already calls them: the local session-store finalizer runs
+# --spool-only, agentic_isolation's WorkspaceSpoolReader pages with
+# --spool-list / --spool-read, and the local-provider doctor FAILS startup
+# unless --help lists all three. Against v0.5.0 none of them exist, so this
+# image could not run the local provider at all.
+#
+# NOT A BEHAVIOUR CHANGE for existing callers: every new mode is a new flag,
+# and the --json result stays at schema 2 with the same fields.
+#
+# Previous pin, for the record:
 # agentic-session-exporter v0.5.0, verified 2026-08-21:
 #   - cosign verified keyless; certificate subject is
 #     .github/workflows/release.yml@refs/tags/v0.5.0, source commit 35584f3
@@ -498,7 +556,7 @@ COPY workspace/capabilities/ /opt/agentic/capabilities/
 # disk so a harness can resume it, which is something a developer does on their
 # own machine, not something a short-lived workspace container ever needs.
 # Copying it would add weight for a path no workspace takes.
-COPY --from=ghcr.io/agentparadise/agentic-session-exporter@sha256:6d40917af5ccfb50de9022af4864333577919948c30d00fd53e860ed777cf98b \
+COPY --from=ghcr.io/agentparadise/agentic-session-exporter@sha256:3bed7d12fa0529621787cf6ea7964f34218fe8f6ee72fad6309d2b86f0cd63f3 \
      /apss-session-exporter /usr/local/bin/
 
 RUN chmod 755 /usr/local/bin/apss-session-exporter \
@@ -516,18 +574,18 @@ RUN chmod 755 /usr/local/bin/apss-session-exporter \
     `# the binary executes; it does not prove WHICH binary was copied. A pin` \
     `# edited to a digest that is signed but older still builds green, and` \
     `# the consumer then gets a workspace whose exporter silently lacks the` \
-    `# capability the pin comment promises - for 0.5.0 that is the` \
-    `# sessions array, where for 0.4.0 it was the --ignore-state flag.` \
+    `# capability the pin comment promises - for 0.6.0 that is the` \
+    `# local spool interface, for 0.5.0 the sessions array.` \
     `# Grepping the output is what turns the comment above into something` \
     `# CI enforces.` \
     `#` \
     `# It proves the VERSION, not byte identity: a different digest whose` \
-    `# binary also reports 0.5.0 would pass. That is the intended strength -` \
+    `# binary also reports 0.6.0 would pass. That is the intended strength -` \
     `# the digest pin is what fixes the bytes, and this catches the pin` \
     `# being moved to something older.` \
     && /usr/local/bin/apss-session-exporter --version \
     && /usr/local/bin/apss-session-exporter --version \
-       | grep -q '^apss-session-exporter 0\.5\.0 '
+       | grep -q '^apss-session-exporter 0\.6\.0 '
 
 # session-store spool root (ADR-040 / agentic_session_store's DEFAULT_SPOOL).
 # The contract defaults AGENTIC_SESSION_STORE_SPOOL to /spool when unset;

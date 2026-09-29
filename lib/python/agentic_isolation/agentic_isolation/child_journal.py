@@ -45,13 +45,24 @@ class ChildIntent(_Wire):
     child_invocation_id: Identity
     call: ChildCall
     child_native_id: Identity | None
-    status: Literal["launched", "launch_failed", "completed", "failed", "cancelled"] | None = None
+    status: (
+        Literal["pending", "launched", "launch_failed", "completed", "failed", "cancelled"] | None
+    ) = None
     exit_code: int | None = Field(default=None, ge=-255, le=255)
+    reason: Identity | None = None
 
     @model_validator(mode="after")
     def valid_outcome(self):
-        if self.status in {None, "launched", "launch_failed"}:
+        native = self.call.target_harness is None
+        if self.status == "pending":
+            # A native intent awaiting its launch decision (schema v3). It is
+            # the explicit recoverable state: never bound, never an outcome.
+            valid = native and self.exit_code is None and self.child_native_id is None
+        elif self.status in {None, "launched", "launch_failed"}:
             valid = self.exit_code is None
+        elif native:
+            # Native children report a stop, never an exit status (schema v3).
+            valid = self.status == "completed" and self.exit_code is None
         elif self.status == "completed":
             valid = self.exit_code == 0
         elif self.status == "failed":
@@ -60,12 +71,31 @@ class ChildIntent(_Wire):
             valid = self.exit_code is not None and self.exit_code < 0
         if not valid or (self.status == "launch_failed" and self.child_native_id is not None):
             raise ValueError("Invalid child launch outcome")
+        if (
+            native
+            and self.status not in {None, "pending", "launch_failed"}
+            and self.child_native_id is None
+        ):
+            raise ValueError("Launched native child must be bound")
+        if self.reason is not None and self.status != "launch_failed":
+            raise ValueError("Only a failed launch carries a reason")
         return self
 
 
 class ChildChange(_Wire):
     sequence: int = Field(gt=0)
     intent: ChildIntent
+    # A rejected identity observed for an already-bound intent (schema v3).
+    conflict_native_id: Identity | None = None
+
+    @model_validator(mode="after")
+    def conflict_needs_binding(self):
+        if self.conflict_native_id is not None and self.intent.child_native_id in {
+            None,
+            self.conflict_native_id,
+        }:
+            raise ValueError("A conflict must differ from a recorded binding")
+        return self
 
 
 class ChildPage(_Wire):
@@ -75,7 +105,7 @@ class ChildPage(_Wire):
 
 
 class _Export(_Wire):
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     page: ChildPage
 
 

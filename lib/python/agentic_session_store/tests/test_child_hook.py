@@ -109,10 +109,19 @@ def test_hook_failure_is_explicit_and_redacted(
     assert result.stderr == b"Durable child-session recording failed.\n"
 
 
-def test_disabled_capability_has_no_side_effect(environment: dict[str, str]) -> None:
-    environment[Env.PROVIDER] = "none"
-    result = _run(environment, b"invalid")
-    assert result.returncode == 0
+@pytest.mark.parametrize("provider", [None, "none", ""])
+def test_installed_hook_without_contract_denies_without_side_effect(
+    environment: dict[str, str], provider: str | None
+) -> None:
+    """Hooks are installed only with capture enabled, so a hook that runs
+    without an active contract lost it; the launch must not proceed."""
+    if provider is None:
+        environment.pop(Env.PROVIDER)
+    else:
+        environment[Env.PROVIDER] = provider
+    result = _run(environment, _event("PreToolUse", "call"))
+    assert (result.returncode, result.stdout) == (2, b"")
+    assert result.stderr == b"Durable child-session recording failed.\n"
     assert not list(Path(environment[Env.SPOOL]).rglob("*.sqlite"))
 
 
@@ -206,9 +215,15 @@ def test_claude_native_child_uses_exact_call_and_parent(environment, tool, neste
     assert changes[1].intent.call.parent_native_id == (
         "agent-parent" if nested else "root"
     )
+    # A conflicting identity is recorded as evidence and never replaces the
+    # binding; repeating it adds nothing.
     event["tool_response"] = {"agentId": "different-child"}
-    assert _run(environment, json.dumps(event).encode()).returncode == 2
-    assert len(journal.page().changes) == 2
+    for _ in range(2):
+        assert _run(environment, json.dumps(event).encode()).returncode == 2
+    changes = journal.page().changes
+    assert len(changes) == 3
+    assert changes[2].conflict_native_id == "agent-different-child"
+    assert changes[2].intent.child_native_id == "agent-child"
 
 
 @pytest.mark.parametrize("response", [None, {}, "agentId: secret", {"agentId": ""}])

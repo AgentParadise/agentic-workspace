@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "agentic-workspace-conformance"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentic-workspace-core",
 ]
 
 [[package]]
 name = "agentic-workspace-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "apss-v1-0006-workspace",
  "serde",
@@ -24,16 +24,17 @@ dependencies = [
 
 [[package]]
 name = "agentic-workspace-docker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentic-workspace-conformance",
  "agentic-workspace-core",
+ "serde_json",
  "tempfile",
 ]
 
 [[package]]
 name = "agentic-workspace-local"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agentic-workspace-conformance",
  "agentic-workspace-core",

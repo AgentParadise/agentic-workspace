@@ -29,6 +29,15 @@
 
 set -e
 
+# Native child capture hooks run through a shell that reads BASH_ENV (bash)
+# or ENV (interactive sh) before the hook command. A file there that the agent
+# can edit could exit before the capture guard runs, and the harness would then
+# launch the child unrecorded (syntropic137#1398). Hooks inherit the harness
+# process environment, which the agent cannot change once it is running, so
+# nothing started from here inherits either variable. The harness launch
+# wrappers in the image and syn-delegate clear them as well.
+unset BASH_ENV ENV
+
 # -----------------------------------------------------------------------------
 # 1. Claude CLI Configuration
 # -----------------------------------------------------------------------------
@@ -596,6 +605,32 @@ if [ -n "${__withheld_names}" ]; then
 fi
 if [ -n "${__withhold_ambient}" ]; then
     echo "[entrypoint] note: AGENTIC_CAPABILITY_WITHHOLD arrived already set, so those names belong to no capability; they are withheld from the agent and restored for no finalizer" >&2
+fi
+
+# -----------------------------------------------------------------------------
+# 5.9 Codex sandbox probe (diagnostic log only)
+# -----------------------------------------------------------------------------
+# Codex runs model shell commands under bubblewrap. Without the Codex sandbox
+# seccomp profile (and, on AppArmor hosts, AppArmor profile) that the provider
+# applies to Codex-capable images, every Codex shell tool call fails while
+# `codex exec` still exits 0. Report the state once at startup so it is visible
+# in container logs. Nothing reads this: syn-delegate probes live, with its own
+# mode, directory and environment, before every Codex launch. Never fatal.
+if command -v codex >/dev/null 2>&1; then
+    __codex_probe_rc=0
+    # workspace-write scopes writes to the cwd; the policy only admits
+    # working directories under /workspace.
+    __codex_probe_err="$(cd /workspace 2>/dev/null && timeout 30 codex sandbox \
+        -c 'sandbox_mode="workspace-write"' -- true 2>&1 >/dev/null)" || __codex_probe_rc=$?
+    if [ "${__codex_probe_rc}" -eq 0 ]; then
+        echo "[entrypoint] codex sandbox: available" >&2
+    else
+        __codex_detail="$( { printf '%s\n' "${__codex_probe_err}" | grep -m 1 -i -E 'bwrap|error' \
+            || printf '%s\n' "${__codex_probe_err}" | tail -n 1; } | cut -c1-300)"
+        echo "[entrypoint] codex sandbox: unavailable (probe exit ${__codex_probe_rc}: ${__codex_detail})" >&2
+        unset __codex_detail
+    fi
+    unset __codex_probe_rc __codex_probe_err
 fi
 
 # -----------------------------------------------------------------------------
