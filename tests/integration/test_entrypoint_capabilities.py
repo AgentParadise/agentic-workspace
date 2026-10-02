@@ -4586,3 +4586,62 @@ def test_an_adapter_refusal_degrades_without_touching_data(tmp_path: Path):
     ]
     assert warning and "symlinks_correct" in warning[0], result.stderr
     assert "[finalize]" not in result.stderr, result.stderr
+
+
+def _flaky_copy(tmp_path: Path, doctor: str) -> Path:
+    """The flaky fixture capability with its doctor replaced."""
+    cap = tmp_path / "flaky"
+    (cap / "flaky").mkdir(parents=True)
+    for rel in ("capability.conf", "flaky/init.sh", "flaky/finalize.sh"):
+        (cap / rel).write_bytes((_FLAKY_CAPABILITY / rel).read_bytes())
+    (cap / "doctor").write_text(doctor)
+    for rel in ("doctor", "flaky/init.sh", "flaky/finalize.sh"):
+        os.chmod(cap / rel, 0o755)
+    return cap
+
+
+_HANGING_DOCTOR = "#!/usr/bin/env bash\nsleep 600\n"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("required", [None, "1"])
+def test_a_hanging_doctor_is_bounded_and_then_follows_the_policy(
+    tmp_path: Path, required: str | None
+):
+    """A doctor that never returns must not hold the workspace forever.
+
+    The lifecycle bounds the whole doctor process and treats the timeout as a
+    failed doctor, so a best-effort capability degrades and a required one
+    hard-fails, both within the bound rather than never.
+    """
+    cap = _flaky_copy(tmp_path, _HANGING_DOCTOR)
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    os.chmod(audit, 0o777)
+    env = {
+        "AGENTIC_CAPABILITIES": "flaky",
+        "AGENTIC_FLAKY_PROVIDER": "flaky",
+        "AGENTIC_CAPABILITY_DOCTOR_TIMEOUT_S": "2",
+        "AGENTIC_CAPABILITY_AUDIT_DIR": "/audit",
+    }
+    if required is not None:
+        env["AGENTIC_FLAKY_REQUIRED"] = required
+    started = time.monotonic()
+    result = _run(
+        ["bash", "-c", "echo AGENT_RAN"],
+        env=env,
+        extra_mounts=[f"{cap}:/opt/agentic/capabilities/flaky:ro", f"{audit}:/audit"],
+    )
+    assert time.monotonic() - started < 60, "the doctor timeout did not bound startup"
+    assert "timed out" in result.stderr, result.stderr
+    rows = _status_rows(audit, "flaky")
+    assert len(rows) == 1, rows
+    assert rows[0]["doctor_exit"] == 124, rows
+    if required is None:
+        assert result.returncode == 0, result.stderr
+        assert "AGENT_RAN" in result.stdout
+        assert rows[0]["status"] == "degraded"
+    else:
+        assert result.returncode != 0
+        assert "AGENT_RAN" not in result.stdout
+        assert rows[0]["status"] == "failed"

@@ -601,6 +601,15 @@ __capability_status_row() {
         "${checks}" "${host}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
+# Upper bound, in seconds, on each capability's whole doctor run. Generous by
+# design: both shipped doctors bound their own network checks at 5s each, so
+# this exists to end a HANG, not to race a slow check. Anything but a positive
+# integer falls back to the default rather than to "no bound".
+__doctor_timeout_s="${AGENTIC_CAPABILITY_DOCTOR_TIMEOUT_S:-120}"
+case "${__doctor_timeout_s}" in
+    '' | *[!0-9]* | 0) __doctor_timeout_s=120 ;;
+esac
+
 # Capabilities whose doctor failed and that this run DISABLED. Read by
 # __discover_finalizers in section 6. Space-separated validated names.
 __degraded_capabilities=""
@@ -647,8 +656,19 @@ for __cap in ${AGENTIC_CAPABILITIES:-}; do
     # It is then written exactly where it went before: the audit file, or
     # stderr when that is unwritable. A failed append is one more warning, for
     # the reason given above: the record is not the run.
+    #
+    # The doctor is BOUNDED (timeout(1), exit 124 on expiry). Without a bound,
+    # degrade-by-policy is a promise the lifecycle cannot keep: a doctor that
+    # hangs (a check with no timeout of its own, a wedged interpreter) holds
+    # the workspace before the agent forever, which for a best-effort
+    # capability is exactly the outage it exists to survive. A timeout is a
+    # failed doctor, and then the declared policy decides as for any other.
     __doctor_rc=0
-    __doctor_out="$(/opt/agentic/capabilities/"${__cap}"/doctor --json)" || __doctor_rc=$?
+    __doctor_out="$(timeout --kill-after=5 "${__doctor_timeout_s}" \
+        /opt/agentic/capabilities/"${__cap}"/doctor --json)" || __doctor_rc=$?
+    if [ "${__doctor_rc}" -eq 124 ] || [ "${__doctor_rc}" -eq 137 ]; then
+        echo "[entrypoint] ${__cap} doctor: timed out after ${__doctor_timeout_s}s (AGENTIC_CAPABILITY_DOCTOR_TIMEOUT_S)" >&2
+    fi
     if [ -n "${__doctor_out}" ] && [ "${__audit_ok}" -eq 1 ]; then
         if ! printf '%s\n' "${__doctor_out}" >> "${__audit_file}" 2>/dev/null; then
             __audit_ok=0

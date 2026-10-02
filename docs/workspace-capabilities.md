@@ -224,6 +224,24 @@ entrypoint:
   that outlives the container still holds the transcripts; nothing uploads
   them on this run.
 
+**A hanging doctor cannot hold the workspace.** Each doctor run is bounded
+by `AGENTIC_CAPABILITY_DOCTOR_TIMEOUT_S` (default 120; a non-positive or
+non-numeric value means the default, never "no bound"). A timeout is a failed
+doctor with exit 124 (137 if it had to be killed), and the policy then
+decides as for any other failure. This applies to every capability: one that
+used to hang forever now fails within the bound.
+
+**What degraded does NOT undo.** Disabling is about this run's lifecycle
+hooks, not a rollback of `init.sh`. For `session-store`: the transcript roots
+still point into the spool; with `provider=local` the child capture hooks
+init installed stay installed (they are only installed after the spool and
+journal proved writable, so they record rather than deny); and anything the
+host reads from the spool is not a captured run. A consumer must check the
+status row before treating a spool as captured. And, as for a healthy
+workspace, a credential delivered with `docker run -e` is still visible to
+`docker exec`'d agents (ADR-040 s2 known limit); 5.8 withholds it from CMD
+only.
+
 **The opt-in to the hard fail** is `AGENTIC_<CAP>_REQUIRED=1`. It can only
 strengthen: `0` or empty defers to the manifest, so `AGENTIC_MEMORY_REQUIRED=0`
 does not make memory best-effort. Any other value is warned about and read as
