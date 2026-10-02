@@ -198,7 +198,16 @@ fn build_image(tag: &str, extra: &str) {
         .stdin
         .take()
         .unwrap()
-        .write_all(format!("FROM {BASE_IMAGE}\n{extra}USER 1000:1000\n").as_bytes())
+        .write_all(
+            format!(
+                "FROM {BASE_IMAGE}\n{extra}\
+                 RUN mkdir -p /spool/.agentic-session-store/run /spool/run/claude /spool/run/codex \
+                 /spool/exec/ws/claude /spool/.hidden/claude /spool/.agentic-session-store/exec/ws \
+                 && chown -R 1000:1000 /spool\n\
+                 USER 1000:1000\n"
+            )
+            .as_bytes(),
+        )
         .unwrap();
     assert!(build.wait().unwrap().success());
 }
@@ -309,7 +318,16 @@ fn codex_mount_policy_admits_bwrap_and_denies_sensitive_mounts() {
         let label = label.trim_matches('"');
         let (allowed, errno) = outcome.trim_end_matches(']').split_once(", ").unwrap();
         let allowed = allowed == "true";
-        if label.starts_with("staging") || label.starts_with("allowed:") {
+        if label.starts_with("allowed: rw remount ")
+            && label != "allowed: rw remount workspace"
+            && !allowed
+        {
+            // This container's root is read-only, so the kernel refuses a
+            // writable remount of anything bound from it (EPERM). AppArmor is
+            // consulted first and would refuse with EACCES, which this rules
+            // out. In a workspace the spool is a writable volume.
+            assert_eq!(errno, "1", "{label} must be allowed by policy: {stdout}");
+        } else if label.starts_with("staging") || label.starts_with("allowed:") {
             assert!(allowed, "{label} must be allowed: {stdout}");
         } else if apparmor || label.contains("rw remount") {
             assert!(!allowed, "{label} must be denied: {stdout}");
@@ -318,5 +336,5 @@ fn codex_mount_policy_admits_bwrap_and_denies_sensitive_mounts() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 21, "{stdout}");
+    assert_eq!(checked, 39, "{stdout}");
 }

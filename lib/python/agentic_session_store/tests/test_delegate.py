@@ -12,12 +12,20 @@ from pathlib import Path
 import pytest
 
 from agentic_session_store.child_journal import ChildJournal
+from agentic_session_store.claude_permissions import PERMISSIONS_ENV
+
+PARENT_GRANT = json.dumps(
+    {"mode": "bypassPermissions", "tools": None, "allowed": [], "disallowed": []}
+)
 
 
 @pytest.fixture
 def environment(tmp_path):
     spool = tmp_path / "spool"
     (spool / ".agentic-session-store/run").mkdir(parents=True)
+    # As session-store init creates them: the partition's transcript roots.
+    (spool / "run/claude").mkdir(parents=True)
+    (spool / "run/codex").mkdir()
     binary = tmp_path / "bin"
     binary.mkdir()
     # The fake codex answers `codex sandbox ...` with this exit status.
@@ -38,6 +46,7 @@ def environment(tmp_path):
         "AGENTIC_ATTEMPT_ID": "attempt",
         "AGENTIC_PARENT_HARNESS": "claude",
         "AGENTIC_PARENT_NATIVE_ID": "parent",
+        PERMISSIONS_ENV: PARENT_GRANT,
     }
 
 
@@ -56,6 +65,21 @@ def _fake(environment, body):
     )
     binary.write_text(f"#!{sys.executable}\n" + dispatch + body)
     binary.chmod(0o700)
+
+
+def _fake_claude(environment, body, logged_in=True):
+    """Fake claude: `claude auth status` reports `logged_in`; anything else
+    runs `body`."""
+    binary = Path(environment["PATH"].split(os.pathsep)[0]) / "claude"
+    status = json.dumps({"loggedIn": logged_in, "authMethod": "api_key"})
+    binary.write_text(
+        f"#!{sys.executable}\nimport sys as _s\n"
+        "if _s.argv[1:3] == ['auth', 'status']:\n"
+        f"    print({status!r})\n"
+        f"    raise SystemExit({0 if logged_in else 1})\n" + body
+    )
+    binary.chmod(0o700)
+    return binary
 
 
 def _journal(environment):
@@ -320,7 +344,30 @@ def test_probe_uses_the_requested_mode(environment, tmp_path, mode):
         json.loads(line)
         for line in (tmp_path / "probes.jsonl").read_text().splitlines()
     ]
-    assert probes == [["sandbox", "-c", f'sandbox_mode="{mode}"', "--", "true"]]
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    journal_dir = str(spool / ".agentic-session-store/run")
+    claude_dir = str(spool / "run/claude")
+    if mode == "read-only":
+        assert probes == [["sandbox", "-c", f'sandbox_mode="{mode}"', "--", "true"]]
+        return
+    # workspace-write: the same grant as the delegate, and the probe proves
+    # the extra writable root is writable inside the sandbox.
+    (probe,) = probes
+    separator = probe.index("--")
+    assert probe[:separator] == [
+        "sandbox",
+        "-c",
+        f'sandbox_mode="{mode}"',
+        "-c",
+        (
+            "sandbox_workspace_write.writable_roots="
+            f"[{json.dumps(journal_dir)}, {json.dumps(claude_dir)}]"
+        ),
+        "-c",
+        "sandbox_workspace_write.network_access=true",
+    ]
+    assert probe[separator + 1 : separator + 3] == ["/bin/sh", "-c"]
+    assert probe[-2:] == [journal_dir, claude_dir]
 
 
 @pytest.mark.parametrize(
@@ -356,9 +403,7 @@ def test_prompt_that_looks_like_an_option_stays_a_prompt(environment, tmp_path, 
 
 def test_claude_delegate_does_not_probe_codex(environment, tmp_path):
     (tmp_path / "probe-rc").write_text("1")
-    binary = Path(environment["PATH"].split(os.pathsep)[0]) / "claude"
-    binary.write_text(f"#!{sys.executable}\n")
-    binary.chmod(0o700)
+    _fake_claude(environment, "")
     command = _command()
     command[command.index("codex")] = "claude"
     result = subprocess.run(
@@ -369,12 +414,10 @@ def test_claude_delegate_does_not_probe_codex(environment, tmp_path):
 
 def test_claude_prompt_follows_an_option_terminator(environment, tmp_path):
     record = tmp_path / "claude-argv.json"
-    binary = Path(environment["PATH"].split(os.pathsep)[0]) / "claude"
-    binary.write_text(
-        f"#!{sys.executable}\nimport json,sys\n"
-        f"open({str(record)!r},'w').write(json.dumps(sys.argv[1:]))\n"
+    _fake_claude(
+        environment,
+        f"import json,sys\nopen({str(record)!r},'w').write(json.dumps(sys.argv[1:]))\n",
     )
-    binary.chmod(0o700)
     command = _command()
     command[command.index("codex")] = "claude"
     at = command.index("--prompt")
@@ -420,3 +463,434 @@ def test_delegate_refuses_when_its_capture_hooks_cannot_run(environment, tmp_pat
         "launch_failed",
         "capture_hook_unreachable",
     )
+
+
+# --- agentic-workspace#19: nested delegation from a workspace-write Codex ---
+
+
+def test_workspace_write_codex_gets_only_the_journal_and_claude_transcript_roots(
+    environment, tmp_path
+):
+    """The journal partition, this partition's Claude transcript root (so a
+    Claude grandchild's transcript is captured) and the network; never the
+    spool, the partition root, the Codex transcript root or the namespace."""
+    record, body = _argv_recorder(tmp_path)
+    _fake(environment, body)
+    result = subprocess.run(
+        _command(), env=environment, capture_output=True, timeout=10, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    argv = json.loads(record.read_text())
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    roots = [str(spool / ".agentic-session-store/run"), str(spool / "run/claude")]
+    overrides = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-c"]
+    assert overrides == [
+        f"sandbox_workspace_write.writable_roots=[{', '.join(map(json.dumps, roots))}]",
+        "sandbox_workspace_write.network_access=true",
+    ]
+    for broader in (
+        spool,
+        spool / "run",
+        spool / "run/codex",
+        spool / ".agentic-session-store",
+    ):
+        assert json.dumps(str(broader)) not in overrides[0]
+    assert "--add-dir" not in argv
+    assert "danger-full-access" not in " ".join(argv)
+    assert argv.index("-c") < argv.index("--")
+
+
+def _writable_roots(argv: list[str]) -> list[str]:
+    (value,) = [
+        argv[i + 1].removeprefix("sandbox_workspace_write.writable_roots=")
+        for i, arg in enumerate(argv)
+        if arg == "-c" and "writable_roots" in argv[i + 1]
+    ]
+    return json.loads(value)
+
+
+def _granted(environment, tmp_path) -> list[str]:
+    record, body = _argv_recorder(tmp_path)
+    _fake(environment, body)
+    result = subprocess.run(
+        _command(), env=environment, capture_output=True, timeout=10, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    return _writable_roots(json.loads(record.read_text()))
+
+
+def test_nested_partition_grants_its_own_claude_root(environment, tmp_path):
+    """Syntropic137 partitions are <execution>/<workspace>."""
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    (spool / "exec-1/ws-1/claude").mkdir(parents=True)
+    (spool / ".agentic-session-store/exec-1/ws-1").mkdir(parents=True)
+    environment["AGENTIC_SESSION_STORE_PARTITION"] = "exec-1/ws-1"
+    assert _granted(environment, tmp_path) == [
+        str(spool / ".agentic-session-store/exec-1/ws-1"),
+        str(spool / "exec-1/ws-1/claude"),
+    ]
+
+
+def test_symlinked_claude_root_is_not_granted(environment, tmp_path):
+    """A link could make another directory (here the Codex root) writable."""
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    (spool / "run/claude").rmdir()
+    (spool / "run/claude").symlink_to(spool / "run/codex")
+    assert _granted(environment, tmp_path) == [
+        str(spool / ".agentic-session-store/run")
+    ]
+
+
+def test_symlinked_partition_is_not_granted(environment, tmp_path):
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    (spool / "elsewhere/claude").mkdir(parents=True)
+    (spool / ".agentic-session-store/linked").mkdir(parents=True)
+    (spool / "linked").symlink_to(spool / "elsewhere")
+    environment["AGENTIC_SESSION_STORE_PARTITION"] = "linked"
+    assert _granted(environment, tmp_path) == [
+        str(spool / ".agentic-session-store/linked")
+    ]
+
+
+def test_missing_claude_root_is_not_granted(environment, tmp_path):
+    """The grant never makes a launch fail that worked without it."""
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    (spool / "run/claude").rmdir()
+    assert _granted(environment, tmp_path) == [
+        str(spool / ".agentic-session-store/run")
+    ]
+
+
+def test_dot_partition_claude_root_is_not_granted(environment, tmp_path):
+    """The AppArmor profile never admits a dot-led partition (it keeps the
+    metadata namespace out), so granting it would only refuse the launch."""
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    (spool / ".hidden/claude").mkdir(parents=True)
+    (spool / ".agentic-session-store/.hidden").mkdir(parents=True)
+    environment["AGENTIC_SESSION_STORE_PARTITION"] = ".hidden"
+    assert _granted(environment, tmp_path) == [
+        str(spool / ".agentic-session-store/.hidden")
+    ]
+
+
+def test_read_only_codex_gets_no_grant(environment, tmp_path):
+    record, body = _argv_recorder(tmp_path)
+    _fake(environment, body)
+    result = subprocess.run(
+        _command() + ["--sandbox", "read-only"],
+        env=environment,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    argv = json.loads(record.read_text())
+    assert "-c" not in argv
+    assert not any("writable_roots" in arg or "network" in arg for arg in argv)
+
+
+def test_journal_denied_launch_prints_a_denial_and_starts_nothing(
+    environment, tmp_path
+):
+    from agentic_session_store.delegate import DENIAL_MARKER, DENIAL_NONCE_ENV, denials
+
+    marker = tmp_path / "launched"
+    _fake(environment, f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+    environment[DENIAL_NONCE_ENV] = "inherited-nonce"
+    # The spool exists but its partition cannot be created or written.
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"])
+    shutil.rmtree(spool)
+    spool.mkdir()
+    spool.chmod(0o500)
+    try:
+        result = subprocess.run(
+            _command(), env=environment, capture_output=True, timeout=10, check=False
+        )
+    finally:
+        spool.chmod(0o700)
+    assert result.returncode == 70
+    assert not marker.exists()
+    (line,) = [
+        line
+        for line in result.stderr.decode().splitlines()
+        if line.startswith(DENIAL_MARKER)
+    ]
+    record = json.loads(line.split(" ", 1)[1])
+    assert record["target"] == "codex"
+    assert record["nonce"] == "inherited-nonce"
+    event = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "aggregated_output": "noise\n" + line + "\n",
+            },
+        }
+    ).encode()
+    assert denials(event, "codex", "inherited-nonce") == [(record["id"], "codex")]
+    # Another delegate's nonce: not this child's denial.
+    assert denials(event, "codex", "other-nonce") == []
+
+
+def _codex_stream(*outputs):
+    """Fake Codex stream. In each output, DENIED becomes a denial line carrying
+    the nonce this delegate handed its child, FOREIGN one with another nonce."""
+    return (
+        "import json, os\n"
+        "from agentic_session_store.delegate import DENIAL_NONCE_ENV, DENIAL_MARKER\n"
+        "nonce = os.environ[DENIAL_NONCE_ENV]\n"
+        "def line(id, nonce):\n"
+        "    return DENIAL_MARKER + ' ' + json.dumps("
+        "{'id': id, 'target': 'claude', 'nonce': nonce})\n"
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 'codex-child'}),"
+        " flush=True)\n"
+        f"for i, output in enumerate({list(outputs)!r}):\n"
+        "    output = output.replace('DENIED', line('d1', nonce))"
+        ".replace('FOREIGN', line('f1', 'foreign'))\n"
+        "    print(json.dumps({'type': 'item.completed', 'item': {'id': f'item_{i}',"
+        " 'type': 'command_execution', 'aggregated_output': output,"
+        " 'exit_code': 70, 'status': 'failed'}}), flush=True)\n"
+    )
+
+
+def _by_parent(environment):
+    latest = {
+        change.intent.child_invocation_id: change.intent
+        for change in _journal(environment).page().changes
+    }
+    return {intent.call.parent_native_id: intent for intent in latest.values()}
+
+
+def test_enclosing_delegate_records_a_nested_denial_as_launch_failed(environment):
+    # Repeated, and once inside other output: one record per denial id.
+    _fake(environment, _codex_stream("DENIED", "x\nDENIED\ny", "plain output"))
+    result = subprocess.run(
+        _command(), env=environment, capture_output=True, timeout=10, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    by_parent = _by_parent(environment)
+    assert set(by_parent) == {"parent", "codex-child"}
+    nested = by_parent["codex-child"]
+    assert nested.call.harness == "codex"
+    assert nested.call.target_harness == "claude"
+    assert nested.call.tool_call_id == "denied-d1"
+    assert (nested.status, nested.reason) == (
+        "launch_failed",
+        "nested_journal_unavailable",
+    )
+    assert nested.child_native_id is None
+    assert (nested.call.invocation_id, nested.call.attempt_id) == (
+        "invocation",
+        "attempt",
+    )
+    assert by_parent["parent"].status == "completed"
+
+
+def test_denial_with_another_nonce_is_ignored(environment):
+    # Output copied from elsewhere (another delegate's run, a log).
+    _fake(environment, _codex_stream("FOREIGN"))
+    result = subprocess.run(
+        _command(), env=environment, capture_output=True, timeout=10, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert set(_by_parent(environment)) == {"parent"}
+
+
+def test_denial_text_outside_tool_output_is_ignored(environment):
+    # A correct denial line, with the right nonce, in the agent's own message.
+    body = _codex_stream() + (
+        "print(json.dumps({'type': 'item.completed', 'item': {'type':"
+        " 'agent_message', 'text': line('d2', nonce)}}), flush=True)\n"
+    )
+    _fake(environment, body)
+    result = subprocess.run(
+        _command(), env=environment, capture_output=True, timeout=10, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert set(_by_parent(environment)) == {"parent"}
+
+
+def test_claude_stream_denials_are_read_from_tool_results():
+    from agentic_session_store.delegate import denial_line, denials
+
+    denied = denial_line("codex", "n")
+    event = {
+        "type": "user",
+        "message": {
+            "content": [
+                {"type": "tool_result", "content": [{"type": "text", "text": denied}]}
+            ]
+        },
+    }
+    assert [t for _, t in denials(json.dumps(event).encode(), "claude", "n")] == [
+        "codex"
+    ]
+    forged = {
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": denied}]},
+    }
+    assert denials(json.dumps(forged).encode(), "claude", "n") == []
+
+
+def test_claude_delegate_from_a_subagent_is_refused(environment, tmp_path):
+    # The Bash hook exports no grant for a native subagent (its own tool list
+    # may be narrower than the session's), so the delegate refuses.
+    from agentic_session_store.command_context import command_context
+
+    output = command_context(
+        json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "session_id": "root",
+                "agent_id": "sub",
+                "permission_mode": "bypassPermissions",
+                "tool_input": {"command": "true"},
+            }
+        ).encode(),
+        {**environment, "CLAUDE_PID": str(os.getppid())},
+    )
+    prefix = output["hookSpecificOutput"]["updatedInput"]["command"]
+    assert prefix.startswith(f"unset {PERMISSIONS_ENV}\n")
+    assert PERMISSIONS_ENV + "=" not in prefix
+
+
+# --- agentic-workspace#20: the delegated Claude inherits its parent's grant ---
+
+
+def _claude_argv(environment, tmp_path, logged_in=True):
+    record = tmp_path / "claude-argv.json"
+    marker = tmp_path / "claude-env.json"
+    _fake_claude(
+        environment,
+        "import json,os,sys\n"
+        f"open({str(record)!r},'w').write(json.dumps(sys.argv[1:]))\n"
+        f"open({str(marker)!r},'w').write(json.dumps(dict(os.environ)))\n",
+        logged_in=logged_in,
+    )
+    command = _command()
+    command[command.index("codex")] = "claude"
+    result = subprocess.run(
+        command, env=environment, capture_output=True, timeout=10, check=False
+    )
+    argv = json.loads(record.read_text()) if record.exists() else None
+    child_env = json.loads(marker.read_text()) if marker.exists() else None
+    return result, argv, child_env
+
+
+def test_claude_child_inherits_the_claude_parent_grant(environment, tmp_path):
+    environment[PERMISSIONS_ENV] = json.dumps(
+        {
+            "mode": "dontAsk",
+            "tools": ["Bash", "Read"],
+            "allowed": ["Bash(git *)"],
+            "disallowed": ["WebFetch"],
+        }
+    )
+    result, argv, child_env = _claude_argv(environment, tmp_path)
+    assert result.returncode == 0, result.stderr
+    separator = argv.index("--")
+    assert argv[:separator] == [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "dontAsk",
+        "--tools",
+        "Bash,Read",
+        "--allowedTools",
+        "Bash(git *)",
+        "--disallowedTools",
+        "WebFetch",
+    ]
+    assert "--dangerously-skip-permissions" not in argv
+    # The grant is not inherited as a marker: the child's own hook sets it.
+    assert PERMISSIONS_ENV not in child_env
+
+
+def test_claude_child_of_bypass_parent_gets_bypass(environment, tmp_path):
+    result, argv, _ = _claude_argv(environment, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+
+
+def test_claude_child_of_codex_parent_gets_dont_ask_with_codex_tools(
+    environment, tmp_path
+):
+    for key in ("AGENTIC_PARENT_HARNESS", "AGENTIC_PARENT_NATIVE_ID", PERMISSIONS_ENV):
+        environment.pop(key)
+    environment["CODEX_THREAD_ID"] = "codex-parent"
+    result, argv, _ = _claude_argv(environment, tmp_path)
+    assert result.returncode == 0, result.stderr
+    separator = argv.index("--")
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert argv[argv.index("--allowedTools") + 1 : separator] == [
+        "Bash",
+        "Read",
+        "Edit",
+        "Write",
+        "Glob",
+        "Grep",
+    ]
+    assert "--tools" not in argv
+
+
+@pytest.mark.parametrize("grant", [None, "not json", '{"mode":"yolo"}'])
+def test_unknown_claude_parent_grant_refuses_launch(environment, tmp_path, grant):
+    if grant is None:
+        environment.pop(PERMISSIONS_ENV)
+    else:
+        environment[PERMISSIONS_ENV] = grant
+    result, argv, _ = _claude_argv(environment, tmp_path)
+    assert result.returncode == 70
+    assert argv is None
+    assert b"permission mode and tools are unavailable" in result.stderr
+    intent = _journal(environment).page().changes[-1].intent
+    assert (intent.status, intent.reason) == (
+        "launch_failed",
+        "parent_permissions_unavailable",
+    )
+
+
+# --- agentic-workspace#21: a Claude child without credentials is refused ---
+
+
+def test_claude_child_without_credentials_is_refused(environment, tmp_path):
+    result, argv, _ = _claude_argv(environment, tmp_path, logged_in=False)
+    assert result.returncode == 69
+    assert argv is None
+    assert b"removes its OAuth token from Bash subprocesses" in result.stderr
+    intent = _journal(environment).page().changes[-1].intent
+    assert (intent.status, intent.reason) == (
+        "launch_failed",
+        "claude_nested_auth_unavailable",
+    )
+    assert intent.child_native_id is None
+
+
+def test_auth_probe_sees_exactly_the_child_environment(environment, tmp_path):
+    # The probe runs with the delegate's own environment; no credential is
+    # ever added to it.
+    seen = tmp_path / "probe-env.json"
+    binary = Path(environment["PATH"].split(os.pathsep)[0]) / "claude"
+    binary.write_text(
+        f"#!{sys.executable}\nimport json,os,sys\n"
+        "if sys.argv[1:3] == ['auth', 'status']:\n"
+        f"    open({str(seen)!r},'w').write(json.dumps(dict(os.environ)))\n"
+        "    print(json.dumps({'loggedIn': False}))\n"
+        "    raise SystemExit(1)\n"
+    )
+    binary.chmod(0o700)
+    environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    environment["CLAUDE_PID"] = "1"
+    command = _command()
+    command[command.index("codex")] = "claude"
+    result = subprocess.run(
+        command, env=environment, capture_output=True, timeout=10, check=False
+    )
+    assert result.returncode == 69
+    probe_env = json.loads(seen.read_text())
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in probe_env
+    assert "CLAUDE_PID" not in probe_env
+    assert PERMISSIONS_ENV not in probe_env

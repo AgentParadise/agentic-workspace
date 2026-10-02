@@ -1,5 +1,21 @@
 # Changelog - delegation plugin
 
+## 1.5.0 - 2026-10-02
+
+Depth-three delegation (agentic-workspace#19, #20, #21).
+
+- `delegating-to-codex`: a `workspace-write` delegate gets two extra writable
+  roots, the child journal's partition directory and the partition's Claude
+  transcript root, and network access, so it can delegate again and a Claude
+  grandchild's transcript is captured. A nested launch denied for want of the journal (for
+  example from a `read-only` delegate) is recorded as `launch_failed` /
+  `nested_journal_unavailable` by the enclosing delegate.
+- `delegating-to-claude-p`: the delegated Claude inherits its parent's grant
+  (Claude parent: permission mode and launch tool lists; Codex parent:
+  `dontAsk` with Codex's own tools), never more. A Claude below a Claude Bash
+  call with OAuth only is refused (`claude_nested_auth_unavailable`): Claude
+  Code removes its OAuth token from Bash subprocesses.
+
 ## 1.4.0 - 2026-09-25
 
 `delegating-to-codex` keeps Codex's own sandbox inside workspace containers
