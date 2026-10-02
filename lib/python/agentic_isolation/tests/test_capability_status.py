@@ -42,7 +42,8 @@ def row(**overrides: object) -> str:
         "at": "2026-10-02T12:00:00Z",
     }
     base.update(overrides)
-    return json.dumps(base)
+    # Compact, exactly as entrypoint.sh 5.7 writes it.
+    return json.dumps(base, separators=(",", ":"))
 
 
 DOCTOR_ROW = json.dumps({"capability": "session-store", "passed": False, "checks": []})
@@ -158,3 +159,32 @@ async def test_reader_selects_status_rows_before_bounding_the_read() -> None:
     # The byte bound applies to status rows only, so a large doctor payload
     # (or many of them) can never push this workspace's verdict out.
     assert command.index("capability_status") < command.index("tail -c")
+
+
+async def _local_sh(
+    command: str,
+    *,
+    timeout: float | None = None,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+) -> ExecuteResult:
+    """Run the reader's real shell script on this machine."""
+    import subprocess
+
+    done = subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=30)
+    return ExecuteResult(exit_code=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+
+@pytest.mark.asyncio
+async def test_other_containers_rows_cannot_push_this_verdict_out(tmp_path) -> None:
+    """A shared audit dir with > 1 MiB of other hosts' rows written later."""
+    probe = await _local_sh(
+        "cat /proc/sys/kernel/hostname 2>/dev/null || printf '%s\\n' \"${HOSTNAME:-}\""
+    )
+    me = "".join(c for c in probe.stdout.strip() if c.isalnum() or c in "._-")
+    assert me, "the test host reports no hostname"
+    foreign = row(host="other-ws", status="ready", failed_checks=[], doctor_exit=0)
+    copies = (1024 * 1024) // len(foreign) + 100
+    (tmp_path / "2026-10-02.jsonl").write_text(row(host=me) + "\n" + (foreign + "\n") * copies)
+    status = await read_capability_status(_local_sh, "session-store", audit_dir=str(tmp_path))
+    assert status is not None and status.degraded

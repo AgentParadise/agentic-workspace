@@ -56,14 +56,22 @@ READ_TIMEOUT_SECONDS = 10.0
 _CAPABILITY_NAME = re.compile(r"[a-z0-9-]+")
 """The entrypoint's capability-name charset (__capability_name_safe)."""
 
-# One exec: the container's hostname first, then this capability's status
-# rows. The hostname is how a row written by THIS container is told apart from
-# one written by another container sharing a persisted audit directory. Rows
-# are SELECTED before the byte bound is applied, so doctor payloads (which can
-# be large and repeat on every start) never push a verdict out of the window.
+# One exec: the container's hostname first, then THIS container's status rows
+# for THIS capability. The hostname is how a row written by this container is
+# told apart from one written by another container sharing a persisted audit
+# directory. Every filter runs BEFORE the byte bound, so neither doctor
+# payloads nor other containers' rows can push this verdict out of the window.
+# Values reach the script as positional parameters, never spliced into it:
+# the capability name is validated and the host is cut to the same charset
+# the entrypoint writes.
 _READ_SCRIPT = (
-    'cat /proc/sys/kernel/hostname 2>/dev/null || printf "%s\\n" "${HOSTNAME:-}"; '
-    'cat "$1"/*.jsonl 2>/dev/null | grep -F \'"record":"capability_status"\' '
+    "h=$(cat /proc/sys/kernel/hostname 2>/dev/null || printf '%s' \"${HOSTNAME:-}\"); "
+    "h=$(printf '%s' \"$h\" | tr -cd 'A-Za-z0-9._-' | cut -c1-253); "
+    "printf '%s\\n' \"$h\"; "
+    'cat "$1"/*.jsonl 2>/dev/null '
+    '| grep -F \'"record":"capability_status"\' '
+    '| grep -F "\\"capability\\":\\"$2\\"" '
+    '| grep -F "\\"host\\":\\"$h\\"" '
     f"| tail -c {MAX_AUDIT_BYTES}; exit 0"
 )
 
@@ -178,7 +186,7 @@ async def read_capability_status(
         raise ValueError("audit_dir must be an absolute path in the workspace")
     result = await exec_argv(
         execute,
-        ["sh", "-c", _READ_SCRIPT, "capability-status", directory],
+        ["sh", "-c", _READ_SCRIPT, "capability-status", directory, capability],
         timeout=timeout,
     )
     if result.exit_code != 0:
