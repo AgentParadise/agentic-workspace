@@ -4545,46 +4545,106 @@ def test_an_unrecognised_manifest_keeps_the_hard_fail(tmp_path: Path, conf: str)
         assert "unrecognised failure_policy" in result.stderr, result.stderr
 
 
+@pytest.fixture
+def stub_store():
+    """A reachable store (GET /healthz -> 200) the CONTAINER can reach.
+
+    Started in this process on an ephemeral port bound to every interface,
+    and reached from the container through host.docker.internal (host-gateway,
+    so it works on Linux CI as well as Docker Desktop). With it, a degraded
+    verdict can be attributed to the failure a test stages, not to an
+    unreachable store that would degrade the run on its own.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Healthz(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - http.server API
+            self.send_response(200 if self.path.rstrip("/") == "/healthz" else 404)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("0.0.0.0", 0), Healthz)  # noqa: S104 - test only
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://host.docker.internal:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 @pytest.mark.integration
-def test_an_adapter_refusal_degrades_without_touching_data(tmp_path: Path):
+@pytest.mark.parametrize("refuse", [True, False], ids=["refused", "control"])
+def test_an_adapter_refusal_degrades_without_touching_data(
+    tmp_path: Path, stub_store: str, refuse: bool
+):
     """The default outcome of an init REFUSAL, the counterpart of
     test_migration_failure_preserves_data_and_fails_loudly (which opts into
     the hard fail): the operator's transcripts are untouched, the refusal is
     named, the agent runs, and nothing is swept or uploaded.
+
+    The store is REACHABLE, so the refusal is the only thing that can degrade
+    this run, and the control (same fixture, no refusal) must not degrade.
     """
     spool = tmp_path / "spool"
     home = tmp_path / "home"
+    audit = tmp_path / "audit"
     proj = home / ".claude" / "projects"
     proj.mkdir(parents=True)
     (proj / "keepme.jsonl").write_text("{}\n")
     spool.mkdir()
+    audit.mkdir()
     _open_perms(home)
     os.chmod(spool, 0o777)
-    # Read-only partition target makes the migration fail.
+    os.chmod(audit, 0o777)
     (spool / "blocked").mkdir()
-    (spool / "blocked").chmod(0o500)
+    # Read-only partition target makes the migration fail.
+    (spool / "blocked").chmod(0o500 if refuse else 0o777)
 
+    env = _dead_store_env("blocked")
+    env[SessionStoreEnv.URL] = stub_store
     result = _run(
         ["bash", "-c", 'echo AGENT_RAN; echo "PID=$$"'],
-        env=_dead_store_env("blocked"),
+        env=env,
         extra_mounts=[
             f"{spool}:/spool",
             f"{home}:/home/agent",
-            f"{tmp_path}:/audit",
+            f"{audit}:/audit",
             f"{_STUB_EXPORTER}:/usr/local/bin/apss-session-exporter:ro",
         ],
+        add_host_gateway=True,
         tmpfs_home=False,
     )
     assert result.returncode == 0, result.stderr
     assert "AGENT_RAN" in result.stdout
+    record = _doctor_record(audit, "session-store")
+    checks = {c["name"]: c["passed"] for c in record["checks"]}
+    assert checks["store_reachable"] is True, "the stub store was not reached"
+    rows = _status_rows(audit, "session-store")
+    assert len(rows) == 1, rows
+    if not refuse:
+        assert rows[0]["status"] == "ready", rows
+        return
     assert "PID=1" in result.stdout, result.stdout
     assert (proj / "keepme.jsonl").exists(), "data was destroyed on a degraded start"
+    # The refusal, and only the refusal, is what degraded the run: the
+    # read-only partition fails the write probe, the migration it blocks
+    # leaves no symlink, and init stops before its completion marker.
+    assert rows[0]["status"] == "degraded", rows
+    assert rows[0]["failed_checks"] == [
+        "init_complete",
+        "spool_writable",
+        "symlinks_correct",
+    ], rows
     warning = [
         line
         for line in result.stderr.splitlines()
         if line.startswith("[entrypoint] WARNING: session-store unavailable")
     ]
     assert warning and "symlinks_correct" in warning[0], result.stderr
+    assert "store_reachable" not in warning[0], result.stderr
     assert "[finalize]" not in result.stderr, result.stderr
 
 
@@ -4645,3 +4705,102 @@ def test_a_hanging_doctor_is_bounded_and_then_follows_the_policy(
         assert result.returncode != 0
         assert "AGENT_RAN" not in result.stdout
         assert rows[0]["status"] == "failed"
+
+
+# --- A degraded capability takes its fail-closed hooks with it (#27) --------
+#
+# provider=local installs fail-closed child capture hooks into the harness
+# configs as the LAST step of init, before the doctor runs. A doctor failure
+# after that point degraded the workspace and left the hooks behind, so a
+# later journal failure could deny Claude and Codex child launches in a
+# workspace reported as running without capture. The adapter's degrade.sh now
+# removes them. tests/.../test_pinned_degraded_launch.py proves with the
+# pinned binaries that children then launch; these prove the entrypoint runs
+# it, for a full and a partial install.
+
+_LOCAL_CONFIGS = (
+    'echo "CLAUDE<<"; cat "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" '
+    '2>/dev/null; echo ">>"; '
+    'echo "CODEX<<"; cat "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null; '
+    'echo ">>"'
+)
+
+
+def _local_env(**extra: str) -> dict[str, str]:
+    return {
+        "AGENTIC_CAPABILITIES": "session-store",
+        SessionStoreEnv.PROVIDER: "local",
+        SessionStoreEnv.SPOOL: "/spool",
+        SessionStoreEnv.PARTITION: "w1/p1",
+        "AGENTIC_CAPABILITY_AUDIT_DIR": "/audit",
+        **extra,
+    }
+
+
+def _section(stdout: str, name: str) -> str:
+    return stdout.split(f"{name}<<", 1)[1].split(">>", 1)[0]
+
+
+@pytest.mark.integration
+def test_degraded_local_capture_removes_its_child_hooks(tmp_path: Path):
+    """Doctor fails AFTER the hooks were installed (the stub exporter has no
+    local spool interface, so exporter_present fails), and the agent then
+    finds no capture hook in either harness config."""
+    spool = _host_spool(tmp_path)
+    audit = _audit_dir(tmp_path)
+    result = _run(
+        ["bash", "-c", _LOCAL_CONFIGS],
+        env=_local_env(),
+        extra_mounts=[
+            f"{spool}:/spool",
+            f"{audit}:/audit",
+            f"{_STUB_EXPORTER}:/usr/local/bin/apss-session-exporter:ro",
+        ],
+    )
+    assert result.returncode == 0, result.stderr
+    rows = _status_rows(audit, "session-store")
+    assert [r["status"] for r in rows] == ["degraded"], rows
+    # The hooks really were installed first: init completed.
+    assert "init_complete" not in rows[0]["failed_checks"], rows
+    assert "exporter_present" in rows[0]["failed_checks"], rows
+    assert "agentic_session_store" not in _section(result.stdout, "CLAUDE"), (
+        result.stdout
+    )
+    assert "agentic_session_store" not in _section(result.stdout, "CODEX"), (
+        result.stdout
+    )
+    assert "[session-store] capture hooks removed" in result.stderr, result.stderr
+
+
+@pytest.mark.integration
+def test_a_partial_hook_install_is_removed_on_degrade(tmp_path: Path):
+    """init installs Codex then Claude. A Claude settings file the installer
+    refuses (not JSON) fails init after the Codex hooks are in. The Codex
+    half must still come out, and the operator's file must be left as is."""
+    spool = _host_spool(tmp_path)
+    audit = _audit_dir(tmp_path)
+    claude_dir = tmp_path / "claude"
+    claude_dir.mkdir()
+    os.chmod(claude_dir, 0o777)
+    (claude_dir / "settings.json").write_text("not json {")
+    os.chmod(claude_dir / "settings.json", 0o666)
+    result = _run(
+        ["bash", "-c", _LOCAL_CONFIGS],
+        env=_local_env(CLAUDE_CONFIG_DIR="/claude-config"),
+        extra_mounts=[
+            f"{spool}:/spool",
+            f"{audit}:/audit",
+            f"{claude_dir}:/claude-config",
+            f"{_STUB_EXPORTER}:/usr/local/bin/apss-session-exporter:ro",
+        ],
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Claude child capture initialization failed" in result.stderr, (
+        result.stderr
+    )
+    rows = _status_rows(audit, "session-store")
+    assert [r["status"] for r in rows] == ["degraded"], rows
+    assert "agentic_session_store" not in _section(result.stdout, "CODEX"), (
+        result.stdout
+    )
+    assert (claude_dir / "settings.json").read_text() == "not json {"
