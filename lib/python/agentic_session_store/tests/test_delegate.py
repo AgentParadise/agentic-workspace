@@ -341,12 +341,9 @@ def test_probe_uses_the_requested_mode(environment, tmp_path, mode):
         json.loads(line)
         for line in (tmp_path / "probes.jsonl").read_text().splitlines()
     ]
-    journal_dir = str(
-        (
-            Path(environment["AGENTIC_SESSION_STORE_SPOOL"])
-            / ".agentic-session-store/run"
-        ).resolve()
-    )
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    journal_dir = str(spool / ".agentic-session-store/run")
+    claude_dir = str(spool / "run/claude")
     if mode == "read-only":
         assert probes == [["sandbox", "-c", f'sandbox_mode="{mode}"', "--", "true"]]
         return
@@ -359,12 +356,15 @@ def test_probe_uses_the_requested_mode(environment, tmp_path, mode):
         "-c",
         f'sandbox_mode="{mode}"',
         "-c",
-        f"sandbox_workspace_write.writable_roots=[{json.dumps(journal_dir)}]",
+        (
+            "sandbox_workspace_write.writable_roots="
+            f"[{json.dumps(journal_dir)}, {json.dumps(claude_dir)}]"
+        ),
         "-c",
         "sandbox_workspace_write.network_access=true",
     ]
     assert probe[separator + 1 : separator + 3] == ["/bin/sh", "-c"]
-    assert probe[-1] == journal_dir
+    assert probe[-2:] == [journal_dir, claude_dir]
 
 
 @pytest.mark.parametrize(
@@ -465,9 +465,12 @@ def test_delegate_refuses_when_its_capture_hooks_cannot_run(environment, tmp_pat
 # --- agentic-workspace#19: nested delegation from a workspace-write Codex ---
 
 
-def test_workspace_write_codex_gets_only_the_journal_root_and_network(
+def test_workspace_write_codex_gets_only_the_journal_and_claude_transcript_roots(
     environment, tmp_path
 ):
+    """The journal partition, this partition's Claude transcript root (so a
+    Claude grandchild's transcript is captured) and the network; never the
+    spool, the partition root, the Codex transcript root or the namespace."""
     record, body = _argv_recorder(tmp_path)
     _fake(environment, body)
     result = subprocess.run(
@@ -475,14 +478,20 @@ def test_workspace_write_codex_gets_only_the_journal_root_and_network(
     )
     assert result.returncode == 0, result.stderr
     argv = json.loads(record.read_text())
-    journal_dir = (
-        Path(environment["AGENTIC_SESSION_STORE_SPOOL"]) / ".agentic-session-store/run"
-    ).resolve()
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    roots = [str(spool / ".agentic-session-store/run"), str(spool / "run/claude")]
     overrides = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-c"]
     assert overrides == [
-        f"sandbox_workspace_write.writable_roots=[{json.dumps(str(journal_dir))}]",
+        f"sandbox_workspace_write.writable_roots=[{', '.join(map(json.dumps, roots))}]",
         "sandbox_workspace_write.network_access=true",
     ]
+    for broader in (
+        spool,
+        spool / "run",
+        spool / "run/codex",
+        spool / ".agentic-session-store",
+    ):
+        assert json.dumps(str(broader)) not in overrides[0]
     assert "--add-dir" not in argv
     assert "danger-full-access" not in " ".join(argv)
     assert argv.index("-c") < argv.index("--")

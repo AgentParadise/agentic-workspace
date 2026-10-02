@@ -61,6 +61,8 @@ for path in (
     "workspace/w",
     "dev",
     "spool/.agentic-session-store/run/.git",
+    "spool/run/claude/.git",
+    "spool/run/codex",
 ):
     os.makedirs(f"/newroot/{path}", exist_ok=True)
 open("/newroot/workspace/sock", "w").close()
@@ -95,6 +97,26 @@ checks = {
         None,
         remount,
     ),
+    # syn-delegate's second extra writable root: the partition's Claude
+    # transcript root, so a Claude grandchild's transcript is captured.
+    "allowed: tmpfs mask in claude transcript root": (
+        "tmpfs",
+        "/newroot/spool/run/claude/.git/",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+    ),
+    "allowed: bind claude transcript root": (
+        "/oldroot/spool/run/claude/",
+        "/newroot/spool/run/claude/",
+        None,
+        bind,
+    ),
+    "allowed: rw remount claude transcript root": (
+        None,
+        "/newroot/spool/run/claude/",
+        None,
+        remount,
+    ),
     # sensitive: expected denied
     "denied: bind proc": ("/oldroot/proc/", "/newroot/p/", None, bind),
     "denied: bind sys": ("/oldroot/sys/", "/newroot/s/", None, bind),
@@ -123,6 +145,19 @@ checks = {
         None,
         bind,
     ),
+    "denied: bind codex transcript root": (
+        "/oldroot/spool/run/codex/",
+        "/newroot/spool/run/codex/",
+        None,
+        bind,
+    ),
+    "denied: bind claude transcript root elsewhere": (
+        "/oldroot/spool/run/claude/",
+        "/newroot/e/",
+        None,
+        bind,
+    ),
+    "denied: bind partition root": ("/oldroot/spool/run/", "/newroot/spool/run/", None, bind),
     "denied: tmpfs elsewhere": ("tmpfs", "/newroot/e/", "tmpfs", MS_NOSUID | MS_NODEV),
     "denied: rw remount etc": (None, "/newroot/etc/", None, remount),
     "denied: rw remount proc": (None, "/newroot/p/", None, remount),

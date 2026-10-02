@@ -360,8 +360,9 @@ def _completed(intent: ChildIntent) -> bool:
 @unittest.skipUnless(ENABLED, "Set both pinned native test binaries")
 def test_claude_codex_claude(tmp_path: Path) -> None:
     """Claude -> Codex (workspace-write) -> Claude: the Codex delegate writes
-    the journal and reaches the model only through syn-delegate's grant, and
-    the Claude grandchild runs a writing Bash command (#20)."""
+    the journal and reaches the model only through syn-delegate's grant, the
+    Claude grandchild runs a writing Bash command (#20), and the grandchild's
+    own transcript is captured on the spool."""
     _check_versions()
     layout = Layout.create(tmp_path, "claude-codex-claude")
     runner = _runner()
@@ -400,14 +401,19 @@ def test_claude_codex_claude(tmp_path: Path) -> None:
         "GRANDCHILD_RAN" in r for r in fixture.results["FIXTURE_CLAUDE_GRANDCHILD"]
     )
     assert codex_child.child_native_id in _codex_sessions(layout)
-    claude_sessions = _claude_sessions(layout)
-    assert root in claude_sessions
-    # KNOWN GAP, pinned so it cannot change unnoticed: the grandchild's own
-    # transcript is not written. Its transcript root is on the spool, outside
-    # the one extra writable root the Codex delegate is granted (the journal),
-    # and Claude runs without it (measured: exit 0, no file). Closing it needs
-    # `$SPOOL/$PARTITION/claude` as a second writable root, an owner decision.
-    assert claude_grandchild.child_native_id not in claude_sessions
+    # Every node's own transcript is captured, the grandchild's included: the
+    # Codex delegate's grant has this partition's Claude transcript root
+    # (`$SPOOL/$PARTITION/claude`), where `~/.claude/projects` is linked.
+    # Before that grant Claude ran without it (exit 0, no file).
+    assert {root, claude_grandchild.child_native_id} <= _claude_sessions(layout)
+    # The grant is that one directory: nothing else on the spool was written
+    # from inside the Codex sandbox.
+    assert sorted(
+        path.name for path in (layout.spool / layout.partition).iterdir()
+    ) == [
+        "claude",
+        "codex",
+    ]
 
 
 @unittest.skipUnless(ENABLED, "Set both pinned native test binaries")
