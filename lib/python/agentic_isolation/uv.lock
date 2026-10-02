@@ -40,7 +40,7 @@ provides-extras = ["docker", "dev"]
 
 [[package]]
 name = "agentic-session-store"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "../agentic_session_store" }
 dependencies = [
     { name = "tomlkit" },
