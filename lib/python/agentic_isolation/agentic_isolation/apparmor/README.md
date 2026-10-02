@@ -108,6 +108,14 @@ runner in enforce mode with the pinned omni-agent image (codex-cli 0.156.1),
 | `/spool/.hidden/claude` (dot partition) | denied | denied |
 | `/spool`, `/spool/.agentic-session-store` | denied | denied |
 
+The same measurement found that the journal rule from #22 refused nested
+partitions: bwrap's `.git` mask lands at
+`/newroot/spool/.agentic-session-store/<execution>/<workspace>/.git`, which the
+single-level mask rule did not admit, so every workspace-write Codex delegate
+under a Syntropic137 partition was refused (`codex_sandbox_unavailable`). The
+journal mask rule now admits `*/{,**/}.{git,codex,agents}/`, matching its bind
+and remount rules.
+
 With the grant, writes to the Codex root and the partition root are still
 refused inside the sandbox. `test_pinned_depth_three.py` (all five cases,
 Claude -> Codex -> Claude on a nested partition, with writes to the spool

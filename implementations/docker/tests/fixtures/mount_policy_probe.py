@@ -64,6 +64,7 @@ for path in (
     "spool/run/claude/.git",
     "spool/run/codex",
     "spool/exec/ws/claude/.git",
+    "spool/.agentic-session-store/exec/ws/.git",
     "spool/.hidden/claude",
 ):
     os.makedirs(f"/newroot/{path}", exist_ok=True)
@@ -120,6 +121,18 @@ checks = {
         remount,
     ),
     # A nested partition, as Syntropic137 builds them (<execution>/<workspace>).
+    "allowed: tmpfs mask in nested journal partition": (
+        "tmpfs",
+        "/newroot/spool/.agentic-session-store/exec/ws/.git/",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+    ),
+    "allowed: bind nested journal partition": (
+        "/oldroot/spool/.agentic-session-store/exec/ws/",
+        "/newroot/spool/.agentic-session-store/exec/ws/",
+        None,
+        bind,
+    ),
     "allowed: tmpfs mask in nested claude transcript root": (
         "tmpfs",
         "/newroot/spool/exec/ws/claude/.git/",

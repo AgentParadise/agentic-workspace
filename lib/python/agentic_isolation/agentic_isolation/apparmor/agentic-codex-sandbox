@@ -94,7 +94,8 @@ profile agentic-codex-sandbox flags=(attach_disconnected,mediate_deleted) {
   mount options=(rw, rbind) /oldroot/spool/[^./]*/{,**/}claude/{,**/} -> /newroot/spool/[^./]*/{,**/}claude/{,**/},
   mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/tmp/codex-daemon-*/,
   mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/{tmp,workspace,workspace/**}/.{git,codex,agents}/,
-  mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/spool/.agentic-session-store/*/.{git,codex,agents}/,
+  #    A nested partition (<execution>/<workspace>) puts the masks deeper.
+  mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/spool/.agentic-session-store/*/{,**/}.{git,codex,agents}/,
   mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/spool/[^./]*/{,**/}claude/.{git,codex,agents}/,
   # 5. Remounts. Read-only anywhere in the sandbox tree (only ever narrows);
   #    read-write only on the writable workspace roots.

@@ -202,7 +202,7 @@ fn build_image(tag: &str, extra: &str) {
             format!(
                 "FROM {BASE_IMAGE}\n{extra}\
                  RUN mkdir -p /spool/.agentic-session-store/run /spool/run/claude /spool/run/codex \
-                 /spool/exec/ws/claude /spool/.hidden/claude \
+                 /spool/exec/ws/claude /spool/.hidden/claude /spool/.agentic-session-store/exec/ws \
                  && chown -R 1000:1000 /spool\n\
                  USER 1000:1000\n"
             )
@@ -336,5 +336,5 @@ fn codex_mount_policy_admits_bwrap_and_denies_sensitive_mounts() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 37, "{stdout}");
+    assert_eq!(checked, 39, "{stdout}");
 }
