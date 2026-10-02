@@ -605,7 +605,11 @@ not.
 `/spool/.agentic-session-store/*/` and below: a partition directory, never
 the spool root or the namespace itself. The mount-policy conformance probe
 asserts the partition bind and remount are allowed and that the spool root,
-the namespace root and the partition bound elsewhere stay denied.
+the namespace root and the partition bound elsewhere stay denied. Enforce-mode
+measurement with the real Codex on a GitHub runner is recorded in the AppArmor
+README: the previous profile denied the journal root, this one admits it and
+still denies the spool root and the namespace, and the pinned depth-three
+tests pass under it.
 
 **Denied nested launch.** When a nested `syn-delegate` cannot write the
 journal (for example inside a `read-only` delegate) nothing can be recorded
