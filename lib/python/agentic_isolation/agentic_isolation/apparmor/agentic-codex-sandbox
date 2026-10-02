@@ -86,15 +86,16 @@ profile agentic-codex-sandbox flags=(attach_disconnected,mediate_deleted) {
   mount options=(rw, rbind) /oldroot/workspace/{,**/} -> /newroot/workspace/{,**/},
   #    syn-delegate's two extra writable roots: the child journal's partition
   #    directory, and a partition's Claude transcript root
-  #    /spool/<partition>/claude (a partition never starts with a dot, so the
-  #    metadata namespace is not one). Never the spool root, a partition root,
+  #    /spool/<partition>/claude, where a partition may be nested
+  #    (Syntropic137 uses <execution>/<workspace>) but its first segment never
+  #    starts with a dot, so the metadata namespace is not one. Never the spool root, a partition root,
   #    the Codex transcript root or the metadata namespace itself.
   mount options=(rw, rbind) /oldroot/spool/.agentic-session-store/*/{,**/} -> /newroot/spool/.agentic-session-store/*/{,**/},
-  mount options=(rw, rbind) /oldroot/spool/[^./]*/claude/{,**/} -> /newroot/spool/[^./]*/claude/{,**/},
+  mount options=(rw, rbind) /oldroot/spool/[^./]*/{,**/}claude/{,**/} -> /newroot/spool/[^./]*/{,**/}claude/{,**/},
   mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/tmp/codex-daemon-*/,
   mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/{tmp,workspace,workspace/**}/.{git,codex,agents}/,
   mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/spool/.agentic-session-store/*/.{git,codex,agents}/,
-  mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/spool/[^./]*/claude/.{git,codex,agents}/,
+  mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/spool/[^./]*/{,**/}claude/.{git,codex,agents}/,
   # 5. Remounts. Read-only anywhere in the sandbox tree (only ever narrows);
   #    read-write only on the writable workspace roots.
   mount options=(ro, nosuid, nodev, remount, bind, silent, relatime) -> /newroot/{,**},
@@ -102,7 +103,7 @@ profile agentic-codex-sandbox flags=(attach_disconnected,mediate_deleted) {
   mount options=(ro, nosuid, nodev, remount, bind, silent) -> /newroot/{,**},
   mount options=(rw, nosuid, nodev, remount, bind, silent, relatime) -> /newroot/workspace/{,**/},
   mount options=(rw, nosuid, nodev, remount, bind, silent, relatime) -> /newroot/spool/.agentic-session-store/*/{,**/},
-  mount options=(rw, nosuid, nodev, remount, bind, silent, relatime) -> /newroot/spool/[^./]*/claude/{,**/},
+  mount options=(rw, nosuid, nodev, remount, bind, silent, relatime) -> /newroot/spool/[^./]*/{,**/}claude/{,**/},
   # 6. Drop the old root and switch into the sandbox.
   mount options=(rw, silent, rprivate) -> /oldroot/,
   pivot_root oldroot=/newroot/ /newroot/,

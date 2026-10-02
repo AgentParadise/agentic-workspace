@@ -66,7 +66,7 @@ class Layout:
     partition: str
 
     @classmethod
-    def create(cls, tmp_path: Path, name: str) -> Layout:
+    def create(cls, tmp_path: Path, name: str, partition: str | None = None) -> Layout:
         root = os.environ.get("AGENTIC_PINNED_ROOT")
         base = (Path(root) if root else tmp_path) / name
         workspace_root = os.environ.get("AGENTIC_PINNED_WORKSPACE")
@@ -77,13 +77,13 @@ class Layout:
             if workspace_root
             else base / "workspace",
             spool=Path(spool_root) if spool_root else base / "spool",
-            partition=name,
+            partition=partition or name,
         )
         for directory in (
             base,
             layout.workspace,
             layout.journal.parent,
-            layout.spool / name,
+            layout.spool / layout.partition,
         ):
             # Under /tmp (or $TMPDIR) every directory would be a Codex
             # writable root, and the test would prove nothing about the grant.
@@ -353,6 +353,17 @@ def _check_versions() -> None:
         )
 
 
+def _outside_grant(layout: Layout) -> dict[str, Path]:
+    """Spool locations a workspace-write Codex delegate must not write."""
+    name = "outside-grant-probe"
+    return {
+        "spool-root": layout.spool / name,
+        "partition-root": layout.spool / layout.partition / name,
+        "codex-root": layout.codex_transcripts / name,
+        "metadata-namespace": layout.spool / ".agentic-session-store" / name,
+    }
+
+
 def _completed(intent: ChildIntent) -> bool:
     return intent.status == "completed" and intent.exit_code == 0
 
@@ -364,11 +375,21 @@ def test_claude_codex_claude(tmp_path: Path) -> None:
     Claude grandchild runs a writing Bash command (#20), and the grandchild's
     own transcript is captured on the spool."""
     _check_versions()
-    layout = Layout.create(tmp_path, "claude-codex-claude")
+    # Nested, as Syntropic137 builds partitions (<execution>/<workspace>).
+    layout = Layout.create(
+        tmp_path, "claude-codex-claude", partition="exec-1/claude-codex-claude"
+    )
     runner = _runner()
     script = {
         "FIXTURE_ROOT": runner + " codex --prompt FIXTURE_CODEX_CHILD --timeout 90",
-        "FIXTURE_CODEX_CHILD": runner
+        # Inside the Codex sandbox: every spool location outside the grant
+        # must refuse a write, then the nested launch runs.
+        "FIXTURE_CODEX_CHILD": " ".join(
+            f"(: > {shlex.quote(str(path))} && echo WROTE:{label} || echo DENIED:{label});"
+            for label, path in _outside_grant(layout).items()
+        )
+        + " "
+        + runner
         + " claude --prompt FIXTURE_CLAUDE_GRANDCHILD --model claude-sonnet-4-5"
         " --timeout 60",
         "FIXTURE_CLAUDE_GRANDCHILD": "touch grandchild-wrote && echo GRANDCHILD_RAN",
@@ -376,6 +397,13 @@ def test_claude_codex_claude(tmp_path: Path) -> None:
     with Fixture(script) as fixture:
         environment = _prepare(layout, fixture.port)
         root = _root_claude(layout, environment)
+    sandboxed = "".join(fixture.results["FIXTURE_CODEX_CHILD"])
+    for label, path in _outside_grant(layout).items():
+        assert f"DENIED:{label}" in sandboxed and f"WROTE:{label}" not in sandboxed, (
+            label,
+            sandboxed,
+        )
+        assert not path.exists(), path
     intents = _latest(layout)
     assert len(intents) == 2, (intents, fixture.results)
     codex_child, claude_grandchild = intents
@@ -406,14 +434,6 @@ def test_claude_codex_claude(tmp_path: Path) -> None:
     # (`$SPOOL/$PARTITION/claude`), where `~/.claude/projects` is linked.
     # Before that grant Claude ran without it (exit 0, no file).
     assert {root, claude_grandchild.child_native_id} <= _claude_sessions(layout)
-    # The grant is that one directory: nothing else on the spool was written
-    # from inside the Codex sandbox.
-    assert sorted(
-        path.name for path in (layout.spool / layout.partition).iterdir()
-    ) == [
-        "claude",
-        "codex",
-    ]
 
 
 @unittest.skipUnless(ENABLED, "Set both pinned native test binaries")

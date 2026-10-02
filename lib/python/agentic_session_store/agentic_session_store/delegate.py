@@ -382,12 +382,34 @@ def codex_command(sandbox: CodexSandboxMode, grant: SandboxGrant) -> list[str]:
     ]
 
 
-def claude_transcript_root(contract: SessionStoreContract) -> str:
+def claude_transcript_root(contract: SessionStoreContract) -> str | None:
     """``$SPOOL/$PARTITION/claude``: where session-store init links
-    ``~/.claude/projects``, so where a Claude grandchild writes its transcript."""
-    # abspath, not resolve: no filesystem access, so nothing can fail here
-    # after the intent is registered.
-    return os.path.abspath(os.path.join(contract.spool, contract.partition, "claude"))
+    ``~/.claude/projects``, so where a Claude grandchild writes its transcript.
+
+    ``None`` when that exact directory cannot be granted, so the grant never
+    makes a launch fail that worked without it (the grandchild then runs
+    without a transcript, which the host reports as a missing body):
+
+    - it is not an existing directory (nothing to capture into);
+    - a component below the spool is a symlink, which could make a different
+      directory (the Codex root, another partition) writable;
+    - the partition's first segment starts with a dot, which the AppArmor
+      profile never admits (it keeps the metadata namespace out).
+
+    Never raises: it runs after the intent is registered.
+    """
+    spool = os.path.abspath(contract.spool)
+    root = os.path.abspath(os.path.join(spool, contract.partition, "claude"))
+    relative = os.path.relpath(root, spool)
+    if relative.startswith((".", os.sep)):
+        return None
+    try:
+        exact = os.path.realpath(root) == os.path.join(
+            os.path.realpath(spool), relative
+        )
+        return root if exact and os.path.isdir(root) else None
+    except (OSError, ValueError):
+        return None
 
 
 def nested_grant(journal: ChildJournal, contract: SessionStoreContract) -> SandboxGrant:
@@ -399,11 +421,11 @@ def nested_grant(journal: ChildJournal, contract: SessionStoreContract) -> Sandb
     Exactly this partition's ``claude`` directory: never the spool root, the
     partition root, the Codex transcript root or the metadata namespace.
     """
+    transcripts = claude_transcript_root(contract)
     return SandboxGrant(
-        writable_roots=(
-            os.path.abspath(journal.path.parent),
-            claude_transcript_root(contract),
-        ),
+        # abspath, not resolve: nothing can fail after the intent is registered.
+        writable_roots=(os.path.abspath(journal.path.parent),)
+        + (() if transcripts is None else (transcripts,)),
         network_access=True,
     )
 

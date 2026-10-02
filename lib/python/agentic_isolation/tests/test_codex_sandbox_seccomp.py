@@ -195,7 +195,7 @@ def test_apparmor_writable_remount_only_on_workspace_roots() -> None:
         "mount options=(rw, nosuid, nodev, remount, bind, silent, relatime)"
         " -> /newroot/spool/.agentic-session-store/*/{,**/},",
         "mount options=(rw, nosuid, nodev, remount, bind, silent, relatime)"
-        " -> /newroot/spool/[^./]*/claude/{,**/},",
+        " -> /newroot/spool/[^./]*/{,**/}claude/{,**/},",
     ]
     readonly = [r for r in _apparmor_rules() if r.startswith("mount options=(ro")]
     assert readonly and all("ro," in r and "remount" in r for r in readonly)
@@ -227,7 +227,8 @@ def test_apparmor_binds_are_the_recorded_pairs() -> None:
             "/oldroot/workspace/{,**/} -> /newroot/workspace/{,**/}",
             "/oldroot/spool/.agentic-session-store/*/{,**/}"
             " -> /newroot/spool/.agentic-session-store/*/{,**/}",
-            "/oldroot/spool/[^./]*/claude/{,**/} -> /newroot/spool/[^./]*/claude/{,**/}",
+            "/oldroot/spool/[^./]*/{,**/}claude/{,**/}"
+            " -> /newroot/spool/[^./]*/{,**/}claude/{,**/}",
         ]
     )
 

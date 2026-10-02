@@ -63,6 +63,8 @@ for path in (
     "spool/.agentic-session-store/run/.git",
     "spool/run/claude/.git",
     "spool/run/codex",
+    "spool/exec/ws/claude/.git",
+    "spool/.hidden/claude",
 ):
     os.makedirs(f"/newroot/{path}", exist_ok=True)
 open("/newroot/workspace/sock", "w").close()
@@ -117,6 +119,19 @@ checks = {
         None,
         remount,
     ),
+    # A nested partition, as Syntropic137 builds them (<execution>/<workspace>).
+    "allowed: tmpfs mask in nested claude transcript root": (
+        "tmpfs",
+        "/newroot/spool/exec/ws/claude/.git/",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+    ),
+    "allowed: bind nested claude transcript root": (
+        "/oldroot/spool/exec/ws/claude/",
+        "/newroot/spool/exec/ws/claude/",
+        None,
+        bind,
+    ),
     # sensitive: expected denied
     "denied: bind proc": ("/oldroot/proc/", "/newroot/p/", None, bind),
     "denied: bind sys": ("/oldroot/sys/", "/newroot/s/", None, bind),
@@ -158,6 +173,18 @@ checks = {
         bind,
     ),
     "denied: bind partition root": ("/oldroot/spool/run/", "/newroot/spool/run/", None, bind),
+    "denied: bind nested partition root": (
+        "/oldroot/spool/exec/ws/",
+        "/newroot/spool/exec/ws/",
+        None,
+        bind,
+    ),
+    "denied: bind claude root of a dot partition": (
+        "/oldroot/spool/.hidden/claude/",
+        "/newroot/spool/.hidden/claude/",
+        None,
+        bind,
+    ),
     "denied: tmpfs elsewhere": ("tmpfs", "/newroot/e/", "tmpfs", MS_NOSUID | MS_NODEV),
     "denied: rw remount etc": (None, "/newroot/etc/", None, remount),
     "denied: rw remount proc": (None, "/newroot/p/", None, remount),

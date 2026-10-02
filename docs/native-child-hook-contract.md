@@ -590,7 +590,12 @@ as `-c` overrides that replace any `CODEX_HOME` value:
   `$SPOOL/$PARTITION/claude` (where session-store init links
   `~/.claude/projects`), so a Claude grandchild's own transcript is captured.
   Exactly that partition's `claude` directory: never the spool root, the
-  partition root or the Codex transcript root;
+  partition root or the Codex transcript root. It is left out (the grandchild
+  then runs without a transcript, a missing body the host reports) when it is
+  not an existing directory, when a component below the spool is a symlink,
+  or when the partition's first segment starts with a dot (the AppArmor
+  profile never admits one), so it never refuses a launch that worked
+  without it;
 - `sandbox_workspace_write.network_access = true`. Egress remains the
   container's network policy.
 

@@ -161,7 +161,8 @@ jobs:
         run: |
           cat > /tmp/probe.sh <<'SH'
           cd /workspace || exit 9
-          mkdir -p /spool/.agentic-session-store/run /spool/run/claude /spool/run/codex
+          mkdir -p /spool/.agentic-session-store/run /spool/run/claude /spool/run/codex \
+            /spool/.agentic-session-store/exec/ws /spool/exec/ws/claude /spool/.hidden/claude
           try() {
             label=$1; roots=$2; target=$3
             if codex sandbox -c 'sandbox_mode="workspace-write"' \
@@ -184,6 +185,10 @@ jobs:
           try "metadata namespace" '"/spool/.agentic-session-store"' /spool/.agentic-session-store/x
           try "grant, write codex root (outside grant)" "$J, $C" /spool/run/codex/x
           try "grant, write partition root (outside grant)" "$J, $C" /spool/run/x
+          try "nested partition grant (journal + claude), write claude" \
+            '"/spool/.agentic-session-store/exec/ws", "/spool/exec/ws/claude"' /spool/exec/ws/claude/x
+          try "nested partition root" '"/spool/exec/ws"' /spool/exec/ws/x
+          try "dot partition claude root" '"/spool/.hidden/claude"' /spool/.hidden/claude/x
           try "no extra root, workspace" '"/workspace"' /workspace/x
           SH
       - name: Run (profile, seccomp) container helper
