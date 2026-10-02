@@ -180,6 +180,120 @@ exec python3 -m agentic_<name>.doctor "$@"
 
 ---
 
+## Step 3b: Decide what a failed doctor means (the capability manifest)
+
+By default a failed doctor stops the workspace before the agent runs. That
+is right for a capability the agent's work depends on. It is wrong for one
+that only observes or backs up the work: when the session store went down,
+every workspace with it enabled failed for two days, although the store is a
+backup of transcripts the orchestrator also keeps (#27).
+
+So a capability DECLARES its failure policy in a manifest,
+`workspace/capabilities/<name>/capability.conf`:
+
+```
+failure_policy=degrade
+```
+
+| Value | On a failed doctor |
+|---|---|
+| `fail` (default) | Hard fail, exit 1, the agent never runs. Also what a missing, unreadable or unrecognised manifest means. |
+| `degrade` | The workspace starts with this capability **disabled**. |
+
+The manifest is data, parsed line by line and never sourced (the same rule
+as `.capture-env`, ADR-040 s9). Only an exact `failure_policy=degrade` or
+`failure_policy=fail` line is recognised; anything else is warned about and
+read as `fail`, so no capability is weakened by a typo. `session-store` is
+the only shipped capability that declares `degrade`. `memory` declares
+nothing and is unchanged.
+
+**Disabled means disabled, not half-on.** For a degraded capability the
+entrypoint:
+
+- prints one greppable line, naming the failed checks:
+  `[entrypoint] WARNING: <name> unavailable, capability DISABLED for this workspace: <checks>`;
+- exports `AGENTIC_<CAP>_READY=0` (overriding the `1` a successful init
+  earned);
+- does **not** run its `finalize.sh`, so nothing sweeps, uploads or waits on
+  a backend that is down. If that was the only finalizer, the command is
+  `exec`ed and keeps PID 1 and its stop grace;
+- still withholds every name its `init.sh` declared in
+  `AGENTIC_CAPABILITY_WITHHOLD` (section 5.8 is unchanged);
+- leaves whatever `init.sh` already did in place. For `session-store` that
+  means the harness transcript roots still point into the spool, so a spool
+  that outlives the container still holds the transcripts; nothing uploads
+  them on this run.
+
+**A hanging doctor cannot hold the workspace.** Each doctor run is bounded
+by `AGENTIC_CAPABILITY_DOCTOR_TIMEOUT_S` (default 120; a non-positive or
+non-numeric value means the default, never "no bound"). A timeout is a failed
+doctor with exit 124 (137 if it had to be killed), and the policy then
+decides as for any other failure. This applies to every capability: one that
+used to hang forever now fails within the bound.
+
+**What degraded undoes, and what it does not.** Disabling covers this run's
+lifecycle, not a rollback of everything `init.sh` did. An adapter may ship an
+optional `degrade.sh` (Step 4) to disarm whatever init left armed for the
+agent's run. `session-store`'s removes the fail-closed child capture hooks
+the local provider installs (full or partial install, Claude and Codex),
+because a guard left behind would deny child launches once the journal
+cannot record them. What stays: the transcript roots still point into the
+spool, and anything the host reads from the spool is not a captured run, so
+a consumer must check the status row before treating a spool as captured.
+And, as for a healthy workspace, a credential delivered with `docker run -e`
+is still visible to `docker exec`'d agents (ADR-040 s2 known limit, tracked
+in #30); 5.8 withholds it from CMD only.
+
+**The opt-in to the hard fail** is `AGENTIC_<CAP>_REQUIRED=1`. It can only
+strengthen: `0` or empty defers to the manifest, so `AGENTIC_MEMORY_REQUIRED=0`
+does not make memory best-effort. Any other value is warned about and read as
+required, so a typo never turns a deliberate hard fail into a degraded run.
+
+Declare `degrade` only if the agent's work is correct without your
+capability. If an agent tool will refuse to work when your capability is
+down, a degraded start just moves the failure somewhere less legible.
+
+### Capability status contract
+
+Every active capability gets one **status row** appended to its doctor audit
+file, after the doctor's own payload, by entrypoint section 5.7. This is the
+machine-readable signal an orchestrator reads, and the one that reaches it:
+production agents run through `docker exec`, so they never see the
+entrypoint's environment, and neither does the host.
+
+Where: `${AGENTIC_CAPABILITY_AUDIT_DIR:-/var/agentic/<name>-doctor}/<UTC date>.jsonl`
+(`/var/agentic` is a per-container tmpfs under the Docker provider). Schema
+version 1, one JSON object per line:
+
+```json
+{"schema_version":1,"record":"capability_status","capability":"session-store","provider":"apss","status":"degraded","policy":"degrade","required":false,"doctor_exit":1,"failed_checks":["store_reachable"],"host":"6a242ec04ebc","at":"2026-10-02T21:32:38Z"}
+```
+
+| Field | Meaning |
+|---|---|
+| `record` | Always `capability_status`. Doctor payloads in the same file have no `record` field. |
+| `status` | `ready` (doctor passed), `degraded` (failed, policy `degrade`, not required: running without it), `failed` (failed and fatal: the workspace exited). |
+| `policy` | The declared policy, `fail` or `degrade`. |
+| `required` | Whether `AGENTIC_<CAP>_REQUIRED` asked for the hard fail. |
+| `doctor_exit` | The doctor's exit code. |
+| `failed_checks` | Names of the failed checks, `[A-Za-z0-9_.-]` only, possibly empty if the doctor printed nothing parseable. |
+| `host` | The container's hostname, so rows from another container sharing a persisted audit dir are not mistaken for this one's. |
+| `at` | UTC, second precision. |
+
+**Read it with `agentic_isolation.capability_status.read_capability_status(execute, "session-store")`**,
+never by parsing the file: it returns a frozen `CapabilityStatus` (Pydantic,
+`extra="forbid"`) or `None`, and raises `CapabilityStatusError` on a failed
+read or a row that breaks the schema. `None` means **unknown**, never ready:
+the capability was not active, the entrypoint never reached 5.7, or the audit
+path was unwritable. In that last case the row was printed to the container's
+stderr instead, as `[entrypoint] <name> status: {...}`, beside the WARNING
+line, so `docker logs` still carries both.
+
+A new field is a schema version bump, not a silent addition: the reader
+forbids unknown fields precisely so that a consumer finds out.
+
+---
+
 ## Step 4: Write the adapter hooks
 
 Adapters live at
@@ -196,7 +310,9 @@ into whatever the underlying tool actually reads.
 
 On success the lifecycle also exports `AGENTIC_<CAP>_READY=1`. On failure
 it warns and continues, and section 5.7's doctor is what turns the failure
-into a hard stop with a specific cause.
+into a hard stop with a specific cause, or, for a capability that declares
+`failure_policy=degrade` (Step 3b), into a degraded start with
+`AGENTIC_<CAP>_READY=0`.
 
 Keep it portable shell. No `docker`, no host paths, no substrate
 assumptions.
@@ -288,6 +404,22 @@ You can wire it into the Python doctor's check list, as memory does with
 `ProviderSpecificCheck`, or leave it as a hand-run tool, as `session-store`
 does today. If you leave it unwired, say so in the module README so nobody
 assumes it runs at startup.
+
+### `degrade.sh` (optional)
+
+Runs only when your capability DEGRADES (Step 3b): entrypoint 5.7, after the
+doctor failed and before the agent starts. Executed, not sourced, with the
+environment your `init.sh` exported, and bounded by
+`AGENTIC_CAPABILITY_DOCTOR_TIMEOUT_S`. Its job is to disarm anything init put
+in place that would misbehave with the capability off, above all anything
+fail closed. Make it idempotent and safe on a partial init: it runs after
+whatever subset of `init.sh` succeeded. A non-zero exit is reported loudly
+and does not stop the workspace.
+
+`session-store` ships one for both providers: it uninstalls the child
+capture hooks (`python -m agentic_session_store.install_child_hooks CONFIG
+--uninstall`), which removes exactly the groups the installer writes and
+moves later Codex groups' index-keyed trust down with them.
 
 ### `finalize.sh` (optional)
 

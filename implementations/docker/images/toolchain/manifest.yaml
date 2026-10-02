@@ -7,7 +7,7 @@
 # See ADR-040 section 12: The workspace image contract
 
 name: toolchain
-version: "1.2.0"
+version: "1.4.0"
 description: >-
   omni-agent (claude + codex on the shared capability runtime) plus a native
   toolchain: build-essential, pkg-config, unzip, rustup (toolchain chosen by

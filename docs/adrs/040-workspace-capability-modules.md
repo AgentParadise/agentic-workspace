@@ -2,7 +2,7 @@
 title: "ADR-040: Workspace Capability Modules"
 status: accepted
 created: 2026-08-12
-updated: 2026-08-14
+updated: 2026-10-02
 author: NeuralEmpowerment
 supersedes: ADR-036 (in mechanism)
 tags: [workspace, capabilities, contracts, claude-cli, session-store, memory, lifecycle]
@@ -15,7 +15,7 @@ tags: [workspace, capabilities, contracts, claude-cli, session-store, memory, li
 **Accepted**
 
 - Created: 2026-08-12
-- Updated: 2026-08-14
+- Updated: 2026-10-02
 - Author(s): NeuralEmpowerment
 - Supersedes: [ADR-036](https://github.com/AgentParadise/agentic-primitives/blob/main/docs/adrs/036-memory-primitive-and-doctor.md) in *mechanism*.
   ADR-036's reasoning about opt-in and loud failure is retained and still
@@ -199,7 +199,8 @@ up automatically.
 | Hook | When | On failure |
 |---|---|---|
 | `init.sh` | entrypoint 5.6, before the agent | Warn and continue. The doctor in 5.7 is what turns a broken init into a hard stop, with a specific cause rather than a bare non-zero exit. |
-| `doctor` | entrypoint 5.7, before the agent | **Hard fail, exit 1.** Opting into a capability is opting into loud failure (ADR-036). Failing here is free because no agent work has happened yet. |
+| `doctor` | entrypoint 5.7, before the agent | **Hard fail, exit 1**, unless the capability's manifest declares `failure_policy=degrade` (see "Best-effort capabilities" below). Opting into a capability is opting into loud failure (ADR-036). Failing here is free because no agent work has happened yet. |
+| `degrade.sh` (optional) | entrypoint 5.7, only when the capability degrades | Reported loudly, never fatal. Executed, not sourced. Disarms what init left armed for the agent's run (session-store: its fail-closed child capture hooks), because skipping the finalizer only stops what runs after the agent. |
 | `finalize.sh` | entrypoint 6, after the agent exits | **Always soft.** Invoked as `"${__fin}" \|\| true`, and the shipped hook itself always exits 0. A failed upload after an hour of successful agent work must never make the phase report as failed. |
 
 `init.sh` is *sourced* into the entrypoint shell so its exports propagate
@@ -209,6 +210,34 @@ it must not be able to corrupt the wrapper's exit-code handling.
 One inherited detail: a successful `init.sh` also causes the lifecycle to
 export `AGENTIC_<CAP>_READY=1`. That is ADR-036's pre-existing, tested
 memory contract, and generalizing the loop must not silently drop it.
+
+**Best-effort capabilities (#27).** "Opting in is opting into loud failure"
+was written for capabilities the agent's work depends on. The session store
+is not one: it backs up transcripts the orchestrator also keeps, and when it
+went down every workspace that enabled it failed before any agent work ran,
+for two days. Loud and fatal turned out to be two properties, and only the
+first is binding.
+
+So a capability may declare, in `workspace/capabilities/<cap>/capability.conf`
+(data, never sourced), `failure_policy=degrade`. Its failed doctor then starts
+the workspace with the capability **disabled** rather than stopping it: a
+greppable `[entrypoint] WARNING: <cap> unavailable, capability DISABLED ...`
+line naming the failed checks, `AGENTIC_<CAP>_READY=0`, its `finalize.sh`
+skipped, its optional `degrade.sh` run to disarm what init left armed, and
+its declared credentials still withheld from CMD. Still loud, no longer
+fatal. `AGENTIC_<CAP>_REQUIRED=1` restores the hard fail per deployment; it
+can only strengthen. A missing, unreadable or unrecognised manifest means
+`fail`, so every capability that declares nothing keeps exactly the behaviour
+above. It is a declared property, not a capability name in the entrypoint,
+so section 4's invariant holds: `session-store` became best-effort with zero
+entrypoint lines that name it.
+
+Every active capability's verdict (`ready`, `degraded` or `failed`) is also
+appended to its doctor audit file as a `capability_status` row, which is the
+channel a host can reach when agents run through `docker exec`.
+`agentic_isolation.capability_status` reads it, and
+[`docs/workspace-capabilities.md`](../workspace-capabilities.md) ("Capability
+status contract") is the schema.
 
 ### 4. The invariant that proves the boundary is real
 
