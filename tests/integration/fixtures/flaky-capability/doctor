@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Preflight for the flaky test capability. Always fails one named check, the
+# way a best-effort capability fails when its backend is down.
+set -eu
+if [ "${1:-}" = "--json" ]; then
+    printf '{"capability":"flaky","passed":false,"checks":[{"name":"backend_reachable","passed":false,"detail":"fixture backend is down"}]}\n'
+fi
+exit 1

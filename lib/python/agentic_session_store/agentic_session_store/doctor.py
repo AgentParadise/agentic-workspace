@@ -1,9 +1,13 @@
 """Session-store doctor — preflight validation for the session-store contract.
 
-The doctor runs at container start, before the agent starts. A failure hard
-stops the workspace (ADR-036: opting into a provider is opting into loud
-failure). It is also invocable on demand: `python -m
-agentic_session_store.doctor [--json]`.
+The doctor runs at container start, before the agent starts. Its verdict is
+unchanged (exit 1 on any failed check), but what the entrypoint does with it
+is the capability's declared policy: session-store ships
+`failure_policy=degrade` (workspace/capabilities/session-store/capability.conf),
+so a failure starts the workspace with capture DISABLED, loudly, rather than
+stopping it (#27). AGENTIC_SESSION_STORE_REQUIRED=1 restores the hard stop.
+It is also invocable on demand: `python -m agentic_session_store.doctor
+[--json]`.
 
 Output shape: pretty summary to stderr, one JSON object to stdout in
 --json mode, exit 0 when every check passes (or the capability is not

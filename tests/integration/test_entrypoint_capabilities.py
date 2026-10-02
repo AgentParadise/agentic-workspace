@@ -44,6 +44,13 @@ _STUB_EXPORTER = Path(__file__).parent / "fixtures" / "stub-exporter"
 STORE_URL = os.getenv("SESSION_STORE_URL", "http://host.docker.internal:18091")
 STORE_URL_FROM_HOST = os.getenv("SESSION_STORE_URL_FROM_HOST", "http://127.0.0.1:18091")
 
+# session-store is best-effort (#27): by default a failed doctor starts the
+# workspace with capture DISABLED. The tests that assert an adapter refusal
+# STOPS the workspace opt into the hard fail with this, which is the
+# deployment-facing switch for exactly that; the default (degraded) outcome of
+# the same refusals is pinned separately, near the end of this file.
+_SESSION_STORE_REQUIRED = "AGENTIC_SESSION_STORE_REQUIRED"
+
 # For the "provider set, finalize.sh missing" regression test, which needs a
 # capability whose provider adapter genuinely has no finalize.sh: memory's
 # hindsight adapter. Mirrors test_entrypoint_memory.py's own reachability
@@ -653,6 +660,7 @@ def test_migration_failure_preserves_data_and_fails_loudly(tmp_path: Path):
             "AGENTIC_SESSION_STORE_URL": STORE_URL,
             "AGENTIC_SESSION_STORE_SPOOL": "/spool",
             "AGENTIC_SESSION_STORE_PARTITION": "blocked",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=[
             f"{spool}:/spool",
@@ -703,6 +711,7 @@ def test_name_collision_clobbers_neither_copy_and_fails_loudly(tmp_path: Path):
             "AGENTIC_SESSION_STORE_URL": STORE_URL,
             "AGENTIC_SESSION_STORE_SPOOL": "/spool",
             "AGENTIC_SESSION_STORE_PARTITION": "coll",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=[
             f"{spool}:/spool",
@@ -1643,6 +1652,7 @@ def test_init_refuses_a_namespace_it_does_not_own(
             "AGENTIC_SESSION_STORE_URL": STORE_URL,
             "AGENTIC_SESSION_STORE_SPOOL": "/workspace",
             "AGENTIC_SESSION_STORE_PARTITION": "repos",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=[
             f"{spool}:/workspace",
@@ -1686,6 +1696,7 @@ def test_init_refuses_when_the_reserved_name_is_not_a_directory(tmp_path: Path):
             "AGENTIC_SESSION_STORE_URL": STORE_URL,
             "AGENTIC_SESSION_STORE_SPOOL": "/workspace",
             "AGENTIC_SESSION_STORE_PARTITION": "repos",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=[
             f"{spool}:/workspace",
@@ -1733,6 +1744,7 @@ def test_init_refuses_to_retarget_a_transcript_symlink_outside_the_spool(
         "AGENTIC_SESSION_STORE_URL": STORE_URL,
         "AGENTIC_SESSION_STORE_SPOOL": "/spool",
         "AGENTIC_SESSION_STORE_PARTITION": "symlink-test",
+        _SESSION_STORE_REQUIRED: "1",
     }.items():
         cmd.extend(["-e", f"{k}={v}"])
     cmd.extend(["--add-host=host.docker.internal:host-gateway"])
@@ -1771,6 +1783,7 @@ def _run_with_persisted_home(
         SessionStoreEnv.URL: STORE_URL,
         SessionStoreEnv.SPOOL: "/spool",
         SessionStoreEnv.PARTITION: partition,
+        _SESSION_STORE_REQUIRED: "1",
     }.items():
         cmd.extend(["-e", f"{k}={v}"])
     cmd.append("--add-host=host.docker.internal:host-gateway")
@@ -3653,6 +3666,7 @@ def test_capture_env_write_failure_is_never_silent(tmp_path: Path):
             SessionStoreEnv.TAGS: "workflow:w1,phase:p2",
             SessionStoreEnv.SPOOL: "/spool",
             SessionStoreEnv.PARTITION: "w1/p2",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=[
             f"{spool}:/spool",
@@ -3784,6 +3798,7 @@ def test_init_refuses_a_symlinked_component_of_the_metadata_path(
             SessionStoreEnv.TAGS: "workflow:w1,phase:p2",
             SessionStoreEnv.SPOOL: "/spool",
             SessionStoreEnv.PARTITION: "w1/p2",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=mounts,
         add_host_gateway=True,
@@ -3927,7 +3942,13 @@ def _doctor_record(audit: Path, capability: str) -> dict:
     ]
     assert lines, f"the 5.7 doctor wrote no audit record into {audit}"
     records = [json.loads(line) for line in lines]
-    mine = [r for r in records if r.get("capability") == capability]
+    # The entrypoint's own capability_status rows (#27) share the file; they
+    # are the lifecycle's verdict, not the doctor's payload.
+    mine = [
+        r
+        for r in records
+        if r.get("capability") == capability and r.get("record") != "capability_status"
+    ]
     assert mine, (
         f"no {capability} record among {[r.get('capability') for r in records]}"
     )
@@ -3977,6 +3998,7 @@ def test_session_store_failed_init_fails_the_doctor_even_with_a_stale_marker(
         SessionStoreEnv.TAGS: "workflow:w1,phase:p2",
         SessionStoreEnv.SPOOL: "/spool",
         SessionStoreEnv.PARTITION: "w1/p2",
+        _SESSION_STORE_REQUIRED: "1",
     }
     mounts = [
         f"{spool}:/spool",
@@ -4225,3 +4247,401 @@ def test_deployment_is_absent_when_the_contract_does_not_set_it(tmp_path: Path):
         add_host_gateway=True,
     )
     assert "ORIGIN_DEPLOYMENT=unset" in result.stdout
+
+
+# --- Best-effort capabilities degrade instead of failing (#27) ---------------
+#
+# A down session store killed every workspace for two days, although the store
+# is only a backup of transcripts the orchestrator also keeps. A capability
+# whose manifest declares `failure_policy=degrade` therefore starts the
+# workspace with that capability DISABLED when its doctor fails, says so
+# loudly, and records a machine-readable status row. AGENTIC_<CAP>_REQUIRED=1
+# restores the hard fail. A capability without that declaration (memory, and
+# anything new) is unchanged: its doctor failure is still fatal.
+
+_FLAKY_CAPABILITY = Path(__file__).parent / "fixtures" / "flaky-capability"
+
+# Port 9 (discard) on loopback inside the container: refused immediately, so
+# store_reachable fails fast and deterministically with no DNS or network.
+_DEAD_STORE_URL = "http://127.0.0.1:9"
+
+
+def _status_rows(audit: Path, capability: str) -> list[dict]:
+    """Every capability_status row the entrypoint wrote for `capability`."""
+    rows = [
+        json.loads(line)
+        for path in sorted(audit.glob("*.jsonl"))
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+    return [
+        r
+        for r in rows
+        if r.get("record") == "capability_status" and r.get("capability") == capability
+    ]
+
+
+def _dead_store_env(partition: str, **extra: str) -> dict[str, str]:
+    return {
+        "AGENTIC_CAPABILITIES": "session-store",
+        SessionStoreEnv.PROVIDER: "apss",
+        SessionStoreEnv.URL: _DEAD_STORE_URL,
+        # A fixture value, not a real credential. Present so the test can
+        # prove a degraded capability still withholds what it declared.
+        SessionStoreEnv.AUTH: "fixture-token-not-a-secret",
+        SessionStoreEnv.SPOOL: "/spool",
+        SessionStoreEnv.PARTITION: partition,
+        SessionStoreEnv.TAGS: "workflow:w1,phase:p1",
+        "AGENTIC_CAPABILITY_AUDIT_DIR": "/audit",
+        **extra,
+    }
+
+
+_DEGRADED_AGENT = (
+    "echo AGENT_RAN; "
+    'echo "READY=${AGENTIC_SESSION_STORE_READY:-unset}"; '
+    'echo "TOKEN=${SESSIONS_WRITE_TOKEN:-unset}"; '
+    'echo "AUTH=${AGENTIC_SESSION_STORE_AUTH:-unset}"; '
+    'echo "PID=$$"; '
+    "sleep 1; echo AGENT_FINISHED; exit 7"
+)
+
+
+@pytest.mark.integration
+def test_unreachable_store_degrades_capture_and_the_agent_runs(tmp_path: Path):
+    """The #27 acceptance case: store down, workspace starts, agent completes.
+
+    Every other check passes here (writable spool, a mounted exporter, a
+    completed init), so store_reachable is the only failure, which is exactly
+    the outage that took every workflow down.
+    """
+    spool = _host_spool(tmp_path)
+    audit = _audit_dir(tmp_path)
+    result = _run(
+        ["bash", "-c", _DEGRADED_AGENT],
+        env=_dead_store_env("w1/p1"),
+        extra_mounts=[
+            f"{spool}:/spool",
+            f"{audit}:/audit",
+            f"{_STUB_EXPORTER}:/usr/local/bin/apss-session-exporter:ro",
+        ],
+    )
+
+    # The agent ran to completion and its own exit code is the container's.
+    assert "AGENT_RAN" in result.stdout, result.stderr
+    assert "AGENT_FINISHED" in result.stdout, result.stderr
+    assert result.returncode == 7, result.stderr
+
+    # 1. Loud and greppable, naming the check that failed.
+    warning = [
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith("[entrypoint] WARNING: session-store unavailable")
+    ]
+    assert warning, result.stderr
+    assert "DISABLED" in warning[0], warning
+    assert "store_reachable" in warning[0], warning
+    assert "AGENTIC_SESSION_STORE_REQUIRED=1" in result.stderr, result.stderr
+
+    # 2. Machine-readable: the env flag and the audit status row.
+    assert "READY=0" in result.stdout, result.stdout
+    rows = _status_rows(audit, "session-store")
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["schema_version"] == 1
+    assert row["status"] == "degraded"
+    assert row["policy"] == "degrade"
+    assert row["required"] is False
+    assert row["provider"] == "apss"
+    assert row["doctor_exit"] == 1
+    assert row["failed_checks"] == ["store_reachable"], row
+    assert row["host"], row
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", row["at"]), row
+    # The doctor's own row is still written beside it, unchanged in shape.
+    record = _doctor_record(audit, "session-store")
+    assert record["passed"] is False
+    failed = [c["name"] for c in record["checks"] if not c["passed"]]
+    assert failed == ["store_reachable"], record
+
+    # 3. Capture is fully off: no finalizer, so no wrapper at all. The agent
+    # is PID 1, exactly as for a workspace that enabled nothing, and nothing
+    # tried to sweep or upload against the dead store.
+    assert "PID=1" in result.stdout, result.stdout
+    assert "[finalize]" not in result.stderr, result.stderr
+
+    # 4. Credentials the adapter declared are still withheld from the agent.
+    assert "TOKEN=unset" in result.stdout, result.stdout
+    assert "AUTH=unset" in result.stdout, result.stdout
+    assert "fixture-token-not-a-secret" not in result.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("value", ["1", "true"])
+def test_required_session_store_still_hard_fails(tmp_path: Path, value: str):
+    """AGENTIC_SESSION_STORE_REQUIRED=1 is the explicit opt-in to the old stop.
+
+    Any value other than 1, 0 or empty is not silently read as "not
+    required": it is warned about and treated as required, so a typo can
+    never turn a deliberate hard fail into a degraded run.
+    """
+    spool = _host_spool(tmp_path)
+    audit = _audit_dir(tmp_path)
+    result = _run(
+        ["bash", "-c", "echo AGENT_RAN"],
+        env=_dead_store_env("w1/p1", AGENTIC_SESSION_STORE_REQUIRED=value),
+        extra_mounts=[
+            f"{spool}:/spool",
+            f"{audit}:/audit",
+            f"{_STUB_EXPORTER}:/usr/local/bin/apss-session-exporter:ro",
+        ],
+    )
+    assert result.returncode != 0, result.stdout
+    assert "AGENT_RAN" not in result.stdout
+    assert "session-store doctor: FAIL" in result.stderr, result.stderr
+    assert "WARNING: session-store unavailable" not in result.stderr, result.stderr
+    if value != "1":
+        assert "AGENTIC_SESSION_STORE_REQUIRED" in result.stderr
+        assert "treating it as required" in result.stderr, result.stderr
+    rows = _status_rows(audit, "session-store")
+    assert [r["status"] for r in rows] == ["failed"], rows
+    assert rows[0]["required"] is True
+    assert rows[0]["failed_checks"] == ["store_reachable"], rows
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("required", [None, "0"])
+def test_a_capability_without_the_declaration_still_hard_fails(
+    tmp_path: Path, required: str | None
+):
+    """Memory declares no failure policy, so its doctor failure stays fatal.
+
+    REQUIRED=0 must not weaken it either: the manifest, not an env var, is
+    what makes a capability best-effort.
+    """
+    audit = _audit_dir(tmp_path)
+    env = {
+        "AGENTIC_CAPABILITIES": "memory",
+        MemoryEnv.PROVIDER: "hindsight",
+        MemoryEnv.NAMESPACE: "degrade-test",
+        MemoryEnv.URL: "http://127.0.0.1:9",
+        "AGENTIC_CAPABILITY_AUDIT_DIR": "/audit",
+    }
+    if required is not None:
+        env["AGENTIC_MEMORY_REQUIRED"] = required
+    result = _run(
+        ["bash", "-c", "echo AGENT_RAN"], env=env, extra_mounts=[f"{audit}:/audit"]
+    )
+    assert result.returncode != 0, result.stdout
+    assert "AGENT_RAN" not in result.stdout
+    assert "memory doctor: FAIL" in result.stderr, result.stderr
+    assert "WARNING: memory unavailable" not in result.stderr, result.stderr
+    rows = _status_rows(audit, "memory")
+    assert [r["status"] for r in rows] == ["failed"], rows
+    assert rows[0]["policy"] == "fail"
+
+
+@pytest.mark.integration
+def test_degrade_is_a_manifest_property_not_a_capability_name(tmp_path: Path):
+    """A fixture capability declaring degrade gets it, with no entrypoint edit.
+
+    It runs beside the healthy probe capability, which proves the degraded
+    one is disabled precisely: its finalizer never runs and its credential is
+    still withheld, while the healthy capability's finalizer still runs (so
+    the wrapper is not simply switched off) and still gets only its own value.
+    """
+    audit = _audit_dir(tmp_path)
+    result = _run(
+        [
+            "bash",
+            "-c",
+            'echo AGENT_RAN; echo "READY=${AGENTIC_FLAKY_READY:-unset}"; '
+            'echo "SECRET=${FLAKY_SECRET:-unset}"',
+        ],
+        env={
+            "AGENTIC_CAPABILITIES": "flaky probe",
+            "AGENTIC_FLAKY_PROVIDER": "flaky",
+            "AGENTIC_PROBE_PROVIDER": "probe",
+            "AGENTIC_CAPABILITY_AUDIT_DIR": "/audit",
+        },
+        extra_mounts=[
+            f"{_FLAKY_CAPABILITY}:/opt/agentic/capabilities/flaky:ro",
+            f"{_PROBE_CAPABILITY}:/opt/agentic/capabilities/probe:ro",
+            f"{audit}:/audit",
+        ],
+    )
+    assert result.returncode == 0, result.stderr
+    assert "AGENT_RAN" in result.stdout
+    assert "READY=0" in result.stdout, result.stdout
+    assert "SECRET=unset" in result.stdout, result.stdout
+    assert (
+        "[entrypoint] WARNING: flaky unavailable, capability DISABLED for this "
+        "workspace" in result.stderr
+    ), result.stderr
+    assert "backend_reachable" in result.stderr
+    assert "FLAKY_FINALIZE_RAN" not in result.stderr, result.stderr
+    assert "PROBE_FINALIZE PROBE_SECRET=probe-owns-this" in result.stderr, (
+        result.stderr
+    )
+    assert "flaky-owns-this" not in result.stderr + result.stdout
+
+    assert [r["status"] for r in _status_rows(audit, "flaky")] == ["degraded"]
+    assert [r["status"] for r in _status_rows(audit, "probe")] == ["ready"]
+
+
+@pytest.mark.integration
+def test_degraded_status_reaches_stderr_when_the_audit_path_is_unwritable():
+    """An unwritable audit path is still a warning, never a reason to fail,
+    and the status row then goes to stderr so container logs still carry it.
+    """
+    result = _run(
+        ["bash", "-c", "echo AGENT_RAN"],
+        env={
+            "AGENTIC_CAPABILITIES": "flaky",
+            "AGENTIC_FLAKY_PROVIDER": "flaky",
+            "AGENTIC_CAPABILITY_AUDIT_DIR": "/proc/no-such-audit-dir",
+        },
+        extra_mounts=[f"{_FLAKY_CAPABILITY}:/opt/agentic/capabilities/flaky:ro"],
+    )
+    assert result.returncode == 0, result.stderr
+    assert "AGENT_RAN" in result.stdout
+    assert "is not writable" in result.stderr, result.stderr
+    rows = [
+        json.loads(line[line.index("{") :])
+        for line in result.stderr.splitlines()
+        if '"record":"capability_status"' in line.replace(" ", "")
+    ]
+    assert [r["status"] for r in rows] == ["degraded"], result.stderr
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "conf",
+    [
+        pytest.param("failure_policy=sometimes\n", id="unknown-value"),
+        pytest.param("failure_policy=degrade$(echo INJECTED >&2)\n", id="shell-syntax"),
+        pytest.param("", id="empty"),
+    ],
+)
+def test_an_unrecognised_manifest_keeps_the_hard_fail(tmp_path: Path, conf: str):
+    """The manifest is DATA, parsed and never sourced, and anything but an
+    exact `failure_policy=degrade` leaves the safe default: hard fail.
+    """
+    cap = tmp_path / "flaky"
+    (cap / "flaky").mkdir(parents=True)
+    for rel in ("doctor", "flaky/init.sh", "flaky/finalize.sh"):
+        (cap / rel).write_bytes((_FLAKY_CAPABILITY / rel).read_bytes())
+        os.chmod(cap / rel, 0o755)
+    (cap / "capability.conf").write_text(conf)
+    result = _run(
+        ["bash", "-c", "echo AGENT_RAN"],
+        env={"AGENTIC_CAPABILITIES": "flaky", "AGENTIC_FLAKY_PROVIDER": "flaky"},
+        extra_mounts=[f"{cap}:/opt/agentic/capabilities/flaky:ro"],
+    )
+    assert result.returncode != 0, result.stdout
+    assert "AGENT_RAN" not in result.stdout
+    assert "flaky doctor: FAIL" in result.stderr, result.stderr
+    assert "INJECTED" not in result.stderr, "the manifest was executed as shell"
+    if conf:
+        assert "unrecognised failure_policy" in result.stderr, result.stderr
+
+
+@pytest.mark.integration
+def test_an_adapter_refusal_degrades_without_touching_data(tmp_path: Path):
+    """The default outcome of an init REFUSAL, the counterpart of
+    test_migration_failure_preserves_data_and_fails_loudly (which opts into
+    the hard fail): the operator's transcripts are untouched, the refusal is
+    named, the agent runs, and nothing is swept or uploaded.
+    """
+    spool = tmp_path / "spool"
+    home = tmp_path / "home"
+    proj = home / ".claude" / "projects"
+    proj.mkdir(parents=True)
+    (proj / "keepme.jsonl").write_text("{}\n")
+    spool.mkdir()
+    _open_perms(home)
+    os.chmod(spool, 0o777)
+    # Read-only partition target makes the migration fail.
+    (spool / "blocked").mkdir()
+    (spool / "blocked").chmod(0o500)
+
+    result = _run(
+        ["bash", "-c", 'echo AGENT_RAN; echo "PID=$$"'],
+        env=_dead_store_env("blocked"),
+        extra_mounts=[
+            f"{spool}:/spool",
+            f"{home}:/home/agent",
+            f"{tmp_path}:/audit",
+            f"{_STUB_EXPORTER}:/usr/local/bin/apss-session-exporter:ro",
+        ],
+        tmpfs_home=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "AGENT_RAN" in result.stdout
+    assert "PID=1" in result.stdout, result.stdout
+    assert (proj / "keepme.jsonl").exists(), "data was destroyed on a degraded start"
+    warning = [
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith("[entrypoint] WARNING: session-store unavailable")
+    ]
+    assert warning and "symlinks_correct" in warning[0], result.stderr
+    assert "[finalize]" not in result.stderr, result.stderr
+
+
+def _flaky_copy(tmp_path: Path, doctor: str) -> Path:
+    """The flaky fixture capability with its doctor replaced."""
+    cap = tmp_path / "flaky"
+    (cap / "flaky").mkdir(parents=True)
+    for rel in ("capability.conf", "flaky/init.sh", "flaky/finalize.sh"):
+        (cap / rel).write_bytes((_FLAKY_CAPABILITY / rel).read_bytes())
+    (cap / "doctor").write_text(doctor)
+    for rel in ("doctor", "flaky/init.sh", "flaky/finalize.sh"):
+        os.chmod(cap / rel, 0o755)
+    return cap
+
+
+_HANGING_DOCTOR = "#!/usr/bin/env bash\nsleep 600\n"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("required", [None, "1"])
+def test_a_hanging_doctor_is_bounded_and_then_follows_the_policy(
+    tmp_path: Path, required: str | None
+):
+    """A doctor that never returns must not hold the workspace forever.
+
+    The lifecycle bounds the whole doctor process and treats the timeout as a
+    failed doctor, so a best-effort capability degrades and a required one
+    hard-fails, both within the bound rather than never.
+    """
+    cap = _flaky_copy(tmp_path, _HANGING_DOCTOR)
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    os.chmod(audit, 0o777)
+    env = {
+        "AGENTIC_CAPABILITIES": "flaky",
+        "AGENTIC_FLAKY_PROVIDER": "flaky",
+        "AGENTIC_CAPABILITY_DOCTOR_TIMEOUT_S": "2",
+        "AGENTIC_CAPABILITY_AUDIT_DIR": "/audit",
+    }
+    if required is not None:
+        env["AGENTIC_FLAKY_REQUIRED"] = required
+    started = time.monotonic()
+    result = _run(
+        ["bash", "-c", "echo AGENT_RAN"],
+        env=env,
+        extra_mounts=[f"{cap}:/opt/agentic/capabilities/flaky:ro", f"{audit}:/audit"],
+    )
+    assert time.monotonic() - started < 60, "the doctor timeout did not bound startup"
+    assert "timed out" in result.stderr, result.stderr
+    rows = _status_rows(audit, "flaky")
+    assert len(rows) == 1, rows
+    assert rows[0]["doctor_exit"] == 124, rows
+    if required is None:
+        assert result.returncode == 0, result.stderr
+        assert "AGENT_RAN" in result.stdout
+        assert rows[0]["status"] == "degraded"
+    else:
+        assert result.returncode != 0
+        assert "AGENT_RAN" not in result.stdout
+        assert rows[0]["status"] == "failed"
