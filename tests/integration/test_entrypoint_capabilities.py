@@ -44,6 +44,13 @@ _STUB_EXPORTER = Path(__file__).parent / "fixtures" / "stub-exporter"
 STORE_URL = os.getenv("SESSION_STORE_URL", "http://host.docker.internal:18091")
 STORE_URL_FROM_HOST = os.getenv("SESSION_STORE_URL_FROM_HOST", "http://127.0.0.1:18091")
 
+# session-store is best-effort (#27): by default a failed doctor starts the
+# workspace with capture DISABLED. The tests that assert an adapter refusal
+# STOPS the workspace opt into the hard fail with this, which is the
+# deployment-facing switch for exactly that; the default (degraded) outcome of
+# the same refusals is pinned separately, near the end of this file.
+_SESSION_STORE_REQUIRED = "AGENTIC_SESSION_STORE_REQUIRED"
+
 # For the "provider set, finalize.sh missing" regression test, which needs a
 # capability whose provider adapter genuinely has no finalize.sh: memory's
 # hindsight adapter. Mirrors test_entrypoint_memory.py's own reachability
@@ -653,6 +660,7 @@ def test_migration_failure_preserves_data_and_fails_loudly(tmp_path: Path):
             "AGENTIC_SESSION_STORE_URL": STORE_URL,
             "AGENTIC_SESSION_STORE_SPOOL": "/spool",
             "AGENTIC_SESSION_STORE_PARTITION": "blocked",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=[
             f"{spool}:/spool",
@@ -703,6 +711,7 @@ def test_name_collision_clobbers_neither_copy_and_fails_loudly(tmp_path: Path):
             "AGENTIC_SESSION_STORE_URL": STORE_URL,
             "AGENTIC_SESSION_STORE_SPOOL": "/spool",
             "AGENTIC_SESSION_STORE_PARTITION": "coll",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=[
             f"{spool}:/spool",
@@ -1643,6 +1652,7 @@ def test_init_refuses_a_namespace_it_does_not_own(
             "AGENTIC_SESSION_STORE_URL": STORE_URL,
             "AGENTIC_SESSION_STORE_SPOOL": "/workspace",
             "AGENTIC_SESSION_STORE_PARTITION": "repos",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=[
             f"{spool}:/workspace",
@@ -1686,6 +1696,7 @@ def test_init_refuses_when_the_reserved_name_is_not_a_directory(tmp_path: Path):
             "AGENTIC_SESSION_STORE_URL": STORE_URL,
             "AGENTIC_SESSION_STORE_SPOOL": "/workspace",
             "AGENTIC_SESSION_STORE_PARTITION": "repos",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=[
             f"{spool}:/workspace",
@@ -1733,6 +1744,7 @@ def test_init_refuses_to_retarget_a_transcript_symlink_outside_the_spool(
         "AGENTIC_SESSION_STORE_URL": STORE_URL,
         "AGENTIC_SESSION_STORE_SPOOL": "/spool",
         "AGENTIC_SESSION_STORE_PARTITION": "symlink-test",
+        _SESSION_STORE_REQUIRED: "1",
     }.items():
         cmd.extend(["-e", f"{k}={v}"])
     cmd.extend(["--add-host=host.docker.internal:host-gateway"])
@@ -1771,6 +1783,7 @@ def _run_with_persisted_home(
         SessionStoreEnv.URL: STORE_URL,
         SessionStoreEnv.SPOOL: "/spool",
         SessionStoreEnv.PARTITION: partition,
+        _SESSION_STORE_REQUIRED: "1",
     }.items():
         cmd.extend(["-e", f"{k}={v}"])
     cmd.append("--add-host=host.docker.internal:host-gateway")
@@ -3653,6 +3666,7 @@ def test_capture_env_write_failure_is_never_silent(tmp_path: Path):
             SessionStoreEnv.TAGS: "workflow:w1,phase:p2",
             SessionStoreEnv.SPOOL: "/spool",
             SessionStoreEnv.PARTITION: "w1/p2",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=[
             f"{spool}:/spool",
@@ -3784,6 +3798,7 @@ def test_init_refuses_a_symlinked_component_of_the_metadata_path(
             SessionStoreEnv.TAGS: "workflow:w1,phase:p2",
             SessionStoreEnv.SPOOL: "/spool",
             SessionStoreEnv.PARTITION: "w1/p2",
+            _SESSION_STORE_REQUIRED: "1",
         },
         extra_mounts=mounts,
         add_host_gateway=True,
@@ -3983,6 +3998,7 @@ def test_session_store_failed_init_fails_the_doctor_even_with_a_stale_marker(
         SessionStoreEnv.TAGS: "workflow:w1,phase:p2",
         SessionStoreEnv.SPOOL: "/spool",
         SessionStoreEnv.PARTITION: "w1/p2",
+        _SESSION_STORE_REQUIRED: "1",
     }
     mounts = [
         f"{spool}:/spool",
@@ -4527,3 +4543,46 @@ def test_an_unrecognised_manifest_keeps_the_hard_fail(tmp_path: Path, conf: str)
     assert "INJECTED" not in result.stderr, "the manifest was executed as shell"
     if conf:
         assert "unrecognised failure_policy" in result.stderr, result.stderr
+
+
+@pytest.mark.integration
+def test_an_adapter_refusal_degrades_without_touching_data(tmp_path: Path):
+    """The default outcome of an init REFUSAL, the counterpart of
+    test_migration_failure_preserves_data_and_fails_loudly (which opts into
+    the hard fail): the operator's transcripts are untouched, the refusal is
+    named, the agent runs, and nothing is swept or uploaded.
+    """
+    spool = tmp_path / "spool"
+    home = tmp_path / "home"
+    proj = home / ".claude" / "projects"
+    proj.mkdir(parents=True)
+    (proj / "keepme.jsonl").write_text("{}\n")
+    spool.mkdir()
+    _open_perms(home)
+    os.chmod(spool, 0o777)
+    # Read-only partition target makes the migration fail.
+    (spool / "blocked").mkdir()
+    (spool / "blocked").chmod(0o500)
+
+    result = _run(
+        ["bash", "-c", 'echo AGENT_RAN; echo "PID=$$"'],
+        env=_dead_store_env("blocked"),
+        extra_mounts=[
+            f"{spool}:/spool",
+            f"{home}:/home/agent",
+            f"{tmp_path}:/audit",
+            f"{_STUB_EXPORTER}:/usr/local/bin/apss-session-exporter:ro",
+        ],
+        tmpfs_home=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "AGENT_RAN" in result.stdout
+    assert "PID=1" in result.stdout, result.stdout
+    assert (proj / "keepme.jsonl").exists(), "data was destroyed on a degraded start"
+    warning = [
+        line
+        for line in result.stderr.splitlines()
+        if line.startswith("[entrypoint] WARNING: session-store unavailable")
+    ]
+    assert warning and "symlinks_correct" in warning[0], result.stderr
+    assert "[finalize]" not in result.stderr, result.stderr

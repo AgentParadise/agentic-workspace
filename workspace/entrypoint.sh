@@ -359,7 +359,8 @@ fi
 # -----------------------------------------------------------------------------
 # Per ADR-040. Each registered capability translates its AGENTIC_<CAP>_*
 # contract into provider-native env. No-op when a capability's provider is
-# unset. Section 5.7 hard-fails if a provider is set but misconfigured.
+# unset. Section 5.7 hard-fails if a provider is set but misconfigured, unless
+# the capability's manifest declares it best-effort (see 5.7).
 #
 # Deviation from the generic template: a successful `. "${__init}"` also
 # exports "${__prefix}_READY=1" (e.g. AGENTIC_MEMORY_READY=1). This mirrors
@@ -475,6 +476,134 @@ done
 # -----------------------------------------------------------------------------
 # Hard-fail on any check failure. Opting into a capability is opting into
 # loud failure, and failing here is free because no agent work has happened.
+#
+# ONE DECLARED EXCEPTION: BEST-EFFORT CAPABILITIES DEGRADE (#27). A capability
+# whose manifest, /opt/agentic/capabilities/<cap>/capability.conf, says
+# `failure_policy=degrade` does not stop the workspace when its doctor fails.
+# The workspace starts with that capability DISABLED instead. Why: the session
+# store is a BACKUP of transcripts the orchestrator also keeps, and when it went
+# down every workspace that had it enabled failed before any agent work ran,
+# for two days. Losing a backup for a while must never stop the work.
+#
+# Degraded is LOUD and MACHINE-READABLE, never silent:
+#   * one greppable stderr line, "[entrypoint] WARNING: <cap> unavailable,
+#     capability DISABLED for this workspace: <failed checks>";
+#   * AGENTIC_<CAP>_READY=0 in this process's environment (and so CMD's);
+#   * a capability_status row appended to the doctor audit file, which is the
+#     one channel a host reaches when agents run through `docker exec` (they
+#     never see this process's environment). Every active capability gets a
+#     row: ready, degraded or failed. agentic_isolation.capability_status
+#     reads it; docs/workspace-capabilities.md is the contract.
+#
+# Disabled means DISABLED, not half-on: the capability's finalizer is not run
+# (see __discover_finalizers), so nothing sweeps, uploads or waits on a store
+# that is down, and 5.8 still withholds every credential the adapter declared.
+#
+# The policy is a property the capability DECLARES, never a name this file
+# knows (ADR-040 s4). A missing, unreadable or unrecognised manifest is the
+# safe default, `fail`, so no capability is weakened by accident.
+# AGENTIC_<CAP>_REQUIRED=1 makes a best-effort capability fatal again for a
+# deployment that wants that; it can only strengthen, never weaken, so a
+# required value cannot make a `fail` capability degrade.
+
+# Prints the declared failure policy for capability $1: `degrade` or `fail`.
+# The manifest is DATA, parsed line by line and never sourced, for the same
+# reason .capture-env is never sourced (ADR-040 s9): a file that is executed
+# can do anything, and this one only needs to say one word. Only an exact
+# `failure_policy=degrade` or `failure_policy=fail` line is recognised; any
+# other value is reported (without echoing it) and read as `fail`.
+__capability_failure_policy() {
+    local conf="/opt/agentic/capabilities/$1/capability.conf" line value=""
+    if [ -r "${conf}" ]; then
+        while IFS= read -r line || [ -n "${line}" ]; do
+            case "${line}" in
+                failure_policy=*) value="${line#failure_policy=}" ;;
+            esac
+        done < "${conf}"
+    fi
+    case "${value}" in
+        degrade) printf 'degrade' ;;
+        fail | "") printf 'fail' ;;
+        *)
+            echo "[entrypoint] warning: $1 capability.conf has an unrecognised failure_policy; treating it as fail" >&2
+            printf 'fail'
+            ;;
+    esac
+}
+
+# Succeeds when ${prefix}_REQUIRED asks for the hard fail. Only "1" means yes
+# and only "0" or empty mean no. Anything else is a typo of SOMETHING, and
+# reading a typo as "not required" would turn a deliberate hard fail into a
+# degraded run, so it is reported (the value is not echoed) and read as yes.
+__capability_required() {
+    local value
+    eval "value=\${${1}_REQUIRED:-}"
+    case "${value}" in
+        1) return 0 ;;
+        0 | "") return 1 ;;
+        *)
+            echo "[entrypoint] warning: ${1}_REQUIRED is not 1, 0 or empty; treating it as required" >&2
+            return 0
+            ;;
+    esac
+}
+
+# Prints the names of the failed checks in a doctor's --json output (stdin),
+# space-separated. Both shipped doctors are understood: session-store marks a
+# failure `"passed": false`, memory marks it `"status": "fail"`. Names are cut
+# down to [A-Za-z0-9_.-] because they are written into JSON and a log line
+# unescaped. Best effort by construction: if Python or the payload is missing
+# this prints nothing and the caller reports the doctor's exit code instead,
+# so a broken doctor can never turn a degrade into a crash.
+__doctor_failed_checks() {
+    local py=python3
+    if [ -x /opt/venv/bin/python ]; then py=/opt/venv/bin/python; fi
+    "${py}" -c '
+import json, re, sys
+names = []
+for line in reversed(sys.stdin.read().splitlines()):
+    try:
+        payload = json.loads(line)
+    except ValueError:
+        continue
+    if not isinstance(payload, dict):
+        continue
+    for check in payload.get("checks") or []:
+        if isinstance(check, dict) and (
+            check.get("passed") is False or check.get("status") == "fail"
+        ):
+            name = re.sub(r"[^A-Za-z0-9_.-]", "", str(check.get("name", "")))[:64]
+            if name:
+                names.append(name)
+    break
+print(" ".join(names[:32]))
+' 2>/dev/null || true
+}
+
+# Prints one capability_status row (schema_version 1). Arguments: capability,
+# provider, status, policy, required (true|false), doctor exit, then the failed
+# check names. Every interpolated value is already confined to a JSON-safe
+# charset: the capability name by __capability_name_safe, the provider by
+# __capability_provider_safe, check names by __doctor_failed_checks, the host
+# by the `tr` below, and the rest are literals or integers chosen here.
+# agentic_isolation.capability_status.CapabilityStatus is the reader's model.
+__capability_status_row() {
+    local cap="$1" provider="$2" status="$3" policy="$4" required="$5" rc="$6"
+    local checks="" name host
+    shift 6
+    for name in "$@"; do
+        checks="${checks:+${checks},}\"${name}\""
+    done
+    host="$(cat /proc/sys/kernel/hostname 2>/dev/null || printf '%s' "${HOSTNAME:-}")"
+    host="$(printf '%s' "${host}" | tr -cd 'A-Za-z0-9._-' | cut -c1-253)"
+    printf '{"schema_version":1,"record":"capability_status","capability":"%s","provider":"%s","status":"%s","policy":"%s","required":%s,"doctor_exit":%s,"failed_checks":[%s],"host":"%s","at":"%s"}\n' \
+        "${cap}" "${provider}" "${status}" "${policy}" "${required}" "${rc}" \
+        "${checks}" "${host}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+# Capabilities whose doctor failed and that this run DISABLED. Read by
+# __discover_finalizers in section 6. Space-separated validated names.
+__degraded_capabilities=""
 
 for __cap in ${AGENTIC_CAPABILITIES:-}; do
     __capability_name_safe "${__cap}" || continue
@@ -509,26 +638,79 @@ for __cap in ${AGENTIC_CAPABILITIES:-}; do
     # block lost the FAIL message and the bypass hint - the workspace still
     # failed, correctly, but silently, which is the defect this block exists to
     # prevent. `if` conditions are exempt from errexit; bare statements are not.
+    # The same holds for the command substitution below: an assignment whose
+    # substitution fails is a failed simple command under `set -e`, so it
+    # carries the same guard.
+    #
+    # The doctor's JSON is CAPTURED rather than redirected straight into the
+    # audit file, because the verdict below needs to name the failed checks.
+    # It is then written exactly where it went before: the audit file, or
+    # stderr when that is unwritable. A failed append is one more warning, for
+    # the reason given above: the record is not the run.
     __doctor_rc=0
-    if [ "${__audit_ok}" -eq 1 ]; then
-        /opt/agentic/capabilities/"${__cap}"/doctor --json >> "${__audit_file}" \
-            || __doctor_rc=$?
-    else
-        /opt/agentic/capabilities/"${__cap}"/doctor --json >&2 || __doctor_rc=$?
+    __doctor_out="$(/opt/agentic/capabilities/"${__cap}"/doctor --json)" || __doctor_rc=$?
+    if [ -n "${__doctor_out}" ] && [ "${__audit_ok}" -eq 1 ]; then
+        if ! printf '%s\n' "${__doctor_out}" >> "${__audit_file}" 2>/dev/null; then
+            __audit_ok=0
+            echo "[entrypoint] ${__cap} doctor: audit write to ${__audit_file} failed; reporting to stderr only." >&2
+        fi
+    fi
+    if [ -n "${__doctor_out}" ] && [ "${__audit_ok}" -eq 0 ]; then
+        printf '%s\n' "${__doctor_out}" >&2
     fi
 
+    __policy="$(__capability_failure_policy "${__cap}")"
+    __required=false
+    if __capability_required "${__prefix}"; then __required=true; fi
+    __failed_checks=""
     if [ "${__doctor_rc}" -eq 0 ]; then
-        if [ "${__audit_ok}" -eq 1 ]; then
-            echo "[entrypoint] ${__cap} doctor: pass (audit: ${__audit_file})" >&2
-        else
-            echo "[entrypoint] ${__cap} doctor: pass (audit unavailable)" >&2
-        fi
+        __status=ready
     else
-        echo "[entrypoint] ${__cap} doctor: FAIL (exit ${__doctor_rc})" >&2
-        echo "[entrypoint] Unset ${__prefix}_PROVIDER to bypass the ${__cap} capability." >&2
-        exit 1
+        __failed_checks="$(printf '%s\n' "${__doctor_out}" | __doctor_failed_checks)"
+        if [ "${__policy}" = degrade ] && [ "${__required}" = false ]; then
+            __status=degraded
+        else
+            __status=failed
+        fi
     fi
+
+    # The verdict is recorded BEFORE it is acted on, so a hard fail leaves a
+    # `failed` row behind as well. Word-splitting __failed_checks is safe:
+    # __doctor_failed_checks emits only [A-Za-z0-9_.-] names.
+    # shellcheck disable=SC2086
+    __status_row="$(__capability_status_row "${__cap}" "${__provider}" "${__status}" \
+        "${__policy}" "${__required}" "${__doctor_rc}" ${__failed_checks})"
+    if [ "${__audit_ok}" -eq 1 ] && printf '%s\n' "${__status_row}" >> "${__audit_file}" 2>/dev/null; then
+        :
+    else
+        echo "[entrypoint] ${__cap} status: ${__status_row}" >&2
+    fi
+
+    case "${__status}" in
+        ready)
+            if [ "${__audit_ok}" -eq 1 ]; then
+                echo "[entrypoint] ${__cap} doctor: pass (audit: ${__audit_file})" >&2
+            else
+                echo "[entrypoint] ${__cap} doctor: pass (audit unavailable)" >&2
+            fi
+            ;;
+        degraded)
+            # READY=0 overrides the READY=1 a successful init.sh earned in 5.6:
+            # init succeeding is not the capability being usable.
+            eval "export ${__prefix}_READY=0"
+            __degraded_capabilities="${__degraded_capabilities} ${__cap}"
+            echo "[entrypoint] ${__cap} doctor: FAIL (exit ${__doctor_rc}); ${__cap} is best-effort (failure_policy=degrade), so the workspace continues without it." >&2
+            echo "[entrypoint] WARNING: ${__cap} unavailable, capability DISABLED for this workspace: ${__failed_checks:-doctor exit ${__doctor_rc}}" >&2
+            echo "[entrypoint] Set ${__prefix}_REQUIRED=1 to make a ${__cap} failure stop the workspace instead." >&2
+            ;;
+        *)
+            echo "[entrypoint] ${__cap} doctor: FAIL (exit ${__doctor_rc})${__failed_checks:+: ${__failed_checks}}" >&2
+            echo "[entrypoint] Unset ${__prefix}_PROVIDER to bypass the ${__cap} capability." >&2
+            exit 1
+            ;;
+    esac
 done
+unset __doctor_out __policy __required __failed_checks __status __status_row
 
 # -----------------------------------------------------------------------------
 # 5.8 Withhold declared contract variables from the agent
@@ -681,6 +863,17 @@ __discover_finalizers() {
         # A capability registered but left unset, or set to "none", is not
         # active: 5.6 skipped its adapter entirely, so it has no finalizer.
         [ -n "${__provider}" ] && [ "${__provider}" != "none" ] || continue
+        # A capability 5.7 DEGRADED is disabled for this run, and that has to
+        # include its finalizer. Running it would sweep and upload against
+        # the very backend whose failure degraded it: on the clean path that
+        # is up to __FINALIZE_BUDGET_CLEAN_S of the container hanging on a
+        # dead store after the agent is done, and it would also hand the
+        # finalizer the credentials 5.8 withheld. Skipping it here, in the
+        # single source of truth, also means a workspace whose only finalizer
+        # was degraded gets `exec "$@"` and keeps PID 1 and its stop grace.
+        case " ${__degraded_capabilities} " in
+            *" ${__cap} "*) continue ;;
+        esac
         # 5.6 rejects an unsafe provider name and exits before CMD ever
         # runs -- but only on the *hard*-fail path. Its init-failure branch
         # (unreadable/missing init.sh, adapter returning non-zero) only
