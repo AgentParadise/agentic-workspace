@@ -142,3 +142,19 @@ async def test_a_failed_read_is_an_error_not_unknown() -> None:
     execute = AsyncMock(return_value=result("", exit_code=126))
     with pytest.raises(CapabilityStatusError):
         await read_capability_status(execute, "session-store")
+
+
+def test_a_malformed_row_from_another_container_is_not_this_workspaces_problem() -> None:
+    text = "\n".join([row(host="other-ws", status="sort-of"), row()])
+    status = parse_capability_status(text, "session-store", host=HOST)
+    assert status is not None and status.degraded
+
+
+@pytest.mark.asyncio
+async def test_reader_selects_status_rows_before_bounding_the_read() -> None:
+    execute = AsyncMock(return_value=result(f"{HOST}\n{row()}\n"))
+    await read_capability_status(execute, "session-store")
+    command = execute.await_args.args[0]
+    # The byte bound applies to status rows only, so a large doctor payload
+    # (or many of them) can never push this workspace's verdict out.
+    assert command.index("capability_status") < command.index("tail -c")

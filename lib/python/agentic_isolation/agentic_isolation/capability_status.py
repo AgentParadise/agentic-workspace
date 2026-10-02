@@ -56,12 +56,15 @@ READ_TIMEOUT_SECONDS = 10.0
 _CAPABILITY_NAME = re.compile(r"[a-z0-9-]+")
 """The entrypoint's capability-name charset (__capability_name_safe)."""
 
-# One exec: the container's hostname first, then every audit row. The
-# hostname is how a row written by THIS container is told apart from one
-# written by another container sharing a persisted audit directory.
+# One exec: the container's hostname first, then this capability's status
+# rows. The hostname is how a row written by THIS container is told apart from
+# one written by another container sharing a persisted audit directory. Rows
+# are SELECTED before the byte bound is applied, so doctor payloads (which can
+# be large and repeat on every start) never push a verdict out of the window.
 _READ_SCRIPT = (
     'cat /proc/sys/kernel/hostname 2>/dev/null || printf "%s\\n" "${HOSTNAME:-}"; '
-    f'cat "$1"/*.jsonl 2>/dev/null | tail -c {MAX_AUDIT_BYTES}; exit 0'
+    'cat "$1"/*.jsonl 2>/dev/null | grep -F \'"record":"capability_status"\' '
+    f"| tail -c {MAX_AUDIT_BYTES}; exit 0"
 )
 
 
@@ -142,14 +145,16 @@ def parse_capability_status(
             continue
         if data.get("record") != STATUS_RECORD or data.get("capability") != capability:
             continue
+        # Another container's row is not this workspace's verdict, malformed
+        # or not, so it is filtered before it can raise.
+        if host is not None and data.get("host") != host:
+            continue
         try:
             status = CapabilityStatus.model_validate(data)
         except ValidationError as error:
             raise CapabilityStatusError(
                 f"Malformed {STATUS_RECORD} row for {capability}"
             ) from error
-        if host is not None and status.host != host:
-            continue
         latest = status
     return latest
 
