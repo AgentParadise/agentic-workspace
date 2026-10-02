@@ -316,7 +316,13 @@ fn codex_mount_policy_admits_bwrap_and_denies_sensitive_mounts() {
         let label = label.trim_matches('"');
         let (allowed, errno) = outcome.trim_end_matches(']').split_once(", ").unwrap();
         let allowed = allowed == "true";
-        if label.starts_with("staging") || label.starts_with("allowed:") {
+        if label == "allowed: rw remount journal partition" && !allowed {
+            // This container's root is read-only, so the kernel refuses a
+            // writable remount of anything bound from it (EPERM). AppArmor is
+            // consulted first and would refuse with EACCES, which this rules
+            // out. In a workspace the spool is a writable volume.
+            assert_eq!(errno, "1", "{label} must be allowed by policy: {stdout}");
+        } else if label.starts_with("staging") || label.starts_with("allowed:") {
             assert!(allowed, "{label} must be allowed: {stdout}");
         } else if apparmor || label.contains("rw remount") {
             assert!(!allowed, "{label} must be denied: {stdout}");
@@ -325,5 +331,5 @@ fn codex_mount_policy_admits_bwrap_and_denies_sensitive_mounts() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 26, "{stdout}");
+    assert_eq!(checked, 27, "{stdout}");
 }

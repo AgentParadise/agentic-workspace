@@ -507,8 +507,11 @@ def test_read_only_codex_gets_no_grant(environment, tmp_path):
 def test_journal_denied_launch_prints_a_denial_and_starts_nothing(
     environment, tmp_path
 ):
+    from agentic_session_store.delegate import DENIAL_MARKER, DENIAL_NONCE_ENV, denials
+
     marker = tmp_path / "launched"
     _fake(environment, f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+    environment[DENIAL_NONCE_ENV] = "inherited-nonce"
     # The spool exists but its partition cannot be created or written.
     spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"])
     shutil.rmtree(spool)
@@ -522,8 +525,6 @@ def test_journal_denied_launch_prints_a_denial_and_starts_nothing(
         spool.chmod(0o700)
     assert result.returncode == 70
     assert not marker.exists()
-    from agentic_session_store.delegate import DENIAL_MARKER, denials
-
     (line,) = [
         line
         for line in result.stderr.decode().splitlines()
@@ -531,55 +532,63 @@ def test_journal_denied_launch_prints_a_denial_and_starts_nothing(
     ]
     record = json.loads(line.split(" ", 1)[1])
     assert record["target"] == "codex"
-    event = {
-        "type": "item.completed",
-        "item": {
-            "type": "command_execution",
-            "aggregated_output": "noise\n" + line + "\n",
-        },
-    }
-    assert denials(json.dumps(event).encode(), "codex") == [(record["id"], "codex")]
+    assert record["nonce"] == "inherited-nonce"
+    event = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "aggregated_output": "noise\n" + line + "\n",
+            },
+        }
+    ).encode()
+    assert denials(event, "codex", "inherited-nonce") == [(record["id"], "codex")]
+    # Another delegate's nonce: not this child's denial.
+    assert denials(event, "codex", "other-nonce") == []
 
 
 def _codex_stream(*outputs):
-    lines = [json.dumps({"type": "thread.started", "thread_id": "codex-child"})]
-    lines += [
-        json.dumps(
-            {
-                "type": "item.completed",
-                "item": {
-                    "id": f"item_{i}",
-                    "type": "command_execution",
-                    "aggregated_output": output,
-                    "exit_code": 70,
-                    "status": "failed",
-                },
-            }
-        )
-        for i, output in enumerate(outputs)
-    ]
-    return "".join(f"print({line!r}, flush=True)\n" for line in lines)
-
-
-def test_enclosing_delegate_records_a_nested_denial_as_launch_failed(environment):
-    from agentic_session_store.delegate import denial_line
-
-    denied = denial_line("claude")
-    # Repeated, and once inside other output: one record per denial id.
-    _fake(environment, _codex_stream(denied, "x\n" + denied + "\ny", "plain output"))
-    result = subprocess.run(
-        _command(), env=environment, capture_output=True, timeout=10, check=False
+    """Fake Codex stream. In each output, DENIED becomes a denial line carrying
+    the nonce this delegate handed its child, FOREIGN one with another nonce."""
+    return (
+        "import json, os\n"
+        "from agentic_session_store.delegate import DENIAL_NONCE_ENV, DENIAL_MARKER\n"
+        "nonce = os.environ[DENIAL_NONCE_ENV]\n"
+        "def line(id, nonce):\n"
+        "    return DENIAL_MARKER + ' ' + json.dumps("
+        "{'id': id, 'target': 'claude', 'nonce': nonce})\n"
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 'codex-child'}),"
+        " flush=True)\n"
+        f"for i, output in enumerate({list(outputs)!r}):\n"
+        "    output = output.replace('DENIED', line('d1', nonce))"
+        ".replace('FOREIGN', line('f1', 'foreign'))\n"
+        "    print(json.dumps({'type': 'item.completed', 'item': {'id': f'item_{i}',"
+        " 'type': 'command_execution', 'aggregated_output': output,"
+        " 'exit_code': 70, 'status': 'failed'}}), flush=True)\n"
     )
-    assert result.returncode == 0, result.stderr
+
+
+def _by_parent(environment):
     latest = {
         change.intent.child_invocation_id: change.intent
         for change in _journal(environment).page().changes
     }
-    by_parent = {intent.call.parent_native_id: intent for intent in latest.values()}
+    return {intent.call.parent_native_id: intent for intent in latest.values()}
+
+
+def test_enclosing_delegate_records_a_nested_denial_as_launch_failed(environment):
+    # Repeated, and once inside other output: one record per denial id.
+    _fake(environment, _codex_stream("DENIED", "x\nDENIED\ny", "plain output"))
+    result = subprocess.run(
+        _command(), env=environment, capture_output=True, timeout=10, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    by_parent = _by_parent(environment)
     assert set(by_parent) == {"parent", "codex-child"}
     nested = by_parent["codex-child"]
     assert nested.call.harness == "codex"
     assert nested.call.target_harness == "claude"
+    assert nested.call.tool_call_id == "denied-d1"
     assert (nested.status, nested.reason) == (
         "launch_failed",
         "nested_journal_unavailable",
@@ -592,31 +601,34 @@ def test_enclosing_delegate_records_a_nested_denial_as_launch_failed(environment
     assert by_parent["parent"].status == "completed"
 
 
-def test_denial_text_outside_tool_output_is_ignored(environment):
-    from agentic_session_store.delegate import denial_line
-
-    denied = denial_line("claude")
-    agent_message = json.dumps(
-        {"type": "item.completed", "item": {"type": "agent_message", "text": denied}}
-    )
-    _fake(
-        environment,
-        _codex_stream() + f"print({agent_message!r}, flush=True)\n",
-    )
+def test_denial_with_another_nonce_is_ignored(environment):
+    # Output copied from elsewhere (another delegate's run, a log).
+    _fake(environment, _codex_stream("FOREIGN"))
     result = subprocess.run(
         _command(), env=environment, capture_output=True, timeout=10, check=False
     )
     assert result.returncode == 0, result.stderr
-    intents = {
-        c.intent.child_invocation_id for c in _journal(environment).page().changes
-    }
-    assert len(intents) == 1
+    assert set(_by_parent(environment)) == {"parent"}
+
+
+def test_denial_text_outside_tool_output_is_ignored(environment):
+    # A correct denial line, with the right nonce, in the agent's own message.
+    body = _codex_stream() + (
+        "print(json.dumps({'type': 'item.completed', 'item': {'type':"
+        " 'agent_message', 'text': line('d2', nonce)}}), flush=True)\n"
+    )
+    _fake(environment, body)
+    result = subprocess.run(
+        _command(), env=environment, capture_output=True, timeout=10, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert set(_by_parent(environment)) == {"parent"}
 
 
 def test_claude_stream_denials_are_read_from_tool_results():
     from agentic_session_store.delegate import denial_line, denials
 
-    denied = denial_line("codex")
+    denied = denial_line("codex", "n")
     event = {
         "type": "user",
         "message": {
@@ -625,12 +637,37 @@ def test_claude_stream_denials_are_read_from_tool_results():
             ]
         },
     }
-    assert [t for _, t in denials(json.dumps(event).encode(), "claude")] == ["codex"]
+    assert [t for _, t in denials(json.dumps(event).encode(), "claude", "n")] == [
+        "codex"
+    ]
     forged = {
         "type": "assistant",
         "message": {"content": [{"type": "text", "text": denied}]},
     }
-    assert denials(json.dumps(forged).encode(), "claude") == []
+    assert denials(json.dumps(forged).encode(), "claude", "n") == []
+
+
+def test_claude_delegate_from_a_subagent_is_refused(environment, tmp_path):
+    # The Bash hook exports no grant for a native subagent (its own tool list
+    # may be narrower than the session's), so the delegate refuses.
+    from agentic_session_store.command_context import command_context
+
+    output = command_context(
+        json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "session_id": "root",
+                "agent_id": "sub",
+                "permission_mode": "bypassPermissions",
+                "tool_input": {"command": "true"},
+            }
+        ).encode(),
+        {**environment, "CLAUDE_PID": str(os.getppid())},
+    )
+    prefix = output["hookSpecificOutput"]["updatedInput"]["command"]
+    assert prefix.startswith(f"unset {PERMISSIONS_ENV}\n")
+    assert PERMISSIONS_ENV + "=" not in prefix
 
 
 # --- agentic-workspace#20: the delegated Claude inherits its parent's grant ---

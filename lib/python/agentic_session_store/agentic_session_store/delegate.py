@@ -63,6 +63,12 @@ AUTH_PROBE_TIMEOUT_SECONDS = 30.0
 # forged line can make coverage less complete, never more.
 DENIAL_MARKER = "agentic-delegate-launch-denied/v1"
 MAX_DENIALS = 64
+# Each delegate hands its child a fresh nonce; a nested syn-delegate repeats
+# the one it inherited in its denial line, and the enclosing delegate accepts
+# only its own. So output copied from elsewhere (a log, another delegate's
+# run) is not mistaken for this child's denial. It is not a secret: the agent
+# can read it, and a forged line can still only add a failed launch.
+DENIAL_NONCE_ENV = "AGENTIC_DELEGATE_DENIAL_NONCE"
 
 
 def launch_context(
@@ -94,8 +100,12 @@ def launch_context(
     return journal, call
 
 
-def denial_line(target: str) -> str:
-    return DENIAL_MARKER + " " + json.dumps({"id": str(uuid4()), "target": target})
+def denial_line(target: str, nonce: str | None) -> str:
+    return (
+        DENIAL_MARKER
+        + " "
+        + json.dumps({"id": str(uuid4()), "target": target, "nonce": nonce})
+    )
 
 
 def _tool_outputs(event: dict[str, object], harness: str) -> list[str]:
@@ -130,8 +140,8 @@ def _tool_outputs(event: dict[str, object], harness: str) -> list[str]:
     return outputs
 
 
-def denials(line: bytes, harness: str) -> list[tuple[str, str]]:
-    """(id, target) of every nested denial reported in one stream frame."""
+def denials(line: bytes, harness: str, nonce: str) -> list[tuple[str, str]]:
+    """(id, target) of every nested denial with this nonce in one frame."""
     if DENIAL_MARKER.encode() not in line:
         return []
     try:
@@ -147,6 +157,8 @@ def denials(line: bytes, harness: str) -> list[tuple[str, str]]:
             try:
                 record = json.loads(text[len(DENIAL_MARKER) + 1 :])
                 denial = (_identity(record["id"]), str(record["target"]))
+                if record["nonce"] != nonce:
+                    continue
             except (ValueError, TypeError, KeyError, RecursionError):
                 continue
             if denial[1] in {"claude", "codex"} and len(denial[0]) <= 64:
@@ -197,16 +209,17 @@ def _terminate(process: subprocess.Popen) -> None:
 class _Observed:
     """What the enclosing delegate has seen of its own child so far."""
 
-    def __init__(self) -> None:
+    def __init__(self, nonce: str) -> None:
         self.native: str | None = None
         self.denials: set[str] = set()
+        self.nonce = nonce
 
 
 def _record_denials(
     line: bytes, journal: ChildJournal, call: ChildCall, observed: _Observed
 ) -> None:
     harness = call.target_harness or call.harness
-    for denial_id, target in denials(line, harness):
+    for denial_id, target in denials(line, harness, observed.nonce):
         if denial_id in observed.denials:
             continue
         if observed.native is None or len(observed.denials) >= MAX_DENIALS:
@@ -251,10 +264,14 @@ def _bind_line(
 
 
 def _stream(
-    process: subprocess.Popen, journal: ChildJournal, call: ChildCall, timeout: float
+    process: subprocess.Popen,
+    journal: ChildJournal,
+    call: ChildCall,
+    timeout: float,
+    nonce: str,
 ) -> int:
     deadline = time.monotonic() + timeout
-    observed = _Observed()
+    observed = _Observed(nonce)
     pending = b""
     discard = False
     with selectors.DefaultSelector() as selector:
@@ -304,6 +321,7 @@ def child_environment(environment: Mapping[str, str]) -> dict[str, str]:
         "CLAUDECODE",
         CLAUDE_PID_ENV,
         PERMISSIONS_ENV,
+        DENIAL_NONCE_ENV,
     ):
         child.pop(key, None)
     return child
@@ -313,6 +331,8 @@ def run(
     command: list[str], journal: ChildJournal, call: ChildCall, timeout: float
 ) -> int:
     environment = child_environment(os.environ)
+    nonce = str(uuid4())
+    environment[DENIAL_NONCE_ENV] = nonce
     try:
         process = subprocess.Popen(
             command,
@@ -339,7 +359,7 @@ def run(
     for signum in (signal.SIGTERM, signal.SIGINT):
         previous[signum] = signal.signal(signum, cancel)
     try:
-        code = _stream(process, journal, call, timeout)
+        code = _stream(process, journal, call, timeout, nonce)
     finally:
         _terminate(process)
         process.stdout.close()
@@ -366,7 +386,10 @@ def nested_grant(journal: ChildJournal) -> SandboxGrant:
     """The journal's own directory (SQLite also writes its rollback journal
     there) and the network: what a nested syn-delegate needs, nothing else."""
     return SandboxGrant(
-        writable_roots=(str(journal.path.parent.resolve()),), network_access=True
+        # abspath, not resolve: no filesystem access, so nothing can fail
+        # here after the intent is registered.
+        writable_roots=(os.path.abspath(journal.path.parent),),
+        network_access=True,
     )
 
 
@@ -539,7 +562,11 @@ def main() -> int:
             file=sys.stderr,
         )
         # Nothing can be written here; an enclosing delegate records it.
-        print(denial_line(args.harness), file=sys.stderr, flush=True)
+        print(
+            denial_line(args.harness, os.environ.get(DENIAL_NONCE_ENV)),
+            file=sys.stderr,
+            flush=True,
+        )
         return EXIT_CONTEXT_UNAVAILABLE
     if sandbox is not None:
         refused = refuse_without_sandbox(journal, call, sandbox, os.environ)

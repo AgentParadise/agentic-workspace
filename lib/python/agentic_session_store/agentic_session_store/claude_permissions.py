@@ -32,9 +32,9 @@ one of them in ``-p`` mode. Bash that writes runs under ``bypassPermissions``
 and under ``dontAsk`` with ``--allowedTools Bash``, and is refused under
 ``default`` and ``acceptEdits``.
 
-Not covered: a native subagent's own tool list (from its agent definition)
-is not visible to the hook, so a Bash call made by a subagent forwards the
-session's launch grant and the subagent's reported mode.
+A native subagent's own tool list (from its agent definition) is not visible
+to the hook, and may be narrower than the session's, so a Bash call made by a
+subagent exports no grant and a Claude delegate from there is refused.
 """
 
 from __future__ import annotations

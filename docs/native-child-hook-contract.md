@@ -560,3 +560,153 @@ explicitly recoverable state.
   repairs if needed, the schema inside its own `BEGIN IMMEDIATE`
   transaction. A 0.4.0 writer can no longer change the triggers between open
   and write. Missing core tables are refused, never recreated.
+
+
+## Depth-three delegation, 2026-10-02 UTC
+
+Part of syntropic137/syntropic137#1398. agentic-workspace#19, #20, #21.
+agentic-session-store 0.6.0, agentic-isolation 0.11.0.
+
+Live validation proved depth two in both directions and found that depth
+three failed in every harness order. Measured against the pinned binaries
+(Claude Code 2.1.281, Codex 0.156.1) offline, in the released omni-agent
+image, with the Codex sandbox seccomp profile:
+
+| Path | Before | Cause |
+| --- | --- | --- |
+| Claude -> Codex -> Claude | grandchild denied, exit 70, nothing recorded | workspace-write makes the spool read-only and has no network |
+| Codex -> Claude -> Codex | Claude child's Bash needs approval | `claude -p` started with no permission mode |
+| Claude -> Claude | child "Not logged in" | Claude Code removes `CLAUDE_CODE_OAUTH_TOKEN` from Bash subprocesses |
+
+### Codex delegate grant (#19)
+
+A `workspace-write` delegate gets exactly two things beyond Codex's defaults,
+as `-c` overrides that replace any `CODEX_HOME` value:
+
+- `sandbox_workspace_write.writable_roots` = the child journal's partition
+  directory, `$SPOOL/.agentic-session-store/$PARTITION` (SQLite writes its
+  rollback journal beside the database, so the directory, not the file);
+- `sandbox_workspace_write.network_access = true`. Egress remains the
+  container's network policy.
+
+`read-only` gets neither. The live probe runs `codex sandbox` with the same
+mode and grant and writes inside every extra root, so a host that cannot
+mount it refuses the launch (`codex_sandbox_unavailable`) before Codex
+starts. `--add-dir` was not used: `codex sandbox` has no such flag, and the
+probe must match the launch exactly.
+
+Measured inside a workspace-write sandbox with the grant: the journal
+partition is writable; the spool root, `$HOME` and the metadata namespace are
+not.
+
+**AppArmor.** The profile admitted writable binds only under `/workspace` and
+`/tmp`, and its enforce-mode verification explicitly denied binding
+`/oldroot/spool`. It now also admits a bind and a read-write remount of
+`/spool/.agentic-session-store/*/` and below: a partition directory, never
+the spool root or the namespace itself. The mount-policy conformance probe
+asserts the partition bind and remount are allowed and that the spool root,
+the namespace root and the partition bound elsewhere stay denied.
+
+**Denied nested launch.** When a nested `syn-delegate` cannot write the
+journal (for example inside a `read-only` delegate) nothing can be recorded
+where it runs. It starts nothing, exits 70 and prints one line,
+`agentic-delegate-launch-denied/v1 {"id": ..., "target": ..., "nonce": ...}`,
+on stderr. The nonce is the one its enclosing `syn-delegate` put in its
+child's environment (`AGENTIC_DELEGATE_DENIAL_NONCE`, fresh per launch). That
+enclosing delegate runs outside the sandbox and reads its own child's machine
+stream: Codex `command_execution` output, Claude `tool_result` content. Lines
+with another nonce (a log, another delegate's output) are ignored. For each
+new id it registers an intent under that
+child (parent = the child's bound native id, `tool_call_id` = `denied-<id>`)
+and marks it `launch_failed` with reason `nested_journal_unavailable`. The
+line can only ever add a failed launch (a gap): never a binding, launch or
+success, so a forged line makes coverage less complete, never more (the nonce
+is not a secret; the agent can read it). At most 64 per delegate. Text outside
+tool output is ignored.
+
+### Delegated Claude permissions (#20)
+
+The child inherits its parent's grant, as explicit flags:
+
+- **Claude parent.** The Bash `PreToolUse` context hook exports
+  `AGENTIC_PARENT_CLAUDE_PERMISSIONS`: the payload's `permission_mode` and
+  the session's `--tools`, `--allowedTools` and `--disallowedTools`, read from
+  the argv of `CLAUDE_PID` after checking that process is the hook's
+  ancestor. On repetition the narrower reading wins: last `--tools` and
+  `--allowedTools`, union of `--disallowedTools`. Settings-file rules need no
+  forwarding; the child reads the same files. If the grant cannot be read
+  exactly the variable is unset and `syn-delegate claude` refuses
+  (`parent_permissions_unavailable`, exit 70).
+- **Codex parent.** Codex exposes no permission mode to its shell.
+  `--permission-mode dontAsk` with `Bash`, `Read`, `Edit`, `Write`, `Glob`,
+  `Grep` allowed; anything else is denied without a prompt. The child also
+  runs inside the parent's OS sandbox when the parent is sandboxed.
+
+Measured at 2.1.281: the payload reports `default`, `acceptEdits`, `plan`,
+`dontAsk` or `bypassPermissions` (`auto` without eligibility and `manual`
+report `default`); `--permission-mode` accepts each in `-p`; a writing Bash
+command runs under `bypassPermissions` and under `dontAsk` with Bash allowed,
+and is refused under `default` and `acceptEdits`.
+
+A native subagent's own agent-definition tool list is not visible to the
+hook and may be narrower than the session's, so a Bash call from a subagent
+exports no grant and `syn-delegate claude` from there is refused
+(`parent_permissions_unavailable`). `syn-delegate codex` from a subagent is
+unaffected.
+
+### Nested Claude credentials (#21)
+
+Measured at 2.1.281: `CLAUDE_CODE_OAUTH_TOKEN` is absent from the
+environment of Bash tool calls; `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL`
+are kept. Syntropic137 injects the real OAuth token directly into the agent
+environment (its ADR-024, 2026-05-01: the Envoy proxy does not substitute
+Claude credentials because Claude Code validates the format locally), so
+there is no placeholder that could safely be re-supplied. With OAuth only, any
+Claude started below a Claude Bash call, directly or through a Codex in
+between, has no credential.
+
+`syn-delegate claude` runs `claude auth status` (offline) with the child's
+own environment first. If Claude reports no credential it records
+`launch_failed` with reason `claude_nested_auth_unavailable` and exits 69. No
+credential is ever copied into a child environment. Supported: an
+`ANTHROPIC_API_KEY` or a Claude credentials file in the workspace, and
+Codex -> Claude under OAuth (Codex passes its environment through).
+
+### Evidence
+
+`tests/test_pinned_depth_three.py`, offline, network-disabled container, no
+credentials, home, workspace and spool kept apart and transcript roots linked
+into the spool partition as session-store init links them:
+
+- Claude -> Codex (workspace-write) -> Claude: two intents, both bound and
+  `completed` exit 0, exact parents, three distinct native ids; the
+  grandchild's writing Bash command ran inside the Codex sandbox.
+- Codex -> Claude -> Codex: same, from a full-access Codex root (Syntropic137's
+  default phase level); the Claude child's Bash ran under `dontAsk`.
+- Claude -> Claude with an API key: child gets the parent's `--tools Bash`
+  (its model requests list only `Bash`) and its write ran.
+- Claude -> Claude with OAuth only: `launch_failed` /
+  `claude_nested_auth_unavailable`, child never reached the model.
+- Read-only Codex child runs `syn-delegate claude`: `launch_failed` /
+  `nested_journal_unavailable` under the Codex child; nothing started.
+
+Mutation check: removing the writable root, the network grant, the forwarded
+permission flags, the auth probe or the denial recording, one at a time, fails
+the matching test.
+
+### Known gaps
+
+- **Claude grandchild transcript.** Under a Codex delegate the grandchild
+  runs and is recorded, but its transcript root (`$SPOOL/$PARTITION/claude`,
+  linked from `~/.claude/projects`) is outside the grant, so no transcript is
+  written (measured: Claude exits 0, no file). Adding that directory as a
+  second writable root makes the transcript land; it is not done here
+  because the approved grant is the journal only. The pinned test asserts the
+  gap so a change is noticed.
+- **Codex below a sandboxed Codex.** A Codex grandchild cannot build its own
+  sandbox inside a workspace-write delegate (`CODEX_HOME` is read-only), so it
+  is refused with `codex_sandbox_unavailable`. Codex -> Claude -> Codex works
+  when the root Codex is not itself sandboxed.
+- **Root Codex in Syntropic137.** A root Codex phase at `workspace-write`
+  needs the same grant for its own nested `syn-delegate`; Syntropic137 builds
+  that command itself.

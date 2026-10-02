@@ -50,7 +50,12 @@ def command_context(content: bytes, environment) -> dict[str, object] | None:
     # The grant a delegated Claude inherits. When it cannot be read exactly it
     # is cleared, so syn-delegate refuses a Claude child instead of guessing.
     # Nothing else depends on it: the command itself still runs.
+    # A native subagent may be narrower than its session (an agent definition
+    # can restrict its tools), and that list is not in the payload. Its grant
+    # is therefore unknown, never the session's.
     try:
+        if "agent_id" in event:
+            raise ValueError("A subagent's own tool grant is not observable")
         permissions = parent_permissions(event.get("permission_mode"), environment)
     except (ValueError, TypeError, OSError, UnicodeError, IndexError):
         unset = f"unset {PERMISSIONS_ENV}\n"

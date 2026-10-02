@@ -60,7 +60,7 @@ for path in (
     "workspace/etc",
     "workspace/w",
     "dev",
-    "spool/.agentic-session-store/run",
+    "spool/.agentic-session-store/run/.git",
 ):
     os.makedirs(f"/newroot/{path}", exist_ok=True)
 open("/newroot/workspace/sock", "w").close()
@@ -74,7 +74,15 @@ checks = {
     "allowed: bind workspace": ("/oldroot/workspace/", "/newroot/workspace/w/", None, bind),
     "allowed: rw remount workspace": (None, "/newroot/workspace/w/", None, remount),
     "allowed: tmpfs dev": ("tmpfs", "/newroot/dev/", "tmpfs", MS_NOSUID | MS_NODEV),
-    # syn-delegate's extra writable root: the child journal partition.
+    # syn-delegate's extra writable root: the child journal partition. Codex
+    # masks .git/.codex/.agents in every writable root, present or not (the
+    # mask goes first here, while its target is still on this tmpfs).
+    "allowed: tmpfs mask in journal partition": (
+        "tmpfs",
+        "/newroot/spool/.agentic-session-store/run/.git/",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+    ),
     "allowed: bind journal partition": (
         "/oldroot/spool/.agentic-session-store/run/",
         "/newroot/spool/.agentic-session-store/run/",

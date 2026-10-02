@@ -30,7 +30,8 @@ inherits its parent's grant, passed explicitly as flags:
   with `--permission-mode bypassPermissions --tools Bash,Read`. Settings-file
   permission rules apply to both because both read the same files. If the
   parent's grant cannot be read exactly, the launch is refused (exit 70,
-  `launch_failed` / `parent_permissions_unavailable`).
+  `launch_failed` / `parent_permissions_unavailable`). That includes a call
+  from a native subagent, whose own tool list the hook cannot see.
 - **From Codex:** `--permission-mode dontAsk` with `Bash`, `Read`, `Edit`,
   `Write`, `Glob` and `Grep` allowed (what Codex itself can do); anything else
   is denied, never prompted for. The child also runs inside the Codex
