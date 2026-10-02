@@ -701,7 +701,7 @@ into the spool partition as session-store init links them:
 - Read-only Codex child runs `syn-delegate claude`: `launch_failed` /
   `nested_journal_unavailable` under the Codex child; nothing started.
 
-Mutation check: removing the writable root, the network grant, the forwarded
+Mutation check: removing either writable root, the network grant, the forwarded
 permission flags, the auth probe or the denial recording, one at a time, fails
 the matching test.
 
