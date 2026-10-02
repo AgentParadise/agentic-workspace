@@ -131,3 +131,75 @@ def merge_capture_hooks(content: str, *, config_path: Path | None = None) -> str
     result = tomlkit.dumps(document) if changed else content
     tomllib.loads(result)
     return result
+
+
+def remove_capture_hooks(content: str, *, config_path: Path | None = None) -> str:
+    """Remove exactly the groups merge_capture_hooks adds, with their trust.
+
+    Used when the session-store capability DEGRADES (#27): capture is off, so
+    a fail-closed PreToolUse guard left behind could deny child launches in a
+    workspace reported as running without capture.
+
+    Codex keys hook trust by GROUP INDEX (``<path>:<label>:<index>:<handler>``),
+    so deleting a group shifts every later group in that event down by one.
+    Their trust entries are moved with them, or the operator's own hooks
+    would silently become untrusted. Only groups equal to what this module
+    writes are removed. An event list emptied here is dropped. Unchanged input
+    is returned as is; the result is re-parsed before it is returned.
+    """
+    document = tomlkit.parse(content)
+    hooks = document.get("hooks")
+    if hooks is None:
+        return content
+    if not isinstance(hooks, MutableMapping):
+        raise TypeError("Codex hooks configuration must be a table")
+    state = hooks.get("state")
+    if state is not None and not isinstance(state, MutableMapping):
+        raise TypeError("Codex hook state must be a table")
+    prefix = f"{config_path.resolve()}:" if config_path is not None else None
+    changed = False
+    for event, expected in CAPTURE_GROUPS.items():
+        groups = hooks.get(event)
+        if groups is None:
+            continue
+        if not isinstance(groups, MutableSequence):
+            raise TypeError("Codex hook event must contain matcher groups")
+        label = CAPTURE_HASHES[event][0]
+        index = len(groups) - 1
+        while index >= 0:
+            if groups[index] != expected:
+                index -= 1
+                continue
+            del groups[index]
+            changed = True
+            if state is not None and prefix is not None:
+                _shift_trust(state, f"{prefix}{label}:", index)
+            index -= 1
+        if not groups:
+            del hooks[event]
+    if not changed:
+        return content
+    result = tomlkit.dumps(document)
+    tomllib.loads(result)
+    return result
+
+
+def _shift_trust(state: MutableMapping, event_prefix: str, removed: int) -> None:
+    """Drop the removed group's trust and move later groups' trust down one."""
+    moves: list[tuple[int, str, str]] = []
+    for key in list(state.keys()):
+        if not key.startswith(event_prefix):
+            continue
+        group, sep, handler = key[len(event_prefix) :].partition(":")
+        if not sep or not group.isdigit():
+            continue
+        position = int(group)
+        if position == removed:
+            del state[key]
+        elif position > removed:
+            moves.append((position, key, f"{event_prefix}{position - 1}:{handler}"))
+    # Ascending by index, numerically: each target is either the removed slot
+    # or one this loop has already vacated.
+    for _position, old, new in sorted(moves):
+        state[new] = state[old]
+        del state[old]

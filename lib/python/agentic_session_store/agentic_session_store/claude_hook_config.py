@@ -30,6 +30,18 @@ def _group(*, deny: bool, matcher: str | None = TOOL_MATCHER) -> dict[str, objec
     return group
 
 
+# Exports the parent's Bash context for syn-delegate (command_context).
+CONTEXT_GROUP: dict[str, object] = {
+    "matcher": "^Bash$",
+    "hooks": [
+        {
+            "type": "command",
+            "command": "python3 -m agentic_session_store.command_context",
+            "timeout": 10,
+        }
+    ],
+}
+
 # SubagentStop matches on agent type; no matcher settles every native child.
 CAPTURE_GROUPS: dict[str, dict[str, object]] = {
     "PreToolUse": _group(deny=True),
@@ -73,17 +85,48 @@ def merge_capture_hooks(content: str) -> str:
         else:
             groups[legacy] = expected
         changed = True
-    context = {
-        "matcher": "^Bash$",
-        "hooks": [
-            {
-                "type": "command",
-                "command": "python3 -m agentic_session_store.command_context",
-                "timeout": 10,
-            }
-        ],
-    }
+    context = dict(CONTEXT_GROUP)
     if context not in hooks["PreToolUse"]:
         hooks["PreToolUse"].append(context)
         changed = True
+    return json.dumps(document, indent=2) + "\n" if changed else content
+
+
+def remove_capture_hooks(content: str) -> str:
+    """Remove exactly the groups merge_capture_hooks adds, and nothing else.
+
+    Used when the session-store capability DEGRADES (#27): capture is off, so
+    a fail-closed PreToolUse guard left behind could deny child launches in a
+    workspace reported as running without capture. Only groups equal to what
+    this module writes are removed; an operator's group is never touched,
+    even one that mentions the recorder. An event list emptied here is
+    dropped. Unchanged input is returned as is.
+    """
+    if not content.strip():
+        return content
+    document = _parse(content)
+    hooks = document.get("hooks")
+    if hooks is None:
+        return content
+    if not isinstance(hooks, dict):
+        raise TypeError("Claude hooks must be an object")
+    owned: dict[str, list[dict[str, object]]] = {
+        event: [group] for event, group in CAPTURE_GROUPS.items()
+    }
+    owned["PreToolUse"] = [CAPTURE_GROUPS["PreToolUse"], CONTEXT_GROUP]
+    changed = False
+    for event, groups_owned in owned.items():
+        groups = hooks.get(event)
+        if groups is None:
+            continue
+        if not isinstance(groups, list):
+            raise TypeError("Claude hook event must contain matcher groups")
+        kept = [group for group in groups if group not in groups_owned]
+        if len(kept) == len(groups):
+            continue
+        changed = True
+        if kept:
+            hooks[event] = kept
+        else:
+            del hooks[event]
     return json.dumps(document, indent=2) + "\n" if changed else content
