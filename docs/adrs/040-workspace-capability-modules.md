@@ -200,6 +200,7 @@ up automatically.
 |---|---|---|
 | `init.sh` | entrypoint 5.6, before the agent | Warn and continue. The doctor in 5.7 is what turns a broken init into a hard stop, with a specific cause rather than a bare non-zero exit. |
 | `doctor` | entrypoint 5.7, before the agent | **Hard fail, exit 1**, unless the capability's manifest declares `failure_policy=degrade` (see "Best-effort capabilities" below). Opting into a capability is opting into loud failure (ADR-036). Failing here is free because no agent work has happened yet. |
+| `degrade.sh` (optional) | entrypoint 5.7, only when the capability degrades | Reported loudly, never fatal. Executed, not sourced. Disarms what init left armed for the agent's run (session-store: its fail-closed child capture hooks), because skipping the finalizer only stops what runs after the agent. |
 | `finalize.sh` | entrypoint 6, after the agent exits | **Always soft.** Invoked as `"${__fin}" \|\| true`, and the shipped hook itself always exits 0. A failed upload after an hour of successful agent work must never make the phase report as failed. |
 
 `init.sh` is *sourced* into the entrypoint shell so its exports propagate
@@ -222,7 +223,8 @@ So a capability may declare, in `workspace/capabilities/<cap>/capability.conf`
 the workspace with the capability **disabled** rather than stopping it: a
 greppable `[entrypoint] WARNING: <cap> unavailable, capability DISABLED ...`
 line naming the failed checks, `AGENTIC_<CAP>_READY=0`, its `finalize.sh`
-skipped, and its declared credentials still withheld. Still loud, no longer
+skipped, its optional `degrade.sh` run to disarm what init left armed, and
+its declared credentials still withheld from CMD. Still loud, no longer
 fatal. `AGENTIC_<CAP>_REQUIRED=1` restores the hard fail per deployment; it
 can only strengthen. A missing, unreadable or unrecognised manifest means
 `fail`, so every capability that declares nothing keeps exactly the behaviour
