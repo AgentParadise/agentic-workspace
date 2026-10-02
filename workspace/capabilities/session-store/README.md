@@ -8,6 +8,32 @@ See `doctor` in this directory for the six preflight checks
 the env-var contract (`Env` in that module is the single source of truth
 for every `AGENTIC_SESSION_STORE_*` variable this capability reads).
 
+## A failed doctor degrades capture; it does not stop the workspace
+
+`capability.conf` in this directory declares `failure_policy=degrade` (#27).
+The store is a backup of transcripts the orchestrator also keeps, so any
+failed check (store down, exporter missing, spool unwritable, an init
+refusal) starts the workspace with capture **disabled** instead of stopping
+it:
+
+```
+[entrypoint] WARNING: session-store unavailable, capability DISABLED for this workspace: store_reachable
+```
+
+On a degraded run `AGENTIC_SESSION_STORE_READY=0`, `finalize.sh` does not
+run (nothing sweeps or uploads, and nothing waits on the dead store), the
+write credential is still withheld from the agent, and a
+`capability_status` row with `"status":"degraded"` is appended to the
+doctor audit file. Whatever init already set up stays: the transcript roots
+still point into the spool, so a spool that outlives the container keeps
+this run's transcripts, and a later workspace with the same `SPOOL` and
+`PARTITION` sweeps them (see "How to actually run a recovery sweep").
+
+Set `AGENTIC_SESSION_STORE_REQUIRED=1` for the previous behaviour: a failed
+doctor stops the workspace before the agent runs. See
+`docs/workspace-capabilities.md` (Step 3b) for the manifest and the status
+contract.
+
 ## Exporter provisioning contract
 
 **This changed.** The omni-agent image now ships
