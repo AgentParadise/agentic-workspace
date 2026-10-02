@@ -145,6 +145,37 @@ RUN claude --version && codex --version && python3 --version && node --version \
 # have introduced new ones.
 RUN find / -path /usr/local -prune -o -path /proc -prune -o -perm /6000 -type f -exec chmod a-s {} \; 2>/dev/null || true
 
+# Give $HOME back to agent, then PROVE it.
+#
+# Everything above ran as root while HOME stayed /home/agent (inherited from
+# omni; this image never overrides it). Anything that touched $HOME therefore
+# left root-owned paths behind. The verification step above has two such
+# writers, both measured: `gh --version` writes a device id under
+# $XDG_STATE_HOME/gh, creating /home/agent/.local, and `codex --version`
+# creates /home/agent/.codex/tmp. Both landed owned root:root.
+#
+# Note the shape of this: the offenders are --version calls, the cheapest
+# possible commands, in a step whose entire purpose is to prove the image is
+# healthy. Any binary may touch $HOME on startup, so the rule cannot be "audit
+# each command" - it has to be "hand $HOME back afterwards, and verify".
+#
+# At runtime the 128 MB tmpfs over /home/agent masks the damage, so production
+# never saw it - and the smoke suite mounts that same tmpfs "as production runs
+# it", so it could not see it either. What does see it is a bare `docker run`,
+# which is how a consumer probes a pinned digest: the entrypoint cannot
+# mkdir ~/.local/share, and EVERY harness probe fails with a permission error
+# that names none of this.
+#
+# The assertion is the point. A chown alone fixes today's instance; the test
+# makes the next root-section write fail the build instead of shipping a latent
+# image. Any image that adds `USER root` needs this pair before `USER agent`.
+RUN chown -R agent:agent /home/agent \
+    && if find /home/agent ! -user agent -print -quit | grep -q .; then \
+         echo "ERROR: root-owned paths remain under /home/agent:" >&2; \
+         find /home/agent ! -user agent -printf '  %u %p\n' >&2; \
+         exit 1; \
+       fi
+
 USER agent
 WORKDIR /workspace
 
