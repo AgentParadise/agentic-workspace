@@ -497,7 +497,9 @@ done
 #
 # Disabled means DISABLED, not half-on: the capability's finalizer is not run
 # (see __discover_finalizers), so nothing sweeps, uploads or waits on a store
-# that is down, and 5.8 still withholds every credential the adapter declared.
+# that is down; the adapter's optional degrade.sh disarms anything init.sh
+# left armed for the agent's run (session-store: its fail-closed child capture
+# hooks); and 5.8 still withholds every credential the adapter declared.
 #
 # The policy is a property the capability DECLARES, never a name this file
 # knows (ADR-040 s4). A missing, unreadable or unrecognised manifest is the
@@ -722,6 +724,29 @@ for __cap in ${AGENTIC_CAPABILITIES:-}; do
             echo "[entrypoint] ${__cap} doctor: FAIL (exit ${__doctor_rc}); ${__cap} is best-effort (failure_policy=degrade), so the workspace continues without it." >&2
             echo "[entrypoint] WARNING: ${__cap} unavailable, capability DISABLED for this workspace: ${__failed_checks:-doctor exit ${__doctor_rc}}" >&2
             echo "[entrypoint] Set ${__prefix}_REQUIRED=1 to make a ${__cap} failure stop the workspace instead." >&2
+            # UNDO WHAT INIT LEFT ARMED. Skipping the finalizer stops what
+            # runs AFTER the agent; it does nothing about what init.sh already
+            # put in place for DURING it. session-store's local provider
+            # installs fail-closed child capture hooks as init's last step,
+            # before this doctor ran, so a degraded workspace kept a guard
+            # that denies child launches once the journal cannot record them.
+            # An adapter's optional degrade.sh is where it disarms such
+            # things. It is EXECUTED (not sourced, so it cannot touch this
+            # shell), bounded like the doctor, and runs before 5.8, with the
+            # environment init.sh exported. Its failure is reported loudly
+            # and does not stop the workspace: not starting is the outcome
+            # degrade exists to remove.
+            __degrade_hook="/opt/agentic/capabilities/${__cap}/${__provider}/degrade.sh"
+            if __capability_provider_safe "${__provider}" && [ -f "${__degrade_hook}" ]; then
+                __degrade_rc=0
+                timeout --kill-after=5 "${__doctor_timeout_s}" "${__degrade_hook}" \
+                    < /dev/null || __degrade_rc=$?
+                if [ "${__degrade_rc}" -ne 0 ]; then
+                    echo "[entrypoint] WARNING: ${__cap} degrade hook failed (exit ${__degrade_rc}); things its init.sh set up may still be active. Set ${__prefix}_REQUIRED=1 to fail instead." >&2
+                fi
+                unset __degrade_rc
+            fi
+            unset __degrade_hook
             ;;
         *)
             echo "[entrypoint] ${__cap} doctor: FAIL (exit ${__doctor_rc})${__failed_checks:+: ${__failed_checks}}" >&2

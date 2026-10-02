@@ -231,16 +231,18 @@ doctor with exit 124 (137 if it had to be killed), and the policy then
 decides as for any other failure. This applies to every capability: one that
 used to hang forever now fails within the bound.
 
-**What degraded does NOT undo.** Disabling is about this run's lifecycle
-hooks, not a rollback of `init.sh`. For `session-store`: the transcript roots
-still point into the spool; with `provider=local` the child capture hooks
-init installed stay installed (they are only installed after the spool and
-journal proved writable, so they record rather than deny); and anything the
-host reads from the spool is not a captured run. A consumer must check the
-status row before treating a spool as captured. And, as for a healthy
-workspace, a credential delivered with `docker run -e` is still visible to
-`docker exec`'d agents (ADR-040 s2 known limit); 5.8 withholds it from CMD
-only.
+**What degraded undoes, and what it does not.** Disabling covers this run's
+lifecycle, not a rollback of everything `init.sh` did. An adapter may ship an
+optional `degrade.sh` (Step 4) to disarm whatever init left armed for the
+agent's run. `session-store`'s removes the fail-closed child capture hooks
+the local provider installs (full or partial install, Claude and Codex),
+because a guard left behind would deny child launches once the journal
+cannot record them. What stays: the transcript roots still point into the
+spool, and anything the host reads from the spool is not a captured run, so
+a consumer must check the status row before treating a spool as captured.
+And, as for a healthy workspace, a credential delivered with `docker run -e`
+is still visible to `docker exec`'d agents (ADR-040 s2 known limit, tracked
+in #30); 5.8 withholds it from CMD only.
 
 **The opt-in to the hard fail** is `AGENTIC_<CAP>_REQUIRED=1`. It can only
 strengthen: `0` or empty defers to the manifest, so `AGENTIC_MEMORY_REQUIRED=0`
@@ -402,6 +404,22 @@ You can wire it into the Python doctor's check list, as memory does with
 `ProviderSpecificCheck`, or leave it as a hand-run tool, as `session-store`
 does today. If you leave it unwired, say so in the module README so nobody
 assumes it runs at startup.
+
+### `degrade.sh` (optional)
+
+Runs only when your capability DEGRADES (Step 3b): entrypoint 5.7, after the
+doctor failed and before the agent starts. Executed, not sourced, with the
+environment your `init.sh` exported, and bounded by
+`AGENTIC_CAPABILITY_DOCTOR_TIMEOUT_S`. Its job is to disarm anything init put
+in place that would misbehave with the capability off, above all anything
+fail closed. Make it idempotent and safe on a partial init: it runs after
+whatever subset of `init.sh` succeeded. A non-zero exit is reported loudly
+and does not stop the workspace.
+
+`session-store` ships one for both providers: it uninstalls the child
+capture hooks (`python -m agentic_session_store.install_child_hooks CONFIG
+--uninstall`), which removes exactly the groups the installer writes and
+moves later Codex groups' index-keyed trust down with them.
 
 ### `finalize.sh` (optional)
 

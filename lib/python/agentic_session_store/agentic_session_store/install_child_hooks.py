@@ -9,13 +9,20 @@ import sqlite3
 import stat
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from agentic_session_store.child_journal import ChildJournal
 from agentic_session_store.claude_hook_config import (
     merge_capture_hooks as merge_claude_hooks,
 )
-from agentic_session_store.codex_hook_config import merge_capture_hooks
+from agentic_session_store.claude_hook_config import (
+    remove_capture_hooks as remove_claude_hooks,
+)
+from agentic_session_store.codex_hook_config import (
+    merge_capture_hooks,
+    remove_capture_hooks,
+)
 from agentic_session_store.contract import SessionStoreContract
 
 MAX_CONFIG_BYTES = 1024 * 1024
@@ -44,9 +51,45 @@ def install(path: Path, *, harness: str = "codex") -> bool:
     """
     if harness not in {"codex", "claude"}:
         raise ValueError("Unsupported capture harness")
+    return _rewrite(
+        path,
+        lambda content: (
+            merge_claude_hooks(content)
+            if harness == "claude"
+            else merge_capture_hooks(content, config_path=path)
+        ),
+        create=True,
+    )
+
+
+def uninstall(path: Path, *, harness: str = "codex") -> bool:
+    """Remove exactly the capture hooks install() adds (#27).
+
+    Run when the session-store capability degrades: capture is off, and a
+    fail-closed guard left behind could deny child launches. Same discipline
+    as install: cooperating writers serialize, invalid configuration is left
+    untouched, symlinks are never followed, and an absent config stays absent.
+    """
+    if harness not in {"codex", "claude"}:
+        raise ValueError("Unsupported capture harness")
+    if not path.exists() and not path.is_symlink():
+        return False
+    return _rewrite(
+        path,
+        lambda content: (
+            remove_claude_hooks(content)
+            if harness == "claude"
+            else remove_capture_hooks(content, config_path=path)
+        ),
+        create=False,
+    )
+
+
+def _rewrite(path: Path, transform: Callable[[str], str], *, create: bool) -> bool:
     if path.parent.is_symlink():
         raise ValueError("Configuration directory must not be a symlink")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
     lock = os.open(
         path.with_name(path.name + ".capture.lock"),
         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
@@ -57,11 +100,7 @@ def install(path: Path, *, harness: str = "codex") -> bool:
         fcntl.flock(lock, fcntl.LOCK_EX)
         original, mode = _read(path)
         content = original.decode("utf-8")
-        updated = (
-            merge_claude_hooks(content)
-            if harness == "claude"
-            else merge_capture_hooks(content, config_path=path)
-        ).encode("utf-8")
+        updated = transform(content).encode("utf-8")
         if original == updated:
             return False
         descriptor, temporary = tempfile.mkstemp(
@@ -94,7 +133,24 @@ def main() -> int:
     parser.add_argument("config", type=Path)
     parser.add_argument("--journal", type=Path)
     parser.add_argument("--harness", choices=("codex", "claude"), default="codex")
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Remove the capture hooks instead (the capability degraded, #27)",
+    )
     args = parser.parse_args()
+    if args.uninstall:
+        # No contract is required: this runs exactly when capture is being
+        # turned off. No journal is touched.
+        try:
+            uninstall(args.config, harness=args.harness)
+        except (ValueError, TypeError, OSError):
+            print(
+                "Child capture hook removal failed; check configuration.",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
     try:
         # Installed hooks deny every launch without an active contract, so
         # installing them with capture disabled would block all children.

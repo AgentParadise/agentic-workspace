@@ -24,7 +24,10 @@ On a degraded run `AGENTIC_SESSION_STORE_READY=0`, `finalize.sh` does not
 run (nothing sweeps or uploads, and nothing waits on the dead store), the
 write credential is still withheld from the agent, and a
 `capability_status` row with `"status":"degraded"` is appended to the
-doctor audit file. Whatever init already set up stays: the transcript roots
+doctor audit file. `degrade.sh` removes the fail-closed child capture hooks
+the local provider installs (a full or partial install, Claude and Codex),
+so child launches no longer depend on a recorder that is off. Everything
+else init already set up stays: the transcript roots
 still point into the spool, so a spool that outlives the container keeps
 this run's transcripts, and a later workspace with the same `SPOOL` and
 `PARTITION` sweeps them (see "How to actually run a recovery sweep").
