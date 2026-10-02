@@ -11,10 +11,21 @@ This is a reliability guard, not a security boundary: an agent can always run
 policy, which the probe only observes.
 
 Modes that disable Codex's own sandbox are rejected, never passed through.
+
+Nested delegation. A delegate's shell commands run inside its sandbox, so a
+``syn-delegate`` started there needs two things workspace-write does not give
+by default (agentic-workspace#19): the retained child journal, which lives on
+the spool outside the working directory, and the network, to reach its own
+model. ``SandboxGrant`` adds exactly those: the journal's partition directory
+as the one extra writable root, and ``network_access``. Egress stays governed
+by the container's network policy. ``read-only`` gets neither, so a read-only
+delegate cannot delegate further; that denial is reported (see
+``delegate.DENIAL_MARKER``), not silent.
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -66,6 +77,31 @@ def resolve_sandbox_mode(
 
 
 @dataclass(frozen=True)
+class SandboxGrant:
+    """What a workspace-write delegate gets beyond Codex's defaults."""
+
+    writable_roots: tuple[str, ...] = ()
+    network_access: bool = False
+
+    def config(self, mode: CodexSandboxMode) -> list[str]:
+        """``-c`` overrides, identical for the probe and the delegate.
+
+        Only workspace-write has writable roots or a network switch; the keys
+        replace any value from ``CODEX_HOME``, so its config cannot widen them.
+        """
+        if mode is not CodexSandboxMode.WORKSPACE_WRITE:
+            return []
+        roots = "[" + ", ".join(json.dumps(root) for root in self.writable_roots) + "]"
+        return [
+            "-c",
+            f"sandbox_workspace_write.writable_roots={roots}",
+            "-c",
+            "sandbox_workspace_write.network_access="
+            + ("true" if self.network_access else "false"),
+        ]
+
+
+@dataclass(frozen=True)
 class CodexSandboxStatus:
     """Probe verdict. Anything but a clean exit means unavailable."""
 
@@ -79,9 +115,39 @@ def probe(
     environment: Mapping[str, str],
     cwd: str | None = None,
     timeout: float = PROBE_TIMEOUT_SECONDS,
+    grant: SandboxGrant | None = None,
 ) -> CodexSandboxStatus:
-    """Run ``codex sandbox`` in ``mode`` exactly as the delegate will run."""
-    command = ["codex", "sandbox", "-c", f'sandbox_mode="{mode.value}"', "--", "true"]
+    """Run ``codex sandbox`` in ``mode`` exactly as the delegate will run.
+
+    With a grant, the probe also writes inside every extra writable root, so a
+    host policy that cannot mount one (for example an AppArmor profile without
+    the rule) refuses the launch instead of failing the delegate later.
+    """
+    extra = [] if grant is None else grant.config(mode)
+    roots = () if grant is None or not extra else grant.writable_roots
+    check = (
+        ["true"]
+        if not roots
+        else [
+            "/bin/sh",
+            "-c",
+            (
+                'for root do : > "$root/.codex-sandbox-probe" && rm -f '
+                '"$root/.codex-sandbox-probe" || exit 1; done'
+            ),
+            "probe",
+            *roots,
+        ]
+    )
+    command = [
+        "codex",
+        "sandbox",
+        "-c",
+        f'sandbox_mode="{mode.value}"',
+        *extra,
+        "--",
+        *check,
+    ]
     try:
         result = subprocess.run(
             command,

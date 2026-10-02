@@ -198,7 +198,14 @@ fn build_image(tag: &str, extra: &str) {
         .stdin
         .take()
         .unwrap()
-        .write_all(format!("FROM {BASE_IMAGE}\n{extra}USER 1000:1000\n").as_bytes())
+        .write_all(
+            format!(
+                "FROM {BASE_IMAGE}\n{extra}\
+                 RUN mkdir -p /spool/.agentic-session-store/run && chown -R 1000:1000 /spool\n\
+                 USER 1000:1000\n"
+            )
+            .as_bytes(),
+        )
         .unwrap();
     assert!(build.wait().unwrap().success());
 }
@@ -318,5 +325,5 @@ fn codex_mount_policy_admits_bwrap_and_denies_sensitive_mounts() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 21, "{stdout}");
+    assert_eq!(checked, 26, "{stdout}");
 }

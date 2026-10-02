@@ -21,8 +21,32 @@ syn-delegate claude --prompt "$TASK_PROMPT" --timeout 600
 ```
 
 Use `--model` when selecting a model explicitly. Run from the intended working
-directory. Existing harness configuration controls permissions; the shim does
-not grant permissions. It records intent before launch, binds the delegate's own
+directory. The shim never grants more than the caller has. The delegated Claude
+inherits its parent's grant, passed explicitly as flags:
+
+- **From Claude:** the parent session's permission mode (from its Bash hook) and
+  its launch `--tools`, `--allowedTools` and `--disallowedTools`. A parent
+  started with `--dangerously-skip-permissions --tools Bash,Read` gets a child
+  with `--permission-mode bypassPermissions --tools Bash,Read`. Settings-file
+  permission rules apply to both because both read the same files. If the
+  parent's grant cannot be read exactly, the launch is refused (exit 70,
+  `launch_failed` / `parent_permissions_unavailable`).
+- **From Codex:** `--permission-mode dontAsk` with `Bash`, `Read`, `Edit`,
+  `Write`, `Glob` and `Grep` allowed (what Codex itself can do); anything else
+  is denied, never prompted for. The child also runs inside the Codex
+  parent's own OS sandbox.
+
+**Claude below Claude needs a credential Claude reads itself.** Claude Code
+removes `CLAUDE_CODE_OAUTH_TOKEN` from the environment of its Bash
+subprocesses (measured at 2.1.281; `ANTHROPIC_API_KEY` is kept). So with OAuth
+only, a Claude started from a Claude Bash call, directly or through a Codex in
+between, has no credential. The shim asks `claude auth status` first and
+refuses (exit 69, `launch_failed` / `claude_nested_auth_unavailable`) rather
+than start a child that fails with "Not logged in". It never copies a token
+back in. Claude -> Claude works when the workspace supplies `ANTHROPIC_API_KEY`
+or a Claude credentials file; Codex -> Claude works with OAuth.
+
+It records intent before launch, binds the delegate's own
 native session ID, and preserves its actual exit status even when a caller uses
 `|| true` or a pipeline. Claude's shell hook supplies exact parent context;
 Codex supplies its native `CODEX_THREAD_ID`. Missing parent context or durable

@@ -13,6 +13,10 @@ from agentic_session_store.child_hook import (
     _identity,
     _parse,
 )
+from agentic_session_store.claude_permissions import (
+    PERMISSIONS_ENV,
+    parent_permissions,
+)
 from agentic_session_store.contract import SessionStoreContract
 
 
@@ -39,12 +43,24 @@ def command_context(content: bytes, environment) -> dict[str, object] | None:
         if "agent_id" in event
         else _identity(event.get("session_id"))
     )
-    prefix = "export " + " ".join(
-        f"{name}={shlex.quote(value)}"
-        for name, value in (
-            ("AGENTIC_PARENT_HARNESS", harness),
-            ("AGENTIC_PARENT_NATIVE_ID", parent),
-        )
+    exports = [
+        ("AGENTIC_PARENT_HARNESS", harness),
+        ("AGENTIC_PARENT_NATIVE_ID", parent),
+    ]
+    # The grant a delegated Claude inherits. When it cannot be read exactly it
+    # is cleared, so syn-delegate refuses a Claude child instead of guessing.
+    # Nothing else depends on it: the command itself still runs.
+    try:
+        permissions = parent_permissions(event.get("permission_mode"), environment)
+    except (ValueError, TypeError, OSError, UnicodeError, IndexError):
+        unset = f"unset {PERMISSIONS_ENV}\n"
+    else:
+        unset = ""
+        exports.append((PERMISSIONS_ENV, permissions.to_json()))
+    prefix = (
+        unset
+        + "export "
+        + " ".join(f"{name}={shlex.quote(value)}" for name, value in exports)
     )
     return {
         "hookSpecificOutput": {
