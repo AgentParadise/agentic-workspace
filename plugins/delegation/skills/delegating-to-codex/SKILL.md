@@ -159,14 +159,13 @@ and writes outside it are denied.
 
 **Nested delegation.** A `workspace-write` delegate gets exactly two things
 beyond Codex's defaults, as `-c sandbox_workspace_write.*` overrides that
-replace any `CODEX_HOME` value: the retained child journal's partition
-directory as its one extra writable root, and `network_access = true` (egress
-is still the container's network policy). That is what lets the delegate run
-`syn-delegate` itself (Claude -> Codex -> Claude). Nothing else outside the
-working directory becomes writable, so:
-
-- A Claude grandchild runs and is recorded, but its own transcript is not
-  written (its transcript root is on the spool, outside the grant).
+replace any `CODEX_HOME` value: two extra writable roots, the retained child
+journal's partition directory and the partition's Claude transcript root
+(`$SPOOL/$PARTITION/claude`), and `network_access = true` (egress is still the
+container's network policy). That is what lets the delegate run
+`syn-delegate` itself (Claude -> Codex -> Claude) with the Claude grandchild's
+own transcript captured. Nothing else outside the working directory becomes
+writable, so:
 - A Codex grandchild cannot start its sandbox (its `CODEX_HOME` is read-only),
   so it is refused with `codex_sandbox_unavailable`.
 - A `read-only` delegate cannot write the journal at all. A `syn-delegate` it

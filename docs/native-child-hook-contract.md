@@ -580,12 +580,22 @@ image, with the Codex sandbox seccomp profile:
 
 ### Codex delegate grant (#19)
 
-A `workspace-write` delegate gets exactly two things beyond Codex's defaults,
+A `workspace-write` delegate gets exactly these beyond Codex's defaults,
 as `-c` overrides that replace any `CODEX_HOME` value:
 
-- `sandbox_workspace_write.writable_roots` = the child journal's partition
-  directory, `$SPOOL/.agentic-session-store/$PARTITION` (SQLite writes its
-  rollback journal beside the database, so the directory, not the file);
+- `sandbox_workspace_write.writable_roots` = two directories: the child
+  journal's partition directory, `$SPOOL/.agentic-session-store/$PARTITION`
+  (SQLite writes its rollback journal beside the database, so the directory,
+  not the file), and this partition's Claude transcript root,
+  `$SPOOL/$PARTITION/claude` (where session-store init links
+  `~/.claude/projects`), so a Claude grandchild's own transcript is captured.
+  Exactly that partition's `claude` directory: never the spool root, the
+  partition root or the Codex transcript root. It is left out (the grandchild
+  then runs without a transcript, a missing body the host reports) when it is
+  not an existing directory, when a component below the spool is a symlink,
+  or when the partition's first segment starts with a dot (the AppArmor
+  profile never admits one), so it never refuses a launch that worked
+  without it;
 - `sandbox_workspace_write.network_access = true`. Egress remains the
   container's network policy.
 
@@ -596,8 +606,9 @@ starts. `--add-dir` was not used: `codex sandbox` has no such flag, and the
 probe must match the launch exactly.
 
 Measured inside a workspace-write sandbox with the grant: the journal
-partition is writable; the spool root, `$HOME` and the metadata namespace are
-not.
+partition and the partition's Claude transcript root are writable; the spool
+root, the partition root, the Codex transcript root, `$HOME` and the metadata
+namespace are not.
 
 **AppArmor.** The profile admitted writable binds only under `/workspace` and
 `/tmp`, and its enforce-mode verification explicitly denied binding
@@ -684,7 +695,8 @@ into the spool partition as session-store init links them:
 
 - Claude -> Codex (workspace-write) -> Claude: two intents, both bound and
   `completed` exit 0, exact parents, three distinct native ids; the
-  grandchild's writing Bash command ran inside the Codex sandbox.
+  grandchild's writing Bash command ran inside the Codex sandbox, and the
+  grandchild's own transcript is on the spool beside the root's.
 - Codex -> Claude -> Codex: same, from a full-access Codex root (Syntropic137's
   default phase level); the Claude child's Bash ran under `dontAsk`.
 - Claude -> Claude with an API key: child gets the parent's `--tools Bash`
@@ -694,19 +706,12 @@ into the spool partition as session-store init links them:
 - Read-only Codex child runs `syn-delegate claude`: `launch_failed` /
   `nested_journal_unavailable` under the Codex child; nothing started.
 
-Mutation check: removing the writable root, the network grant, the forwarded
+Mutation check: removing either writable root, the network grant, the forwarded
 permission flags, the auth probe or the denial recording, one at a time, fails
 the matching test.
 
 ### Known gaps
 
-- **Claude grandchild transcript.** Under a Codex delegate the grandchild
-  runs and is recorded, but its transcript root (`$SPOOL/$PARTITION/claude`,
-  linked from `~/.claude/projects`) is outside the grant, so no transcript is
-  written (measured: Claude exits 0, no file). Adding that directory as a
-  second writable root makes the transcript land; it is not done here
-  because the approved grant is the journal only. The pinned test asserts the
-  gap so a change is noticed.
 - **Codex below a sandboxed Codex.** A Codex grandchild cannot build its own
   sandbox inside a workspace-write delegate (`CODEX_HOME` is read-only), so it
   is refused with `codex_sandbox_unavailable`. Codex -> Claude -> Codex works

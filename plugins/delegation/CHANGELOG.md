@@ -4,9 +4,10 @@
 
 Depth-three delegation (agentic-workspace#19, #20, #21).
 
-- `delegating-to-codex`: a `workspace-write` delegate gets the child journal's
-  partition directory as its one extra writable root and network access, so it
-  can delegate again. A nested launch denied for want of the journal (for
+- `delegating-to-codex`: a `workspace-write` delegate gets two extra writable
+  roots, the child journal's partition directory and the partition's Claude
+  transcript root, and network access, so it can delegate again and a Claude
+  grandchild's transcript is captured. A nested launch denied for want of the journal (for
   example from a `read-only` delegate) is recorded as `launch_failed` /
   `nested_journal_unavailable` by the enclosing delegate.
 - `delegating-to-claude-p`: the delegated Claude inherits its parent's grant

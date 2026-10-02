@@ -16,9 +16,11 @@ Nested delegation. A delegate's shell commands run inside its sandbox, so a
 ``syn-delegate`` started there needs two things workspace-write does not give
 by default (agentic-workspace#19): the retained child journal, which lives on
 the spool outside the working directory, and the network, to reach its own
-model. ``SandboxGrant`` adds exactly those: the journal's partition directory
-as the one extra writable root, and ``network_access``. Egress stays governed
-by the container's network policy. ``read-only`` gets neither, so a read-only
+model. ``SandboxGrant`` adds exactly those, ``network_access`` and two extra
+writable roots: the journal's partition directory, and this partition's Claude
+transcript root ``$SPOOL/$PARTITION/claude`` so a Claude grandchild's own
+transcript is captured. Egress stays governed by the container's network
+policy. ``read-only`` gets neither, so a read-only
 delegate cannot delegate further; that denial is reported (see
 ``delegate.DENIAL_MARKER``), not silent.
 """

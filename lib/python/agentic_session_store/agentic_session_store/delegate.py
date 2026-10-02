@@ -73,7 +73,7 @@ DENIAL_NONCE_ENV = "AGENTIC_DELEGATE_DENIAL_NONCE"
 
 def launch_context(
     target: str, environment: Mapping[str, str]
-) -> tuple[ChildJournal, ChildCall]:
+) -> tuple[ChildJournal, ChildCall, SessionStoreContract]:
     contract = SessionStoreContract.from_env(environment)
     if contract is None:
         raise ValueError("Durable delegation requires session capture")
@@ -97,7 +97,7 @@ def launch_context(
         / "children.sqlite"
     )
     journal.register(call)
-    return journal, call
+    return journal, call, contract
 
 
 def denial_line(target: str, nonce: str | None) -> str:
@@ -382,13 +382,50 @@ def codex_command(sandbox: CodexSandboxMode, grant: SandboxGrant) -> list[str]:
     ]
 
 
-def nested_grant(journal: ChildJournal) -> SandboxGrant:
-    """The journal's own directory (SQLite also writes its rollback journal
-    there) and the network: what a nested syn-delegate needs, nothing else."""
+def claude_transcript_root(contract: SessionStoreContract) -> str | None:
+    """``$SPOOL/$PARTITION/claude``: where session-store init links
+    ``~/.claude/projects``, so where a Claude grandchild writes its transcript.
+
+    ``None`` when that exact directory cannot be granted, so the grant never
+    makes a launch fail that worked without it (the grandchild then runs
+    without a transcript, which the host reports as a missing body):
+
+    - it is not an existing directory (nothing to capture into);
+    - a component below the spool is a symlink, which could make a different
+      directory (the Codex root, another partition) writable;
+    - the partition's first segment starts with a dot, which the AppArmor
+      profile never admits (it keeps the metadata namespace out).
+
+    Never raises: it runs after the intent is registered.
+    """
+    spool = os.path.abspath(contract.spool)
+    root = os.path.abspath(os.path.join(spool, contract.partition, "claude"))
+    relative = os.path.relpath(root, spool)
+    if relative.startswith((".", os.sep)):
+        return None
+    try:
+        exact = os.path.realpath(root) == os.path.join(
+            os.path.realpath(spool), relative
+        )
+        return root if exact and os.path.isdir(root) else None
+    except (OSError, ValueError):
+        return None
+
+
+def nested_grant(journal: ChildJournal, contract: SessionStoreContract) -> SandboxGrant:
+    """What a nested syn-delegate needs, nothing else: the journal's own
+    directory (SQLite also writes its rollback journal there), this
+    partition's Claude transcript root (so a Claude grandchild's transcript
+    is captured, not silently dropped), and the network.
+
+    Exactly this partition's ``claude`` directory: never the spool root, the
+    partition root, the Codex transcript root or the metadata namespace.
+    """
+    transcripts = claude_transcript_root(contract)
     return SandboxGrant(
-        # abspath, not resolve: no filesystem access, so nothing can fail
-        # here after the intent is registered.
-        writable_roots=(os.path.abspath(journal.path.parent),),
+        # abspath, not resolve: nothing can fail after the intent is registered.
+        writable_roots=(os.path.abspath(journal.path.parent),)
+        + (() if transcripts is None else (transcripts,)),
         network_access=True,
     )
 
@@ -407,6 +444,7 @@ def claude_command(permissions: ClaudePermissions) -> list[str]:
 def refuse_without_sandbox(
     journal: ChildJournal,
     call: ChildCall,
+    contract: SessionStoreContract,
     sandbox: CodexSandboxMode,
     environment: Mapping[str, str],
 ) -> int | None:
@@ -417,7 +455,7 @@ def refuse_without_sandbox(
     status = probe(
         sandbox,
         environment=child_environment(environment),
-        grant=nested_grant(journal),
+        grant=nested_grant(journal, contract),
     )
     if status.available:
         return None
@@ -555,7 +593,7 @@ def main() -> int:
     elif args.sandbox is not None:
         parser.error("--sandbox applies to codex only")
     try:
-        journal, call = launch_context(args.harness, os.environ)
+        journal, call, contract = launch_context(args.harness, os.environ)
     except RECORD_ERRORS:
         print(
             "Delegate launch denied: durable parent context or storage unavailable.",
@@ -569,10 +607,10 @@ def main() -> int:
         )
         return EXIT_CONTEXT_UNAVAILABLE
     if sandbox is not None:
-        refused = refuse_without_sandbox(journal, call, sandbox, os.environ)
+        refused = refuse_without_sandbox(journal, call, contract, sandbox, os.environ)
         if refused is not None:
             return refused
-        command = codex_command(sandbox, nested_grant(journal))
+        command = codex_command(sandbox, nested_grant(journal, contract))
     else:
         permissions, refused = refuse_without_parent_permissions(
             journal, call, os.environ

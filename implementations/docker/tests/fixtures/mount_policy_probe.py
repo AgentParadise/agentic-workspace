@@ -61,6 +61,11 @@ for path in (
     "workspace/w",
     "dev",
     "spool/.agentic-session-store/run/.git",
+    "spool/run/claude/.git",
+    "spool/run/codex",
+    "spool/exec/ws/claude/.git",
+    "spool/.agentic-session-store/exec/ws/.git",
+    "spool/.hidden/claude",
 ):
     os.makedirs(f"/newroot/{path}", exist_ok=True)
 open("/newroot/workspace/sock", "w").close()
@@ -95,6 +100,51 @@ checks = {
         None,
         remount,
     ),
+    # syn-delegate's second extra writable root: the partition's Claude
+    # transcript root, so a Claude grandchild's transcript is captured.
+    "allowed: tmpfs mask in claude transcript root": (
+        "tmpfs",
+        "/newroot/spool/run/claude/.git/",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+    ),
+    "allowed: bind claude transcript root": (
+        "/oldroot/spool/run/claude/",
+        "/newroot/spool/run/claude/",
+        None,
+        bind,
+    ),
+    "allowed: rw remount claude transcript root": (
+        None,
+        "/newroot/spool/run/claude/",
+        None,
+        remount,
+    ),
+    # A nested partition, as Syntropic137 builds them (<execution>/<workspace>).
+    "allowed: tmpfs mask in nested journal partition": (
+        "tmpfs",
+        "/newroot/spool/.agentic-session-store/exec/ws/.git/",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+    ),
+    "allowed: bind nested journal partition": (
+        "/oldroot/spool/.agentic-session-store/exec/ws/",
+        "/newroot/spool/.agentic-session-store/exec/ws/",
+        None,
+        bind,
+    ),
+    "allowed: tmpfs mask in nested claude transcript root": (
+        "tmpfs",
+        "/newroot/spool/exec/ws/claude/.git/",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+    ),
+    "allowed: bind nested claude transcript root": (
+        "/oldroot/spool/exec/ws/claude/",
+        "/newroot/spool/exec/ws/claude/",
+        None,
+        bind,
+    ),
     # sensitive: expected denied
     "denied: bind proc": ("/oldroot/proc/", "/newroot/p/", None, bind),
     "denied: bind sys": ("/oldroot/sys/", "/newroot/s/", None, bind),
@@ -120,6 +170,31 @@ checks = {
     "denied: bind journal partition elsewhere": (
         "/oldroot/spool/.agentic-session-store/run/",
         "/newroot/e/",
+        None,
+        bind,
+    ),
+    "denied: bind codex transcript root": (
+        "/oldroot/spool/run/codex/",
+        "/newroot/spool/run/codex/",
+        None,
+        bind,
+    ),
+    "denied: bind claude transcript root elsewhere": (
+        "/oldroot/spool/run/claude/",
+        "/newroot/e/",
+        None,
+        bind,
+    ),
+    "denied: bind partition root": ("/oldroot/spool/run/", "/newroot/spool/run/", None, bind),
+    "denied: bind nested partition root": (
+        "/oldroot/spool/exec/ws/",
+        "/newroot/spool/exec/ws/",
+        None,
+        bind,
+    ),
+    "denied: bind claude root of a dot partition": (
+        "/oldroot/spool/.hidden/claude/",
+        "/newroot/spool/.hidden/claude/",
         None,
         bind,
     ),

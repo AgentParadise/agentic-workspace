@@ -201,7 +201,9 @@ fn build_image(tag: &str, extra: &str) {
         .write_all(
             format!(
                 "FROM {BASE_IMAGE}\n{extra}\
-                 RUN mkdir -p /spool/.agentic-session-store/run && chown -R 1000:1000 /spool\n\
+                 RUN mkdir -p /spool/.agentic-session-store/run /spool/run/claude /spool/run/codex \
+                 /spool/exec/ws/claude /spool/.hidden/claude /spool/.agentic-session-store/exec/ws \
+                 && chown -R 1000:1000 /spool\n\
                  USER 1000:1000\n"
             )
             .as_bytes(),
@@ -316,7 +318,10 @@ fn codex_mount_policy_admits_bwrap_and_denies_sensitive_mounts() {
         let label = label.trim_matches('"');
         let (allowed, errno) = outcome.trim_end_matches(']').split_once(", ").unwrap();
         let allowed = allowed == "true";
-        if label == "allowed: rw remount journal partition" && !allowed {
+        if label.starts_with("allowed: rw remount ")
+            && label != "allowed: rw remount workspace"
+            && !allowed
+        {
             // This container's root is read-only, so the kernel refuses a
             // writable remount of anything bound from it (EPERM). AppArmor is
             // consulted first and would refuse with EACCES, which this rules
@@ -331,5 +336,5 @@ fn codex_mount_policy_admits_bwrap_and_denies_sensitive_mounts() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 27, "{stdout}");
+    assert_eq!(checked, 39, "{stdout}");
 }

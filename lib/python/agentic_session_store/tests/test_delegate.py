@@ -23,6 +23,9 @@ PARENT_GRANT = json.dumps(
 def environment(tmp_path):
     spool = tmp_path / "spool"
     (spool / ".agentic-session-store/run").mkdir(parents=True)
+    # As session-store init creates them: the partition's transcript roots.
+    (spool / "run/claude").mkdir(parents=True)
+    (spool / "run/codex").mkdir()
     binary = tmp_path / "bin"
     binary.mkdir()
     # The fake codex answers `codex sandbox ...` with this exit status.
@@ -341,12 +344,9 @@ def test_probe_uses_the_requested_mode(environment, tmp_path, mode):
         json.loads(line)
         for line in (tmp_path / "probes.jsonl").read_text().splitlines()
     ]
-    journal_dir = str(
-        (
-            Path(environment["AGENTIC_SESSION_STORE_SPOOL"])
-            / ".agentic-session-store/run"
-        ).resolve()
-    )
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    journal_dir = str(spool / ".agentic-session-store/run")
+    claude_dir = str(spool / "run/claude")
     if mode == "read-only":
         assert probes == [["sandbox", "-c", f'sandbox_mode="{mode}"', "--", "true"]]
         return
@@ -359,12 +359,15 @@ def test_probe_uses_the_requested_mode(environment, tmp_path, mode):
         "-c",
         f'sandbox_mode="{mode}"',
         "-c",
-        f"sandbox_workspace_write.writable_roots=[{json.dumps(journal_dir)}]",
+        (
+            "sandbox_workspace_write.writable_roots="
+            f"[{json.dumps(journal_dir)}, {json.dumps(claude_dir)}]"
+        ),
         "-c",
         "sandbox_workspace_write.network_access=true",
     ]
     assert probe[separator + 1 : separator + 3] == ["/bin/sh", "-c"]
-    assert probe[-1] == journal_dir
+    assert probe[-2:] == [journal_dir, claude_dir]
 
 
 @pytest.mark.parametrize(
@@ -465,9 +468,12 @@ def test_delegate_refuses_when_its_capture_hooks_cannot_run(environment, tmp_pat
 # --- agentic-workspace#19: nested delegation from a workspace-write Codex ---
 
 
-def test_workspace_write_codex_gets_only_the_journal_root_and_network(
+def test_workspace_write_codex_gets_only_the_journal_and_claude_transcript_roots(
     environment, tmp_path
 ):
+    """The journal partition, this partition's Claude transcript root (so a
+    Claude grandchild's transcript is captured) and the network; never the
+    spool, the partition root, the Codex transcript root or the namespace."""
     record, body = _argv_recorder(tmp_path)
     _fake(environment, body)
     result = subprocess.run(
@@ -475,17 +481,96 @@ def test_workspace_write_codex_gets_only_the_journal_root_and_network(
     )
     assert result.returncode == 0, result.stderr
     argv = json.loads(record.read_text())
-    journal_dir = (
-        Path(environment["AGENTIC_SESSION_STORE_SPOOL"]) / ".agentic-session-store/run"
-    ).resolve()
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    roots = [str(spool / ".agentic-session-store/run"), str(spool / "run/claude")]
     overrides = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-c"]
     assert overrides == [
-        f"sandbox_workspace_write.writable_roots=[{json.dumps(str(journal_dir))}]",
+        f"sandbox_workspace_write.writable_roots=[{', '.join(map(json.dumps, roots))}]",
         "sandbox_workspace_write.network_access=true",
     ]
+    for broader in (
+        spool,
+        spool / "run",
+        spool / "run/codex",
+        spool / ".agentic-session-store",
+    ):
+        assert json.dumps(str(broader)) not in overrides[0]
     assert "--add-dir" not in argv
     assert "danger-full-access" not in " ".join(argv)
     assert argv.index("-c") < argv.index("--")
+
+
+def _writable_roots(argv: list[str]) -> list[str]:
+    (value,) = [
+        argv[i + 1].removeprefix("sandbox_workspace_write.writable_roots=")
+        for i, arg in enumerate(argv)
+        if arg == "-c" and "writable_roots" in argv[i + 1]
+    ]
+    return json.loads(value)
+
+
+def _granted(environment, tmp_path) -> list[str]:
+    record, body = _argv_recorder(tmp_path)
+    _fake(environment, body)
+    result = subprocess.run(
+        _command(), env=environment, capture_output=True, timeout=10, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    return _writable_roots(json.loads(record.read_text()))
+
+
+def test_nested_partition_grants_its_own_claude_root(environment, tmp_path):
+    """Syntropic137 partitions are <execution>/<workspace>."""
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    (spool / "exec-1/ws-1/claude").mkdir(parents=True)
+    (spool / ".agentic-session-store/exec-1/ws-1").mkdir(parents=True)
+    environment["AGENTIC_SESSION_STORE_PARTITION"] = "exec-1/ws-1"
+    assert _granted(environment, tmp_path) == [
+        str(spool / ".agentic-session-store/exec-1/ws-1"),
+        str(spool / "exec-1/ws-1/claude"),
+    ]
+
+
+def test_symlinked_claude_root_is_not_granted(environment, tmp_path):
+    """A link could make another directory (here the Codex root) writable."""
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    (spool / "run/claude").rmdir()
+    (spool / "run/claude").symlink_to(spool / "run/codex")
+    assert _granted(environment, tmp_path) == [
+        str(spool / ".agentic-session-store/run")
+    ]
+
+
+def test_symlinked_partition_is_not_granted(environment, tmp_path):
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    (spool / "elsewhere/claude").mkdir(parents=True)
+    (spool / ".agentic-session-store/linked").mkdir(parents=True)
+    (spool / "linked").symlink_to(spool / "elsewhere")
+    environment["AGENTIC_SESSION_STORE_PARTITION"] = "linked"
+    assert _granted(environment, tmp_path) == [
+        str(spool / ".agentic-session-store/linked")
+    ]
+
+
+def test_missing_claude_root_is_not_granted(environment, tmp_path):
+    """The grant never makes a launch fail that worked without it."""
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    (spool / "run/claude").rmdir()
+    assert _granted(environment, tmp_path) == [
+        str(spool / ".agentic-session-store/run")
+    ]
+
+
+def test_dot_partition_claude_root_is_not_granted(environment, tmp_path):
+    """The AppArmor profile never admits a dot-led partition (it keeps the
+    metadata namespace out), so granting it would only refuse the launch."""
+    spool = Path(environment["AGENTIC_SESSION_STORE_SPOOL"]).resolve()
+    (spool / ".hidden/claude").mkdir(parents=True)
+    (spool / ".agentic-session-store/.hidden").mkdir(parents=True)
+    environment["AGENTIC_SESSION_STORE_PARTITION"] = ".hidden"
+    assert _granted(environment, tmp_path) == [
+        str(spool / ".agentic-session-store/.hidden")
+    ]
 
 
 def test_read_only_codex_gets_no_grant(environment, tmp_path):

@@ -87,6 +87,43 @@ so the rule decides only what a Codex sandbox may make writable inside it. `test
 this profile and fails under the previous one (the Codex delegate is refused
 with `codex_sandbox_unavailable`).
 
+**Claude transcript root (agentic-workspace#19).** `syn-delegate` also grants
+that delegate the partition's Claude transcript root
+`/spool/<partition>/claude`, so a Claude grandchild's own transcript is
+captured. The profile admits a bind of `/oldroot/spool/[^./]*/{,**/}claude/`
+(and below) to the same place, the `.git`/`.codex`/`.agents` masks in it and
+a read-write remount there. Partitions may be nested (Syntropic137 uses
+`<execution>/<workspace>`); the first segment never starts with a dot, so the
+metadata namespace is never matched. Measured on a GitHub `ubuntu-latest`
+runner in enforce mode with the pinned omni-agent image (codex-cli 0.156.1),
+2026-10-02:
+
+| Writable root | Previous profile | This profile |
+|---|---|---|
+| `/spool/run/claude` | denied (bind) | allowed |
+| `/spool/.agentic-session-store/run` + `/spool/run/claude` (the grant) | denied (bind of the claude root) | allowed |
+| `/spool/.agentic-session-store/exec/ws` + `/spool/exec/ws/claude` (nested) | denied | allowed |
+| `/spool/run/codex` | denied | denied |
+| `/spool/run`, `/spool/exec/ws` (partition roots) | denied | denied |
+| `/spool/.hidden/claude` (dot partition) | denied | denied |
+| `/spool`, `/spool/.agentic-session-store` | denied | denied |
+
+The same measurement found that the journal rule from #22 refused nested
+partitions: bwrap's `.git` mask lands at
+`/newroot/spool/.agentic-session-store/<execution>/<workspace>/.git`, which the
+single-level mask rule did not admit, so every workspace-write Codex delegate
+under a Syntropic137 partition was refused (`codex_sandbox_unavailable`). The
+journal mask rule now admits `*/{,**/}.{git,codex,agents}/`, matching its bind
+and remount rules.
+
+With the grant, writes to the Codex root and the partition root are still
+refused inside the sandbox. `test_pinned_depth_three.py` (all five cases,
+Claude -> Codex -> Claude on a nested partition, with writes to the spool
+root, partition root, Codex root and namespace asserted denied) passes under
+this profile; under the previous one the Codex delegate is refused.
+`syn-delegate` leaves the root out of the grant rather than refuse a launch
+when it is missing, symlinked or under a dot-led partition.
+
 AppArmor cannot say "source equals target", so the workspace bind rule allows
 any `/workspace` subdirectory onto any other; both sides stay inside the
 workspace the container can already write.
