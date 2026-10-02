@@ -75,7 +75,15 @@ omni-agent image (codex-cli 0.156.1), 2026-10-02:
 | none beyond `/workspace` | allowed | allowed |
 
 With the bind rule alone bwrap failed on the `.git` mask, which is why the
-mask rule is there. `test_pinned_depth_three.py` (all five cases) passed under
+mask rule is there.
+
+The rule admits any partition under the namespace, as the workspace rule
+admits any `/workspace` subdirectory: the profile is loaded once per host and
+cannot name a workspace's partition. `syn-delegate` grants only its own
+partition; a sandboxed process that called bubblewrap itself could ask for a
+sibling partition of the same `/spool`. That spool is the workspace's own
+capture volume, which its agent can already write outside any Codex sandbox,
+so the rule decides only what a Codex sandbox may make writable inside it. `test_pinned_depth_three.py` (all five cases) passed under
 this profile and fails under the previous one (the Codex delegate is refused
 with `codex_sandbox_unavailable`).
 
