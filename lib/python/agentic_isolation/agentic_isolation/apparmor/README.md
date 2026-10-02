@@ -46,8 +46,8 @@ workspace-shaped container (`/workspace` bind mount, `/spool`, `/var/agentic`,
 | staging | `rslave` on `/`; tmpfs on `/tmp/`; bind `/tmp/newroot/` onto itself; `pivot_root` into `/tmp/` |
 | sandbox tree | tmpfs on `/newroot/`; bind `/oldroot/` to `/newroot/`, or `/oldroot/usr/`, `usr/bin`, `usr/sbin`, `usr/lib`, `usr/lib64`, `etc` to their `/newroot/` names |
 | devices | tmpfs on `/newroot/dev/`; bind `null`, `zero`, `full`, `random`, `urandom`, `tty` each to itself; `devpts` on `/newroot/dev/pts/`; `proc` on `/newroot/proc/` |
-| writable roots | bind `/oldroot/tmp/`, the `codex-bwrap-synthetic-mount-targets-*` dir, and `/oldroot/workspace/...` to the same place under `/newroot/`; read-only tmpfs masks for `.git`, `.codex`, `.agents` in those roots and the `codex-daemon-*` dir |
-| remounts | read-only (three exact flag sets, all with `ro`) anywhere under `/newroot/`, which only narrows; read-write only on `/newroot/workspace/...` |
+| writable roots | bind `/oldroot/tmp/`, the `codex-bwrap-synthetic-mount-targets-*` dir, `/oldroot/workspace/...` and the child journal partition `/oldroot/spool/.agentic-session-store/*/...` to the same place under `/newroot/`; read-only tmpfs masks for `.git`, `.codex`, `.agents` in those roots and the `codex-daemon-*` dir |
+| remounts | read-only (three exact flag sets, all with `ro`) anywhere under `/newroot/`, which only narrows; read-write only on `/newroot/workspace/...` and the journal partition |
 | switch | `rprivate` on `/oldroot/`; final `pivot_root` into `/newroot/` |
 | explicit deny | `sysfs`, `cgroup`, `cgroup2`, `securityfs`, `debugfs`, `tracefs`, `bpf` filesystems; any bind from `/proc`, `/sys`, `/run`, `/var/run` (or their `/oldroot/` views); any bind of a `docker.sock`; a writable remount of `/newroot/{etc,usr,bin,sbin,lib,lib64,proc,sys,dev}` |
 
@@ -55,6 +55,37 @@ Consequence: Codex's working directory must be under `/workspace`
 (workspace-write binds it as a writable root). A Codex sandbox started from
 elsewhere is refused by the profile, and `syn-delegate`'s live probe reports
 that before launching.
+
+**Child journal partition (agentic-workspace#19).** `syn-delegate` gives a
+workspace-write Codex delegate one extra writable root, the child journal's
+partition directory `/spool/.agentic-session-store/<partition>/`, so the
+delegate can itself delegate. The profile admits exactly what bwrap does for
+it: a bind of `/oldroot/spool/.agentic-session-store/*/` (and below) to the
+same place under `/newroot/`, the `.git`/`.codex`/`.agents` tmpfs masks inside
+it, and a read-write remount there. The `*/` needs a partition component, so
+the spool root and the metadata namespace itself stay denied. Measured on a
+GitHub `ubuntu-latest` runner in enforce mode with the pinned
+omni-agent image (codex-cli 0.156.1), 2026-10-02:
+
+| Writable root | Previous profile | This profile |
+|---|---|---|
+| `/spool/.agentic-session-store/run` | denied (bind) | allowed |
+| `/spool` | denied | denied |
+| `/spool/.agentic-session-store` | denied | denied |
+| none beyond `/workspace` | allowed | allowed |
+
+With the bind rule alone bwrap failed on the `.git` mask, which is why the
+mask rule is there.
+
+The rule admits any partition under the namespace, as the workspace rule
+admits any `/workspace` subdirectory: the profile is loaded once per host and
+cannot name a workspace's partition. `syn-delegate` grants only its own
+partition; a sandboxed process that called bubblewrap itself could ask for a
+sibling partition of the same `/spool`. That spool is the workspace's own
+capture volume, which its agent can already write outside any Codex sandbox,
+so the rule decides only what a Codex sandbox may make writable inside it. `test_pinned_depth_three.py` (all five cases) passed under
+this profile and fails under the previous one (the Codex delegate is refused
+with `codex_sandbox_unavailable`).
 
 AppArmor cannot say "source equals target", so the workspace bind rule allows
 any `/workspace` subdirectory onto any other; both sides stay inside the

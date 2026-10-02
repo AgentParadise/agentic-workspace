@@ -123,3 +123,22 @@ def test_agent_modifiable_startup_variable_fails_even_if_harmless_now(
     environment[name] = str(rc)
     with pytest.raises(CaptureProbeError):
         probe_guard(HookHarness.CODEX, environment, shells=[("/bin/sh", "-c")])
+
+
+def test_missing_passwd_entry_is_a_probe_failure(monkeypatch):
+    """A container UID without a passwd entry must refuse, not crash after
+    the delegate registered its intent."""
+    import pwd
+
+    import pytest
+
+    from agentic_session_store.hook_command import HookHarness
+    from agentic_session_store.hook_probe import CaptureProbeError, hook_shells
+
+    def missing(_uid):
+        raise KeyError("getpwuid(): uid not found")
+
+    monkeypatch.setattr(pwd, "getpwuid", missing)
+    with pytest.raises(CaptureProbeError):
+        hook_shells(HookHarness.CODEX)
+    assert hook_shells(HookHarness.CLAUDE) == [("/bin/sh", "-c")]

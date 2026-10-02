@@ -157,8 +157,28 @@ performs, so Codex must run from a directory under `/workspace`. With both,
 `-s workspace-write` works as designed: writes inside the workspace succeed
 and writes outside it are denied.
 
-`syn-delegate codex` probes `codex sandbox -c 'sandbox_mode="<mode>"' -- true`
-live before every launch and refuses when it fails: it records `launch_failed`
+**Nested delegation.** A `workspace-write` delegate gets exactly two things
+beyond Codex's defaults, as `-c sandbox_workspace_write.*` overrides that
+replace any `CODEX_HOME` value: the retained child journal's partition
+directory as its one extra writable root, and `network_access = true` (egress
+is still the container's network policy). That is what lets the delegate run
+`syn-delegate` itself (Claude -> Codex -> Claude). Nothing else outside the
+working directory becomes writable, so:
+
+- A Claude grandchild runs and is recorded, but its own transcript is not
+  written (its transcript root is on the spool, outside the grant).
+- A Codex grandchild cannot start its sandbox (its `CODEX_HOME` is read-only),
+  so it is refused with `codex_sandbox_unavailable`.
+- A `read-only` delegate cannot write the journal at all. A `syn-delegate` it
+  runs starts nothing, exits 70, and prints an
+  `agentic-delegate-launch-denied/v1` line; the enclosing `syn-delegate` reads
+  that line from its child's output and records `launch_failed` with reason
+  `nested_journal_unavailable` under the Codex child, so the denial is a
+  visible gap, not silence.
+
+`syn-delegate codex` probes `codex sandbox` with the same mode and grant
+(writing inside the extra root) live before every launch and refuses when it
+fails: it records `launch_failed`
 with reason `codex_sandbox_unavailable` and exits 69, rather than running a
 Codex that cannot execute a single command. There is no status file to trust.
 The entrypoint logs the same probe at startup (`[entrypoint] codex sandbox:`)
@@ -294,6 +314,8 @@ the format section is what steers the output. See Trial T2.
 | `bwrap: Can't bind mount ... Permission denied` | Codex started outside `/workspace` on an AppArmor host | Run from a directory under `/workspace` |
 | `syn-delegate` exits 69, `launch_failed` / `codex_sandbox_unavailable` | The live probe found the Codex sandbox unusable | Same fixes; the stderr line names the bwrap cause |
 | `syn-delegate` exits 2, `--prompt: expected one argument` | Prompt starts with `-` | Use `--prompt="$TASK_PROMPT"` |
+| Nested `syn-delegate` exits 70, `agentic-delegate-launch-denied/v1` on stderr | Run inside a `read-only` delegate (journal not writable) | Delegate with `workspace-write` if the child must delegate further |
+| `syn-delegate claude` exits 69, `claude_nested_auth_unavailable` | Claude below a Claude Bash call with OAuth only | Supply `ANTHROPIC_API_KEY` or a credentials file, or delegate from Codex |
 | Command fails on a quirky local env (e.g. `pytest` exit 127 under pyenv) | Sandbox shell inherits host PATH quirks | Under `-s workspace-write` Codex often self-recovers (Trial T1); for wrappers, pre-set env via `-c shell_environment_policy...` |
 
 ## Trial T1 — empirical reference

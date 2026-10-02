@@ -51,7 +51,17 @@ results["staging bind newroot"] = mount("/tmp/newroot", "/tmp/newroot", None, MS
 os.chdir("/tmp")
 pivoted = libc.syscall(PIVOT_ROOT, b".", b"oldroot") == 0
 results["staging pivot_root"] = [pivoted, 0 if pivoted else ctypes.get_errno()]
-for path in ("p", "s", "c", "e", "etc", "workspace/etc", "workspace/w", "dev"):
+for path in (
+    "p",
+    "s",
+    "c",
+    "e",
+    "etc",
+    "workspace/etc",
+    "workspace/w",
+    "dev",
+    "spool/.agentic-session-store/run/.git",
+):
     os.makedirs(f"/newroot/{path}", exist_ok=True)
 open("/newroot/workspace/sock", "w").close()
 
@@ -64,6 +74,27 @@ checks = {
     "allowed: bind workspace": ("/oldroot/workspace/", "/newroot/workspace/w/", None, bind),
     "allowed: rw remount workspace": (None, "/newroot/workspace/w/", None, remount),
     "allowed: tmpfs dev": ("tmpfs", "/newroot/dev/", "tmpfs", MS_NOSUID | MS_NODEV),
+    # syn-delegate's extra writable root: the child journal partition. Codex
+    # masks .git/.codex/.agents in every writable root, present or not (the
+    # mask goes first here, while its target is still on this tmpfs).
+    "allowed: tmpfs mask in journal partition": (
+        "tmpfs",
+        "/newroot/spool/.agentic-session-store/run/.git/",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+    ),
+    "allowed: bind journal partition": (
+        "/oldroot/spool/.agentic-session-store/run/",
+        "/newroot/spool/.agentic-session-store/run/",
+        None,
+        bind,
+    ),
+    "allowed: rw remount journal partition": (
+        None,
+        "/newroot/spool/.agentic-session-store/run/",
+        None,
+        remount,
+    ),
     # sensitive: expected denied
     "denied: bind proc": ("/oldroot/proc/", "/newroot/p/", None, bind),
     "denied: bind sys": ("/oldroot/sys/", "/newroot/s/", None, bind),
@@ -79,6 +110,19 @@ checks = {
         bind,
     ),
     "denied: bind dev": ("/oldroot/dev/", "/newroot/e/", None, bind),
+    "denied: bind spool root": ("/oldroot/spool/", "/newroot/spool/", None, bind),
+    "denied: bind journal namespace": (
+        "/oldroot/spool/.agentic-session-store/",
+        "/newroot/spool/.agentic-session-store/",
+        None,
+        bind,
+    ),
+    "denied: bind journal partition elsewhere": (
+        "/oldroot/spool/.agentic-session-store/run/",
+        "/newroot/e/",
+        None,
+        bind,
+    ),
     "denied: tmpfs elsewhere": ("tmpfs", "/newroot/e/", "tmpfs", MS_NOSUID | MS_NODEV),
     "denied: rw remount etc": (None, "/newroot/etc/", None, remount),
     "denied: rw remount proc": (None, "/newroot/p/", None, remount),

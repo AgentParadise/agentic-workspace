@@ -95,7 +95,13 @@ def without_untrusted_startup(environment: Mapping[str, str]) -> dict[str, str]:
 def hook_shells(harness: HookHarness) -> list[tuple[str, ...]]:
     if harness is HookHarness.CLAUDE:
         return [("/bin/sh", "-c")]
-    return [(pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh", "-c")]
+    try:
+        entry = pwd.getpwuid(os.getuid())
+    except KeyError:
+        # Codex runs hooks through the passwd shell; without an entry the
+        # shell it would use is unknown, so the guard is not proven reachable.
+        raise CaptureProbeError("No passwd entry for the current user") from None
+    return [(entry.pw_shell or "/bin/sh", "-c")]
 
 
 def _run(
