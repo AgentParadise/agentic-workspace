@@ -169,12 +169,20 @@ RUN find / -path /usr/local -prune -o -path /proc -prune -o -perm /6000 -type f 
 # The assertion is the point. A chown alone fixes today's instance; the test
 # makes the next root-section write fail the build instead of shipping a latent
 # image. Any image that adds `USER root` needs this pair before `USER agent`.
+# `set -eu` and the temp file are deliberate. Piping find into `grep -q` would
+# report only GREP's status, so a find that errors part way (and prints nothing)
+# would look identical to a clean home and pass the gate silently. Under -e a
+# failing find aborts the build instead, which is the fail-closed direction.
 RUN chown -R agent:agent /home/agent \
-    && if find /home/agent ! -user agent -print -quit | grep -q .; then \
+    && set -eu; \
+       bad=/tmp/home-ownership-violations; \
+       find /home/agent ! -user agent -printf '  %u %p\n' > "$bad"; \
+       if [ -s "$bad" ]; then \
          echo "ERROR: root-owned paths remain under /home/agent:" >&2; \
-         find /home/agent ! -user agent -printf '  %u %p\n' >&2; \
+         cat "$bad" >&2; \
          exit 1; \
-       fi
+       fi; \
+       rm -f "$bad"
 
 USER agent
 WORKDIR /workspace
