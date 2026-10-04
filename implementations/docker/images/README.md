@@ -12,6 +12,27 @@ Pre-configured Docker images for running AI agents in isolated environments.
 | `toolchain` | `omni-agent` plus a native toolchain: build-essential, pkg-config, unzip, rustup (no toolchain; the repo's `rust-toolchain.toml` installs one on first use), pnpm via corepack, bun. Tool homes live under `/workspace/.tools`, cargo jobs follow the CPU quota. Built FROM an omni digest; compile smoke in [`toolchain/smoke/`](./toolchain/smoke/run.sh). | ✅ (inherited) |
 | `base` | Minimal secure base (no agent) | N/A |
 
+## Browser QA
+
+`claude-cli`, `omni-agent` and `toolchain` (inherited) ship a headless browser
+so an agent can check a UI change with a real screenshot. The agent runs
+without root, so it cannot install these itself:
+
+- Playwright CLI `1.63.0`, exact-pinned, on `PATH`
+- Chromium's system libraries (`playwright install --with-deps`)
+- Chromium headless shell in `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`
+
+```bash
+npx playwright screenshot --browser chromium http://localhost:5173 out.png
+```
+
+This works offline. A repository that depends on a different `playwright` or
+`@playwright/test` version expects a different browser revision and will not
+find it here, so pin `1.63.0` to reuse the baked browser. There is no headed
+Chromium, Firefox or WebKit. Proven in the built image, as the agent user with
+`--network none`, by
+[`tests/integration/test_browser_qa.py`](../../../tests/integration/test_browser_qa.py).
+
 ## Published Images
 
 Release builds are published only from the protected `release` branch, signed

@@ -19,6 +19,7 @@ The omni case carries "omni" in its id so the release workflow's
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -74,7 +75,11 @@ PY
 
 
 def _available(image: str) -> bool:
-    r = subprocess.run(["docker", "image", "inspect", image], capture_output=True)
+    if shutil.which("docker") is None:
+        return False
+    r = subprocess.run(
+        ["docker", "image", "inspect", image], capture_output=True, check=False
+    )
     return r.returncode == 0
 
 
@@ -100,6 +105,7 @@ def test_agent_can_screenshot_a_local_page_offline(image: str):
         capture_output=True,
         text=True,
         timeout=180,
+        check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "BROWSER_QA_PASS" in result.stdout, result.stdout + result.stderr
