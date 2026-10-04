@@ -44,6 +44,9 @@ ARG CLAUDE_CLI_VERSION=2.1.126
 ARG CODEX_CLI_VERSION=0.144.6
 # Keep this aligned with Agentic Skills' validated installer contract.
 ARG SKILLS_CLI_VERSION=1.7.0
+# Playwright CLI for headless browser QA. Exact pin: the CLI version decides
+# which browser revision it launches, and the image bakes exactly that one.
+ARG PLAYWRIGHT_VERSION=1.63.0
 
 # =============================================================================
 # Stage 1: Node.js base with system dependencies
@@ -137,6 +140,39 @@ RUN for bin in claude codex; do \
 ARG SKILLS_CLI_VERSION
 RUN npm install -g skills@${SKILLS_CLI_VERSION} \
     && test "$(skills --version)" = "${SKILLS_CLI_VERSION}"
+
+# =============================================================================
+# Headless browser for UI QA (syntropic137/syntropic137#1028)
+# =============================================================================
+# WHY THIS IS HERE. Agents validate UI changes by rendering them and taking a
+# screenshot. They run as uid 1000 with no root and no apt lists, so they
+# cannot install Chromium's ~20 shared libraries (libnss3, libgbm1,
+# libasound2, libatk1.0-0, libxkbcommon0, ...) at run time. A May probe
+# needed a 40s .deb-extraction hack to get past that.
+#
+# WHAT. The Playwright CLI, exact-pinned and on PATH (so `npx playwright`
+# resolves it with no network), Chromium's system libraries via --with-deps,
+# and the headless shell only. `playwright screenshot` and every headless
+# launch use the headless shell; full Chromium is only for headed mode,
+# which a workspace has no display for, and would add ~170 MB.
+#
+# WHERE. A fixed, root-owned, world-readable PLAYWRIGHT_BROWSERS_PATH, not
+# ~/.cache: $HOME is a tmpfs at run time and would hide anything baked there.
+# A repository that depends on a DIFFERENT playwright version expects a
+# different browser revision and will not find it here; pin to this version
+# to reuse the baked browser.
+#
+# ASSERT THE VERSION, as for skills above, so a moved pin cannot ship a
+# different CLI than the one whose browser revision was installed.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+ARG PLAYWRIGHT_VERSION
+RUN npm install -g playwright@${PLAYWRIGHT_VERSION} \
+    && test "$(playwright --version)" = "Version ${PLAYWRIGHT_VERSION}" \
+    && playwright install --with-deps --only-shell chromium \
+    && chmod -R a+rX "${PLAYWRIGHT_BROWSERS_PATH}" \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && npm cache clean --force
 
 # =============================================================================
 # LSP: Language Servers for code intelligence
