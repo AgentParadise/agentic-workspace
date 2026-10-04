@@ -38,6 +38,21 @@ ARG CLAUDE_CLI_VERSION=2.1.281
 ARG CODEX_CLI_VERSION=0.156.1
 # Keep this aligned with Agentic Skills' validated installer contract.
 ARG SKILLS_CLI_VERSION=1.7.0
+# Playwright CLI for headless browser QA. Exact pin: the CLI version decides
+# which browser revision it launches, and the image bakes exactly that one.
+ARG PLAYWRIGHT_VERSION=1.63.0
+# The archives that Playwright version downloads: revision, browser version
+# and a sha256 per architecture, verified before unpacking. They move
+# with PLAYWRIGHT_VERSION: the build checks them against that version's own
+# install plan and fails if they disagree. How the digests were obtained is
+# in the browser install layer below.
+ARG PLAYWRIGHT_HEADLESS_SHELL_REVISION=1243
+ARG PLAYWRIGHT_HEADLESS_SHELL_VERSION=153.0.8010.12
+ARG PLAYWRIGHT_HEADLESS_SHELL_SHA256_AMD64=a9da028861a0cf789ff25c2fed45f5f1aaf969ed9247835b6a7821a4f7af9d1d
+ARG PLAYWRIGHT_HEADLESS_SHELL_SHA256_ARM64=d433c45172c7836e38124fe545f767b02210bfb43a6262f08a297473a8e91c99
+ARG PLAYWRIGHT_FFMPEG_REVISION=1011
+ARG PLAYWRIGHT_FFMPEG_SHA256_AMD64=ebc74fc5b94830176a3c2914ae96bd8bc7f6a91f4f33890230f84a172ee61ccc
+ARG PLAYWRIGHT_FFMPEG_SHA256_ARM64=2628c03f05318ff812c8c9baaf207dea2ddf53e818c0dc936714b0fbe3afb009
 # The `just` command runner. Pinned like the harnesses above; `latest` would
 # silently change between builds. Bump deliberately, and update the two
 # SHA256 pins in the install layer at the same time - they are per-version.
@@ -202,6 +217,133 @@ ARG SKILLS_CLI_VERSION
 RUN npm install -g skills@${SKILLS_CLI_VERSION} \
     && test "$(skills --version)" = "${SKILLS_CLI_VERSION}" \
     && npm cache clean --force
+
+# =============================================================================
+# Headless browser for UI QA (syntropic137/syntropic137#1028)
+# =============================================================================
+# WHY THIS IS HERE. Agents validate UI changes by rendering them and taking a
+# screenshot. They run as uid 1000 with no root and no apt lists, so they
+# cannot install Chromium's shared libraries (libnss3, libgbm1, libasound2,
+# libatk1.0-0, libxkbcommon0, ...) at run time. A May probe needed a 40s
+# .deb-extraction hack to get past that.
+#
+# WHAT. The Playwright CLI, exact-pinned and on PATH (so `npx playwright`
+# resolves it with no network), and the Chromium headless shell only.
+# `playwright screenshot` and every headless launch use the headless shell;
+# full Chromium is for headed mode, which a workspace has no display for.
+#
+# WHY NOT --with-deps. It also installs Playwright's "tools" set (xvfb and
+# CJK/emoji fonts), and xvfb drags in mesa and libllvm15: ~312 MiB of apt
+# packages on bookworm against ~40 MiB for the list below, which is
+# Playwright 1.63's own debian12 chromium list plus one Latin font so text
+# renders. The ldd check after the browser install is what keeps this list
+# honest: a Playwright bump that needs a library missing here fails the build
+# instead of shipping a browser that cannot start.
+#
+# WHERE. A fixed, root-owned, world-readable PLAYWRIGHT_BROWSERS_PATH, not
+# ~/.cache: $HOME is a tmpfs at run time and would hide anything baked there.
+# A repository that depends on a DIFFERENT playwright version expects a
+# different browser revision and will not find it here; pin to this version
+# to reuse the baked browser.
+#
+# ASSERT THE VERSION, as for skills above, so a moved pin cannot ship a
+# different CLI than the one whose browser revision was installed.
+#
+# WHY NOT `playwright install`. It downloads executables (the headless shell
+# and ffmpeg, which `--only-shell chromium` also pulls in for video capture)
+# and checks no digest. So the layer fetches the same archives itself and
+# runs `sha256sum -c` BEFORE unpacking, as for `just`: a checksum taken after
+# extraction has already run the risk it exists to prevent. It then lays them
+# out exactly as Playwright would (<name>-<revision>/ under
+# PLAYWRIGHT_BROWSERS_PATH plus the INSTALLATION_COMPLETE marker), so
+# `npx playwright` finds them offline. Playwright's own
+# `install --dry-run` plan is the reference: each pinned URL and directory
+# must appear in it verbatim, so a PLAYWRIGHT_VERSION bump that moves the
+# browser fails here until the pins move with it. The closing
+# `playwright install`, pointed at a dead download host, writes Playwright's
+# registry entry (.links/, which `install --list` and browser GC read) over
+# the verified bytes; it fails the build rather than download anything
+# those bytes did not already satisfy.
+#
+# WHERE THE DIGESTS COME FROM. Each archive was downloaded from the URL the
+# dry-run plan names, and from a second, independent origin (Google's
+# chrome-for-testing-public bucket for the shell; Playwright's Microsoft
+# ESRP mirror for ffmpeg). Both copies hashed identically, and the shell
+# archives also matched the MD5 Google's bucket publishes for them.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libatspi2.0-0 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libgbm1 \
+    libglib2.0-0 \
+    libnspr4 \
+    libnss3 \
+    libpango-1.0-0 \
+    libx11-6 \
+    libxcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    fonts-liberation \
+    unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+ARG PLAYWRIGHT_VERSION
+ARG PLAYWRIGHT_HEADLESS_SHELL_REVISION
+ARG PLAYWRIGHT_HEADLESS_SHELL_VERSION
+ARG PLAYWRIGHT_HEADLESS_SHELL_SHA256_AMD64
+ARG PLAYWRIGHT_HEADLESS_SHELL_SHA256_ARM64
+ARG PLAYWRIGHT_FFMPEG_REVISION
+ARG PLAYWRIGHT_FFMPEG_SHA256_AMD64
+ARG PLAYWRIGHT_FFMPEG_SHA256_ARM64
+RUN set -eux; \
+    npm install -g playwright@${PLAYWRIGHT_VERSION}; \
+    test "$(playwright --version)" = "Version ${PLAYWRIGHT_VERSION}"; \
+    arch="$(dpkg --print-architecture)"; \
+    case "${arch}" in \
+      amd64) shell_platform="linux64"; ffmpeg_zip="ffmpeg-linux.zip"; \
+             shell_sha256="${PLAYWRIGHT_HEADLESS_SHELL_SHA256_AMD64}"; \
+             ffmpeg_sha256="${PLAYWRIGHT_FFMPEG_SHA256_AMD64}" ;; \
+      arm64) shell_platform="linux-arm64"; ffmpeg_zip="ffmpeg-linux-arm64.zip"; \
+             shell_sha256="${PLAYWRIGHT_HEADLESS_SHELL_SHA256_ARM64}"; \
+             ffmpeg_sha256="${PLAYWRIGHT_FFMPEG_SHA256_ARM64}" ;; \
+      *) echo "unsupported architecture for the Playwright browser: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    plan="$(playwright install --dry-run --only-shell chromium | tr -s ' ')"; \
+    install_verified() { \
+      dir="${PLAYWRIGHT_BROWSERS_PATH}/$1"; url="$2"; \
+      printf '%s\n' "${plan}" | grep -qxF " Install location: ${dir}" \
+        || { echo "playwright ${PLAYWRIGHT_VERSION} does not install to ${dir}" >&2; exit 1; }; \
+      printf '%s\n' "${plan}" | grep -qxF " Download url: ${url}" \
+        || { echo "playwright ${PLAYWRIGHT_VERSION} does not download ${url}" >&2; exit 1; }; \
+      curl --fail --retry 3 -sSL -o /tmp/playwright-archive.zip "${url}"; \
+      echo "$3  /tmp/playwright-archive.zip" | sha256sum -c -; \
+      mkdir -p "${dir}"; \
+      unzip -q /tmp/playwright-archive.zip -d "${dir}"; \
+      rm /tmp/playwright-archive.zip; \
+      touch "${dir}/INSTALLATION_COMPLETE"; \
+    }; \
+    install_verified "chromium_headless_shell-${PLAYWRIGHT_HEADLESS_SHELL_REVISION}" \
+      "https://cdn.playwright.dev/builds/cft/${PLAYWRIGHT_HEADLESS_SHELL_VERSION}/${shell_platform}/chrome-headless-shell-${shell_platform}.zip" \
+      "${shell_sha256}"; \
+    install_verified "ffmpeg-${PLAYWRIGHT_FFMPEG_REVISION}" \
+      "https://cdn.playwright.dev/dbazure/download/playwright/builds/ffmpeg/${PLAYWRIGHT_FFMPEG_REVISION}/${ffmpeg_zip}" \
+      "${ffmpeg_sha256}"; \
+    PLAYWRIGHT_DOWNLOAD_HOST=http://127.0.0.1:9 playwright install --only-shell chromium; \
+    chmod -R a+rX,go-w "${PLAYWRIGHT_BROWSERS_PATH}"; \
+    shell="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -type f -name chrome-headless-shell)"; \
+    test -x "${shell}"; \
+    if ldd "${shell}" | grep 'not found'; then exit 1; fi; \
+    npm cache clean --force
 
 # =============================================================================
 # RTK: bash output compression (ADR-056)
