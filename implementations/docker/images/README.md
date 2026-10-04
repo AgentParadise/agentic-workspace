@@ -19,7 +19,7 @@ so an agent can check a UI change with a real screenshot. The agent runs
 without root, so it cannot install these itself:
 
 - Playwright CLI `1.63.0`, exact-pinned, on `PATH`
-- Chromium's system libraries (`playwright install --with-deps`)
+- Chromium's system libraries (Playwright's debian12 chromium list, no xvfb)
 - Chromium headless shell in `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`
 
 ```bash

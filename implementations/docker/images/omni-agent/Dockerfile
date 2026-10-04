@@ -211,15 +211,22 @@ RUN npm install -g skills@${SKILLS_CLI_VERSION} \
 # =============================================================================
 # WHY THIS IS HERE. Agents validate UI changes by rendering them and taking a
 # screenshot. They run as uid 1000 with no root and no apt lists, so they
-# cannot install Chromium's ~20 shared libraries (libnss3, libgbm1,
-# libasound2, libatk1.0-0, libxkbcommon0, ...) at run time. A May probe
-# needed a 40s .deb-extraction hack to get past that.
+# cannot install Chromium's shared libraries (libnss3, libgbm1, libasound2,
+# libatk1.0-0, libxkbcommon0, ...) at run time. A May probe needed a 40s
+# .deb-extraction hack to get past that.
 #
 # WHAT. The Playwright CLI, exact-pinned and on PATH (so `npx playwright`
-# resolves it with no network), Chromium's system libraries via --with-deps,
-# and the headless shell only. `playwright screenshot` and every headless
-# launch use the headless shell; full Chromium is only for headed mode,
-# which a workspace has no display for, and would add ~170 MB.
+# resolves it with no network), and the Chromium headless shell only.
+# `playwright screenshot` and every headless launch use the headless shell;
+# full Chromium is for headed mode, which a workspace has no display for.
+#
+# WHY NOT --with-deps. It also installs Playwright's "tools" set (xvfb and
+# CJK/emoji fonts), and xvfb drags in mesa and libllvm15: ~312 MiB of apt
+# packages on bookworm against ~40 MiB for the list below, which is
+# Playwright 1.63's own debian12 chromium list plus one Latin font so text
+# renders. The ldd check after the browser install is what keeps this list
+# honest: a Playwright bump that needs a library missing here fails the build
+# instead of shipping a browser that cannot start.
 #
 # WHERE. A fixed, root-owned, world-readable PLAYWRIGHT_BROWSERS_PATH, not
 # ~/.cache: $HOME is a tmpfs at run time and would hide anything baked there.
@@ -229,15 +236,42 @@ RUN npm install -g skills@${SKILLS_CLI_VERSION} \
 #
 # ASSERT THE VERSION, as for skills above, so a moved pin cannot ship a
 # different CLI than the one whose browser revision was installed.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libatspi2.0-0 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libgbm1 \
+    libglib2.0-0 \
+    libnspr4 \
+    libnss3 \
+    libpango-1.0-0 \
+    libx11-6 \
+    libxcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    fonts-liberation \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 ARG PLAYWRIGHT_VERSION
-RUN npm install -g playwright@${PLAYWRIGHT_VERSION} \
-    && test "$(playwright --version)" = "Version ${PLAYWRIGHT_VERSION}" \
-    && playwright install --with-deps --only-shell chromium \
-    && chmod -R a+rX "${PLAYWRIGHT_BROWSERS_PATH}" \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean \
-    && npm cache clean --force
+RUN set -eux; \
+    npm install -g playwright@${PLAYWRIGHT_VERSION}; \
+    test "$(playwright --version)" = "Version ${PLAYWRIGHT_VERSION}"; \
+    playwright install --only-shell chromium; \
+    chmod -R a+rX "${PLAYWRIGHT_BROWSERS_PATH}"; \
+    shell="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -type f -name chrome-headless-shell)"; \
+    test -x "${shell}"; \
+    if ldd "${shell}" | grep 'not found'; then exit 1; fi; \
+    npm cache clean --force
 
 # =============================================================================
 # RTK: bash output compression (ADR-056)
