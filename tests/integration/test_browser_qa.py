@@ -44,6 +44,13 @@ fail() { echo "BROWSER_QA_FAIL: $*" >&2; exit 1; }
 [ "$(id -u)" = 1000 ] || fail "running as uid $(id -u), not the agent"
 [ "$(npx --no-install playwright --version)" = "Version ${EXPECTED_PLAYWRIGHT}" ] \
   || fail "npx playwright is not the pinned ${EXPECTED_PLAYWRIGHT}"
+[ "$(stat -c %u "${PLAYWRIGHT_BROWSERS_PATH}")" = 0 ] \
+  || fail "${PLAYWRIGHT_BROWSERS_PATH} is not root-owned"
+[ -z "$(find "${PLAYWRIGHT_BROWSERS_PATH}" -writable -print -quit)" ] \
+  || fail "the agent can write under ${PLAYWRIGHT_BROWSERS_PATH}"
+npx --no-install playwright install --list \
+  | grep -qF "${PLAYWRIGHT_BROWSERS_PATH}/chromium_headless_shell-" \
+  || fail "Playwright's registry does not list the baked headless shell"
 
 site="$(mktemp -d)"
 printf '<body style="margin:0;background:#d01010"><h1>red</h1></body>' > "$site/red.html"

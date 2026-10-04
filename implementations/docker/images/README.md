@@ -20,7 +20,9 @@ without root, so it cannot install these itself:
 
 - Playwright CLI `1.63.0`, exact-pinned, on `PATH`
 - Chromium's system libraries (Playwright's debian12 chromium list, no xvfb)
-- Chromium headless shell in `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`
+- Chromium headless shell in `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`,
+  root-owned, fetched from a pinned URL and checked against a per-architecture
+  sha256 before unpacking (the `PLAYWRIGHT_*_SHA256_*` build args)
 
 ```bash
 npx playwright screenshot --browser chromium http://localhost:5173 out.png
