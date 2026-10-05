@@ -4,7 +4,7 @@
 # See ADR-027: Provider-Based Workspace Images
 
 name: claude-cli
-version: "2.1.9"
+version: "2.2.0"
 description: Claude CLI workspace with native OpenTelemetry support
 
 # Workspace capability modules (ADR-040)
@@ -117,6 +117,15 @@ capabilities:
       version: "3.12"
     - name: rust
       version: stable
+
+  tools:
+    # Headless browser QA (syntropic137/syntropic137#1028). Pinned Playwright
+    # CLI, Chromium's system libraries and the headless shell, baked into
+    # PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright. Proven offline as the agent
+    # by tests/integration/test_browser_qa.py.
+    - name: playwright
+      version: "1.63.0"
+      browsers: [chromium-headless-shell]
 
 # Health check configuration
 health:
