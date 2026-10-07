@@ -1,5 +1,5 @@
 """Shell startup files cannot preempt the capture guard, against pinned
-Claude Code 2.1.281 and Codex 0.160.1 (syntropic137#1398).
+Claude Code 2.1.293 and Codex 0.160.1 (syntropic137#1398).
 
 Codex runs hooks with the passwd shell and ``-c`` (``/bin/bash -c`` in the
 image); Claude runs ``/bin/sh -c``. A non-interactive ``bash -c`` reads only
