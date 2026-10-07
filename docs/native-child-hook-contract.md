@@ -719,3 +719,29 @@ the matching test.
 - **Root Codex in Syntropic137.** A root Codex phase at `workspace-write`
   needs the same grant for its own nested `syn-delegate`; Syntropic137 builds
   that command itself.
+
+
+## Re-verification at Codex 0.160.1, 2026-10-06 UTC
+
+The omni-agent and claude-cli images moved to Codex 0.160.1 (Claude Code is
+unchanged). Sections above that name 0.156.1 record what was observed there
+and are kept as history.
+
+All nine pinned modules (`test_pinned_codex_hooks.py`, `_codex_child`,
+`_claude_child`, `_cross_harness`, `_fail_closed`, `_degraded_launch`,
+`_shell_startup`, `_codex_sandbox_mode` and `_depth_three`, all five cases)
+passed against the real binaries in a locally built omni-agent image
+(linux/arm64, Docker Desktop, so seccomp only, no AppArmor), in a
+network-disabled container with the Codex sandbox seccomp profile and no
+credentials. `test_pinned_codex_hooks.py` reads the trust hashes through the
+0.160.1 `hooks/list` API and they still report `trusted`, so `CAPTURE_HASHES`
+is unchanged.
+
+Upstream changes between `rust-v0.156.1` and `rust-v0.160.1` that touch this
+contract: `codex-rs/linux-sandbox` now also masks `.aws` in every writable
+root (openai/codex#48176), which the AppArmor profile had to admit (see
+`agentic_isolation/apparmor/README.md`); `SessionMeta` gained two optional
+creator fields (see `native-session-evidence.md`). The AppArmor half is
+verified in enforce mode by the release workflow's Integration Gate, which now
+runs `test_codex_sandbox_seccomp.py` against the built image with the profile
+loaded.

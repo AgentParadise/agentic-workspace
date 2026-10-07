@@ -59,8 +59,10 @@ for path in (
     "etc",
     "workspace/etc",
     "workspace/w",
+    "workspace/w/.aws",
     "dev",
     "spool/.agentic-session-store/run/.git",
+    "spool/.agentic-session-store/run/.aws",
     "spool/run/claude/.git",
     "spool/run/codex",
     "spool/exec/ws/claude/.git",
@@ -74,6 +76,14 @@ bind = MS_BIND | MS_REC
 remount = MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV | MS_SILENT | MS_RELATIME
 checks = {
     # bwrap-shaped: expected allowed
+    # codex-cli 0.160.1 also masks .aws in every writable root (openai/codex
+    # #48176). The mask goes first, while its target is on this tmpfs.
+    "allowed: tmpfs aws mask in workspace": (
+        "tmpfs",
+        "/newroot/workspace/w/.aws/",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+    ),
     "allowed: bind etc": ("/oldroot/etc/", "/newroot/etc/", None, bind),
     "allowed: ro remount etc": (None, "/newroot/etc/", None, remount | MS_RDONLY),
     "allowed: bind workspace": ("/oldroot/workspace/", "/newroot/workspace/w/", None, bind),
@@ -85,6 +95,12 @@ checks = {
     "allowed: tmpfs mask in journal partition": (
         "tmpfs",
         "/newroot/spool/.agentic-session-store/run/.git/",
+        "tmpfs",
+        MS_NOSUID | MS_NODEV,
+    ),
+    "allowed: tmpfs aws mask in journal partition": (
+        "tmpfs",
+        "/newroot/spool/.agentic-session-store/run/.aws/",
         "tmpfs",
         MS_NOSUID | MS_NODEV,
     ),

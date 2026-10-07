@@ -35,7 +35,7 @@
 # Stages that need these must re-declare `ARG <name>` without a default.
 # Both harnesses are pinned; bump deliberately.
 ARG CLAUDE_CLI_VERSION=2.1.281
-ARG CODEX_CLI_VERSION=0.156.1
+ARG CODEX_CLI_VERSION=0.160.1
 # Keep this aligned with Agentic Skills' validated installer contract.
 ARG SKILLS_CLI_VERSION=1.7.0
 # Playwright CLI for headless browser QA. Exact pin: the CLI version decides

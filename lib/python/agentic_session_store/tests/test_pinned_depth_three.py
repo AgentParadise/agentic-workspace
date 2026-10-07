@@ -345,7 +345,7 @@ def _codex_sessions(layout: Layout) -> set[str]:
 def _check_versions() -> None:
     for binary, version in (
         (CLAUDE, "2.1.281 (Claude Code)"),
-        (CODEX, "codex-cli 0.156.1"),
+        (CODEX, "codex-cli 0.160.1"),
     ):
         assert (
             subprocess.check_output([binary or "", "--version"], text=True).strip()

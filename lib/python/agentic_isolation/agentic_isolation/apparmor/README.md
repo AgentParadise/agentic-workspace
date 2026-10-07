@@ -159,3 +159,22 @@ example a remote daemon) the option is still passed and Docker's own
 
 No capabilities are added, `apparmor=unconfined` is never used, and host
 sysctls such as `kernel.apparmor_restrict_unprivileged_userns` are left alone.
+
+### codex-cli 0.160.1: the `.aws` mask
+
+codex-cli 0.160.1 protects `.aws` in every writable root alongside `.git`,
+`.codex` and `.agents` (openai/codex#48176, `codex-rs/linux-sandbox/src/bwrap.rs`),
+with the same read-only tmpfs mask, present or not. Under the 0.156.1 profile
+that mount matches no rule, so bwrap fails and every Codex sandbox on an
+AppArmor host is refused. The three mask rules now admit
+`.{git,codex,agents,aws}`; nothing else changed. The mount probe
+(`implementations/docker/tests/fixtures/mount_policy_probe.py`) asserts the
+`.aws` mask in a workspace root and a journal partition, and the release
+Integration Gate runs `tests/integration/test_codex_sandbox_seccomp.py`
+(including a write into `/workspace/.aws` that must be refused) against the
+built image in enforce mode.
+
+The change only widens what the profile admits, so a host can load it before
+its workspaces move to a 0.160.1 image. Load it before, never after: a
+0.160.1 image on a host still running the old profile cannot start a Codex
+sandbox.

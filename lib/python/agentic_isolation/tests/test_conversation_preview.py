@@ -3,8 +3,8 @@
 Claude fixtures mirror row shapes counted in real Claude Code 2.1.x transcripts
 (attachment/system/summary rows, isMeta and isCompactSummary user rows,
 tool_result user rows, thinking/tool_use assistant blocks, origin.kind). The
-Codex fixture is a REAL codex-cli 0.156.1 rollout generated offline by
-tests/fixtures/generate_codex_rollout.py.
+Codex fixtures are REAL codex-cli 0.156.1 and 0.160.1 rollouts generated offline
+by tests/fixtures/generate_codex_rollout.py.
 """
 
 from __future__ import annotations
@@ -123,8 +123,10 @@ def test_claude_child_transcript_previews_its_sidechain_rows() -> None:
     ]
 
 
-def test_real_codex_0_156_1_rollout_shows_only_the_human_turns() -> None:
-    content = (FIXTURES / "codex_rollout_0.156.1.jsonl").read_bytes()
+# 0.156.1 is what older stored sessions carry; 0.160.1 is the pinned binary.
+@pytest.mark.parametrize("version", ["0.156.1", "0.160.1"])
+def test_real_codex_rollout_shows_only_the_human_turns(version: str) -> None:
+    content = (FIXTURES / f"codex_rollout_{version}.jsonl").read_bytes()
     assert b"SECRET_REASONING" in content and b"TOOL_OUTPUT_SECRET" in content  # hazard present
     assert b"environment_context" in content  # injected user response_item present
     preview = CodexConversationReader().conversation(content)
