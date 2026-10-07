@@ -27,7 +27,7 @@ ENABLED = os.environ.get("CLAUDE_NATIVE_TEST_BINARY") and os.environ.get(
 @unittest.skipUnless(ENABLED, "Set both pinned native test binaries")
 def test_real_cross_harness_depth_three(tmp_path):
     for binary, version in (
-        ("claude", "2.1.281 (Claude Code)"),
+        ("claude", "2.1.293 (Claude Code)"),
         ("codex", "codex-cli 0.160.1"),
     ):
         assert (

@@ -38,7 +38,7 @@
 # pull the value in. Bump deliberately — controls JSONL output contract,
 # tool names (Agent vs Task), stream-json event schema, hook event names.
 # See ClaudeToolName in agentic_events.types.
-ARG CLAUDE_CLI_VERSION=2.1.126
+ARG CLAUDE_CLI_VERSION=2.1.293
 # Codex CLI is installed alongside claude so a phase's primary agent can
 # delegate one-shot to the other harness (opt-in via agent.allow_delegation).
 ARG CODEX_CLI_VERSION=0.160.1

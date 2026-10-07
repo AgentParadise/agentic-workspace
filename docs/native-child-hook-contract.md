@@ -46,7 +46,7 @@ alter the capture contract below.
 
 ## Claude Code
 
-Workspace pin: 2.1.281. Current official
+Workspace pin: 2.1.293. Current official
 [hook reference](https://code.claude.com/docs/en/hooks) documents `agent_id` for
 SubagentStop, distinct from the parent `session_id`. The workspace stop handler
 now preserves this field, with the old `subagent_id` adapter spelling as a
