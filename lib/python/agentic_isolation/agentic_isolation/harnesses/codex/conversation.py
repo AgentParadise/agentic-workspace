@@ -6,7 +6,8 @@ generated offline) the ``response_item`` user messages include injected
 ``<environment_context>`` and the developer/skills instructions, none of which a
 human saw. ALLOWLIST:
 
-* 0.156.x: ``event_msg`` / ``item_completed`` whose ``item.type`` is
+* 0.156.x and 0.160.x (``codex_rollout_0.160.1.jsonl`` has the same row and
+  item shapes): ``event_msg`` / ``item_completed`` whose ``item.type`` is
   ``UserMessage`` (read ``text`` parts) or ``AgentMessage`` (read ``Text``
   parts). Items are de-duplicated by ``item.id``.
 * earlier rollouts: ``event_msg`` / ``user_message`` and ``agent_message`` with

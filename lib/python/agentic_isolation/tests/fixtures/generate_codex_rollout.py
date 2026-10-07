@@ -1,6 +1,7 @@
-"""Regenerate codex_rollout_0.156.1.jsonl from the REAL pinned codex binary, offline.
+"""Regenerate codex_rollout_<version>.jsonl from the REAL pinned codex binary, offline.
 
-Usage: uv run python generate_codex_rollout.py <codex-0.156.1 binary> <out.jsonl>
+Usage: uv run python generate_codex_rollout.py <codex binary> <out.jsonl>
+(codex_rollout_0.160.1.jsonl: npm @openai/codex@0.160.1, 2026-10-06.)
 
 A local Responses fixture server returns: reasoning (SECRET_REASONING*), an assistant
 message, a shell call printing TOOL_OUTPUT_SECRET, then FINAL_ANSWER. No credentials.

@@ -46,7 +46,7 @@ profile agentic-codex-sandbox flags=(attach_disconnected,mediate_deleted) {
   deny @{PROC}/kcore rwklx,
 
   # --- agentic-isolation: bubblewrap sandbox construction (replaces `deny mount,`)
-  # Exactly the mount operations codex-cli 0.156.1's bubblewrap performs for
+  # Exactly the mount operations codex-cli 0.160.1's bubblewrap performs for
   # sandbox_mode read-only and workspace-write, recorded in complain mode on
   # an AppArmor host (see README.md). Anything else stays denied. These only
   # take effect inside a user namespace the container created itself; the
@@ -79,7 +79,7 @@ profile agentic-codex-sandbox flags=(attach_disconnected,mediate_deleted) {
   # 4. Writable roots (workspace-write): /tmp and the working directory, which
   #    must be under /workspace, plus the child journal partition and the
   #    partition's Claude transcript root (below). Codex masks
-  #    .git/.codex/.agents in each root and its daemon directory with
+  #    .git/.codex/.agents/.aws in each root and its daemon directory with
   #    read-only tmpfs.
   mount options=(rw, rbind) /oldroot/tmp/ -> /newroot/tmp/,
   mount options=(rw, rbind) /oldroot/tmp/codex-bwrap-synthetic-mount-targets-*/ -> /newroot/tmp/codex-bwrap-synthetic-mount-targets-*/,
@@ -93,10 +93,10 @@ profile agentic-codex-sandbox flags=(attach_disconnected,mediate_deleted) {
   mount options=(rw, rbind) /oldroot/spool/.agentic-session-store/*/{,**/} -> /newroot/spool/.agentic-session-store/*/{,**/},
   mount options=(rw, rbind) /oldroot/spool/[^./]*/{,**/}claude/{,**/} -> /newroot/spool/[^./]*/{,**/}claude/{,**/},
   mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/tmp/codex-daemon-*/,
-  mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/{tmp,workspace,workspace/**}/.{git,codex,agents}/,
+  mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/{tmp,workspace,workspace/**}/.{git,codex,agents,aws}/,
   #    A nested partition (<execution>/<workspace>) puts the masks deeper.
-  mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/spool/.agentic-session-store/*/{,**/}.{git,codex,agents}/,
-  mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/spool/[^./]*/{,**/}claude/.{git,codex,agents}/,
+  mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/spool/.agentic-session-store/*/{,**/}.{git,codex,agents,aws}/,
+  mount fstype=tmpfs options=(rw, nosuid, nodev) tmpfs -> /newroot/spool/[^./]*/{,**/}claude/.{git,codex,agents,aws}/,
   # 5. Remounts. Read-only anywhere in the sandbox tree (only ever narrows);
   #    read-write only on the writable workspace roots.
   mount options=(ro, nosuid, nodev, remount, bind, silent, relatime) -> /newroot/{,**},
