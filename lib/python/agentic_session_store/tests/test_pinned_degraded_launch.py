@@ -1,5 +1,5 @@
 """A DEGRADED workspace launches native children even when nothing can record
-them (#27). Pinned Claude 2.1.281 and Codex 0.160.1, offline.
+them (#27). Pinned Claude 2.1.293 and Codex 0.160.1, offline.
 
 test_pinned_fail_closed proves the installed guard DENIES a launch it cannot
 record. That is right while capture is on. When the session-store capability

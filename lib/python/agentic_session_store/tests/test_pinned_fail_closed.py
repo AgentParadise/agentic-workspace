@@ -1,4 +1,4 @@
-"""Pinned Claude 2.1.281 and Codex 0.160.1 deny a child launch whose intent
+"""Pinned Claude 2.1.293 and Codex 0.160.1 deny a child launch whose intent
 cannot be recorded, offline and without credentials (syntropic137#1398).
 
 Unguarded, both harnesses let the tool call proceed when a hook command cannot
@@ -201,7 +201,7 @@ class PinnedFailClosed(unittest.TestCase):
     def test_claude_denies_unrecordable_launch(self):
         self.assertEqual(
             subprocess.check_output([CLAUDE, "--version"], text=True).strip(),
-            "2.1.281 (Claude Code)",
+            "2.1.293 (Claude Code)",
         )
         for mode in MODES:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:

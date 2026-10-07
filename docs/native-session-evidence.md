@@ -13,7 +13,7 @@ An unsupported harness returns no capability rather than a guessed identity.
 
 ## Format anchors
 
-The workspace currently pins Claude Code 2.1.281 and Codex 0.160.1 in
+The workspace currently pins Claude Code 2.1.293 and Codex 0.160.1 in
 `implementations/docker/images/omni-agent/Dockerfile`. Extraction uses these mechanisms:
 
 - Claude: `sessionId` for root context; `agentId` with `isSidechain` for a
