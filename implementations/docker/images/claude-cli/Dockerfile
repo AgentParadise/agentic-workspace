@@ -41,7 +41,7 @@
 ARG CLAUDE_CLI_VERSION=2.1.126
 # Codex CLI is installed alongside claude so a phase's primary agent can
 # delegate one-shot to the other harness (opt-in via agent.allow_delegation).
-ARG CODEX_CLI_VERSION=0.144.6
+ARG CODEX_CLI_VERSION=0.160.1
 # Keep this aligned with Agentic Skills' validated installer contract.
 ARG SKILLS_CLI_VERSION=1.7.0
 # Playwright CLI for headless browser QA. Exact pin: the CLI version decides

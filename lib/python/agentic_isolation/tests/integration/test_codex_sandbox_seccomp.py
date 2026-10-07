@@ -282,6 +282,28 @@ class TestWithCodexSandboxProfile:
         assert control.returncode == 0, control.stderr
 
     @pytest.mark.asyncio
+    async def test_workspace_write_keeps_aws_protected(
+        self, codex_workspace: tuple[str, Workspace]
+    ) -> None:
+        # codex-cli 0.160.1 masks .aws in every writable root (openai/codex
+        # #48176) with a read-only tmpfs, which the AppArmor profile must
+        # admit or bwrap fails before the command runs.
+        container, _ = codex_workspace
+        made = _docker_exec(container, ["mkdir", "-p", "/workspace/.aws"])
+        assert made.returncode == 0, made.stderr
+        sibling = _docker_exec(
+            container, [*SANDBOX, "sh", "-c", "echo sibling > /workspace/sibling.txt"]
+        )
+        assert sibling.returncode == 0, sibling.stderr
+        denied = _docker_exec(
+            container, [*SANDBOX, "sh", "-c", "echo x > /workspace/.aws/credentials"]
+        )
+        assert denied.returncode != 0, denied.stdout
+        assert "bwrap" not in denied.stderr, denied.stderr
+        leaked = _docker_exec(container, ["test", "-e", "/workspace/.aws/credentials"])
+        assert leaked.returncode != 0, "sandboxed write reached .aws"
+
+    @pytest.mark.asyncio
     async def test_syn_delegate_passes_the_sandbox_gate(
         self, codex_workspace: tuple[str, Workspace]
     ) -> None:

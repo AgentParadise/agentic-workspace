@@ -336,5 +336,5 @@ fn codex_mount_policy_admits_bwrap_and_denies_sensitive_mounts() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 39, "{stdout}");
+    assert_eq!(checked, 41, "{stdout}");
 }

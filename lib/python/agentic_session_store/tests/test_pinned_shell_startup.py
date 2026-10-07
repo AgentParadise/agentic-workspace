@@ -1,5 +1,5 @@
 """Shell startup files cannot preempt the capture guard, against pinned
-Claude Code 2.1.281 and Codex 0.156.1 (syntropic137#1398).
+Claude Code 2.1.281 and Codex 0.160.1 (syntropic137#1398).
 
 Codex runs hooks with the passwd shell and ``-c`` (``/bin/bash -c`` in the
 image); Claude runs ``/bin/sh -c``. A non-interactive ``bash -c`` reads only
@@ -19,7 +19,7 @@ This module:
   directly through each harness: the child is recorded (pending, then
   launched) and no hook shell read any of them.
 
-Measured, not assumed: Codex 0.156.1 itself starts a login ``bash -lc`` at
+Measured, not assumed: Codex 0.160.1 itself starts a login ``bash -lc`` at
 session start to snapshot the user's shell for its shell tool, and that reads
 ``~/.bash_profile`` and ``~/.bashrc``. Its hooks do not use that snapshot:
 variables exported there never reach a hook shell. The assertion is therefore

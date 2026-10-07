@@ -133,6 +133,23 @@ jobs:
         run: |
           uv sync --locked --all-extras
           uv run python -m pytest ../../../tests/integration -q
+      # Codex's own bubblewrap sandbox in the built omni image, under the
+      # production policy: the seccomp profile plus the AppArmor profile in
+      # enforce mode (this runner uses AppArmor). A Codex bump whose bwrap
+      # performs a mount the profile does not admit fails here, not in a
+      # workspace (codex-cli 0.160.1 added a .aws mask).
+      - name: Load Codex sandbox AppArmor profile
+        run: sudo apparmor_parser -r lib/python/agentic_isolation/agentic_isolation/apparmor/agentic-codex-sandbox
+      - name: Codex sandbox in the built image (seccomp + AppArmor enforce)
+        working-directory: lib/python/agentic_isolation
+        env:
+          AGENTIC_OMNI_AGENT_IMAGE: omni-agent-workspace:latest
+        run: |
+          set -euo pipefail
+          # The module skips itself when the image is absent; never let that pass.
+          docker image inspect "$AGENTIC_OMNI_AGENT_IMAGE" > /dev/null
+          docker info --format '{{json .SecurityOptions}}' | grep -q apparmor
+          uv run python -m pytest tests/integration/test_codex_sandbox_seccomp.py -q -rs
       - name: Toolchain keeps the omni capability-runtime contract
         working-directory: lib/python/agentic_isolation
         env:

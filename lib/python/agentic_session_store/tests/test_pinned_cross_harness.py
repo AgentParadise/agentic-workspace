@@ -28,7 +28,7 @@ ENABLED = os.environ.get("CLAUDE_NATIVE_TEST_BINARY") and os.environ.get(
 def test_real_cross_harness_depth_three(tmp_path):
     for binary, version in (
         ("claude", "2.1.281 (Claude Code)"),
-        ("codex", "codex-cli 0.156.1"),
+        ("codex", "codex-cli 0.160.1"),
     ):
         assert (
             subprocess.check_output([binary, "--version"], text=True).strip() == version

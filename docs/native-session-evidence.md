@@ -13,7 +13,7 @@ An unsupported harness returns no capability rather than a guessed identity.
 
 ## Format anchors
 
-The workspace currently pins Claude Code 2.1.281 and Codex 0.156.1 in
+The workspace currently pins Claude Code 2.1.281 and Codex 0.160.1 in
 `implementations/docker/images/omni-agent/Dockerfile`. Extraction uses these mechanisms:
 
 - Claude: `sessionId` for root context; `agentId` with `isSidechain` for a
@@ -23,10 +23,13 @@ The workspace currently pins Claude Code 2.1.281 and Codex 0.156.1 in
 - Codex: the first `session_meta` header identifies the current transcript.
   Later copied headers cannot replace it. Explicit subagent parent and fork
   fields remain separate relationship types. See the pinned
-  [Codex protocol source](https://github.com/openai/codex/blob/rust-v0.156.1/codex-rs/protocol/src/protocol.rs).
+  [Codex protocol source](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/protocol/src/protocol.rs).
   Between 0.150.1 and 0.156.1 `SessionMeta` only gained
   `forked_from_ordinal_exclusive` and `runtime_workspace_roots`; the fields
-  this reader uses are unchanged.
+  this reader uses are unchanged. Between 0.156.1 and 0.160.1 it only gained
+  the optional `creator_user_id` and `creator_account_id`; the reader ignores
+  unknown fields, and a real 0.160.1 rollout has the same row shapes
+  (`tests/fixtures/codex_rollout_0.160.1.jsonl`).
 
 `lib/python/agentic_isolation/tests/test_native_evidence.py` uses content-free structural fixtures for these
 mechanisms, including depth three, missing bodies, duplicate calls, conflicting
