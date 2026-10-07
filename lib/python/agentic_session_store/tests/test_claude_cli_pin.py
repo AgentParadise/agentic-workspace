@@ -19,7 +19,7 @@ MINIMUM = (2, 1, 284)
 
 def _pin(image: str) -> str:
     text = (IMAGES / image / "Dockerfile").read_text()
-    return re.search(r"^ARG CLAUDE_CLI_VERSION=(\S+)$", text, re.M).group(1)
+    return re.search(r"^ARG CLAUDE_CLI_VERSION=(\S+)$", text, re.MULTILINE).group(1)
 
 
 def test_workspace_images_share_one_claude_pin():
