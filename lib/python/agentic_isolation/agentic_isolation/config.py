@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from importlib import resources
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Literal
@@ -84,6 +85,56 @@ class DockerDetectionError(RuntimeError):
 
     Never treated as "feature absent": that would silently drop protection.
     """
+
+
+class WorkspaceRuntime(StrEnum):
+    """The OCI runtime a workspace container runs under."""
+
+    RUNC = "runc"
+    GVISOR = "gvisor"
+    KATA = "kata"
+    SYSBOX = "sysbox"
+
+
+# How each runtime is recognised from the ``path`` Docker reports for an alias:
+# the basename must be exactly one of the runtime's binary or shim names. The
+# alias name is never trusted: an alias called "kata" that points at runc is
+# runc, and neither is ``/usr/bin/not-kata-runtime``. Docker reports no path
+# for a shim-v2 runtime registered by ``runtimeType`` (``docker info`` copies
+# only Path and Args), so such an alias cannot be verified here. The second
+# entry is the conventional alias, preferred when several aliases resolve to
+# the same runtime.
+_KATA_VMMS = ("qemu", "clh", "fc", "dragonball", "stratovirt")
+_RUNTIME_BINARIES: dict[WorkspaceRuntime, tuple[re.Pattern[str], str]] = {
+    WorkspaceRuntime.GVISOR: (re.compile(r"runsc|containerd-shim-runsc-v1"), "runsc"),
+    WorkspaceRuntime.KATA: (
+        re.compile(rf"kata-runtime|containerd-shim-kata(?:-(?:{'|'.join(_KATA_VMMS)}))?-v2"),
+        "kata",
+    ),
+    WorkspaceRuntime.SYSBOX: (re.compile(r"sysbox-runc"), "sysbox-runc"),
+}
+
+
+@dataclass(frozen=True)
+class ResolvedRuntime:
+    """The runtime a workspace will run under, as verified against the Docker host.
+
+    Proves the alias is registered and points at the runtime's binary or
+    shim, not that a guest kernel booted.
+    """
+
+    requested: WorkspaceRuntime | None  # None = auto
+    effective: WorkspaceRuntime
+    alias: str  # the name Docker registered, passed as --runtime
+    runtime_path: str  # the binary or shim Docker reports for the alias ("" if none)
+
+
+_RUNC = ResolvedRuntime(
+    requested=WorkspaceRuntime.RUNC,
+    effective=WorkspaceRuntime.RUNC,
+    alias="runc",
+    runtime_path="runc",
+)
 
 
 class AppArmorProfileNotLoadedError(RuntimeError):
@@ -188,8 +239,10 @@ class SecurityConfig:
     # Process limits
     pids_limit: int = 256  # --pids-limit=256
 
-    # gVisor runtime (extra sandbox layer)
-    use_gvisor: bool | None = None  # None = auto-detect, True/False = force
+    # OCI runtime. None = auto: gVisor if Docker has it registered, else runc.
+    # An explicit runtime Docker does not have registered is refused, never
+    # replaced with runc. See resolve_runtime().
+    runtime: WorkspaceRuntime | None = None
 
     # Seccomp profile file (--security-opt=seccomp=<path>). None keeps Docker's
     # default profile. Set for Codex-capable images by resolve_for_image();
@@ -278,12 +331,12 @@ class SecurityConfig:
         """
         return cls(
             read_only_root=False,
-            use_gvisor=False,
+            runtime=WorkspaceRuntime.RUNC,
         )
 
-    # Cache for gVisor detection to avoid repeated blocking subprocess calls.
+    # Cache for Docker host detection to avoid repeated blocking subprocess calls.
     # Only successful answers are cached; a failed probe is retried next time.
-    _gvisor_available: ClassVar[bool | None] = None
+    _docker_runtimes: ClassVar[dict[str, str] | None] = None
     _apparmor_available: ClassVar[bool | None] = None
 
     @staticmethod
@@ -322,20 +375,100 @@ class SecurityConfig:
         return cls._apparmor_available
 
     @classmethod
-    def detect_gvisor(cls) -> bool:
-        """Detect if the gVisor runtime is available.
+    def _registered_runtimes(cls) -> dict[str, str]:
+        """Docker's runtime aliases, each mapped to the path it reports ("" if none).
 
-        No docker CLI means no runtime to detect (and nothing can launch).
-        A failed query raises DockerDetectionError and is not cached, so a
-        transient failure never silently drops gVisor.
+        A failed query raises DockerDetectionError and is not cached.
         """
-        if cls._gvisor_available is not None:
-            return cls._gvisor_available
-        if shutil.which("docker") is None:
-            return False
-        runtimes = cls._docker_info("{{json .Runtimes}}")
-        cls._gvisor_available = "runsc" in runtimes or "gvisor" in runtimes
-        return cls._gvisor_available
+        if cls._docker_runtimes is None:
+            raw = cls._docker_info("{{json .Runtimes}}")
+            try:
+                runtimes = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise DockerDetectionError(
+                    f"docker info returned unreadable Runtimes: {raw.strip()[:300]}"
+                ) from error
+            if not isinstance(runtimes, dict):
+                raise DockerDetectionError(
+                    f"docker info returned unreadable Runtimes: {raw.strip()[:300]}"
+                )
+            cls._docker_runtimes = {
+                str(alias): str(spec.get("path") or "") if isinstance(spec, dict) else ""
+                for alias, spec in runtimes.items()
+            }
+        return cls._docker_runtimes
+
+    @classmethod
+    def _find_alias(cls, runtime: WorkspaceRuntime) -> ResolvedRuntime | None:
+        """The registered alias whose binary or shim is ``runtime``'s, if any."""
+        binary, conventional = _RUNTIME_BINARIES[runtime]
+        matches = {
+            alias: path
+            for alias, path in cls._registered_runtimes().items()
+            if binary.fullmatch(PurePosixPath(path).name)
+        }
+        if not matches:
+            return None
+        if conventional in matches:
+            alias = conventional
+        elif len(matches) == 1:
+            (alias,) = matches
+        else:
+            raise DockerDetectionError(
+                f"Docker has several {runtime} runtimes registered "
+                f"({', '.join(sorted(matches))}) and none is named {conventional!r}; "
+                f"register the one to use as {conventional!r} in daemon.json"
+            )
+        return ResolvedRuntime(
+            requested=runtime,
+            effective=runtime,
+            alias=alias,
+            runtime_path=matches[alias],
+        )
+
+    def resolve_runtime(self) -> ResolvedRuntime:
+        """The runtime this config will run under on the current Docker host.
+
+        Explicit RUNC needs no probe. Any other explicit runtime must be
+        registered with Docker under an alias whose binary or shim is that
+        runtime's, or DockerDetectionError is raised: it never falls back to
+        runc. An alias Docker reports no path for (a shim-v2 runtime) cannot be
+        verified, so it is refused too. Auto (None) keeps the pre-AW-1 choice:
+        gVisor when registered, including a ``runsc`` alias Docker reports no
+        path for, else runc; with no docker CLI there is nothing to detect and
+        nothing can launch, so it is runc. A failed ``docker info`` raises in
+        every mode.
+        """
+        requested = self.runtime
+        if requested is WorkspaceRuntime.RUNC:
+            return _RUNC
+        if requested is None:
+            if shutil.which("docker") is None:
+                return replace(_RUNC, requested=None)
+            found = self._find_alias(WorkspaceRuntime.GVISOR)
+            if found is None and self._registered_runtimes().get("runsc") == "":
+                # gVisor's documented registration is runtimeType only, which
+                # docker info reports without a path; auto selected it by alias
+                # before AW-1 and still does.
+                found = ResolvedRuntime(
+                    requested=None,
+                    effective=WorkspaceRuntime.GVISOR,
+                    alias="runsc",
+                    runtime_path="",
+                )
+            return replace(found or _RUNC, requested=None)
+        found = self._find_alias(requested)
+        if found is None:
+            registered = self._registered_runtimes()
+            listed = ", ".join(f"{a} ({p or 'no path'})" for a, p in sorted(registered.items()))
+            raise DockerDetectionError(
+                f"runtime {requested} was requested but Docker has no runtime registered "
+                f"whose binary or shim is {requested}'s (registered: {listed or 'none'}). "
+                "Register it in the Docker daemon's runtimes by path (docker info reports "
+                "no path for a runtimeType-only runtime, so it cannot be verified), or "
+                "request another runtime; refusing to fall back to runc."
+            )
+        return found
 
     def to_docker_run_args(self) -> list[str]:
         """Convert to docker run command line arguments."""
@@ -385,12 +518,9 @@ class SecurityConfig:
                     raise AppArmorProfileNotLoadedError(name)
                 args.append(f"--security-opt=apparmor={name}")
 
-        # gVisor runtime
-        use_gvisor = self.use_gvisor
-        if use_gvisor is None:
-            use_gvisor = self.detect_gvisor()
-        if use_gvisor:
-            args.append("--runtime=runsc")
+        resolved = self.resolve_runtime()
+        if resolved.effective is not WorkspaceRuntime.RUNC:
+            args.append(f"--runtime={resolved.alias}")
 
         return args
 

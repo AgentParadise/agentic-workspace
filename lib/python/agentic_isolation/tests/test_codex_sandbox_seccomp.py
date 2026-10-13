@@ -18,6 +18,7 @@ from agentic_isolation import (
     SecurityConfig,
     WorkspaceConfig,
     WorkspaceDockerProvider,
+    WorkspaceRuntime,
     codex_sandbox_apparmor_profile_path,
     codex_sandbox_seccomp_profile,
 )
@@ -61,7 +62,7 @@ def test_profile_is_installed_as_a_real_file() -> None:
 
 def test_default_production_keeps_docker_default_seccomp() -> None:
     config = SecurityConfig.production()
-    config.use_gvisor = False
+    config.runtime = WorkspaceRuntime.RUNC
     assert config.seccomp_profile is None
     assert _seccomp_args(config.to_docker_run_args()) == []
     assert _seccomp_args(_run_command(config)) == []
@@ -69,9 +70,9 @@ def test_default_production_keeps_docker_default_seccomp() -> None:
 
 def test_codex_sandbox_adds_only_the_profile() -> None:
     plain = SecurityConfig.production()
-    plain.use_gvisor = False
+    plain.runtime = WorkspaceRuntime.RUNC
     codex = SecurityConfig.production(codex_sandbox=True)
-    codex.use_gvisor = False
+    codex.runtime = WorkspaceRuntime.RUNC
     codex.use_apparmor = False
 
     profile = codex_sandbox_seccomp_profile().resolve()
@@ -88,7 +89,7 @@ def test_codex_sandbox_adds_only_the_profile() -> None:
 
 def test_provider_emits_the_profile() -> None:
     codex = SecurityConfig.production(codex_sandbox=True)
-    codex.use_gvisor = False
+    codex.runtime = WorkspaceRuntime.RUNC
     codex.use_apparmor = False
     command = _run_command(codex)
     assert f"--security-opt=seccomp={codex_sandbox_seccomp_profile().resolve()}" in command
@@ -97,7 +98,7 @@ def test_provider_emits_the_profile() -> None:
 
 
 def test_missing_profile_fails_closed(tmp_path: Path) -> None:
-    config = SecurityConfig(seccomp_profile=tmp_path / "absent.json", use_gvisor=False)
+    config = SecurityConfig(seccomp_profile=tmp_path / "absent.json", runtime=WorkspaceRuntime.RUNC)
     with pytest.raises(FileNotFoundError, match="Seccomp profile not found"):
         config.to_docker_run_args()
 
@@ -258,7 +259,7 @@ def test_development_does_not_opt_in() -> None:
 
 def _codex_on_apparmor_host() -> SecurityConfig:
     config = SecurityConfig.production(codex_sandbox=True)
-    config.use_gvisor = False
+    config.runtime = WorkspaceRuntime.RUNC
     config.use_apparmor = True
     return config
 
@@ -295,14 +296,14 @@ def test_apparmor_host_without_loaded_profile_fails_closed(
 
 def test_no_apparmor_option_on_hosts_without_apparmor() -> None:
     config = SecurityConfig.production(codex_sandbox=True)
-    config.use_gvisor = False
+    config.runtime = WorkspaceRuntime.RUNC
     config.use_apparmor = False
     assert not any(a.startswith("--security-opt=apparmor") for a in config.to_docker_run_args())
 
 
 def test_default_production_never_sets_apparmor() -> None:
     config = SecurityConfig.production()
-    config.use_gvisor = False
+    config.runtime = WorkspaceRuntime.RUNC
     config.use_apparmor = True
     assert config.apparmor_profile is None
     assert not any(a.startswith("--security-opt=apparmor") for a in config.to_docker_run_args())
@@ -310,7 +311,7 @@ def test_default_production_never_sets_apparmor() -> None:
 
 @pytest.mark.parametrize("name", ["", "unconfined;x", "../x", "a b"])
 def test_invalid_apparmor_names_rejected(name: str) -> None:
-    config = SecurityConfig(apparmor_profile=name, use_apparmor=True, use_gvisor=False)
+    config = SecurityConfig(apparmor_profile=name, use_apparmor=True, runtime=WorkspaceRuntime.RUNC)
     with pytest.raises(ValueError, match="Invalid AppArmor profile name"):
         config.to_docker_run_args()
 
@@ -377,7 +378,7 @@ def test_failed_apparmor_detection_fails_launch_then_recovers(
 
     monkeypatch.setattr(config_module.subprocess, "run", run)
     config = SecurityConfig.production(codex_sandbox=True)
-    config.use_gvisor = False
+    config.runtime = WorkspaceRuntime.RUNC
     with pytest.raises(DockerDetectionError):
         config.to_docker_run_args()
     assert SecurityConfig._apparmor_available is None  # the failure was not cached
@@ -391,7 +392,7 @@ def test_missing_docker_cli_is_not_treated_as_no_apparmor(
 ) -> None:
     monkeypatch.setattr(config_module.shutil, "which", lambda _name: None)
     config = SecurityConfig.production(codex_sandbox=True)
-    config.use_gvisor = False
+    config.runtime = WorkspaceRuntime.RUNC
     with pytest.raises(DockerDetectionError, match="docker CLI not found"):
         config.to_docker_run_args()
 
@@ -471,7 +472,7 @@ async def _create(
 ) -> list[list[str]]:
     calls: list[list[str]] = []
     _fake_docker(monkeypatch, labels, calls)
-    security.use_gvisor = False
+    security.runtime = WorkspaceRuntime.RUNC
     security.use_apparmor = False
     provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path, security=security)
 
@@ -598,7 +599,7 @@ async def test_codex_image_effective_args_are_the_shipped_pair(
     )
     calls: list[list[str]] = []
     _fake_docker(monkeypatch, {"agentic.codex_cli_version": "0.156.1"}, calls)
-    security.use_gvisor = False
+    security.runtime = WorkspaceRuntime.RUNC
     security.use_apparmor = True
     provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
 
