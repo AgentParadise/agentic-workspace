@@ -1,5 +1,7 @@
 """Tests for WorkspaceLocalProvider."""
 
+from pathlib import Path
+
 import pytest
 
 from agentic_isolation import (
@@ -7,6 +9,8 @@ from agentic_isolation import (
     WorkspaceConfig,
     WorkspaceLocalProvider,
 )
+from agentic_isolation.config import host_env_credential
+from agentic_isolation.providers import CredentialPolicyError, HostEnvironmentCredentials
 
 
 class TestWorkspaceLocalProvider:
@@ -73,12 +77,15 @@ class TestWorkspaceLocalProvider:
             await provider.destroy(workspace)
 
     @pytest.mark.asyncio
-    async def test_execute_with_secrets(self, provider: WorkspaceLocalProvider) -> None:
-        """Should inject secrets as environment variables."""
-        config = WorkspaceConfig(
-            provider="local",
-            secrets={"SECRET_KEY": "secret123"},
+    async def test_execute_with_credentials(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bound credential is resolved at create and delivered to the command."""
+        monkeypatch.setenv("SECRET_KEY", "secret123")
+        provider = WorkspaceLocalProvider(
+            base_dir=tmp_path, credentials=HostEnvironmentCredentials()
         )
+        config = WorkspaceConfig(provider="local", credentials=[host_env_credential("SECRET_KEY")])
         workspace = await provider.create(config)
 
         try:
@@ -194,14 +201,14 @@ class TestAgenticWorkspaceLocal:
             assert "hello" in content
 
     @pytest.mark.asyncio
-    async def test_secrets_injection(self) -> None:
-        """Should inject secrets."""
-        async with AgenticWorkspace.create(
-            provider="local",
-            secrets={"MY_SECRET": "secret_value"},
-        ) as workspace:
-            result = await workspace.execute("echo $MY_SECRET")
-            assert "secret_value" in result.stdout
+    async def test_credentials_without_a_resolver_are_refused(self) -> None:
+        """No resolver injected means a bound credential fails closed at create."""
+        with pytest.raises(CredentialPolicyError, match="no CredentialResolver"):
+            async with AgenticWorkspace.create(
+                provider="local",
+                credentials=[host_env_credential("MY_SECRET")],
+            ):
+                pass
 
     @pytest.mark.asyncio
     async def test_to_dict(self) -> None:

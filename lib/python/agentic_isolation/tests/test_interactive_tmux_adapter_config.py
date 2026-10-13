@@ -16,6 +16,7 @@ from agentic_isolation.config import (
     ResourceLimits,
     SecurityConfig,
     WorkspaceConfig,
+    host_env_credential,
 )
 from agentic_isolation.providers.interactive_tmux import (
     InteractiveTmuxProvider,
@@ -52,7 +53,7 @@ class TestUnsupportedConfigFields:
             ({"image": "ubuntu:24.04"}, ["image"]),
             ({"dockerfile": "Dockerfile"}, ["dockerfile"]),
             ({"mounts": [MountConfig("/h", "/c")]}, ["mounts"]),
-            ({"secrets": {"API_KEY": "x"}}, ["secrets"]),
+            ({"credentials": [host_env_credential("API_KEY")]}, ["credentials"]),
             ({"environment": {"FOO": "bar"}}, ["environment"]),
             ({"security": SecurityConfig.development()}, ["security"]),
             ({"limits": ResourceLimits(cpu="8")}, ["limits"]),
@@ -68,8 +69,8 @@ class TestUnsupportedConfigFields:
         provider = _provider()
         config = WorkspaceConfig(
             provider="interactive-tmux",
-            secrets={"API_KEY": "x"},
+            credentials=[host_env_credential("API_KEY")],
             plugins=["/opt/plugin"],
         )
-        with pytest.raises(ValueError, match="secrets, plugins"):
+        with pytest.raises(ValueError, match="credentials, plugins"):
             await provider.create(config)
