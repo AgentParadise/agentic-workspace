@@ -20,7 +20,12 @@ from agentic_isolation.providers.base import (
     UnsupportedLimitError,
     Workspace,
 )
-from agentic_isolation.providers.docker import EXEC_ID_ENV, WorkspaceDockerProvider
+from agentic_isolation.providers.docker import WorkspaceDockerProvider
+from agentic_isolation.providers.docker_operations import DockerOperations
+from tests.test_docker_operations import FAKE_DOCKER
+
+# Outer bound on each execute, so a lifecycle that never settles fails, not hangs.
+_TEST_BOUND = 20
 
 LIVE_VALUE = "sk-live-7f3a9c-must-never-appear-in-argv"
 
@@ -284,57 +289,75 @@ def test_timeout_seconds_must_be_positive() -> None:
         ResourceLimits(timeout_seconds=0)
 
 
-async def test_limits_timeout_seconds_ends_execute_timed_out(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """No per-call timeout: the workspace's own limit must end `sleep 5`."""
-    real_spawn = asyncio.create_subprocess_exec
+@pytest.fixture
+def docker_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The operations suite's stand-in `docker`, which runs `exec` as host processes."""
+    fake = tmp_path / "docker"
+    fake.write_text(FAKE_DOCKER)
+    fake.chmod(0o755)
+    monkeypatch.setenv("FAKE_DOCKER_LOG", str(tmp_path / "docker.log"))
+    monkeypatch.setenv("FAKE_DOCKER_STATE", str(tmp_path / "state"))
+    return tmp_path
 
-    async def run_locally(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
-        argv = [str(arg) for arg in args]
-        assert argv[:2] == ["docker", "exec"]
-        return await real_spawn(*argv[argv.index("sh") :], **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", run_locally)
-    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
-    workspace = _workspace(tmp_path, ResourceLimits(timeout_seconds=1))
+def _operations_provider(docker_env: Path) -> WorkspaceDockerProvider:
+    """A provider whose execute runs the real `DockerOperations` lifecycle.
+
+    Only the `docker` client is a stand-in: launch marker, collector, spool,
+    deadline and group termination are all the production code.
+    """
+    provider = WorkspaceDockerProvider(workspace_base_dir=docker_env)
+    provider._operations = DockerOperations(
+        credentials=None,
+        retention_bytes=1 << 20,
+        max_page_bytes=1 << 16,
+        docker=str(docker_env / "docker"),
+    )
+    return provider
+
+
+async def test_limits_timeout_seconds_ends_execute_timed_out(docker_env: Path) -> None:
+    """No per-call timeout: the workspace's own limit must end `sleep 30`."""
+    provider = _operations_provider(docker_env)
+    workspace = _workspace(docker_env, ResourceLimits(timeout_seconds=1))
 
     started = time.monotonic()
-    result = await provider.execute(workspace, "sleep 5")
+    result = await asyncio.wait_for(provider.execute(workspace, "sleep 30"), _TEST_BOUND)
     elapsed = time.monotonic() - started
 
     assert result.timed_out is True
-    # 1s limit plus the 2s cleanup bound; `sleep 5` running out would be 5s.
-    assert elapsed < 3, f"one-second limit returned after {elapsed:.2f}s"
+    assert "Command timed out" in result.stderr
+    # The 1s limit plus termination's grace; the 3600s default would not return.
+    assert elapsed < 5, f"one-second limit returned after {elapsed:.2f}s"
 
 
-async def test_timed_out_operation_tree_is_killed_and_cannot_act_later(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+async def test_per_call_timeout_overrides_the_workspace_limit(docker_env: Path) -> None:
+    provider = _operations_provider(docker_env)
+    workspace = _workspace(docker_env, ResourceLimits(timeout_seconds=1))
+
+    result = await asyncio.wait_for(
+        provider.execute(workspace, "sleep 1.5; echo done", timeout=4), _TEST_BOUND
+    )
+
+    assert (result.timed_out, result.exit_code, result.stdout) == (False, 0, "done\n")
+
+
+async def test_timed_out_operation_tree_is_killed_and_cannot_act_later(docker_env: Path) -> None:
     """A descendant of the timed-out command must not perform its delayed write."""
-    real_spawn = asyncio.create_subprocess_exec
-    spawned: list[list[str]] = []
+    provider = _operations_provider(docker_env)
+    workspace = _workspace(docker_env, ResourceLimits(timeout_seconds=1))
+    marker = docker_env / "late-side-effect"
 
-    async def run_locally(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
-        argv = [str(arg) for arg in args]
-        spawned.append(argv)
-        return await real_spawn(*argv[argv.index("sh") :], **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", run_locally)
-    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
-    workspace = _workspace(tmp_path, ResourceLimits(timeout_seconds=1))
-    marker = tmp_path / "late-side-effect"
-
-    result = await provider.execute(workspace, f"(sleep 2; echo late > '{marker}') & sleep 5")
+    result = await asyncio.wait_for(
+        provider.execute(workspace, f"(sleep 2; echo late > '{marker}') & sleep 30"),
+        _TEST_BOUND,
+    )
     await asyncio.sleep(2.5)
 
     assert result.timed_out is True
     assert not marker.exists(), "a descendant of the timed-out command kept running"
-    # The in-container kill targets the id this execute exported to its tree.
-    exec_argv, kill_argv = spawned
-    assert kill_argv[:3] == ["docker", "exec", "agentic-ws-test"]
-    assert kill_argv[-2] == EXEC_ID_ENV
-    assert f"{EXEC_ID_ENV}={kill_argv[-1]}" in exec_argv
+    # Settled and released: no operation record outlives the call.
+    assert provider._operations._operations == {}
 
 
 # W-6.3-a: bindings are validated as contract references with deliverable targets

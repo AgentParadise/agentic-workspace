@@ -68,8 +68,11 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# CI runs `pytest -q`; this nets to per-file progress lines plus skip reasons,
+# so the log shows whether the Docker-backed files ran or skipped.
+addopts = "-v -rs"
 markers = [
-    "integration: needs external services (skipped when they are absent)",
+    "integration: needs a Docker daemon; skips without one, CI python-compatibility runs it",
     "docker_conformance: Python Docker provider contract tests; CI runs them with REQUIRE_DOCKER_CONFORMANCE=1",
 ]
 

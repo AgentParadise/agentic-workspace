@@ -1,0 +1,984 @@
+"""Event stream processor for workflow execution.
+
+Processes Claude CLI JSONL output stream, dispatching events to
+TokenAccumulator, SubagentTracker, and ObservabilityCollector.
+
+Extracted from WorkflowExecutionEngine._execute_phase_in_container().
+Refactored in ISS-196 to delegate telemetry to ObservabilityCollector (Lane 2).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from enum import Enum, StrEnum, auto
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict
+
+# Any: dict[str, Any] used for JSON data from json.loads() (system boundary — external CLI JSONL)
+from agentic_events.types import ClaudeToolName, EventType
+
+from syn_domain.contexts.orchestration.slices.execute_workflow.announced_model import (
+    announced_model_from,
+)
+from syn_domain.contexts.orchestration.slices.execute_workflow.CancelSignalPoller import (
+    CancelSignalPoller,
+)
+from syn_domain.contexts.orchestration.slices.execute_workflow.EmbeddedEventScanner import (
+    EmbeddedEventScanner,
+)
+from syn_domain.contexts.orchestration.slices.execute_workflow.HookEventParser import (
+    HookEventParser,
+)
+from syn_domain.contexts.orchestration.slices.execute_workflow.phase_cost_limit import (
+    limit_exceeded,
+    spend,
+)
+from syn_domain.contexts.orchestration.slices.execute_workflow.phase_verdict import (
+    AgentVerdict,
+    VerdictReader,
+)
+from syn_domain.contexts.orchestration.slices.execute_workflow.side_effect_free import (
+    tool_call_changes_nothing,
+)
+from syn_shared.agents import AgentProvider
+from syn_shared.delegation import (
+    DELEGATION_TARGET_BY_PRIMARY,
+    DelegationTarget,
+    looks_like_delegation_command,
+)
+from syn_shared.events import VALID_EVENT_TYPES
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from syn_adapters.control import ExecutionController
+    from syn_domain.contexts.agent_sessions.domain.events.agent_observation import (
+        ObservationType,
+    )
+    from syn_domain.contexts.orchestration.slices.execute_workflow.ObservabilityCollector import (
+        ObservabilityCollector,
+    )
+    from syn_domain.contexts.orchestration.slices.execute_workflow.phase_cost_limit import (
+        PhaseCostLimit,
+    )
+    from syn_domain.contexts.orchestration.slices.execute_workflow.phase_push import (
+        PushObserver,
+    )
+    from syn_domain.contexts.orchestration.slices.execute_workflow.SubagentTracker import (
+        SubagentTracker,
+    )
+    from syn_domain.contexts.orchestration.slices.execute_workflow.TokenAccumulator import (
+        TokenAccumulator,
+    )
+
+logger = logging.getLogger(__name__)
+
+
+class InterruptibleWorkspace(Protocol):
+    """Protocol for workspace interrupt capability needed during stream processing."""
+
+    async def interrupt(self) -> bool: ...
+
+
+class ObservabilityRecorder(Protocol):
+    """Protocol for recording observations to the observability backend."""
+
+    async def record_observation(
+        self,
+        session_id: str,
+        observation_type: ObservationType | str,
+        data: dict[str, Any],
+        execution_id: str | None = None,
+        phase_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> None: ...
+
+
+_MAX_ERROR_REASON_LEN = 200
+
+
+class ApiErrorType(StrEnum):
+    """Well-known API error ``type`` values a CLI result can carry."""
+
+    OVERLOADED = "overloaded_error"
+    RATE_LIMIT = "rate_limit_error"
+    API = "api_error"
+    AUTHENTICATION = "authentication_error"
+    INVALID_REQUEST = "invalid_request_error"
+    NOT_FOUND = "not_found_error"
+    PERMISSION = "permission_error"
+
+
+# Well-known API error types -> human-readable labels.
+# Public because the codex parser reuses this vocabulary rather than inventing
+# a second one for the same underlying faults (issue #891).
+API_ERROR_LABELS: dict[str, str] = {
+    ApiErrorType.OVERLOADED: "API overloaded",
+    ApiErrorType.RATE_LIMIT: "Rate limited",
+    ApiErrorType.API: "API internal error",
+    ApiErrorType.AUTHENTICATION: "Authentication failed",
+    ApiErrorType.INVALID_REQUEST: "Invalid request",
+    ApiErrorType.NOT_FOUND: "Resource not found",
+    ApiErrorType.PERMISSION: "Permission denied",
+}
+
+
+def api_error_label(error_type: str, http_code: str = "") -> str:
+    """Return the human-readable label for ``error_type``, with optional HTTP code.
+
+    A shared spelling of a fault, so "Authentication failed (HTTP 401)" reads
+    the same whether the claude parser or the codex parser produced it.
+    """
+    label = API_ERROR_LABELS.get(error_type, error_type.replace("_", " "))
+    return f"{label} (HTTP {http_code})" if http_code else label
+
+
+def api_error_with_message(error_type: str, message: str) -> str:
+    """The label for ``error_type`` followed by the provider's own message.
+
+    Shared with the upstream failure reader, which recognises this shape by
+    the prefix it writes with an empty ``message``.
+    """
+    return f"{api_error_label(error_type)}: {message}"
+
+
+def _http_code_from_prefix(prefix: str) -> str:
+    """Return the first 3-digit token from a prefix like 'API Error: 529 '."""
+    return next((w for w in prefix.split() if w.isdigit() and len(w) == 3), "")
+
+
+def _format_anthropic_error(error_obj: dict[str, object], prefix: str) -> str:
+    """Format a human-readable label from an Anthropic API error dict."""
+    error_type = str(error_obj.get("type", ""))
+    message = str(error_obj.get("message", ""))
+    label = api_error_label(error_type)
+    http_code = _http_code_from_prefix(prefix)
+    if http_code:
+        return api_error_label(error_type, http_code)
+    if message and message.lower() != label.lower():
+        return api_error_with_message(error_type, message)
+    return label
+
+
+def _parse_json_error(text: str) -> str | None:
+    """Try to parse an embedded JSON error body and return a label, or None."""
+    brace_start = text.find("{")
+    if brace_start < 0:
+        return None
+    prefix = text[:brace_start].strip()
+    try:
+        parsed = json.loads(text[brace_start:])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    error_obj = parsed.get("error")
+    if isinstance(error_obj, dict):
+        return _format_anthropic_error(error_obj, prefix)
+    if isinstance(parsed.get("message"), str):
+        return str(parsed["message"])[:_MAX_ERROR_REASON_LEN]
+    return None
+
+
+def _extract_error_reason(raw: str) -> str:
+    """Extract a clean, human-readable error reason from CLI result text.
+
+    The CLI result can contain raw JSON error bodies, stack traces, or plain
+    text. This function extracts the most useful signal and returns a short,
+    readable string suitable for display in the dashboard and CLI.
+
+    Examples:
+        >>> _extract_error_reason('API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},...}')
+        'API overloaded (HTTP 529)'
+        >>> _extract_error_reason('Connection refused')
+        'Connection refused'
+    """
+    text = raw.strip()
+    if not text:
+        return "Unknown error"
+    json_label = _parse_json_error(text)
+    if json_label is not None:
+        return json_label
+    if len(text) <= _MAX_ERROR_REASON_LEN:
+        return text
+    return text[:_MAX_ERROR_REASON_LEN].rsplit(" ", 1)[0] + "..."
+
+
+class ClaudeUsageBlock(TypedDict, total=False):
+    """The cumulative usage block a claude CLI ``result`` line carries.
+
+    Harness knowledge, and it stays here rather than in the domain vocabulary:
+    these are the CLI's key names, and they change when Anthropic ships a new
+    CLI, not when we decide what usage means. ``total=False`` because a result
+    event may omit any of them and the reader defaults each to zero.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    cache_creation_input_tokens: int
+    cache_read_input_tokens: int
+
+
+class ClaudeResultLine(TypedDict, total=False):
+    """The fields this processor reads off a claude CLI ``result`` line.
+
+    A line of someone else's stream, deliberately not named ``...Event``: it is
+    not a domain event, has no aggregate and is never stored or replayed.
+
+    Not the whole event - only what is consumed here, which is what makes the
+    declaration worth checking: a key renamed upstream now fails the type
+    checker at the read instead of silently returning ``None`` at runtime.
+
+    The value arrives from ``json.loads``, so this is an assertion about the
+    stream rather than a validated parse. Every field is optional and every
+    read is defaulted, so a stream that disagrees degrades rather than raises.
+    """
+
+    usage: ClaudeUsageBlock
+    result: str
+    is_error: bool
+    total_cost_usd: float
+    duration_ms: int
+    num_turns: int
+
+
+@dataclass(frozen=True)
+class ReportedUsage:
+    """A harness's OWN cumulative token totals, from the terminal event it emits.
+
+    Exists so that "the harness reported" and "the harness reported a lot" stay
+    different questions. A run whose final usage is legitimately ``0/0`` and a
+    run that was SIGKILLed before it could report anything produce the same four
+    numbers; only the presence of this object tells them apart. Asking the
+    magnitude instead - ``bool(input_tokens or output_tokens)`` - answered the
+    second question and silently discarded the first run's authoritative answer
+    in favour of a partial one (#1164).
+
+    The four counts travel as a set because they share one accounting basis. A
+    harness that reports usage reports all of them, and a genuine zero in one is
+    its answer, not a gap; mixing a reported input against an accumulated output
+    would produce a total neither source ever measured.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    cache_creation: int
+    cache_read: int
+
+    @classmethod
+    def from_claude_result(cls, cli_event: ClaudeResultLine) -> ReportedUsage:
+        """Read the usage block off a claude CLI ``result`` event.
+
+        Call this ONLY where a terminal event was actually parsed: constructing
+        it is the assertion that one arrived, and a zero-filled instance means
+        "the harness counted, and counted zero".
+        """
+        usage = cli_event.get("usage", {})
+        return cls(
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            cache_creation=usage.get("cache_creation_input_tokens", 0),
+            cache_read=usage.get("cache_read_input_tokens", 0),
+        )
+
+
+@dataclass(frozen=True)
+class StreamResult:
+    """Result of processing the event stream."""
+
+    line_count: int
+    interrupt_requested: bool
+    interrupt_reason: str | None
+    #: What the phase said about its own outcome, read off the last thing its
+    #: agent said. Never None: a phase that made no claim reports
+    #: `NOT_REPORTED`, which is a fact about the run and not a missing value
+    #: (#1256). The dispatcher refuses to complete a phase whose verdict
+    #: refuses completion, so this field is READ, unlike the raw dict it
+    #: replaced - which nothing downstream ever consumed.
+    verdict: AgentVerdict = field(default_factory=AgentVerdict.not_reported)
+    conversation_lines: list[str] = field(default_factory=list)
+    # Authoritative totals from the CLI result event (ISS-217).
+    #
+    # `total_cost_usd`, `duration_ms` and `num_turns` are optional FIELD BY
+    # FIELD: a result event may omit any of them. `reported_usage` is optional
+    # as a WHOLE, and its absence is the record that no terminal event arrived
+    # at all (#1164).
+    total_cost_usd: float | None = None
+    reported_usage: ReportedUsage | None = None
+    duration_ms: int | None = None
+    num_turns: int | None = None
+    # Error reason extracted from CLI result event (e.g. "API Error: 529 Overloaded")
+    error_reason: str | None = None
+    # #894: How many times the primary agent invoked its declared delegate CLI,
+    # and how many of those invocations actually succeeded. A delegation-enabled
+    # phase with zero SUCCESSES did not do what it declared, whatever the agent
+    # reported about itself.
+    delegation_attempts: int = 0
+    delegation_successes: int = 0
+    #: The session id the HARNESS chose for this phase's own run, read off its
+    #: stream. A different namespace from the platform id this processor was
+    #: constructed with: the platform mints its id before the agent starts, so
+    #: the two can never be derived from one another.
+    #:
+    #: This exists so the delegate import can dedup by LOOKUP. The filesystem
+    #: sweep reports every session a phase produced, all keyed by harness id,
+    #: and without this the leader is indistinguishable from its delegates -
+    #: which is what forced the old classify-by-agent-name inference, and what
+    #: made a claude phase delegating to claude unattributable (#895).
+    leader_native_session_id: str | None = None
+    #: The last thing this phase's agent SAID, as opposed to what it wrote.
+    #:
+    #: Kept because the file the phase writes is not the only copy of its
+    #: conclusion, and it turned out to be the less reliable one: in
+    #: exec-0bac0e1ed2b2 a verify phase ran for nine minutes and then wrote an
+    #: empty file, and because nothing held on to what it had said, the whole
+    #: execution failed with the verdict irrecoverable (#1195).
+    #:
+    #: None means the agent said nothing at all on this stream, which is a
+    #: different fact from "it said something empty" and the artifact path
+    #: needs to be able to tell them apart.
+    last_agent_message: str | None = None
+    #: The model the HARNESS announced for this run, read off its own stream
+    #: (#1284). Not the model the phase requested, and not derived from it:
+    #: those two diverge in practice, and a requested value reported as the one
+    #: that ran would be worse than no value at all, because a reader would
+    #: take it as evidence.
+    #:
+    #: FIRST announcement wins, the same rule and the same reason as
+    #: ``leader_native_session_id``: a delegate or subagent line arriving late
+    #: must not rebind the leader's identity at the end of the run.
+    #:
+    #: None means the harness announced none. That is the codex case today -
+    #: its stream carries no model, which is why its cost goes unpriced rather
+    #: than guessed (#788) - and it is also what a stream cut off before its
+    #: first announcement leaves behind.
+    announced_model: str | None = None
+    #: Why the platform stopped this run for spending past the phase's
+    #: `max_cost_usd`, or None if it did not (#1376). Set together with
+    #: `interrupt_requested`, which is what makes the attempt settled and the
+    #: missing exit status expected; this is what tells it apart from a cancel.
+    cost_limit_reason: str | None = None
+
+
+def _model_under_message(message: object) -> object:
+    """``model`` as an assistant line carries it, under ``message``."""
+    return message.get("model") if isinstance(message, Mapping) else None
+
+
+_SUBAGENT_TOOL_NAMES = frozenset({ClaudeToolName.SUBAGENT, ClaudeToolName.SUBAGENT_LEGACY})
+
+#: Assistant content blocks that cannot themselves have written (#1825): the
+#: model's words, and a `tool_use`, which `_handle_tool_use` decides alone.
+_WORDS_OR_TOOL_USE = frozenset({"text", "thinking", "redacted_thinking", "tool_use"})
+
+#: The claude tool that invokes a skill, and the input field naming the skill
+#: (#1269). Recorded as its own field, never read back out of the preview: the
+#: preview is cut at 500 characters and a long ``args`` before ``skill`` would
+#: cut the name off.
+SKILL_TOOL_NAME = "Skill"
+_SKILL_INPUT_FIELD = "skill"
+
+# This processor drives a CLAUDE primary, so its declared delegate is codex.
+DELEGATION_TARGET: DelegationTarget = DELEGATION_TARGET_BY_PRIMARY[AgentProvider.CLAUDE]
+
+
+class _LineAction(Enum):
+    """Outcome of processing a single stream line."""
+
+    CONTINUE = auto()
+    BREAK = auto()
+
+
+@dataclass
+class _LineOutcome:
+    action: _LineAction
+    #: True when the line handler decided the run must stop. Carried
+    #: explicitly rather than inferred from ``interrupt_reason``: the reason is
+    #: an OPTIONAL human-readable message, and a cancel sent without one is
+    #: still a cancel (#918).
+    interrupt_requested: bool = False
+    interrupt_reason: str | None = None
+
+
+class EventStreamProcessor:
+    """Processes Claude CLI JSONL event stream.
+
+    Dispatches events to TokenAccumulator and SubagentTracker,
+    delegates telemetry recording to ObservabilityCollector (Lane 2).
+    """
+
+    def __init__(
+        self,
+        tokens: TokenAccumulator,
+        subagents: SubagentTracker,
+        observability: ObservabilityRecorder | None,
+        controller: ExecutionController | None,
+        execution_id: str,
+        phase_id: str,
+        session_id: str,
+        workspace_id: str | None,
+        agent_model: str | None,
+        collector: ObservabilityCollector | None = None,
+        cost_limit: PhaseCostLimit | None = None,
+        on_push: PushObserver | None = None,
+    ) -> None:
+        self._tokens = tokens
+        self._cost_limit = cost_limit
+        self._cost_limit_reason: str | None = None
+        self._subagents = subagents
+        self._execution_id = execution_id
+        self._phase_id = phase_id
+        self._session_id = session_id
+        self._leader_native_session_id: str | None = None
+        self._workspace_id = workspace_id
+        self._agent_model = agent_model
+
+        # ISS-217: Authoritative totals captured from the CLI result event.
+        # `_reported_usage` stays None until a terminal `result` event is
+        # actually parsed - that is the whole record of whether one arrived.
+        self._result_cost_usd: float | None = None
+        self._reported_usage: ReportedUsage | None = None
+        self._result_duration_ms: int | None = None
+        self._result_num_turns: int | None = None
+        self._error_reason: str | None = None
+        self._last_agent_message: str | None = None
+        # Two different questions about the same words, so two fields. The
+        # message above is the agent's LAST words, which is what the artifact
+        # fallback wants (#1195). The verdict is what the agent CLAIMED, and
+        # that is read as each message arrives rather than off whatever text
+        # survived to the end - a claim already read cannot then be erased by
+        # a later "done" (#1256).
+        self._verdict_reader = VerdictReader()
+        self._announced_model: str | None = None
+
+        # #894: A claude phase delegates to `codex exec`. Track the tool_use_ids
+        # of those invocations so the tool_result can tell "tried and failed"
+        # apart from "tried and succeeded".
+        self._delegation_tool_use_ids: set[str] = set()
+        #: Tool calls `side_effect_free` read as read-only at their start, so
+        #: their results, which repeat no input, are judged the same (#1825).
+        self._read_only_tool_use_ids: set[str] = set()
+        # A tool_result can be replayed for the same tool_use_id; dedup so the
+        # same delegation is not counted twice.
+        self._delegation_completed_ids: set[str] = set()
+        self._delegation_attempts: int = 0
+        self._delegation_successes: int = 0
+
+        # #695: Dedup usage by message.id. Claude CLI emits one assistant event per
+        # content block (text, tool_use, etc.) for a single API response, each carrying
+        # the same message.id and identical usage. Without this, mid-flight totals
+        # overcount by the number of content blocks per turn.
+        self._seen_message_ids: set[str] = set()
+
+        # ISS-196: Use collector if provided, else create one from raw writer
+        if collector is not None:
+            self._collector = collector
+        else:
+            from syn_domain.contexts.orchestration.slices.execute_workflow.ObservabilityCollector import (
+                ObservabilityCollector as OC,
+            )
+
+            self._collector = OC(
+                writer=observability,
+                session_id=session_id,
+                execution_id=execution_id,
+                phase_id=phase_id,
+                workspace_id=workspace_id,
+                requested_model=agent_model,
+            )
+
+        # Collaborators extracted for CC reduction (ISS-196)
+        self._hook_parser = HookEventParser()
+        self._embedded_scanner = EmbeddedEventScanner(
+            collector=self._collector,
+            execution_id=execution_id,
+            phase_id=phase_id,
+            on_push=on_push,
+        )
+        self._cancel_poller = CancelSignalPoller(
+            controller=controller,
+            execution_id=execution_id,
+        )
+
+    async def process_stream(
+        self,
+        stream: AsyncIterator[str],
+        workspace: InterruptibleWorkspace,
+    ) -> StreamResult:
+        """Process the JSONL event stream from Claude CLI.
+
+        Args:
+            stream: Async iterator of JSONL lines from workspace.stream()
+            workspace: Workspace instance (for interrupt())
+
+        Returns:
+            StreamResult with accumulated state
+        """
+        conversation_lines: list[str] = []
+        line_count = 0
+        interrupt_requested = False
+        interrupt_reason: str | None = None
+
+        async for line in stream:
+            line_count += 1
+            outcome = await self._process_line(line, line_count, workspace)
+            if line.strip():
+                conversation_lines.append(line)
+            if outcome.action is _LineAction.BREAK:
+                interrupt_requested = outcome.interrupt_requested
+                interrupt_reason = outcome.interrupt_reason
+                break
+
+        # Read from what the agent SAID, not only from the terminal `result`
+        # line: a phase that was killed or timed out after stating its verdict
+        # is exactly the phase whose verdict matters, and the terminal line is
+        # the thing it is missing (#1195, #1256). Already decided by now - the
+        # reader was fed each message as it arrived, so nothing here depends on
+        # which message happened to be last.
+        verdict = self._verdict_reader.verdict
+        logger.info("Agent verdict: %s %s", verdict.status.name, verdict.comments[:100])
+
+        logger.info(
+            "Agent runner streaming complete: %d lines, cost=$%s, harness totals: %s",
+            line_count,
+            self._result_cost_usd,
+            f"{self._reported_usage.input_tokens} in, {self._reported_usage.output_tokens} out"
+            if self._reported_usage is not None
+            else "never reported",
+        )
+
+        return StreamResult(
+            line_count=line_count,
+            interrupt_requested=interrupt_requested,
+            interrupt_reason=interrupt_reason,
+            verdict=verdict,
+            conversation_lines=conversation_lines,
+            total_cost_usd=self._result_cost_usd,
+            reported_usage=self._reported_usage,
+            duration_ms=self._result_duration_ms,
+            num_turns=self._result_num_turns,
+            error_reason=self._error_reason,
+            delegation_attempts=self._delegation_attempts,
+            delegation_successes=self._delegation_successes,
+            leader_native_session_id=self._leader_native_session_id,
+            last_agent_message=self._last_agent_message,
+            announced_model=self._announced_model,
+            cost_limit_reason=self._cost_limit_reason,
+        )
+
+    async def _process_line(
+        self,
+        line: str,
+        line_count: int,
+        workspace: InterruptibleWorkspace,
+    ) -> _LineOutcome:
+        """Process a single stream line: cancel check, hook events, or CLI event."""
+        logger.debug("Received line %d: %s", line_count, line[:100])
+
+        poll = await self._cancel_poller.check(line_count)
+        if poll.should_interrupt:
+            await workspace.interrupt()
+            return _LineOutcome(
+                action=_LineAction.BREAK,
+                interrupt_requested=True,
+                interrupt_reason=poll.reason,
+            )
+
+        hook_events = self._hook_parser.parse(line)
+        if hook_events:
+            for hook_event in hook_events:
+                await self._process_hook_event(hook_event)
+            return _LineOutcome(action=_LineAction.CONTINUE)
+
+        await self._process_cli_event(line)
+        return await self._stop_if_over_cost_limit(workspace)
+
+    async def _stop_if_over_cost_limit(self, workspace: InterruptibleWorkspace) -> _LineOutcome:
+        """Interrupt the agent once the phase has spent past its limit (#1376)."""
+        reason = limit_exceeded(self._cost_limit)
+        if reason is None:
+            return _LineOutcome(action=_LineAction.CONTINUE)
+        logger.warning("Phase %s %s - interrupting the agent", self._phase_id, reason)
+        self._cost_limit_reason = reason
+        await workspace.interrupt()
+        return _LineOutcome(
+            action=_LineAction.BREAK, interrupt_requested=True, interrupt_reason=reason
+        )
+
+    async def _process_hook_event(self, hook_event: dict[str, Any]) -> None:
+        """Process a single hook event: validate, enrich, record, track subagents."""
+        from agentic_events import enrich_event
+
+        event_type = hook_event.get("event_type")
+        if event_type not in VALID_EVENT_TYPES:
+            logger.warning(
+                "Unknown event_type from hook: %s — "
+                "add it to syn_shared.events or check for a producer/consumer mismatch",
+                event_type,
+            )
+
+        enriched = enrich_event(
+            hook_event,
+            execution_id=self._execution_id,
+            phase_id=self._phase_id,
+        )
+        logger.debug("Hook event: %s", enriched.get("event_type"))
+
+        # Lane 2: Record via collector
+        await self._collector.record_hook_event(enriched)
+
+        # ADR-037: Track subagent lifecycle from hook events
+        await self._track_subagent_from_hook(hook_event, enriched)
+
+    async def _track_subagent_from_hook(
+        self, hook_event: dict[str, Any], enriched: dict[str, Any]
+    ) -> None:
+        """ADR-037: Detect subagent lifecycle from Task tool hook events."""
+        ctx_data = enriched.get("context", {})
+        tool_name = ctx_data.get("tool_name", "")
+        tool_use_id = ctx_data.get("tool_use_id", "")
+
+        if tool_name not in _SUBAGENT_TOOL_NAMES:
+            if tool_name and self._subagents.has_active:
+                self._subagents.attribute_tool(tool_name)
+            return
+
+        if not tool_use_id:
+            return
+
+        hook_event_type = hook_event.get("event_type", "")
+        if hook_event_type == EventType.TOOL_EXECUTION_STARTED:
+            await self._on_hook_subagent_started(ctx_data, tool_use_id)
+        elif hook_event_type == EventType.TOOL_EXECUTION_COMPLETED:
+            await self._on_hook_subagent_completed(ctx_data, tool_use_id)
+
+    async def _on_hook_subagent_started(self, ctx_data: dict[str, Any], tool_use_id: str) -> None:
+        """Handle TOOL_EXECUTION_STARTED hook for a subagent tool."""
+        input_preview = ctx_data.get("input_preview", "")
+        event = self._subagents.on_task_started_from_hook(tool_use_id, input_preview)
+        await self._collector.record_subagent_started(event.agent_name, tool_use_id)
+
+    async def _on_hook_subagent_completed(self, ctx_data: dict[str, Any], tool_use_id: str) -> None:
+        """Handle TOOL_EXECUTION_COMPLETED hook for a subagent tool."""
+        success = ctx_data.get("success", True)
+        stopped_event = self._subagents.on_task_completed(tool_use_id, success=success)
+        if stopped_event:
+            await self._collector.record_subagent_stopped(
+                agent_name=stopped_event.agent_name,
+                tool_use_id=tool_use_id,
+                duration_ms=stopped_event.duration_ms,
+                success=stopped_event.success,
+                tools_used=stopped_event.tools_used,
+            )
+
+    async def _process_cli_event(self, line: str) -> None:
+        """Process a Claude CLI native event."""
+        try:
+            cli_event = json.loads(line)
+        except json.JSONDecodeError:
+            logger.debug("Non-JSON line: %s", line[:50])
+            return
+
+        cli_type = cli_event.get("type", "")
+        logger.debug("CLI event type: %s", cli_type)
+
+        # FIRST id wins, and later lines are ignored even though claude repeats
+        # session_id on every one. Last-wins would be a live hazard: anything
+        # that ever put another session's line on this stream would rebind the
+        # leader at the end of the run, and the import would then treat the
+        # real leader as a delegate and bill it twice.
+        if self._leader_native_session_id is None:
+            announced = cli_event.get("session_id")
+            if isinstance(announced, str) and announced.strip():
+                self._leader_native_session_id = announced
+
+        if self._announced_model is None:
+            self._note_announced_model(cli_event.get("model"), cli_event.get("message"))
+
+        if cli_type == "result":
+            await self._handle_result_event(cli_event)
+
+        if cli_type == "assistant":
+            await self._handle_assistant_event(cli_event)
+
+        if cli_type == "user":
+            await self._handle_user_event(cli_event)
+
+        if cli_type == "system":
+            logger.debug("CLI message: %s", cli_type)
+
+    def _note_announced_model(self, model: object, message: object) -> None:
+        """Take the model this line announces, if it names one (#1284, ADR-067).
+
+        The collector stamps every later usage row and the summary with it, so
+        it learns it the moment the stream says it. Values rather than the
+        line, for the reason ``announced_model_from`` gives (#673).
+        """
+        self._announced_model = announced_model_from(model, _model_under_message(message))
+        if self._announced_model is not None:
+            self._collector.note_observed_model(self._announced_model)
+
+    def _capture_result_tokens(self, cli_event: ClaudeResultLine) -> None:
+        """Store authoritative cumulative token counts from a result event.
+
+        Reached only from `_handle_result_event`, i.e. only on a real terminal
+        `result` line - so assigning `_reported_usage` here IS the record that
+        the harness reported. The log is gated on the same fact rather than on
+        the numbers being large: a run that finished having used nothing is
+        exactly the run whose totals are worth seeing.
+        """
+        self._reported_usage = ReportedUsage.from_claude_result(cli_event)
+        self._result_cost_usd = cli_event.get("total_cost_usd")
+        self._result_duration_ms = cli_event.get("duration_ms")
+        self._result_num_turns = cli_event.get("num_turns")
+        logger.info(
+            "Result totals: cost=$%s, %d in, %d out (cache: %d read, %d create)",
+            self._result_cost_usd,
+            self._reported_usage.input_tokens,
+            self._reported_usage.output_tokens,
+            self._reported_usage.cache_read,
+            self._reported_usage.cache_creation,
+        )
+
+    async def _handle_result_event(self, cli_event: ClaudeResultLine) -> None:
+        """Handle a result event — remember the agent's last word and its totals."""
+        result_text = cli_event.get("result", "")
+        if cli_event.get("is_error") and result_text:
+            self._error_reason = _extract_error_reason(result_text)
+        elif result_text.strip():
+            # The terminal, most-complete statement the agent made, so it wins
+            # over any earlier message remembered mid-stream - the MESSAGE,
+            # that is. The verdict below is settled by `VerdictReader` and is
+            # not the last speaker's to overwrite. Skipped when `is_error`,
+            # where `result` holds the harness's own failure text rather than
+            # the agent's - recovering THAT into an artifact would file a stack
+            # trace as a verdict (#1195).
+            self._last_agent_message = result_text
+            # Inside the same branch, for the same reason: `is_error` text is
+            # the HARNESS's, and harness prose that mentions the marker would
+            # otherwise be read as the agent having botched a report.
+            self._verdict_reader.read(result_text)
+        self._capture_result_tokens(cli_event)
+
+    async def _handle_assistant_event(self, cli_event: dict[str, Any]) -> None:
+        """Handle assistant event — extract per-turn tokens and tool_use.
+
+        Claude CLI emits one assistant JSONL line per content block of a single
+        API response. All lines for the same response share ``message.id`` and
+        carry identical ``usage``. We dedup usage recording by message.id so
+        multi-block responses don't inflate running totals; tool_use blocks are
+        always processed because each block appears on exactly one line (#695).
+        """
+        message = cli_event.get("message", {})
+        if not isinstance(message, dict):
+            return
+
+        await self._record_turn_usage_once(message)
+
+        content = message.get("content") or []
+        if content:
+            # ANY content, before a single block is looked at. The loop below
+            # knows two block types and the model emits more than two:
+            # `thinking` spends real tokens and settles what the agent is about
+            # to do, and a type shipped after this parser was written is read
+            # here as nothing at all. Both used to leave the attempt indexed as
+            # "never started" and eligible to be run again from the top, so
+            # what is claimed here is only what is certain - the model produced
+            # a turn - and recognising the turn is left to the loop (#1303).
+            # A turn made only of words changed nothing; a tool call is decided
+            # by its own record below, and any other block type may have
+            # written (#1825).
+            self._collector.note_agent_activity(
+                changed_nothing=all(
+                    isinstance(block, dict) and block.get("type") in _WORDS_OR_TOOL_USE
+                    for block in content
+                )
+            )
+
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "tool_use":
+                await self._handle_tool_use(item)
+            elif item.get("type") == "text":
+                # Remembered as the stream goes rather than only at the end: a
+                # phase whose harness never emits a terminal `result` line -
+                # killed, timed out, cut off - is exactly the phase whose
+                # output is most likely to be missing, and its last words are
+                # the only copy left (#1195).
+                said = str(item.get("text", ""))
+                if said.strip():
+                    self._last_agent_message = said
+                    # Parsed HERE, in the turn that said it. This assignment
+                    # is last-one-wins by design and always was; feeding the
+                    # reader on the same line is what stops the verdict
+                    # inheriting that, which is how a terminated failure
+                    # report followed by "done" used to complete (#1256).
+                    self._verdict_reader.read(said)
+
+    async def _record_turn_usage_once(self, message: Mapping[str, Any]) -> None:
+        """Record per-turn token usage, deduped by message.id (#695)."""
+        msg_id = message.get("id")
+        if msg_id and msg_id in self._seen_message_ids:
+            return
+
+        usage = message.get("usage") or {}
+        if not usage:
+            return
+
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        cache_creation = usage.get("cache_creation_input_tokens", 0)
+        cache_read = usage.get("cache_read_input_tokens", 0)
+
+        if input_tokens or output_tokens or cache_creation or cache_read:
+            self._tokens.record(input_tokens, output_tokens, cache_creation, cache_read)
+            # The model THIS message names, not the session's: a subagent turn
+            # on another model is priced as that model, not as the leader.
+            turn_model = announced_model_from(message.get("model"))
+            await self._collector.record_token_usage(
+                input_tokens,
+                output_tokens,
+                cache_creation,
+                cache_read,
+                model=turn_model,
+            )
+            spend(
+                self._cost_limit,
+                turn_model,
+                input_tokens,
+                output_tokens,
+                cache_creation,
+                cache_read,
+            )
+            logger.info(
+                "Per-turn token usage: %d in, %d out (cache: %d read, %d create)",
+                input_tokens,
+                output_tokens,
+                cache_read,
+                cache_creation,
+            )
+
+        if msg_id:
+            self._seen_message_ids.add(msg_id)
+
+    async def _handle_tool_use(self, item: dict[str, Any]) -> None:
+        """Handle a tool_use content block from an assistant message."""
+        tool_name = item.get("name", "unknown")
+        tool_use_id = item.get("id", "unknown")
+        tool_input = item.get("input", {})
+        if isinstance(tool_input, str):
+            try:
+                tool_input = json.loads(tool_input)
+            except (json.JSONDecodeError, ValueError):
+                tool_input = {}
+
+        # Cache tool_name for enriching tool_result events
+        self._subagents.register_tool_use(tool_use_id, tool_name)
+
+        self._note_delegation_attempt(tool_use_id, tool_input.get("command"))
+        self._collector.note_command_started(tool_use_id, tool_input.get("command"))
+
+        skill = tool_input.get(_SKILL_INPUT_FIELD) if tool_name == SKILL_TOOL_NAME else None
+        changes_nothing = tool_call_changes_nothing(tool_name, tool_input.get("command"))
+        if changes_nothing:
+            self._read_only_tool_use_ids.add(tool_use_id)
+        await self._collector.record_tool_started(
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+            input_preview=json.dumps(tool_input)[:500],
+            skill_name=skill if isinstance(skill, str) and skill else None,
+            changes_nothing=changes_nothing,
+        )
+        logger.debug("Tool started: %s", tool_name)
+
+        # ADR-037: Detect Task/Agent tool as subagent start (raw CLI format)
+        if tool_name in _SUBAGENT_TOOL_NAMES and tool_use_id:
+            event = self._subagents.on_task_started(tool_use_id, tool_input)
+            await self._collector.record_subagent_started(event.agent_name, tool_use_id)
+
+    def _note_delegation_attempt(self, tool_use_id: str, command: object) -> None:
+        """Record a tool_use that invokes the declared delegate CLI (#894).
+
+        Keyed off the ``command`` the tool was given, not the tool NAME: the
+        command text is what the harness actually ran, and it is the one part
+        of a delegation the primary agent cannot misreport.
+        """
+        if not isinstance(command, str):
+            return
+        if not looks_like_delegation_command(command, DELEGATION_TARGET):
+            return
+        if tool_use_id in self._delegation_tool_use_ids:
+            return
+        self._delegation_tool_use_ids.add(tool_use_id)
+        self._delegation_attempts += 1
+        logger.info("Delegation invocation detected (tool_use_id=%s)", tool_use_id)
+
+    async def _handle_user_event(self, cli_event: dict[str, Any]) -> None:
+        """Handle user event — process tool results."""
+        message = cli_event.get("message", {})
+        content = message.get("content", [])
+
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "tool_result":
+                await self._handle_tool_result(item)
+
+    async def _handle_tool_result(self, item: dict[str, Any]) -> None:
+        """Handle a tool_result content block from a user message."""
+        tool_use_id = item.get("tool_use_id", "unknown")
+        is_error = item.get("is_error", False)
+
+        # Extract tool output content
+        tool_content = item.get("content", "")
+        if isinstance(tool_content, list):
+            # Newlines, not spaces: a block boundary is a line boundary, and the
+            # shipped ledger reads the LAST line of a `gh pr create`.
+            tool_content = "\n".join(
+                str(c.get("text", c) if isinstance(c, dict) else c) for c in tool_content
+            )
+        output_preview = str(tool_content)[:500] if tool_content else None
+        tool_name = self._subagents.resolve_tool_name(tool_use_id)
+
+        # Scan tool output for embedded git hook JSONL (ADR-043)
+        if tool_content:
+            await self._embedded_scanner.scan_and_record(str(tool_content), tool_name)
+
+        if (
+            tool_use_id in self._delegation_tool_use_ids
+            and not is_error
+            and tool_use_id not in self._delegation_completed_ids
+        ):
+            self._delegation_completed_ids.add(tool_use_id)
+            self._delegation_successes += 1
+
+        await self._collector.note_command_finished(tool_use_id, not is_error, tool_content)
+        # Record tool completion
+        await self._collector.record_tool_completed(
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+            success=not is_error,
+            output_preview=output_preview,
+            changes_nothing=tool_use_id in self._read_only_tool_use_ids,
+        )
+        logger.debug("Tool completed: %s (%s) success=%s", tool_use_id, tool_name, not is_error)
+
+        # ADR-037: Detect Task/Agent tool completion as subagent stop (raw CLI format)
+        if tool_name in _SUBAGENT_TOOL_NAMES:
+            await self._record_subagent_completion(tool_use_id, is_error)
+        else:
+            # Attribute non-subagent tool to the most recently started subagent
+            self._subagents.attribute_tool(tool_name)
+
+    async def _record_subagent_completion(self, tool_use_id: str, is_error: bool) -> None:
+        """Record subagent completion from raw CLI tool_result."""
+        event = self._subagents.on_task_completed(tool_use_id, success=not is_error)
+        if event:
+            await self._collector.record_subagent_stopped(
+                agent_name=event.agent_name,
+                tool_use_id=tool_use_id,
+                duration_ms=event.duration_ms,
+                success=event.success,
+                tools_used=event.tools_used,
+            )

@@ -75,6 +75,7 @@ jobs:
           - agentic_logging
           - agentic_memory
           - agentic_session_store
+          - scripted_agent
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:

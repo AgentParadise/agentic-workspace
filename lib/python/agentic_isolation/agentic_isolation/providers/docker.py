@@ -17,9 +17,10 @@ import contextlib
 import errno
 import json
 import logging
+import math
 import os
+import posixpath
 import shutil
-import signal
 import tempfile
 import time
 import uuid
@@ -33,6 +34,13 @@ from agentic_isolation.config import (
     WorkspaceConfig,
     is_apparmor_profile_error,
 )
+from agentic_isolation.contract import (
+    ObservationPage,
+    OperationRef,
+    OperationSpec,
+    OperationStatus,
+    ProviderDescriptor,
+)
 from agentic_isolation.harnesses import ExecFn, TranscriptSource, get_harness
 from agentic_isolation.providers.base import (
     BaseProvider,
@@ -40,8 +48,11 @@ from agentic_isolation.providers.base import (
     ExecuteResult,
     UnsupportedLimitError,
     Workspace,
+    drain_operation,
     resolve_env_credentials,
 )
+from agentic_isolation.providers.docker_operations import DockerOperations
+from agentic_isolation.providers.operation_spool import OperationFailure
 
 # Security tmpfs targets that an explicit mount may never replace or sit beneath:
 # /home/agent holds harness configuration and credentials, /tmp and /var/agentic
@@ -58,19 +69,6 @@ logger = logging.getLogger(__name__)
 
 # Default network for workspace containers
 DEFAULT_NETWORK = "agentic-workspace-net"
-
-# Every process an execute() starts inherits this variable, so a timed-out
-# operation's whole tree can be found and killed inside the container: killing
-# the local `docker exec` client alone leaves the workload running.
-EXEC_ID_ENV = "AGENTIC_EXEC_ID"
-_KILL_EXEC_TREE = (
-    "for d in /proc/[0-9]*; do "
-    'if tr "\\0" "\\n" < "$d/environ" 2>/dev/null | grep -qx "$0=$1"; then '
-    'kill -KILL "${d#/proc/}" 2>/dev/null; fi; done; true'
-)
-# How long a timed-out operation may take to be torn down before execute()
-# returns anyway.
-_TIMEOUT_CLEANUP_SECONDS = 2.0
 
 
 class WorkspaceDockerProvider(BaseProvider):
@@ -110,6 +108,8 @@ class WorkspaceDockerProvider(BaseProvider):
         workspace_base_dir: Path | str | None = None,
         workspace_host_dir: Path | str | None = None,
         credentials: CredentialResolver | None = None,
+        observation_retention_bytes: int = 64 << 20,
+        observation_max_page_bytes: int = 4 << 20,
     ):
         """Initialize Docker provider.
 
@@ -121,8 +121,11 @@ class WorkspaceDockerProvider(BaseProvider):
             workspace_host_dir: Base directory for Docker volume mounts (host path).
                 Required when running inside a container (Docker-in-Docker).
                 If not set, uses workspace_base_dir for mounts.
-            credentials: Resolves `WorkspaceConfig.credentials`. Without one,
-                a config that binds a credential is refused.
+            credentials: Resolves `WorkspaceConfig.credentials` and
+                `OperationSpec.credential_bindings`. Without one, a config or
+                spec that binds a credential is refused.
+            observation_retention_bytes: Output retained per operation.
+            observation_max_page_bytes: Largest serialised observation page.
         """
         self._default_image = default_image
         self._default_network = default_network
@@ -144,6 +147,11 @@ class WorkspaceDockerProvider(BaseProvider):
         # archiving from.
         self._teardown_locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
+        self._operations = DockerOperations(
+            credentials=credentials,
+            retention_bytes=observation_retention_bytes,
+            max_page_bytes=observation_max_page_bytes,
+        )
 
     @property
     def name(self) -> str:
@@ -616,112 +624,91 @@ class WorkspaceDockerProvider(BaseProvider):
         cwd: str | None = None,
         env: dict[str, str] | None = None,
     ) -> ExecuteResult:
-        """Execute a command in the Docker container."""
-        container_name = workspace._handle
-        if not container_name:
-            return ExecuteResult(
-                exit_code=-1,
-                stdout="",
-                stderr="Container not available",
-                duration_ms=0,
-            )
+        """Execute a command in the Docker container, via the operation contract.
 
-        exec_id = uuid.uuid4().hex
-        exec_cmd = self._build_docker_exec_cmd(
-            container_name,
-            ["sh", "-c", command],
-            cwd=cwd,
-            env={**(env or {}), EXEC_ID_ENV: exec_id},
-        )
-
-        async def kill_in_container() -> None:
-            await self._kill_exec_tree(container_name, exec_id)
-
-        return await self._run_exec(
-            exec_cmd,
-            timeout=timeout or workspace.config.limits.timeout_seconds,
-            on_timeout=kill_in_container,
-        )
-
-    async def _kill_exec_tree(self, container_name: str, exec_id: str) -> None:
-        """SIGKILL every container process carrying `exec_id`, within the cleanup bound."""
-        proc = await asyncio.create_subprocess_exec(
-            "docker",
-            "exec",
-            container_name,
-            "sh",
-            "-c",
-            _KILL_EXEC_TREE,
-            EXEC_ID_ENV,
-            exec_id,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=_TIMEOUT_CLEANUP_SECONDS)
-        except TimeoutError:
-            proc.kill()
-            logger.warning(
-                "Could not confirm timed-out exec %s was killed in %s", exec_id, container_name
-            )
-
-    async def _run_exec(
-        self,
-        exec_cmd: list[str],
-        *,
-        timeout: float,
-        on_timeout: Callable[[], Awaitable[None]] | None = None,
-    ) -> ExecuteResult:
-        """Run a docker exec command and return the result.
-
-        On timeout the client's whole process group is killed, `on_timeout`
-        stops the operation where it actually runs, and cleanup is bounded so
-        the call returns close to its deadline.
+        `stdout` and `stderr` are the workload's own channels, captured apart
+        at the client, while the operation's observation stream carries both.
+        `env` values are delivered like credentials: by name on the client
+        argv, value only in the client's environment.
         """
-        start_time = time.perf_counter()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *exec_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=timeout,
-                )
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-                if on_timeout is not None:
-                    await on_timeout()
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(proc.wait(), timeout=_TIMEOUT_CLEANUP_SECONDS)
-                duration_ms = (time.perf_counter() - start_time) * 1000
-                return ExecuteResult(
-                    exit_code=-1,
-                    stdout="",
-                    stderr="Command timed out",
-                    duration_ms=duration_ms,
-                    timed_out=True,
-                )
-
-            duration_ms = (time.perf_counter() - start_time) * 1000
+        if not workspace._handle:
             return ExecuteResult(
-                exit_code=proc.returncode or 0,
-                stdout=stdout.decode() if stdout else "",
-                stderr=stderr.decode() if stderr else "",
-                duration_ms=duration_ms,
+                exit_code=-1, stdout="", stderr="Container not available", duration_ms=0
             )
-        except Exception as e:
-            duration_ms = (time.perf_counter() - start_time) * 1000
+        start_time = time.perf_counter()
+        spec = OperationSpec(
+            execution_id=workspace.id,
+            operation_key=f"execute-{uuid.uuid4().hex}",
+            argv=("sh", "-c", command),
+            working_directory=_relative_workdir(cwd),
+            environment={},
+            credential_bindings=(),
+            timeout_seconds=max(1, math.ceil(timeout or workspace.config.limits.timeout_seconds)),
+            metadata={},
+        )
+        try:
+            ref = await self._operations.start(
+                workspace, spec, delivered_env=env, separate_channels=True
+            )
+            status, _ = await drain_operation(self, ref)
+            out, err = self._operations.channels(ref)
+            # The key is private to this call, so no replay can need the record.
+            self._operations.release(ref)
+        except OperationFailure as e:
             return ExecuteResult(
                 exit_code=-1,
                 stdout="",
                 stderr=str(e),
-                duration_ms=duration_ms,
+                duration_ms=(time.perf_counter() - start_time) * 1000,
             )
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
+        if status.state == "timed_out":
+            return ExecuteResult(
+                exit_code=-1,
+                stdout=stdout,
+                stderr=f"{stderr}Command timed out",
+                duration_ms=duration_ms,
+                timed_out=True,
+            )
+        exit_code = status.exit_code if isinstance(status.exit_code, int) else -1
+        return ExecuteResult(
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr
+            if status.state in ("succeeded", "failed")
+            else f"operation {status.state}",
+            duration_ms=duration_ms,
+        )
+
+    def describe(self) -> ProviderDescriptor:
+        """SupportsOperations: published before any launch."""
+        return self._operations.describe()
+
+    async def start(self, workspace: Workspace, spec: OperationSpec) -> OperationRef:
+        """SupportsOperations: accept `spec`; idempotent per operation_key."""
+        return await self._operations.start(workspace, spec)
+
+    async def status(self, ref: OperationRef) -> OperationStatus:
+        """SupportsOperations: status from the daemon-reported exit code."""
+        return await self._operations.status(ref)
+
+    async def observe(
+        self,
+        ref: OperationRef,
+        *,
+        cursor: str | None,
+        max_bytes: int,
+        wait_seconds: float = 0,
+    ) -> ObservationPage:
+        """SupportsOperations: a page of the host-side spool."""
+        return await self._operations.observe(
+            ref, cursor=cursor, max_bytes=max_bytes, wait_seconds=wait_seconds
+        )
+
+    async def cancel(self, ref: OperationRef, *, grace_seconds: float) -> OperationStatus:
+        """SupportsOperations: group TERM then KILL, confirmed, else container stop."""
+        return await self._operations.cancel(ref, grace_seconds=grace_seconds)
 
     async def stream(
         self,
@@ -917,6 +904,8 @@ class WorkspaceDockerProvider(BaseProvider):
             await self._teardown_locked(
                 workspace, while_running=while_running, before_delete=before_delete
             )
+            # The workspace is gone, so its idempotency records may go too.
+            self._operations.forget_workspace(workspace.id)
         # Drop the lock entry only once nobody else holds or wants it. Removing
         # it any earlier - in particular inside the teardown, which an earlier
         # version did - lets the next caller build a FRESH lock and run
@@ -1081,3 +1070,11 @@ def _open_contained(root: Path, path: str, flags: int, *, create_parents: bool =
     finally:
         for fd in stack:
             os.close(fd)
+
+
+def _relative_workdir(cwd: str | None) -> str:
+    """`execute`'s cwd (absolute, or relative to /workspace) as a spec path."""
+    if not cwd:
+        return "."
+    relative = posixpath.relpath(posixpath.join("/workspace", cwd), "/workspace")
+    return relative
