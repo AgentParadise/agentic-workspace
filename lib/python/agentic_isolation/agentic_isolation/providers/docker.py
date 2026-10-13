@@ -5,7 +5,7 @@ providing real process and filesystem isolation with security hardening.
 
 Features:
 - Security hardening (cap-drop, no-new-privileges, read-only root)
-- gVisor runtime support (auto-detected)
+- OCI runtime selection (runc, gVisor, Kata, Sysbox; gVisor auto-detected)
 - Real-time stdout streaming
 - Resource limits (memory, CPU, pids)
 """
@@ -216,6 +216,8 @@ class WorkspaceDockerProvider(BaseProvider):
         security = (config.security or self._security).resolve_for_image(
             bool(labels.get(CODEX_IMAGE_LABEL))
         )
+        # Before anything is created: an unregistered runtime is refused here.
+        runtime = security.resolve_runtime()
 
         short_id = uuid.uuid4().hex[:8]
         workspace_id = f"ws-{short_id}"
@@ -254,10 +256,13 @@ class WorkspaceDockerProvider(BaseProvider):
         )
 
         logger.info(
-            "Creating workspace container (id=%s, image=%s, gvisor=%s)",
+            "Creating workspace container (id=%s, image=%s, runtime requested=%s "
+            "effective=%s alias=%s)",
             workspace_id,
             image,
-            security.use_gvisor,
+            runtime.requested or "auto",
+            runtime.effective,
+            runtime.alias,
         )
 
         try:
@@ -296,6 +301,9 @@ class WorkspaceDockerProvider(BaseProvider):
                     "image": image,
                     "image_id": image_id,
                     "workspace_dir": str(workspace_dir),
+                    "runtime_requested": str(runtime.requested or "auto"),
+                    "runtime_effective": str(runtime.effective),
+                    "runtime_alias": runtime.alias,
                 },
                 _handle=container_name,  # Use name for docker exec
             )

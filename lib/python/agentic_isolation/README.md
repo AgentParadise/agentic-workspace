@@ -194,7 +194,9 @@ class SecurityConfig:
     tmpfs_tmp: bool = True
     tmpfs_home: bool = True
     pids_limit: int = 256
-    use_gvisor: bool | None = None  # None = auto-detect
+    runtime: WorkspaceRuntime | None = None  # None = auto: gVisor if registered, else runc
+
+    def resolve_runtime(self) -> ResolvedRuntime: ...  # refuses an unregistered explicit runtime
 
     @classmethod
     def production(cls) -> SecurityConfig: ...
