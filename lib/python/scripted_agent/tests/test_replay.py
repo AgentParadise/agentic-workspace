@@ -8,7 +8,6 @@ import socket
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import pytest
 
@@ -133,33 +132,6 @@ def _models(value: Any) -> Iterator[str]:
 
 
 # --- zero tokens -------------------------------------------------------------
-
-
-@pytest.fixture
-def no_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Fail on any connection to a host other than ANTHROPIC_BASE_URL's."""
-    allowed = urlsplit(BASE_URL).hostname
-    contacted: list[str] = []
-
-    def guard(host: object) -> None:
-        contacted.append(str(host))
-        if host != allowed:
-            raise AssertionError(f"replayer contacted {host}; only {allowed} is allowed")
-
-    real_connect = socket.socket.connect
-
-    def connect(self: socket.socket, address: Any) -> None:
-        if self.family in (socket.AF_INET, socket.AF_INET6):
-            guard(address[0])
-        real_connect(self, address)
-
-    def getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
-        guard(host)
-        raise OSError("no network in tests")
-
-    monkeypatch.setattr(socket.socket, "connect", connect)
-    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
-    return contacted
 
 
 def test_the_network_guard_trips_on_a_model_provider(no_network: list[str]) -> None:
@@ -453,7 +425,6 @@ def test_refuses_a_phase_the_profile_does_not_have(
     [
         ({"tool_uses": 3}, "has 2 tool_use events but the profile declares tool_uses 3"),
         ({"cli_version": "2.1.29"}, "captured from CLI '2.0.74' but the profile declares"),
-        ({"harness": "codex"}, "harness 'codex' cannot be replayed yet"),
         ({"recording": "/nonexistent.jsonl"}, "cannot be read"),
     ],
 )

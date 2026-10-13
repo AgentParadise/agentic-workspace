@@ -1,9 +1,10 @@
-"""``claude`` in a load-test workspace: replay one phase of a ScriptedAgentProfile.
+"""``claude`` or ``codex`` in a load-test workspace: replay one phase of a
+ScriptedAgentProfile.
 
 Arguments are ignored except ``--version``, which reports the phase's
-recorded ``cli_version``. Exit codes: 0 the phase ran; 78 no usable profile,
-phase or execution id; 65 the recording is not the declared stream; 69 a
-workload or git/gh step failed.
+recorded ``cli_version`` the way that phase's harness prints it. Exit codes:
+0 the phase ran; 78 no usable profile, phase or execution id; 65 the
+recording is not the declared stream; 69 a workload or git/gh step failed.
 
 Where the inputs come from:
 
@@ -63,7 +64,7 @@ Run = Callable[[Sequence[str], Path | None], str]
 def main() -> None:
     try:
         if "--version" in sys.argv[1:]:
-            print(f"{cli_version(os.environ)} (Claude Code)")
+            print(cli_version(os.environ))
             return
         replay(os.environ, WORKSPACE, _subprocess, time.sleep, sys.stdout)
     except Refusal as e:
@@ -102,15 +103,18 @@ def replay(
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(artifact, encoding="utf-8")
 
-    verdict = profile.task_result(target.phase_id)
-    _emit(out, {**recording.result, "result": verdict})
+    for event in recording.closing(profile.task_result(target.phase_id)):
+        _emit(out, event)
 
 
 def cli_version(environ: Mapping[str, str]) -> str:
-    """The CLI version this workspace's phase was recorded from, for ``--version``."""
+    """``--version`` as the phase's harness prints it, at the version it was recorded from."""
     profile = load_profile(environ)
     target = _Target.from_tags(environ.get(TAGS_ENV, ""), profile)
-    return profile.phases[target.phase_id].stream.cli_version
+    stream = profile.phases[target.phase_id].stream
+    if stream.harness == "codex":
+        return f"codex-cli {stream.cli_version}"
+    return f"{stream.cli_version} (Claude Code)"
 
 
 def load_profile(environ: Mapping[str, str]) -> ScriptedAgentProfile:
