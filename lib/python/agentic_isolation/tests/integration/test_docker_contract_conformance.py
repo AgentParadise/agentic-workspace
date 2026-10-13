@@ -107,7 +107,7 @@ async def test_timeout_seconds_stops_the_operation_tree_in_the_container() -> No
         await provider.destroy(workspace)
 
     assert result.timed_out is True
-    # 1s limit, 2s cleanup bound, and docker exec start-up overhead.
+    # 1s limit, the operation's termination grace, and docker exec start-up overhead.
     assert elapsed < 5, f"one-second limit returned after {elapsed:.2f}s"
     assert late.stdout.strip() == "absent", "a timed-out descendant ran its delayed write"
 
