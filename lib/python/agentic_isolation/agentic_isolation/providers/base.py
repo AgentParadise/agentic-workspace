@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -13,6 +14,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from agentic_isolation.config import WorkspaceConfig
+from agentic_isolation.contract import (
+    CredentialRef,
+    ObservationPage,
+    OperationRef,
+    OperationSpec,
+    OperationStatus,
+    ProviderDescriptor,
+)
 
 if TYPE_CHECKING:
     from agentic_isolation.harnesses import TranscriptSource
@@ -341,6 +350,98 @@ class SupportsStagedTeardown(Protocol):
         removed regardless, so a failure cannot strand a running container.
         """
         ...
+
+
+@runtime_checkable
+class SupportsOperations(Protocol):
+    """Optional capability: the APSS EXP-V1-0006 0.2.0 operation contract.
+
+    Separate from `WorkspaceProvider` for the reason `SupportsWorkspaceLogs`
+    gives: a provider that cannot start, observe and cancel a detached
+    operation should not grow methods it can only raise from. A caller tests
+    for it once, at wiring:
+
+        if not isinstance(provider, SupportsOperations):
+            raise ...  # fail fast, no silent fallback
+
+    Unlike `logs`, everything here is authoritative. `status` comes from a
+    channel the workload cannot write, and `observe` reads a provider-owned
+    spool whose integrity is published in `describe().observation`.
+    Failures are raised as `OperationFailure`, carrying a typed
+    `OperationError`; callers dispatch on `error.kind`.
+    """
+
+    def describe(self) -> ProviderDescriptor:
+        """What this provider can enforce, published before any launch."""
+        ...
+
+    async def start(self, workspace: Workspace, spec: OperationSpec) -> OperationRef:
+        """Accept `spec` and return without waiting for it to end.
+
+        The same `(workspace, operation_key)` with an equal spec returns the
+        original ref and launches nothing, however many callers race. The
+        same key with a different spec raises `conflict`.
+        """
+        ...
+
+    async def status(self, ref: OperationRef) -> OperationStatus:
+        """Where the operation is. Raises `unknown_operation` or `provider_unavailable`."""
+        ...
+
+    async def observe(
+        self,
+        ref: OperationRef,
+        *,
+        cursor: str | None,
+        max_bytes: int,
+        wait_seconds: float = 0,
+    ) -> ObservationPage:
+        """The next page after `cursor`, never larger than `max_bytes` serialised."""
+        ...
+
+    async def cancel(self, ref: OperationRef, *, grace_seconds: float) -> OperationStatus:
+        """Stop the operation and every descendant; idempotent.
+
+        Returns `cancelled` only once they are confirmed gone. An operation
+        that already ended keeps its terminal state.
+        """
+        ...
+
+
+class CredentialResolver(Protocol):
+    """Port the host implements to turn a `CredentialRef` into its value.
+
+    The value is delivered only into the workload's environment. A provider
+    must never write it into an argv, a spool, a status or a page.
+    """
+
+    async def resolve(self, ref: CredentialRef) -> str:
+        """The current value of `ref`; raise to refuse the launch."""
+        ...
+
+
+async def run_to_completion(
+    provider: SupportsOperations,
+    workspace: Workspace,
+    spec: OperationSpec,
+    *,
+    page_bytes: int = 1 << 20,
+) -> tuple[OperationStatus, bytes]:
+    """Start `spec`, drain its output and return the terminal status and bytes.
+
+    Built only on `start`, `observe` and `status`, so it behaves identically on
+    every provider. Output is read until a `complete` page, which guarantees no
+    byte retained up to the terminal offset is left unread.
+    """
+    ref = await provider.start(workspace, spec)
+    cursor: str | None = None
+    output = bytearray()
+    while True:
+        page = await provider.observe(ref, cursor=cursor, max_bytes=page_bytes, wait_seconds=1.0)
+        output.extend(base64.b64decode(page.data_b64))
+        cursor = page.next_cursor
+        if page.complete:
+            return await provider.status(ref), bytes(output)
 
 
 @runtime_checkable
