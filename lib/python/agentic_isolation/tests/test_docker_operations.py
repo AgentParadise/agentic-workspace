@@ -245,10 +245,15 @@ async def test_g_cursor_older_than_retention_reports_exact_gap(docker_env: Path)
 
 
 async def test_h_foreign_generation_cursor_is_unknown_operation(docker_env: Path) -> None:
+    # Both drained, and the foreign offset (3) lies inside the recipient's 13
+    # bytes, so only the generation check can reject it.
     ops = _ops(docker_env)
-    one = await ops.start(_workspace(), _spec("echo one", key="one"))
-    two = await ops.start(_workspace(), _spec("echo two", key="two"))
-    foreign = (await ops.observe(one, cursor=None, max_bytes=4096, wait_seconds=1)).next_cursor
+    one = await ops.start(_workspace(), _spec("printf one", key="one"))
+    two = await ops.start(_workspace(), _spec("printf 'thirteen byte'", key="two"))
+    _, first = await drain_operation(ops, one)
+    _, second = await drain_operation(ops, two)
+    assert (len(first), len(second)) == (3, 13)
+    foreign = (await ops.observe(one, cursor=None, max_bytes=4096)).next_cursor
     with pytest.raises(OperationFailure) as caught:
         await ops.observe(two, cursor=foreign, max_bytes=4096)
     assert caught.value.error.kind == "unknown_operation"
@@ -384,7 +389,7 @@ async def test_regression_execute_runs_through_the_operation_contract(
     result = await provider.execute(
         _workspace(), "echo hi; echo err >&2; exit 3", env={"TOKEN_X": "v"}
     )
-    assert (result.exit_code, result.stdout) == (3, "hi\nerr\n")
+    assert (result.exit_code, result.stdout, result.stderr) == (3, "hi\n", "err\n")
     log = Path(os.environ["FAKE_DOCKER_LOG"]).read_text()
     assert "-e TOKEN_X " in log and "TOKEN_X=v" not in log
 
@@ -394,3 +399,72 @@ async def test_run_to_completion_returns_terminal_status_and_bytes(docker_env: P
     provider._operations = _ops(docker_env)
     status, output = await run_to_completion(provider, _workspace(), _spec("printf done"))
     assert (status.state, output) == ("succeeded", b"done")
+
+
+async def test_run_to_completion_keeps_both_channels_in_the_stream(docker_env: Path) -> None:
+    provider = WorkspaceDockerProvider()
+    provider._operations = _ops(docker_env)
+    spec = _spec("printf out; printf err >&2; exit 4")
+    status, output = await run_to_completion(provider, _workspace(), spec)
+    assert (status.state, status.exit_code) == ("failed", 4)
+    assert sorted((output[:3], output[3:])) == [b"err", b"out"]
+
+
+async def test_timeout_keeps_the_workloads_final_output(docker_env: Path) -> None:
+    ops = _ops(docker_env)
+    script = "trap 'echo final; exit 0' TERM; echo initial; while :; do sleep 0.1; done"
+    ref = await ops.start(_workspace(), _spec(script, timeout_seconds=1))
+    status, output = await drain_operation(ops, ref)
+    # The stand-in's sh may also report the killed sleep on stderr.
+    assert status.state == "timed_out"
+    assert output.startswith(b"initial\n") and output.endswith(b"final\n")
+
+
+class _ParkedResolver:
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.failures = 0
+
+    async def resolve(self, ref: CredentialRef) -> str:
+        await self.release.wait()
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("resolver refused")
+        return SECRET
+
+
+def _bound_spec(key: str) -> OperationSpec:
+    binding = CredentialBinding(
+        ref=CredentialRef(name="token", scope="repo"), target="TOKEN", delivery="env"
+    )
+    return _spec("echo bound", key=key, credential_bindings=(binding,))
+
+
+async def test_slow_resolver_does_not_block_another_workspace(docker_env: Path) -> None:
+    resolver = _ParkedResolver()
+    ops = _ops(docker_env)
+    ops._credentials = resolver
+    parked = asyncio.create_task(ops.start(_workspace(), _bound_spec("slow")))
+    await asyncio.sleep(0.1)
+    other = Workspace(
+        id="ws2", provider="docker", path=Path("."), config=WorkspaceConfig(), _handle="c2"
+    )
+    try:
+        ref = await asyncio.wait_for(ops.start(other, _spec("echo free")), timeout=5)
+        assert not parked.done()
+        assert (await drain_operation(ops, ref))[1] == b"free\n"
+    finally:
+        resolver.release.set()
+        await drain_operation(ops, await parked)
+
+
+async def test_resolver_failure_releases_the_key_for_a_retry(docker_env: Path) -> None:
+    resolver = _ParkedResolver()
+    resolver.failures = 1
+    resolver.release.set()
+    ops = _ops(docker_env)
+    ops._credentials = resolver
+    with pytest.raises(RuntimeError):
+        await ops.start(_workspace(), _bound_spec("retry"))
+    ref = await ops.start(_workspace(), _bound_spec("retry"))
+    assert (await drain_operation(ops, ref))[1] == b"bound\n"

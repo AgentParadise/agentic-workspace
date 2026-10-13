@@ -588,10 +588,10 @@ class WorkspaceDockerProvider(BaseProvider):
     ) -> ExecuteResult:
         """Execute a command in the Docker container, via the operation contract.
 
-        Output is the combined stdout and stderr, as observed (ADR-043), so
-        `stderr` is empty unless the launch itself failed. `env` values are
-        delivered like credentials: by name on the client argv, value only in
-        the client's environment.
+        `stdout` and `stderr` are the workload's own channels, captured apart
+        at the client, while the operation's observation stream carries both.
+        `env` values are delivered like credentials: by name on the client
+        argv, value only in the client's environment.
         """
         if not workspace._handle:
             return ExecuteResult(
@@ -609,8 +609,11 @@ class WorkspaceDockerProvider(BaseProvider):
             metadata={},
         )
         try:
-            ref = await self._operations.start(workspace, spec, delivered_env=env)
-            status, output = await drain_operation(self, ref)
+            ref = await self._operations.start(
+                workspace, spec, delivered_env=env, separate_channels=True
+            )
+            status, _ = await drain_operation(self, ref)
+            out, err = self._operations.channels(ref)
         except OperationFailure as e:
             return ExecuteResult(
                 exit_code=-1,
@@ -619,19 +622,22 @@ class WorkspaceDockerProvider(BaseProvider):
                 duration_ms=(time.perf_counter() - start_time) * 1000,
             )
         duration_ms = (time.perf_counter() - start_time) * 1000
+        stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
         if status.state == "timed_out":
             return ExecuteResult(
                 exit_code=-1,
-                stdout=output.decode(errors="replace"),
-                stderr="Command timed out",
+                stdout=stdout,
+                stderr=f"{stderr}Command timed out",
                 duration_ms=duration_ms,
                 timed_out=True,
             )
         exit_code = status.exit_code if isinstance(status.exit_code, int) else -1
         return ExecuteResult(
             exit_code=exit_code,
-            stdout=output.decode(errors="replace"),
-            stderr="" if status.state in ("succeeded", "failed") else f"operation {status.state}",
+            stdout=stdout,
+            stderr=stderr
+            if status.state in ("succeeded", "failed")
+            else f"operation {status.state}",
             duration_ms=duration_ms,
         )
 

@@ -7,7 +7,10 @@ provider delegates to it, so the decisions below are made in one place.
 
 - Output is read by a provider-owned `docker exec` client and appended to an
   `OperationSpool` in this process, outside every mount. The workload cannot
-  reach it, so observed bytes are exactly what the workload printed.
+  reach it, so observed bytes are exactly what the workload printed. The
+  client's stdout and stderr are read from separate pipes, so the legacy
+  `execute` path can keep the two channels apart while the observation stream
+  carries both as they arrive.
 - Status comes from the client's daemon-reported exit code, never from
   anything the workload can write.
 - The wrapper records its own pid and start time on the first stdout line
@@ -25,6 +28,7 @@ provider delegates to it, so the decisions below are made in one place.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import posixpath
 import signal
@@ -87,6 +91,10 @@ _Presence = Literal["running", "removing", "stopped", "gone"]
 # this long for the container to be gone before leaving `status` to re-probe.
 _REMOVAL_WAIT_SECONDS = 30.0
 
+# After a timeout terminates the group, the pipes are read this long for the
+# workload's final output (a TERM handler's last words) before giving up.
+_FINAL_OUTPUT_SECONDS = 5.0
+
 
 @dataclass
 class _Operation:
@@ -106,6 +114,8 @@ class _Operation:
     collector: asyncio.Task[None] | None = None
     leader_known: asyncio.Event = field(default_factory=asyncio.Event)
     client_finished: bool = False
+    # Per-channel copies (stdout, stderr), kept only when the caller asked.
+    channels: tuple[bytearray, bytearray] | None = None
 
 
 def _now() -> str:
@@ -139,7 +149,9 @@ class DockerOperations:
         self._docker = docker
         self._operations: dict[str, _Operation] = {}
         self._by_key: dict[tuple[str, str], _Operation] = {}
-        self._lock = asyncio.Lock()
+        # One lock per (workspace, operation_key): a slow credential resolver
+        # holds back only racing starts of the same key, never the fleet.
+        self._launching: dict[tuple[str, str], asyncio.Lock] = {}
         self._sequence = 0
 
     def describe(self) -> ProviderDescriptor:
@@ -166,19 +178,22 @@ class DockerOperations:
         spec: OperationSpec,
         *,
         delivered_env: dict[str, str] | None = None,
+        separate_channels: bool = False,
     ) -> OperationRef:
         """Accept `spec` once per `(workspace, operation_key)`.
 
-        `delivered_env` is for the legacy `execute` path only: values the
-        caller already holds, delivered exactly like resolved credentials.
+        `delivered_env` and `separate_channels` are for the legacy `execute`
+        path only: values the caller already holds, delivered exactly like
+        resolved credentials, and a per-channel copy of the output for
+        `channels`.
         """
         container = workspace._handle
         if not isinstance(container, str) or not container:
             raise _error("unknown_operation", f"workspace {workspace.id} has no container")
         key = (workspace.id, spec.operation_key)
-        # The lock spans the launch, so racing same-key starts see the record
-        # of the first and launch nothing.
-        async with self._lock:
+        # The key's lock spans the launch, so racing same-key starts see the
+        # record of the first and launch nothing.
+        async with self._launching.setdefault(key, asyncio.Lock()):
             existing = self._by_key.get(key)
             if existing is not None:
                 if existing.spec != spec:
@@ -220,12 +235,13 @@ class DockerOperations:
                 container=container,
                 spool=OperationSpool(retention_bytes=self._retention),
                 started_at=_now(),
+                channels=(bytearray(), bytearray()) if separate_channels else None,
             )
             process = await asyncio.create_subprocess_exec(
                 *self.client_argv(container, spec, secret_names=tuple(secrets)),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, **secrets},
             )
             marker = spec.launch_marker
@@ -254,31 +270,69 @@ class DockerOperations:
         argv.extend([container, "sh", "-c", _OUTER, "aw-operation", _INNER, *spec.argv])
         return argv
 
+    def channels(self, ref: OperationRef) -> tuple[bytes, bytes]:
+        """The (stdout, stderr) bytes of an operation started with `separate_channels`."""
+        operation = self._lookup(ref)
+        if operation.channels is None:
+            raise _error("unknown_operation", f"{ref.operation_id} kept no separate channels", ref)
+        return bytes(operation.channels[0]), bytes(operation.channels[1])
+
     async def _collect(self, operation: _Operation, process: asyncio.subprocess.Process) -> None:
-        assert process.stdout is not None  # created with stdout=PIPE
+        assert process.stdout is not None and process.stderr is not None  # both PIPE
+        # The readers run outside the timeout, so a timed-out operation's
+        # pipes keep draining while its group is terminated.
+        readers = asyncio.gather(
+            self._read_stdout(operation, process.stdout),
+            self._pump(operation, process.stderr, channel=1),
+        )
         timed_out = False
         try:
             async with asyncio.timeout(operation.spec.timeout_seconds):
-                header = await process.stdout.readline()
-                fields = header.decode(errors="replace").split()
-                if len(fields) == 2 and all(f.isdigit() for f in fields):
-                    operation.leader = (fields[0], fields[1])
-                elif header:
-                    # Not the wrapper's line (it failed before exec); keep it.
-                    operation.spool.append(header)
-                operation.leader_known.set()
-                while chunk := await process.stdout.read(65536):
-                    operation.spool.append(chunk)
-                    operation.changed.set()
+                await asyncio.shield(readers)
                 await process.wait()
         except TimeoutError:
             timed_out = True
             await self._terminate_group(operation, grace_seconds=1.0)
+            try:
+                async with asyncio.timeout(_FINAL_OUTPUT_SECONDS):
+                    await asyncio.shield(readers)
+            except TimeoutError:
+                pass
             await process.wait()
         finally:
+            if not readers.done():
+                readers.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await readers
             operation.leader_known.set()
         operation.client_finished = True
         await self._settle(operation, process.returncode, timed_out=timed_out, wait=True)
+
+    async def _read_stdout(self, operation: _Operation, stream: asyncio.StreamReader) -> None:
+        try:
+            header = await stream.readline()
+            fields = header.decode(errors="replace").split()
+            if len(fields) == 2 and all(f.isdigit() for f in fields):
+                operation.leader = (fields[0], fields[1])
+            elif header:
+                # Not the wrapper's line (it failed before exec); keep it.
+                self._record(operation, header, channel=0)
+        finally:
+            operation.leader_known.set()
+        await self._pump(operation, stream, channel=0)
+
+    async def _pump(
+        self, operation: _Operation, stream: asyncio.StreamReader, *, channel: Literal[0, 1]
+    ) -> None:
+        while chunk := await stream.read(65536):
+            self._record(operation, chunk, channel=channel)
+
+    @staticmethod
+    def _record(operation: _Operation, chunk: bytes, *, channel: Literal[0, 1]) -> None:
+        operation.spool.append(chunk)
+        if operation.channels is not None:
+            operation.channels[channel].extend(chunk)
+        operation.changed.set()
 
     async def _settle(
         self, operation: _Operation, code: int | None, *, timed_out: bool, wait: bool

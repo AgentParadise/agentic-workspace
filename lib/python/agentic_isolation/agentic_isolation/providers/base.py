@@ -425,7 +425,12 @@ async def run_to_completion(
     workspace: Workspace,
     spec: OperationSpec,
 ) -> tuple[OperationStatus, bytes]:
-    """Start `spec`, drain its output and return the terminal status and bytes."""
+    """Start `spec`, drain its output and return the terminal status and bytes.
+
+    The bytes are the operation's observation stream: everything the workload
+    wrote to stdout and stderr, in arrival order, with no channel identity.
+    Callers that must parse stdout alone use `WorkspaceProvider.execute`.
+    """
     return await drain_operation(provider, await provider.start(workspace, spec))
 
 

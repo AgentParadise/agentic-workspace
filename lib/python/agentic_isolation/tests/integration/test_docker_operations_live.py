@@ -130,9 +130,16 @@ async def test_k_cancel_kills_leader_grandchild_and_term_trapper(
             seen[name] = pid
     status = await provider.cancel(ref, grace_seconds=1)
     assert status.state == "cancelled"
-    for pid in seen.values():
-        result = await provider.execute(workspace, f"kill -0 {pid} 2>/dev/null && echo alive")
-        assert "alive" not in result.stdout, seen
+    # The group signals alone must do it: a stopped container would make every
+    # probe below fail, which must not read as "dead".
+    assert "cancel_escalation" not in status.metadata, status.metadata
+    probe = (
+        'st=$(cat /proc/"$1"/stat 2>/dev/null) || { echo dead; exit 0; }; '
+        'set -- ${st##*) }; [ "$1" = Z ] && echo dead || echo alive'
+    )
+    for name, pid in seen.items():
+        result = await provider.execute(workspace, f"sh -c '{probe}' probe {pid}")
+        assert (result.exit_code, result.stdout) == (0, "dead\n"), (name, pid, result)
 
 
 async def test_l_destroyed_container_is_lost(
