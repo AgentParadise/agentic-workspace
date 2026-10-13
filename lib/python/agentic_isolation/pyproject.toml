@@ -68,6 +68,10 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: needs external services (skipped when they are absent)",
+    "docker_conformance: Python Docker provider contract tests; CI runs them with REQUIRE_DOCKER_CONFORMANCE=1",
+]
 
 [tool.uv.sources]
 agentic-session-store = { path = "../agentic_session_store", editable = true }
