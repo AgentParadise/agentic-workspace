@@ -35,6 +35,7 @@ from typing import Literal
 from agentic_isolation.contract import (
     TERMINAL_STATES,
     EnforceableLimits,
+    LaunchMarker,
     ObservationDescriptor,
     ObservationPage,
     OperationError,
@@ -55,7 +56,7 @@ from agentic_isolation.providers.operation_spool import OperationFailure, Operat
 # the new session's pgid. `wait` returns the workload's status, 128+n for a
 # signal.
 _OUTER = (
-    'IFS= read -r argv0; IFS= read -r line; inner=$1; shift; '
+    "IFS= read -r argv0; IFS= read -r line; inner=$1; shift; "
     'setsid sh -c "$inner" "$argv0" "$line" "$@" & wait "$!"'
 )
 # Runs as session leader. Line one is the trusted pid and start time, then the
@@ -68,14 +69,14 @@ _INNER = (
 # Prints `alive` while the recorded leader (same start time, not a zombie) or
 # any non-zombie member of its process group remains, else `gone`.
 _GROUP_ALIVE = (
-    'leader=$1; start=$2; '
-    'for s in /proc/[0-9]*/stat; do '
+    "leader=$1; start=$2; "
+    "for s in /proc/[0-9]*/stat; do "
     'st=$(cat "$s" 2>/dev/null) || continue; set -- ${st##*) }; '
-    'pid=${s#/proc/}; pid=${pid%/stat}; '
+    "pid=${s#/proc/}; pid=${pid%/stat}; "
     '[ "$1" = Z ] && continue; '
     '[ "$pid" = "$leader" ] && [ "${20}" != "$start" ] && continue; '
     'if [ "$3" = "$leader" ]; then echo alive; exit 0; fi; '
-    'done; echo gone'
+    "done; echo gone"
 )
 
 _Presence = Literal["running", "stopped", "gone"]
@@ -219,7 +220,9 @@ class DockerOperations:
                 env={**os.environ, **secrets},
             )
             marker = spec.launch_marker
-            argv0, line = (marker.argv0, marker.line) if marker else ("sh", "")
+            argv0, line = (
+                (marker.argv0, marker.line) if isinstance(marker, LaunchMarker) else ("sh", "")
+            )
             if process.stdin is not None:
                 process.stdin.write(f"{argv0}\n{line}\n".encode())
                 await process.stdin.drain()
@@ -370,7 +373,9 @@ class DockerOperations:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + within
         while True:
-            code, out = await self._exec(container, "sh", "-c", _GROUP_ALIVE, "aw-probe", pid, start)
+            code, out = await self._exec(
+                container, "sh", "-c", _GROUP_ALIVE, "aw-probe", pid, start
+            )
             if code == 0 and out.strip() == "gone":
                 return True
             if loop.time() >= deadline:
@@ -398,11 +403,14 @@ class DockerOperations:
             return "running" if out.strip() == "true" else "stopped"
         if "no such" in out.lower():
             return "gone"
-        raise _error("provider_unavailable", f"docker could not report container {container}: {out.strip()}")
+        raise _error(
+            "provider_unavailable", f"docker could not report container {container}: {out.strip()}"
+        )
 
     def _lookup(self, ref: OperationRef) -> _Operation:
         operation = self._operations.get(ref.operation_id)
         if operation is None or operation.ref != ref:
-            raise _error("unknown_operation", f"no operation {ref.operation_id} in this provider", ref)
+            raise _error(
+                "unknown_operation", f"no operation {ref.operation_id} in this provider", ref
+            )
         return operation
-
