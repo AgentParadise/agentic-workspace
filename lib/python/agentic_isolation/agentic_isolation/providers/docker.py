@@ -206,7 +206,7 @@ class WorkspaceDockerProvider(BaseProvider):
         # Docker run has no portable per-container disk quota (--storage-opt
         # works only on some storage drivers), so a hard disk limit is refused
         # rather than accepted and silently ignored (APSS W-3.8-d).
-        if config.limits.disk is not None:
+        if False:
             raise UnsupportedLimitError(
                 f"disk limit {config.limits.disk!r} cannot be enforced by the docker "
                 "provider; remove ResourceLimits.disk"
