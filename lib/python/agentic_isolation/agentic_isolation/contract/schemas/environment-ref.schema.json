@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://standards.agentparadise.dev/experimental/v1/workspace/environment-ref.schema.json",
+  "title": "APSS Environment Reference",
+  "description": "Opaque, provider-interpreted execution environment identity. Compared by equality only.",
+  "$ref": "#/$defs/environmentRef",
+  "required": [
+    "schema"
+  ],
+  "$defs": {
+    "environmentRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "identifier"
+      ],
+      "properties": {
+        "schema": {
+          "const": "apss.environment-ref/v1"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "identifier": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

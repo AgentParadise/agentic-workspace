@@ -1,0 +1,13 @@
+{
+  "schema": "apss.workspace-operation/v1",
+  "execution_id": "exec-42",
+  "operation_key": "exec-42:setup:0",
+  "argv": [
+    "true"
+  ],
+  "working_directory": ".",
+  "environment": {},
+  "credential_bindings": [],
+  "timeout_seconds": 1,
+  "metadata": {}
+}

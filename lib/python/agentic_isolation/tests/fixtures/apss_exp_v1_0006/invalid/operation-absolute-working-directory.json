@@ -1,0 +1,11 @@
+{
+  "description": "working_directory is workspace-relative.",
+  "base": "valid/workspace-operation/minimal.json",
+  "set": [
+    {
+      "path": "/working_directory",
+      "value": "/etc"
+    }
+  ],
+  "remove": []
+}

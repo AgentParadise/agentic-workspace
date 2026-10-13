@@ -1,0 +1,27 @@
+{
+  "description": "status on a ref the provider never issued is a typed unknown_operation error, not lost.",
+  "steps": [
+    {
+      "call": "status",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        }
+      },
+      "expect": {
+        "schema": "workspace-status.schema.json",
+        "document": {
+          "schema": "apss.workspace-status/v1",
+          "kind": "unknown_operation",
+          "message": "no operation op-0001 in workspace ws-7f3a"
+        }
+      },
+      "launches": 0
+    }
+  ]
+}

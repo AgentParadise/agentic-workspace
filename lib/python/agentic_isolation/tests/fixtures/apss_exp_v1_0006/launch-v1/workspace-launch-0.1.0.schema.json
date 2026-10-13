@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://standards.agentparadise.dev/experimental/v1/workspace/workspace-launch.schema.json",
+  "title": "APSS Workspace Launch Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "execution_id", "workspace", "agent", "transcript"],
+  "properties": {
+    "schema": { "const": "apss.workspace-launch/v1" },
+    "execution_id": { "$ref": "#/$defs/nonEmpty" },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["working_directory", "security_profile"],
+      "properties": {
+        "working_directory": { "$ref": "#/$defs/relativePath" },
+        "security_profile": { "enum": ["insecure-local", "isolated"] },
+        "provider_hint": { "type": ["string", "null"] }
+      }
+    },
+    "content": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repositories": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/repository" }
+        },
+        "inputs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fileInput" }
+        },
+        "context_files": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fileInput" }
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["harness", "prompt"],
+      "properties": {
+        "harness": { "$ref": "#/$defs/nonEmpty" },
+        "model": { "type": ["string", "null"] },
+        "prompt": { "$ref": "#/$defs/nonEmpty" },
+        "arguments": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "skills": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/skill" }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } },
+        "deny": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } },
+        "sandbox": { "type": ["string", "null"] }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/nonEmpty" }
+    },
+    "transcript": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "source_format", "destination"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/nonEmpty" },
+        "source_format": { "$ref": "#/$defs/nonEmpty" },
+        "destination": { "$ref": "#/$defs/relativePath" },
+        "required": { "type": "boolean" }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": { "type": "array", "items": { "$ref": "#/$defs/nonEmpty" } },
+        "collect_logs": { "type": "boolean" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "memory_mb": { "type": ["integer", "null"], "minimum": 1 },
+        "cpu_millis": { "type": ["integer", "null"], "minimum": 1 },
+        "disk_mb": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "relativePath": { "type": "string", "minLength": 1, "pattern": "^[^/]" },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "revision", "destination"],
+      "properties": {
+        "url": { "$ref": "#/$defs/nonEmpty" },
+        "revision": { "$ref": "#/$defs/nonEmpty" },
+        "destination": { "$ref": "#/$defs/relativePath" }
+      }
+    },
+    "fileInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "destination"],
+      "properties": {
+        "source": { "$ref": "#/$defs/nonEmpty" },
+        "destination": { "$ref": "#/$defs/relativePath" },
+        "read_only": { "type": "boolean" },
+        "sha256": { "type": ["string", "null"], "pattern": "^[a-fA-F0-9]{64}$" }
+      }
+    },
+    "skill": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "source", "revision", "digest"],
+      "properties": {
+        "name": { "$ref": "#/$defs/nonEmpty" },
+        "source": { "$ref": "#/$defs/nonEmpty" },
+        "revision": { "$ref": "#/$defs/nonEmpty" },
+        "digest": { "type": "string", "pattern": "^sha256:[a-fA-F0-9]{64}$" }
+      }
+    }
+  }
+}

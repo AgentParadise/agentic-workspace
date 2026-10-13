@@ -1,0 +1,11 @@
+{
+  "description": "success must be false when capture is required and not captured.",
+  "base": "valid/workspace-result/succeeded.json",
+  "set": [
+    {
+      "path": "/capture/state",
+      "value": "unknown"
+    }
+  ],
+  "remove": []
+}

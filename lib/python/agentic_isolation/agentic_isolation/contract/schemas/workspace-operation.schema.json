@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://standards.agentparadise.dev/experimental/v1/workspace/workspace-operation.schema.json",
+  "title": "APSS Workspace Operation",
+  "description": "A request to start one operation inside a workspace, and the reference a provider returns for it.",
+  "$ref": "#/$defs/operationSpec",
+  "required": [
+    "schema"
+  ],
+  "$defs": {
+    "operationSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_id",
+        "operation_key",
+        "argv",
+        "working_directory",
+        "environment",
+        "credential_bindings",
+        "timeout_seconds",
+        "metadata"
+      ],
+      "properties": {
+        "schema": {
+          "const": "apss.workspace-operation/v1"
+        },
+        "execution_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operation_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "working_directory": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^/]"
+        },
+        "environment": {
+          "$ref": "credential-ref.schema.json#/$defs/credentialFreeStringMap"
+        },
+        "credential_bindings": {
+          "type": "array",
+          "items": {
+            "$ref": "credential-ref.schema.json#/$defs/credentialBinding"
+          }
+        },
+        "launch_marker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "argv0",
+            "line"
+          ],
+          "properties": {
+            "argv0": {
+              "type": "string",
+              "minLength": 1
+            },
+            "line": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "metadata": {
+          "$ref": "credential-ref.schema.json#/$defs/credentialFreeStringMap"
+        }
+      }
+    },
+    "operationRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspace",
+        "operation_id",
+        "operation_key"
+      ],
+      "properties": {
+        "workspace": {
+          "$ref": "workspace-ref.schema.json#/$defs/workspaceRef"
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operation_key": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

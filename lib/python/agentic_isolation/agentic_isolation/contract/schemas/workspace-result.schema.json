@@ -1,0 +1,200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://standards.agentparadise.dev/experimental/v1/workspace/workspace-result.schema.json",
+  "title": "APSS Workspace Result",
+  "description": "The terminal record of one workspace execution: process, capture and finalization as separate facts.",
+  "$ref": "#/$defs/workspaceResult",
+  "required": [
+    "schema"
+  ],
+  "$defs": {
+    "workspaceResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_id",
+        "metadata",
+        "process",
+        "resolved_commits",
+        "artifacts",
+        "capture",
+        "finalization",
+        "success"
+      ],
+      "properties": {
+        "schema": {
+          "const": "apss.workspace-result/v1"
+        },
+        "execution_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "metadata": {
+          "$ref": "credential-ref.schema.json#/$defs/credentialFreeStringMap"
+        },
+        "process": {
+          "allOf": [
+            {
+              "$ref": "workspace-status.schema.json#/$defs/operationStatus"
+            },
+            {
+              "properties": {
+                "state": {
+                  "$ref": "workspace-status.schema.json#/$defs/terminalState"
+                }
+              }
+            }
+          ]
+        },
+        "effective_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effective_environment": {
+          "$ref": "environment-ref.schema.json#/$defs/environmentRef"
+        },
+        "resolved_commits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "destination",
+              "commit"
+            ],
+            "properties": {
+              "destination": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^/]"
+              },
+              "commit": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "content-ref.schema.json#/$defs/contentRef"
+          }
+        },
+        "capture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "required",
+            "state",
+            "needs_backfill"
+          ],
+          "properties": {
+            "required": {
+              "type": "boolean"
+            },
+            "state": {
+              "enum": [
+                "captured",
+                "incomplete",
+                "failed",
+                "unknown",
+                "disabled"
+              ]
+            },
+            "needs_backfill": {
+              "type": "boolean"
+            }
+          }
+        },
+        "finalization": {
+          "$ref": "workspace-finalization.schema.json#/$defs/finalizationOutcome"
+        },
+        "primary_failure": {
+          "$ref": "workspace-status.schema.json#/$defs/operationError"
+        },
+        "teardown_failure": {
+          "$ref": "workspace-status.schema.json#/$defs/operationError"
+        },
+        "success": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "process": {
+                    "properties": {
+                      "state": {
+                        "const": "succeeded"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "capture": {
+                    "anyOf": [
+                      {
+                        "properties": {
+                          "required": {
+                            "const": false
+                          }
+                        }
+                      },
+                      {
+                        "properties": {
+                          "state": {
+                            "const": "captured"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "success": {
+                "const": true
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "success": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "process": {
+                "properties": {
+                  "state": {
+                    "const": "succeeded"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "primary_failure": false
+            }
+          }
+        }
+      ]
+    }
+  }
+}

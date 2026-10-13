@@ -1,0 +1,21 @@
+{
+  "schema": "apss.workspace-launch/v1",
+  "execution_id": "exec-01JQWORKSPACE",
+  "workspace": {
+    "working_directory": "repos/example",
+    "security_profile": "insecure-local",
+    "provider_hint": "local"
+  },
+  "agent": {
+    "harness": "codex",
+    "model": "gpt-5",
+    "prompt": "Inspect the repository and report its architecture.",
+    "arguments": []
+  },
+  "transcript": {
+    "session_id": "session-01JQWORKSPACE",
+    "source_format": "codex-jsonl",
+    "destination": "artifacts/output/session-envelope.json",
+    "required": true
+  }
+}

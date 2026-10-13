@@ -1,0 +1,9 @@
+{
+  "schema": "apss.workspace-finalization/v1",
+  "state": "failed",
+  "stage": "while_running",
+  "error": {
+    "kind": "internal",
+    "message": "exporter probe exited 2"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "description": "An unknown top-level field is rejected.",
+  "base": "valid/workspace-operation/full.json",
+  "set": [
+    {
+      "path": "/priority",
+      "value": 5
+    }
+  ],
+  "remove": []
+}

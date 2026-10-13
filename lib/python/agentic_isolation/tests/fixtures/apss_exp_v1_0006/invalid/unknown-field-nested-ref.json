@@ -1,0 +1,11 @@
+{
+  "description": "An unknown field inside an embedded WorkspaceRef is rejected.",
+  "base": "valid/workspace-status/running.json",
+  "set": [
+    {
+      "path": "/ref/workspace/host_path",
+      "value": "/var/lib/ws-7f3a"
+    }
+  ],
+  "remove": []
+}

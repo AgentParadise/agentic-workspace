@@ -1,0 +1,51 @@
+{
+  "schema": "apss.workspace-result/v1",
+  "execution_id": "exec-42",
+  "metadata": {
+    "phase_id": "phase-1"
+  },
+  "process": {
+    "ref": {
+      "workspace": {
+        "provider": "docker",
+        "resource_id": "ws-7f3a"
+      },
+      "operation_id": "op-0001",
+      "operation_key": "exec-42:phase-1:fence-9:agent"
+    },
+    "state": "succeeded",
+    "started_at": "2026-10-13T09:00:00Z",
+    "execution_id": "exec-42",
+    "metadata": {},
+    "exit_code": 0,
+    "ended_at": "2026-10-13T09:05:00Z"
+  },
+  "effective_model": "model-x",
+  "effective_environment": {
+    "kind": "oci-image",
+    "identifier": "ghcr.io/acme/agent-runtime:1.4.2",
+    "digest": "sha256:abababababababababababababababababababababababababababababababab"
+  },
+  "resolved_commits": [
+    {
+      "destination": "repo",
+      "commit": "9fceb02d0ae598e95dc970b74767f19372d61af8"
+    }
+  ],
+  "artifacts": [
+    {
+      "digest": "sha256:abababababababababababababababababababababababababababababababab",
+      "size_bytes": 1048576,
+      "locator": "s3://artifacts/exec-42/out.tar.gz"
+    }
+  ],
+  "capture": {
+    "required": false,
+    "state": "unknown",
+    "needs_backfill": true
+  },
+  "finalization": {
+    "state": "completed"
+  },
+  "success": true
+}

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://standards.agentparadise.dev/experimental/v1/workspace/workspace-ref.schema.json",
+  "title": "APSS Workspace Reference",
+  "description": "Opaque provider-issued handle to one workspace. Equality is the only operation.",
+  "$ref": "#/$defs/workspaceRef",
+  "required": [
+    "schema"
+  ],
+  "$defs": {
+    "workspaceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "resource_id"
+      ],
+      "properties": {
+        "schema": {
+          "const": "apss.workspace-ref/v1"
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resource_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

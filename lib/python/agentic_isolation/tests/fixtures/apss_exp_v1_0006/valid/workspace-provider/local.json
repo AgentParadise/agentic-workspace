@@ -1,0 +1,20 @@
+{
+  "schema": "apss.workspace-provider/v1",
+  "provider": "local",
+  "security_profile": "insecure-local",
+  "enforceable_limits": {
+    "cpu": false,
+    "memory": false,
+    "disk": false,
+    "network": false,
+    "timeout": true
+  },
+  "capabilities": [],
+  "observation": {
+    "retention_bytes": 1048576,
+    "max_page_bytes": 16384,
+    "integrity": "continuity_detected"
+  },
+  "interactive": false,
+  "environment_kinds": []
+}

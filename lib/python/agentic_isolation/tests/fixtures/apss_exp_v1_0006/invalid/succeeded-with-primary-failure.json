@@ -1,0 +1,14 @@
+{
+  "description": "A result whose process succeeded cannot carry a primary failure.",
+  "base": "valid/workspace-result/succeeded.json",
+  "set": [
+    {
+      "path": "/primary_failure",
+      "value": {
+        "kind": "internal",
+        "message": "spurious"
+      }
+    }
+  ],
+  "remove": []
+}

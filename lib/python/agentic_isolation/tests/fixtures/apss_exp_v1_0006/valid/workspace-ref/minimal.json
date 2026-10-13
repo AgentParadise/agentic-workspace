@@ -1,0 +1,5 @@
+{
+  "schema": "apss.workspace-ref/v1",
+  "provider": "docker",
+  "resource_id": "ws-7f3a"
+}

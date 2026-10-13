@@ -1,0 +1,15 @@
+{
+  "schema": "apss.workspace-status/v1",
+  "ref": {
+    "workspace": {
+      "provider": "docker",
+      "resource_id": "ws-7f3a"
+    },
+    "operation_id": "op-0001",
+    "operation_key": "exec-42:phase-1:fence-9:agent"
+  },
+  "state": "running",
+  "started_at": "2026-10-13T09:00:00Z",
+  "execution_id": "exec-42",
+  "metadata": {}
+}

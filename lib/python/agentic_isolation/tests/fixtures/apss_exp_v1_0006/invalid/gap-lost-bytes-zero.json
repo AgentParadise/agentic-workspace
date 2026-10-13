@@ -1,0 +1,11 @@
+{
+  "description": "A gap reports at least one lost byte or null.",
+  "base": "valid/workspace-observation/gap-exact.json",
+  "set": [
+    {
+      "path": "/gap/lost_bytes",
+      "value": 0
+    }
+  ],
+  "remove": []
+}
