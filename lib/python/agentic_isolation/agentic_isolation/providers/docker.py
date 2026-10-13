@@ -640,7 +640,6 @@ class WorkspaceDockerProvider(BaseProvider):
         return await self._run_exec(
             exec_cmd,
             timeout=timeout or workspace.config.limits.timeout_seconds,
-            on_timeout=kill_in_container,
         )
 
     async def _kill_exec_tree(self, container_name: str, exec_id: str) -> None:
