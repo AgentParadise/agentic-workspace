@@ -8,7 +8,7 @@ Quick Start:
 
     async with AgenticWorkspace.create(
         provider="local",  # or "docker"
-        secrets={"API_KEY": "secret"},
+        environment={"LOG_LEVEL": "debug"},
     ) as workspace:
         result = await workspace.execute("echo hello")
         print(result.stdout)
