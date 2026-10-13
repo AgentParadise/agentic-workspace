@@ -633,6 +633,8 @@ class WorkspaceDockerProvider(BaseProvider):
             )
             status, _ = await drain_operation(self, ref)
             out, err = self._operations.channels(ref)
+            # The key is private to this call, so no replay can need the record.
+            self._operations.release(ref)
         except OperationFailure as e:
             return ExecuteResult(
                 exit_code=-1,
@@ -880,9 +882,15 @@ class WorkspaceDockerProvider(BaseProvider):
         entry.users += 1
         try:
             async with entry.lock:
-                return await self._teardown_locked(
+                report = await self._teardown_locked(
                     workspace, while_running=while_running, before_delete=before_delete
                 )
+                # The workspace is gone, so its idempotency records may go too.
+                # A RETAINED one is not gone: it stays registered for a retry
+                # by ref, and so do its records.
+                if report.finalization.state == "completed":
+                    self._operations.forget_workspace(workspace.id)
+                return report
         finally:
             # Drop the entry only once no caller holds it or waits on it.
             # `lock.locked()` cannot tell: a waiter woken by `release()` does

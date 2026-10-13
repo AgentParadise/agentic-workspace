@@ -35,6 +35,7 @@ from agentic_isolation.providers.docker import (
     WorkspaceDockerProvider,
     _usage_from_cgroup,
 )
+from agentic_isolation.providers.docker_operations import DockerOperations
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 
 
@@ -72,6 +73,7 @@ def _provider() -> Any:
     p._retained = {}
     p._lock = asyncio.Lock()
     p._teardown_locks = {}
+    p._operations = DockerOperations(credentials=None, retention_bytes=1024, max_page_bytes=1024)
     return p
 
 
@@ -210,6 +212,35 @@ class TestFailedArchiveRetainsTheData:
         assert report.finalization.state == "failed"
         assert report.finalization.stage == "while_running"
         assert "exporter blew up" in report.finalization.error.message
+
+
+class TestOperationRecordsFollowTheOutcome:
+    """Idempotency records go with the workspace, and only once it is gone."""
+
+    def test_retained_keeps_them_and_completed_forgets_them(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _record(monkeypatch, [])
+        provider = _provider()
+        forgotten: list[str] = []
+        monkeypatch.setattr(provider._operations, "forget_workspace", forgotten.append)
+        d = tmp_path / "ws"
+        d.mkdir()
+
+        async def _fails() -> None:
+            raise RuntimeError("store unreachable")
+
+        first = asyncio.run(
+            provider.teardown(_Workspace(workspace_dir=str(d)), before_delete=_fails)
+        )
+        # Still registered for a retry by ref, so its records stay too.
+        assert first.finalization.state == "retained"
+        assert forgotten == []
+
+        assert first.finalization.retained is not MISSING
+        second = asyncio.run(provider.teardown(first.finalization.retained))
+        assert second.finalization.state == "completed"
+        assert forgotten == ["ws-1"]
 
 
 class TestRegistryIsNotLeaked:

@@ -390,7 +390,11 @@ class SupportsOperations(Protocol):
 
         The same `(workspace, operation_key)` with an equal spec returns the
         original ref and launches nothing, however many callers race. The
-        same key with a different spec raises `conflict`.
+        same key with a different spec raises `conflict`. The key's record
+        lives at least as long as the workspace (EXP-V1-0006 5.1.3). A
+        provider may reclaim a terminal operation's output after a retention
+        window it documents; the old ref is then `unknown_operation`, but the
+        key still replays it.
         """
         ...
 
