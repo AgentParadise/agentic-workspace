@@ -424,16 +424,23 @@ async def run_to_completion(
     provider: SupportsOperations,
     workspace: Workspace,
     spec: OperationSpec,
+) -> tuple[OperationStatus, bytes]:
+    """Start `spec`, drain its output and return the terminal status and bytes."""
+    return await drain_operation(provider, await provider.start(workspace, spec))
+
+
+async def drain_operation(
+    provider: SupportsOperations,
+    ref: OperationRef,
     *,
     page_bytes: int = 1 << 20,
 ) -> tuple[OperationStatus, bytes]:
-    """Start `spec`, drain its output and return the terminal status and bytes.
+    """Read `ref` to its `complete` page, then return its terminal status.
 
-    Built only on `start`, `observe` and `status`, so it behaves identically on
-    every provider. Output is read until a `complete` page, which guarantees no
-    byte retained up to the terminal offset is left unread.
+    Built only on `observe` and `status`, so it behaves identically on every
+    provider. A `complete` page guarantees no retained byte up to the terminal
+    offset is left unread.
     """
-    ref = await provider.start(workspace, spec)
     cursor: str | None = None
     output = bytearray()
     while True:
