@@ -68,6 +68,9 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# CI runs `pytest -q`; this nets to per-file progress lines plus skip reasons,
+# so the log shows whether the Docker-backed files ran or skipped.
+addopts = "-v -rs"
 
 [tool.uv.sources]
 agentic-session-store = { path = "../agentic_session_store", editable = true }
