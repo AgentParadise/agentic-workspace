@@ -178,7 +178,8 @@ class DockerOperations:
                 if existing.spec != spec:
                     raise _error(
                         "conflict",
-                        f"operation_key {spec.operation_key!r} already started with a different spec",
+                        f"operation_key {spec.operation_key!r} already started "
+                        "with a different spec",
                         existing.ref,
                     )
                 return existing.ref
@@ -188,14 +189,16 @@ class DockerOperations:
                     raise OperationFailure(
                         OperationError(
                             kind="unsupported_capability",
-                            message=f"credential delivery {binding.delivery!r} is not supported by docker",
+                            message=f"credential delivery {binding.delivery!r} "
+                            "is not supported by docker",
                         )
                     )
                 if self._credentials is None:
                     raise OperationFailure(
                         OperationError(
                             kind="rejected_policy",
-                            message="credential bindings need a CredentialResolver; none was injected",
+                            message="credential bindings need a CredentialResolver; "
+                            "none was injected",
                         )
                     )
                 secrets[binding.target] = await self._credentials.resolve(binding.ref)

@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import logging
+import math
 import os
 import posixpath
 import shutil
@@ -32,7 +32,6 @@ from agentic_isolation.config import (
     WorkspaceConfig,
     is_apparmor_profile_error,
 )
-from agentic_isolation.harnesses import ExecFn, TranscriptSource, get_harness
 from agentic_isolation.contract import (
     ObservationPage,
     OperationRef,
@@ -40,6 +39,7 @@ from agentic_isolation.contract import (
     OperationStatus,
     ProviderDescriptor,
 )
+from agentic_isolation.harnesses import ExecFn, TranscriptSource, get_harness
 from agentic_isolation.providers.base import (
     BaseProvider,
     CredentialResolver,
