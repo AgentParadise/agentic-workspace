@@ -21,6 +21,7 @@ import os
 import signal
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -507,6 +508,15 @@ async def test_local_cancel_after_the_leader_exited_fails_closed(tmp_path: Path)
     await provider.destroy(workspace)
 
 
+def _term_escape(ready: Path, child: Path) -> str:
+    """A busy leader whose TERM handler starts one unmarked child that escapes."""
+    return (
+        f'trap \'trap "" TERM; env -i setsid sh -c "echo \\$\\$ > {child}; exec sleep 300" '
+        f">/dev/null 2>&1 & while [ ! -s {child} ]; do :; done; exit 0' TERM; "
+        f"echo ready > {ready}; while :; do :; done"
+    )
+
+
 async def test_local_cancel_never_confirms_a_descendant_that_escaped_during_term(
     tmp_path: Path,
 ) -> None:
@@ -518,14 +528,9 @@ async def test_local_cancel_never_confirms_a_descendant_that_escaped_during_term
     assert local_operations.CANCEL_POLICY in provider.describe().capabilities
     workspace = await provider.create(WorkspaceConfig())
     ready, child = tmp_path / "ready", tmp_path / "child"
-    script = (
-        f'trap \'trap "" TERM; env -i setsid sh -c "echo \\$\\$ > {child}; exec sleep 300" '
-        f">/dev/null 2>&1 & while [ ! -s {child} ]; do :; done; exit 0' TERM; "
-        f"echo ready > {ready}; while :; do :; done"
-    )
     try:
         async with _bounded():
-            ref = await provider.start(workspace, _spec(script))
+            ref = await provider.start(workspace, _spec(_term_escape(ready, child)))
             while not ready.exists():
                 await asyncio.sleep(0.01)
             cancelled = await provider.cancel(ref, grace_seconds=0.5)
@@ -545,6 +550,75 @@ async def test_local_cancel_never_confirms_a_descendant_that_escaped_during_term
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(int(child.read_text()), signal.SIGKILL)
         await provider.destroy(workspace)
+
+
+# Runs the TERM escape in a fresh interpreter. `self` makes the provider's own
+# process a subreaper; `parent` puts the provider under a subreaper wrapper.
+_SUBREAPER_DRIVER = """
+import asyncio, json, subprocess, sys
+from pathlib import Path
+from agentic_isolation.config import WorkspaceConfig
+from agentic_isolation.contract import OperationSpec
+from agentic_isolation.providers import local_operations
+from agentic_isolation.providers.local import WorkspaceLocalProvider
+
+mode, base, spec = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+if mode != "run":
+    local_operations._become_subreaper()
+if mode == "parent":
+    sys.exit(subprocess.run([sys.executable, *sys.argv[:1], "run", *sys.argv[2:]]).returncode)
+
+async def main():
+    provider = WorkspaceLocalProvider(base_dir=base, allow_insecure=True)
+    workspace = await provider.create(WorkspaceConfig())
+    ref = await provider.start(workspace, OperationSpec.model_validate_json(spec))
+    while not (base / "ready").exists():
+        await asyncio.sleep(0.01)
+    cancelled = await provider.cancel(ref, grace_seconds=0.5)
+    while not (base / "child").read_text().strip():
+        await asyncio.sleep(0.01)
+    child = int((base / "child").read_text())
+    print(json.dumps({
+        "state": cancelled.state,
+        "failure": cancelled.metadata.get("cancel_signal_failure", ""),
+        "child": child,
+        "reaper": int(local_operations._stat_fields(child)[1]),
+    }))
+    await provider.destroy(workspace)
+
+asyncio.run(main())
+"""
+
+
+@pytest.mark.parametrize("subreaper", ["self", "parent"])
+def test_local_cancel_never_confirms_an_escapee_adopted_by_a_subreaper(
+    tmp_path: Path, subreaper: str
+) -> None:
+    """On a host where a subreaper (the provider, or an ancestor such as
+    `systemd --user`) adopts the escapee instead of init, cancel still fails."""
+    base, driver = tmp_path / "base", tmp_path / "driver.py"
+    base.mkdir()
+    driver.write_text(_SUBREAPER_DRIVER)
+    ready, child = base / "ready", base / "child"
+    spec = _spec(_term_escape(ready, child)).model_dump_json()
+    process = subprocess.Popen(
+        [sys.executable, str(driver), subreaper, str(base), spec], stdout=subprocess.PIPE
+    )
+    try:
+        out, _ = process.communicate(timeout=TEST_SECONDS)
+        assert process.returncode == 0
+        result = json.loads(out)
+        # The subreaper, not init, adopted the escapee.
+        assert result["reaper"] == process.pid
+        assert _alive(result["child"])
+        assert result["state"] == "failed"
+        assert str(result["child"]) in result["failure"]
+    finally:
+        process.kill()
+        process.wait()
+        if child.exists() and child.read_text().strip():
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(int(child.read_text()), signal.SIGKILL)
 
 
 async def test_local_cancel_with_a_surviving_orphan_settles_failed(
