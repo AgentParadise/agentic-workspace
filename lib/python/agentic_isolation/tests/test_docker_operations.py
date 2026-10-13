@@ -17,6 +17,7 @@ import hashlib
 import os
 import signal
 import stat
+import subprocess
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -38,6 +39,7 @@ from agentic_isolation.providers.base import (
     drain_operation,
     run_to_completion,
 )
+from agentic_isolation.providers import docker_operations
 from agentic_isolation.providers.docker import WorkspaceDockerProvider
 from agentic_isolation.providers.docker_operations import DockerOperations, _Operation
 from agentic_isolation.providers.operation_spool import OperationFailure, OperationSpool
@@ -250,6 +252,72 @@ async def test_cancel_escalates_and_reports_a_failed_signal(docker_env: Path) ->
     assert metadata["cancel_escalation"] == "container_stopped"
     assert metadata["cancel_signal_failure"] == "kill -TERM: exit 126: sh: not found"
     ops._docker_cmd.assert_awaited_once_with("stop", "-t", "0", "c1")
+
+
+# Overrides the shell's `kill` builtin: fails as a real kill would, signals nothing.
+_FAILING_KILL = "kill() { echo simulated-kill-failure >&2; return 42; }; "
+
+
+def _start_of(pid: int) -> str:
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+
+
+def _run_signal_script(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["sh", "-c", _FAILING_KILL + docker_operations._SIGNAL, "aw-signal", *args],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+@contextlib.contextmanager
+def _sleeper():
+    """A live process in its own session, so no group around it is ours."""
+    process = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        yield process.pid
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_signal_script_reports_a_kill_that_fails_on_a_live_target() -> None:
+    with _sleeper() as pid:
+        start = _start_of(pid)
+        by_pid = _run_signal_script("TERM", "", start, str(pid), start)
+        by_group = _run_signal_script("TERM", str(pid), start)
+        assert _alive(pid)
+    assert by_pid.returncode == 1, by_pid
+    assert f"pid {pid}: simulated-kill-failure" in by_pid.stderr
+    assert by_group.returncode == 1, by_group
+    assert f"group {pid}: simulated-kill-failure" in by_group.stderr
+
+
+def test_signal_script_accepts_a_kill_whose_target_vanished() -> None:
+    with _sleeper() as pid:
+        start = _start_of(pid)
+    # Reaped: the pid and the group are empty, so a failed kill is no failure.
+    result = _run_signal_script("TERM", str(pid), start, str(pid), start)
+    assert (result.returncode, result.stderr) == (0, "")
+
+
+async def test_cancel_escalates_when_the_real_signal_script_fails(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(docker_operations, "_SIGNAL", _FAILING_KILL + docker_operations._SIGNAL)
+    ops = _ops(docker_env)
+    with _sleeper() as pid:
+        operation = _held_operation((str(pid), _start_of(pid)))
+        await ops._terminate_group(operation, grace_seconds=0)
+        assert _alive(pid)
+    metadata = ops._status(operation).metadata
+    assert metadata["cancel_escalation"] == "container_stopped"
+    assert metadata["cancel_signal_failure"] == (
+        f"kill -TERM: exit 1: group {pid}: simulated-kill-failure\n"
+        f"pid {pid}: simulated-kill-failure"
+    )
+    assert "stop -t 0 c1" in (docker_env / "docker.log").read_text()
 
 
 async def test_cancel_kills_a_descendant_that_left_the_group(docker_env: Path) -> None:

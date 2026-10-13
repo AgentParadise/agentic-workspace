@@ -83,16 +83,24 @@ _PROCESSES = (
 # `pid start` pair, each only while its pid still has the recorded start
 # time, so a reused pid is never signalled. A group whose leader has exited
 # is still signalled: Linux keeps a pgid's number from reuse while any member
-# lives. The shell's builtin `kill` needs no binary in the image.
+# lives. The shell's builtin `kill` needs no binary in the image. A kill that
+# fails while its target still lives is reported on stderr and exits 1; one
+# whose target vanished meanwhile is the outcome wanted, not a failure.
 _SIGNAL = (
     "start_of() { st=$(cat /proc/$1/stat 2>/dev/null) || return 0; "
     'set -- ${st##*) }; echo "${20}"; }; '
-    "sig=$1; group=$2; group_start=$3; shift 3; "
+    "in_group() { for s in /proc/[0-9]*/stat; do "
+    'st=$(cat "$s" 2>/dev/null) || continue; set -- ${st##*) }; '
+    '[ "$1" != Z ] && [ "$3" = "$group" ] && return 0; done; return 1; }; '
+    "sig=$1; group=$2; group_start=$3; shift 3; failed=0; "
     'if [ -n "$group" ]; then cur=$(start_of "$group"); '
     'if [ -z "$cur" ] || [ "$cur" = "$group_start" ]; then '
-    'kill -s "$sig" -- "-$group" 2>/dev/null; fi; fi; '
+    'if ! err=$(kill -s "$sig" -- "-$group" 2>&1) && in_group; then '
+    'echo "group $group: $err" >&2; failed=1; fi; fi; fi; '
     'while [ $# -ge 2 ]; do cur=$(start_of "$1"); '
-    '[ "$cur" = "$2" ] && kill -s "$sig" "$1" 2>/dev/null; shift 2; done; exit 0'
+    'if [ "$cur" = "$2" ] && ! err=$(kill -s "$sig" "$1" 2>&1) '
+    '&& [ "$(start_of "$1")" = "$2" ]; then echo "pid $1: $err" >&2; failed=1; fi; '
+    "shift 2; done; exit $failed"
 )
 
 # pid -> (ppid, pgrp, start), as `_PROCESSES` reports it.
