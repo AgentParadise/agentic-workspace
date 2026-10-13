@@ -3,14 +3,17 @@
 Hermetic: synthetic credentials from an injected resolver, no external API.
 The unit tests in tests/test_docker_contract_debt.py prove the logic at the
 subprocess boundary; these prove the same contract end to end through
-`docker run` / `docker exec`. With REQUIRE_DOCKER_CONFORMANCE=1 (the CI
-docker-conformance job) a missing daemon fails instead of skipping.
+`docker run` / `docker exec`. With REQUIRE_DOCKER_CONFORMANCE=1, or on a
+GitHub Actions Linux runner (which always has a daemon), a missing daemon fails
+instead of skipping. tests/integration/conftest.py prints one outcome line per
+test, so a CI log names each of them.
 
 Run with: pytest -m docker_conformance tests/integration/test_docker_contract_conformance.py
 """
 
 import asyncio
 import os
+import sys
 import time
 
 import pytest
@@ -26,7 +29,9 @@ from agentic_isolation.contract import CredentialBinding, CredentialRef
 IMAGE = "python:3.12-slim"
 SYNTHETIC_VALUE = "synthetic-conformance-credential-4d1e"
 
-_REQUIRED = os.environ.get("REQUIRE_DOCKER_CONFORMANCE") == "1"
+_REQUIRED = os.environ.get("REQUIRE_DOCKER_CONFORMANCE") == "1" or (
+    os.environ.get("GITHUB_ACTIONS") == "true" and sys.platform == "linux"
+)
 _AVAILABLE = WorkspaceDockerProvider.is_available()
 
 pytestmark = [
@@ -39,7 +44,10 @@ pytestmark = [
 @pytest.fixture(autouse=True)
 def _docker_is_required() -> None:
     if _REQUIRED and not _AVAILABLE:
-        pytest.fail("REQUIRE_DOCKER_CONFORMANCE=1 but the docker daemon is not available")
+        pytest.fail(
+            "Docker conformance is required here (REQUIRE_DOCKER_CONFORMANCE=1 or a GitHub"
+            " Actions Linux runner) but the docker daemon is not available"
+        )
 
 
 class Vault:
