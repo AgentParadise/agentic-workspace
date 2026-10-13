@@ -26,6 +26,14 @@ CODEX_TOOL_ITEM_TYPES: Final = frozenset({"command_execution", "file_change"})
 """The ``item.started`` item types syntropic137's ``CodexStreamProcessor`` records as
 a tool start (``_handle_item_started`` @ 1017ec7b); every other item is not a tool."""
 CODEX_VERDICT_ITEM_ID: Final = "scripted_agent_verdict"
+TASK_RESULT_MARKER: Final = "TASK_RESULT:"
+"""What syntropic137's ``VerdictReader`` (``phase_verdict.py`` @ 1017ec7b) looks for in
+every message the agent says. It settles all of them by precedence, FAILURE over
+SUCCESS, not by which came last, so a recorded report anywhere in the stream would
+outrank the profile's verdict whenever the recorded run failed."""
+WITHHELD_REPORT: Final = "[scripted-agent replay: the recorded run's own verdict is withheld]"
+"""What a recorded message carrying a report says instead, so the only report the
+consumer reads is the one ``closing`` writes."""
 SUBAGENT_TOOL_NAMES: Final = frozenset({"Task", "Agent"})
 """Tools the session observer records as a subagent start, not a tool execution
 (``agentic_isolation``'s ``EventParser``), so they cannot be counted in ``tool_uses``."""
@@ -89,7 +97,7 @@ class Recording:
             )
 
         *replayed, result = records
-        events = [_rewrite(e) for e in replayed]
+        events = [_withhold_report(harness, _rewrite(e)) for e in replayed]
         if harness == "codex" and events:
             # Codex names no model on stdout; its consumer takes the first top-level
             # ``model`` on the stream before falling back to the rollout on disk.
@@ -150,6 +158,34 @@ def _tool_blocks(harness: Harness, event: Event) -> list[Event]:
     if not isinstance(content, list):
         return []
     return [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+
+
+def _withhold_report(harness: Harness, event: Event) -> Event:
+    """``event`` with every message its consumer reads for a verdict cleared of the
+    recording's own ``TASK_RESULT``: codex ``agent_message`` items, claude assistant
+    ``text`` blocks. Everything else, including the event itself, is kept."""
+    if harness == "codex":
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message" and _reports(item):
+            return {**event, "item": {**item, "text": WITHHELD_REPORT}}
+        return event
+    message = event.get("message")
+    if event.get("type") != "assistant" or not isinstance(message, dict):
+        return event
+    content = message.get("content")
+    if not isinstance(content, list):
+        return event
+    blocks = [
+        {**b, "text": WITHHELD_REPORT}
+        if isinstance(b, dict) and b.get("type") == "text" and _reports(b)
+        else b
+        for b in content
+    ]
+    return {**event, "message": {**message, "content": blocks}}
+
+
+def _reports(said: Event) -> bool:
+    return TASK_RESULT_MARKER in str(said.get("text", ""))
 
 
 def _rewrite(event: Event) -> Event:

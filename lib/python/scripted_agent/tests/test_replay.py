@@ -213,6 +213,35 @@ def test_last_message_is_the_profiles_task_result_not_the_recordings(tmp_path: P
     assert all("result" not in e or e["type"] != "result" for e in events[:-1])
 
 
+def test_the_recorded_runs_own_verdict_never_reaches_the_consumer(tmp_path: Path) -> None:
+    # EventStreamProcessor feeds every assistant text block to VerdictReader, which ranks
+    # FAILURE over SUCCESS whatever the order; only the profile's report may carry one.
+    failure = 'TASK_RESULT: {"success": false, "comments": "tests failed"}\nTASK_RESULT_END'
+    rows = [json.loads(line) for line in RECORDING.read_text().splitlines()]
+    said = [b for r in rows if r.get("type") == "assistant" for b in r["message"]["content"]]
+    next(b for b in said if b["type"] == "text")["text"] += f"\n{failure}"
+    failed = tmp_path / "failed-run.jsonl"
+    failed.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    profile = _profile()
+    profile["phases"]["reverify"]["stream"]["recording"] = str(failed)
+
+    events, _, _ = _replay(_env("reverify", profile), tmp_path)
+
+    reports = [
+        text
+        for e in events
+        for text in (
+            [b.get("text", "") for b in e["message"]["content"]]
+            if e["type"] == "assistant"
+            else [e.get("result", "")]
+        )
+        if "TASK_RESULT:" in str(text)
+    ]
+    assert reports == [events[-1]["result"]]
+    assert '"success":true' in reports[0]
+    assert all("tests failed" not in json.dumps(e) for e in events)
+
+
 def test_open_draft_pushes_the_execution_branch_and_opens_the_pr(tmp_path: Path) -> None:
     _, _, git = _replay(_env("implement"), tmp_path, FakeGit(branch_exists=False))
 

@@ -28,7 +28,11 @@ never part of a production image.
    names no model on stdout, so its first event carries one), then
    sleeps the recorded delay before the closing event. The phase's work runs
    after that delay rather than inside it, so the verdict is never earlier
-   than its scaled schedule.
+   than its scaled schedule. Any recorded agent message carrying the
+   recorded run's own `TASK_RESULT:` (a codex `agent_message`, a claude
+   assistant `text` block) is replaced by a fixed note. syntropic137's
+   `VerdictReader` ranks FAILURE over SUCCESS across every message, so a
+   recorded failure left in the stream would outrank the profile's verdict.
 5. Runs the workload (`none`, `synthetic`, or `just preflight-agent` in the
    cloned fixture repo), performs the side effect with git/gh, writes
    `artifacts/output/<phase_id>.md` via `render_artifact`, and prints
