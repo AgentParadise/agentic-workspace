@@ -55,7 +55,7 @@ protocol-level tests run parametrised for both Docker and Local:
 | Operation start, idempotency and conflict | `::test_a_*`, `::test_b_*`, `::test_c_*`, `::test_unknown_ref_is_unknown_operation`, `::test_local_unlaunchable_spec_is_a_typed_rejection` |
 | Operation status from a trusted channel | `::test_m_*`, `::test_a_signalled_workload_reports_its_signal`, `::test_timeout_settles_as_timed_out_with_the_final_output` |
 | Operation observation pages, gaps and cursors | `::test_e_*`, `::test_f_*`, `::test_g_*`, `::test_h_*`, `::test_i_*`, `::test_j_*`, `::test_local_describe_matches_the_published_local_descriptor`, `::test_local_marker_comes_from_a_named_launcher_the_workload_replaces` |
-| Operation cancellation of the process tree | `::test_k_*`, `::test_local_cancel_kills_a_descendant_that_left_the_group`, `::test_cancel_never_signals_a_refused_group`, `::test_unsafe_group_*`, `::test_local_cancel_kills_an_orphan_that_detached_before_cancel`, `::test_local_never_signals_a_reused_leader_or_tracked_pid`, `::test_local_never_signals_a_pid_reused_between_term_and_kill` |
+| Operation cancellation of the process tree | `::test_k_*`, `::test_local_cancel_kills_a_descendant_that_left_the_group`, `::test_cancel_never_signals_a_refused_group`, `::test_unsafe_group_*`, `::test_local_cancel_kills_an_orphan_that_detached_before_cancel`, `::test_local_cancel_after_the_leader_exited_fails_closed`, `::test_local_never_signals_a_reused_leader_or_tracked_pid`, `::test_local_never_signals_a_pid_reused_between_term_and_kill` |
 
 Python Local publishes `integrity: continuity_detected`, not `exact`: its
 workload runs as the caller's uid in the caller's pid namespace, so the spool

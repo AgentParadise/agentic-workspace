@@ -18,7 +18,13 @@ the process-group cancel. It mirrors `DockerOperations` without a container:
   launcher's exec), so a descendant whose parent exits is reparented to the
   leader, not to init, and stays on the leader's parent chain whatever its
   session or environment. Every process the workload starts also inherits an
-  ownership token in its environment, for descendants that outlive the leader.
+  ownership token in its environment, and every process holding the
+  operation's output pipe is owned, so a descendant that outlives the leader
+  is still found while it keeps the operation running. A leader that exited
+  before cancel took the first look at its tree leaves descendants that hold
+  neither unconfirmable: if anything owned was still running, cancel fails
+  closed instead of claiming `cancelled`; if nothing was, the operation keeps
+  its own outcome, since nothing was cancelled.
   Processes are owned by pid plus start time; a pid whose start time changed
   is a replacement and is never signalled.
 - Cancel refuses a group numbered <= 1 or equal to the caller's own group: the
@@ -180,6 +186,20 @@ def _send(pid: int, start: int, sig: signal.Signals) -> None:
         os.close(fd)
 
 
+def _holds(pid: int, pipe: int) -> bool:
+    """Whether `pid` has the pipe with inode `pipe` open."""
+    target = f"pipe:[{pipe}]"
+    try:
+        fds = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return False
+    for fd in fds:
+        with contextlib.suppress(OSError):
+            if os.readlink(fd) == target:
+                return True
+    return False
+
+
 def _invalid_launch(argv: tuple[str, ...], env: dict[str, str]) -> str | None:
     """Why the OS cannot launch this argv and environment, or None."""
     if any("\0" in arg for arg in argv):
@@ -216,6 +236,8 @@ class _Operation:
     started_at: str
     process: asyncio.subprocess.Process
     token: str
+    # Inode of the output pipe; whoever still holds it keeps the operation open.
+    pipe: int | None = None
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     state: OperationState = "running"
     exit_code: int | None = None
@@ -336,11 +358,13 @@ class LocalOperations:
             raise _error("provider_unavailable", f"could not launch {spec.argv[0]!r}")
         token = secrets.token_hex(16)
         env[OWNER_VARIABLE] = token
+        read_end, write_end = os.pipe()
+        inode = os.fstat(read_end).st_ino
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
+                stdout=write_end,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(cwd),
                 env=env,
@@ -348,7 +372,15 @@ class LocalOperations:
                 preexec_fn=_become_subreaper,
             )
         except (OSError, subprocess.SubprocessError) as e:
+            os.close(read_end)
             raise _error("provider_unavailable", f"could not launch {spec.argv[0]!r}: {e}") from e
+        finally:
+            os.close(write_end)
+        output = asyncio.StreamReader()
+        loop = asyncio.get_running_loop()
+        transport, _ = await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(output), os.fdopen(read_end, "rb", 0)
+        )
         self._sequence += 1
         ref = OperationRef(
             workspace=WorkspaceRef(provider="local", resource_id=workspace.id),
@@ -363,16 +395,21 @@ class LocalOperations:
             started_at=_now(),
             process=process,
             token=token,
+            pipe=inode,
         )
-        operation.collector = asyncio.create_task(self._collect(operation))
+        operation.collector = asyncio.create_task(self._collect(operation, output, transport))
         self._operations[ref.operation_id] = operation
         self._by_key[key] = operation
         return ref
 
-    async def _collect(self, operation: _Operation) -> None:
+    async def _collect(
+        self,
+        operation: _Operation,
+        output: asyncio.StreamReader,
+        transport: asyncio.ReadTransport,
+    ) -> None:
         process = operation.process
-        assert process.stdout is not None  # PIPE
-        reader = asyncio.ensure_future(self._pump(operation, process.stdout))
+        reader = asyncio.ensure_future(self._pump(operation, output))
         try:
             async with asyncio.timeout(operation.spec.timeout_seconds):
                 await asyncio.shield(reader)
@@ -390,6 +427,7 @@ class LocalOperations:
                 reader.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await reader
+            transport.close()
         # A cancel still confirming decides between cancelled and failed.
         async with operation.stopping:
             self._settle(operation, process.returncode)
@@ -486,6 +524,15 @@ class LocalOperations:
         pgid = operation.process.pid
         if refusal := unsafe_group(pgid):
             self._note(operation, refusal)
+        # Once the leader has exited, its subreaper no longer collects orphans,
+        # so a tree never looked at while it lived cannot be fully confirmed.
+        unseen = not operation.tracked and (
+            operation.process.returncode is not None or _start_time(pgid) is None
+        )
+        if unseen and not self._owned(operation):
+            # Nothing of it is left running: the workload ended on its own.
+            operation.cancel_requested = False
+            return
         for sig, wait in ((signal.SIGTERM, grace_seconds), (signal.SIGKILL, _KILL_WAIT_SECONDS)):
             owned = self._owned(operation)
             operation.tracked.update(owned)
@@ -496,6 +543,13 @@ class LocalOperations:
             for pid, start in owned.items():
                 _send(pid, start, sig)
             if await self._gone(operation, within=wait):
+                if unseen:
+                    operation.unconfirmed = True
+                    self._note(
+                        operation,
+                        "the workload leader exited before cancel; descendants that "
+                        "left its output pipe and environment cannot be confirmed gone",
+                    )
                 return
         survivors = sorted(self._owned(operation))
         operation.unconfirmed = True
@@ -507,19 +561,25 @@ class LocalOperations:
 
         Owned: a tracked process whose start time still matches, the leader's
         group while the leader is unreaped, anything carrying the ownership
-        token, and every descendant of those through the parent chain. A
+        token or holding the output pipe, and every descendant of those through the parent chain. A
         refused group is never counted, since it may hold the caller.
         """
         table = _proc_table()
         pgid = operation.process.pid
         ours = operation.process.returncode is None and unsafe_group(pgid) is None
         leader = pgid if ours else None
+        # This process holds the pipe's read end; its children are not owned.
         found = {
             pid: start
             for pid, (_, pgrp, start) in table.items()
-            if operation.tracked.get(pid) == start
-            or pgrp == leader
-            or _carries(pid, operation.token)
+            if pid > 1
+            and pid != os.getpid()
+            and (
+                operation.tracked.get(pid) == start
+                or pgrp == leader
+                or _carries(pid, operation.token)
+                or (operation.pipe is not None and _holds(pid, operation.pipe))
+            )
         }
         grew = True
         while grew:

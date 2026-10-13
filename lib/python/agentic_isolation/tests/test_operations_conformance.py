@@ -470,6 +470,36 @@ async def test_local_cancel_kills_an_orphan_that_detached_before_cancel(
     await provider.destroy(workspace)
 
 
+async def test_local_cancel_after_the_leader_exited_fails_closed(tmp_path: Path) -> None:
+    """A clean-environment child that outlived the leader is found by the pipe
+    it holds and killed, and cancel still refuses to claim `cancelled`."""
+    provider = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
+    workspace = await provider.create(WorkspaceConfig())
+    leader, child, bystander = tmp_path / "leader", tmp_path / "child", tmp_path / "bystander"
+    script = f"echo $$ > {leader}; env -i setsid sleep 300 & echo $! > {child}; exit 0"
+    async with _bounded():
+        other = await provider.start(
+            workspace, _spec(f"echo $$ > {bystander}; exec sleep 300", key="k2")
+        )
+        ref = await provider.start(workspace, _spec(script))
+        (leader_pid,) = await _wait_for_pids(leader, 1)
+        (child_pid,) = await _wait_for_pids(child, 1)
+        (bystander_pid,) = await _wait_for_pids(bystander, 1)
+        while _alive(leader_pid):
+            await asyncio.sleep(0.05)
+        assert _alive(child_pid)
+        assert (await provider.status(ref)).state == "running"
+        cancelled = await provider.cancel(ref, grace_seconds=0.5)
+        assert not _alive(child_pid)
+        assert cancelled.state == "failed"
+        assert "leader exited before cancel" in cancelled.metadata["cancel_signal_failure"]
+        assert (await provider.status(ref)).state == "failed"
+        assert (await provider.cancel(ref, grace_seconds=0.5)).state == "failed"
+        assert _alive(bystander_pid)
+        assert (await provider.status(other)).state == "running"
+    await provider.destroy(workspace)
+
+
 async def test_local_cancel_with_a_surviving_orphan_settles_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
