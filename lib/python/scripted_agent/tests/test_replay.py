@@ -280,6 +280,12 @@ def test_platform_verify_refuses_an_absent_branch(tmp_path: Path) -> None:
 # --- refusals: exit non-zero with the reason ----------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _never_the_real_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``main()`` writes under the workspace root; never let a test reach /workspace."""
+    monkeypatch.setattr("scripted_agent.cli.WORKSPACE", tmp_path / "main-workspace")
+
+
 def _exit(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], environ: dict[str, str]
 ) -> tuple[int, str]:

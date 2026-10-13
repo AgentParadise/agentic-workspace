@@ -54,6 +54,7 @@ from scripted_agent.recording import Recording
 PROFILE_PATH_ENV: Final = "SYN_SCRIPTED_AGENT_PROFILE_PATH"
 TAGS_ENV: Final = "AGENTIC_SESSION_STORE_TAGS"
 _CHUNK: Final = 1 << 20
+WORKSPACE: Final = Path("/workspace")
 
 Run = Callable[[Sequence[str], Path | None], str]
 """Run a command in a directory and return its stdout; raise ``SideEffectFailed``."""
@@ -64,7 +65,7 @@ def main() -> None:
         if "--version" in sys.argv[1:]:
             print(f"{cli_version(os.environ)} (Claude Code)")
             return
-        replay(os.environ, Path("/workspace"), _subprocess, time.sleep, sys.stdout)
+        replay(os.environ, WORKSPACE, _subprocess, time.sleep, sys.stdout)
     except Refusal as e:
         print(f"scripted-agent: {e}", file=sys.stderr)
         sys.exit(e.exit_code)
