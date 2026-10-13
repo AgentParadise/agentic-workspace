@@ -42,6 +42,7 @@ from agentic_isolation import (
     Workspace,
     WorkspaceConfig,
     WorkspaceDockerProvider,
+    WorkspaceRuntime,
 )
 
 IMAGE = os.environ.get("AGENTIC_OMNI_AGENT_IMAGE", "agentic-workspace-omni-agent:latest")
@@ -109,7 +110,7 @@ def _host_config(container: str) -> dict[str, object]:
 async def _workspace(
     security: SecurityConfig, image: str = IMAGE
 ) -> AsyncIterator[tuple[str, Workspace]]:
-    security.use_gvisor = False
+    security.runtime = WorkspaceRuntime.RUNC
     provider = WorkspaceDockerProvider(default_image=image, security=security)
     # WorkspaceConfig.security wins over the provider's (as Syntropic137 wires
     # it, both are set to the same value).
@@ -139,7 +140,7 @@ def unprotected_container() -> Iterator[str]:
     the point; it exists here only to prove the delegate's refusal.
     """
     security = SecurityConfig.production()
-    security.use_gvisor = False
+    security.runtime = WorkspaceRuntime.RUNC
     name = f"agentic-ws-unprotected-{os.getpid()}"
     run = subprocess.run(
         [

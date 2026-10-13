@@ -157,4 +157,4 @@ class TestSecurityConfigContract:
         dev = SecurityConfig.development()
 
         # At least one field should differ
-        assert prod.read_only_root != dev.read_only_root or prod.use_gvisor != dev.use_gvisor
+        assert prod.read_only_root != dev.read_only_root or prod.runtime != dev.runtime
