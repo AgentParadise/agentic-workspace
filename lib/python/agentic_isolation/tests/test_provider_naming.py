@@ -16,7 +16,7 @@ class TestProviderNaming:
         from agentic_isolation import WorkspaceLocalProvider
 
         assert WorkspaceLocalProvider is not None
-        assert WorkspaceLocalProvider().name == "local"
+        assert WorkspaceLocalProvider(allow_insecure=True).name == "local"
 
     def test_agentic_workspace_exists(self) -> None:
         """AgenticWorkspace should be importable."""
@@ -60,7 +60,7 @@ class TestStreamingMethodExists:
         """WorkspaceLocalProvider should have stream method."""
         from agentic_isolation import WorkspaceLocalProvider
 
-        provider = WorkspaceLocalProvider()
+        provider = WorkspaceLocalProvider(allow_insecure=True)
         assert hasattr(provider, "stream")
         assert callable(provider.stream)
 

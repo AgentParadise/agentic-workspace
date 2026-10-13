@@ -255,10 +255,10 @@ class TestWorkspaceProviderProtocol:
 
     def test_local_provider_is_workspace_provider(self) -> None:
         """WorkspaceLocalProvider should implement WorkspaceProvider."""
-        provider = WorkspaceLocalProvider()
+        provider = WorkspaceLocalProvider(allow_insecure=True)
         assert isinstance(provider, WorkspaceProvider)
 
     def test_provider_has_name(self) -> None:
         """Provider should have a name."""
-        provider = WorkspaceLocalProvider()
+        provider = WorkspaceLocalProvider(allow_insecure=True)
         assert provider.name == "local"
