@@ -302,6 +302,33 @@ def test_signal_script_accepts_a_kill_whose_target_vanished() -> None:
     assert (result.returncode, result.stderr) == (0, "")
 
 
+def test_signal_script_accepts_a_target_that_died_during_its_kill() -> None:
+    # The sleeper's parent shell reaps it; the override kills only that pid.
+    helper = subprocess.Popen(
+        ["sh", "-c", "sleep 60 & echo $!; wait"], stdout=subprocess.PIPE, start_new_session=True
+    )
+    try:
+        assert helper.stdout is not None
+        pid = int(helper.stdout.readline())
+        assert pid > 1 and os.getpgid(pid) not in (os.getpgrp(), 0, 1)
+        start = _start_of(pid)
+        racing_kill = (
+            'kill() { command kill -s KILL "$3"; '
+            'while [ -e "/proc/$3" ]; do sleep 0.01; done; echo vanished >&2; return 1; }; '
+        )
+        result = subprocess.run(
+            ["sh", "-c", racing_kill + docker_operations._SIGNAL, "aw-signal", "TERM", "", start]
+            + [str(pid), start],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    finally:
+        helper.kill()
+        helper.wait()
+    assert (result.returncode, result.stderr) == (0, "")
+
+
 async def test_cancel_escalates_when_the_real_signal_script_fails(
     docker_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
