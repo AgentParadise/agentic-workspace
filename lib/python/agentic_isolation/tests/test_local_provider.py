@@ -20,7 +20,7 @@ class TestWorkspaceLocalProvider:
     @pytest.fixture
     def provider(self) -> WorkspaceLocalProvider:
         """Create a local provider."""
-        return WorkspaceLocalProvider()
+        return WorkspaceLocalProvider(allow_insecure=True)
 
     @pytest.mark.asyncio
     async def test_create_workspace(self, provider: WorkspaceLocalProvider) -> None:
@@ -93,7 +93,9 @@ class TestWorkspaceLocalProvider:
                 assert ref == CredentialRef(name="team/api-key", scope="vault")
                 return "synthetic-credential-123"
 
-        provider = WorkspaceLocalProvider(base_dir=tmp_path, credentials=Vault())
+        provider = WorkspaceLocalProvider(
+            base_dir=tmp_path, credentials=Vault(), allow_insecure=True
+        )
         config = WorkspaceConfig(
             provider="local",
             credentials=[

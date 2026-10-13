@@ -17,6 +17,13 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from agentic_isolation.config import WorkspaceConfig
+from agentic_isolation.contract import (
+    ObservationPage,
+    OperationRef,
+    OperationSpec,
+    OperationStatus,
+    ProviderDescriptor,
+)
 from agentic_isolation.providers.base import (
     BaseProvider,
     CredentialResolver,
@@ -24,8 +31,13 @@ from agentic_isolation.providers.base import (
     Workspace,
     resolve_env_credentials,
 )
+from agentic_isolation.providers.local_operations import LocalOperations
 
 logger = logging.getLogger(__name__)
+
+
+class InsecureProviderError(RuntimeError):
+    """An insecure provider was constructed without its explicit opt-in (APSS W-6.2)."""
 
 
 class WorkspaceLocalProvider(BaseProvider):
@@ -38,8 +50,11 @@ class WorkspaceLocalProvider(BaseProvider):
     WARNING: No security isolation! Agent code runs with your permissions.
     Use WorkspaceDockerProvider for untrusted workloads.
 
+    Construction refuses unless `allow_insecure=True` is passed (APSS W-6.2),
+    so no code path, default or registry lookup, reaches it by accident.
+
     Usage:
-        provider = WorkspaceLocalProvider()
+        provider = WorkspaceLocalProvider(allow_insecure=True)
         workspace = await provider.create(config)
         result = await provider.execute(workspace, "echo hello")
         await provider.destroy(workspace)
@@ -50,6 +65,8 @@ class WorkspaceLocalProvider(BaseProvider):
         base_dir: str | Path | None = None,
         shell: str = "/bin/bash",
         credentials: CredentialResolver | None = None,
+        *,
+        allow_insecure: bool = False,
     ):
         """Initialize local provider.
 
@@ -58,7 +75,18 @@ class WorkspaceLocalProvider(BaseProvider):
             shell: Shell to use for command execution
             credentials: Resolves `WorkspaceConfig.credentials`. Without one,
                 a config that binds a credential is refused.
+            allow_insecure: Must be `True`: the caller acknowledges that
+                workloads run unisolated, as this user, on this host.
+
+        Raises:
+            InsecureProviderError: `allow_insecure` is not `True`.
         """
+        if allow_insecure is not True:
+            raise InsecureProviderError(
+                "WorkspaceLocalProvider runs workloads unisolated on the host and is "
+                "test-only; construct it with allow_insecure=True to opt in, or use "
+                "WorkspaceDockerProvider"
+            )
         self._base_dir = Path(base_dir) if base_dir else Path(tempfile.gettempdir())
         self._shell = shell
         self._workspaces: dict[str, Workspace] = {}
@@ -66,6 +94,7 @@ class WorkspaceLocalProvider(BaseProvider):
         # Resolved credential values per workspace id, kept off the Workspace
         # (whose metadata is rendered and serialised) and dropped on destroy.
         self._credential_env: dict[str, dict[str, str]] = {}
+        self._operations = LocalOperations(credentials=credentials)
 
     @property
     def name(self) -> str:
@@ -104,13 +133,42 @@ class WorkspaceLocalProvider(BaseProvider):
         return workspace
 
     async def destroy(self, workspace: Workspace) -> None:
-        """Remove the workspace directory."""
+        """Cancel its operations and remove the workspace directory."""
+        await self._operations.forget_workspace(workspace.id)
         if workspace.id in self._workspaces:
             del self._workspaces[workspace.id]
         self._credential_env.pop(workspace.id, None)
 
         if workspace.path.exists():
             shutil.rmtree(workspace.path, ignore_errors=True)
+
+    def describe(self) -> ProviderDescriptor:
+        """What this provider can enforce: little, and it says so."""
+        return self._operations.describe()
+
+    async def start(self, workspace: Workspace, spec: OperationSpec) -> OperationRef:
+        """Start `spec` as a host process in the workspace directory."""
+        return await self._operations.start(
+            workspace, spec, base_env=self._build_exec_env(workspace)
+        )
+
+    async def status(self, ref: OperationRef) -> OperationStatus:
+        return await self._operations.status(ref)
+
+    async def observe(
+        self,
+        ref: OperationRef,
+        *,
+        cursor: str | None,
+        max_bytes: int,
+        wait_seconds: float = 0,
+    ) -> ObservationPage:
+        return await self._operations.observe(
+            ref, cursor=cursor, max_bytes=max_bytes, wait_seconds=wait_seconds
+        )
+
+    async def cancel(self, ref: OperationRef, *, grace_seconds: float) -> OperationStatus:
+        return await self._operations.cancel(ref, grace_seconds=grace_seconds)
 
     async def execute(
         self,
