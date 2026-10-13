@@ -29,7 +29,8 @@ from typing import Any
 import pytest
 
 from agentic_isolation import SupportsStagedTeardown, TeardownReport, TeardownUsage
-from agentic_isolation.contract import MISSING, WorkspaceRef
+from agentic_isolation.contract import MISSING, OperationSpec, WorkspaceRef
+from agentic_isolation.providers.base import drain_operation
 from agentic_isolation.providers.docker import (
     ContainerRemovalError,
     WorkspaceDockerProvider,
@@ -75,6 +76,26 @@ def _provider() -> Any:
     p._teardown_locks = {}
     p._operations = DockerOperations(credentials=None, retention_bytes=1024, max_page_bytes=1024)
     return p
+
+
+# `docker exec [flags] CONTAINER CMD...` runs CMD here and every container is
+# running, so operation records come from the real producer without a daemon.
+_FAKE_DOCKER = r"""#!/bin/sh
+case "$1" in
+exec)
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        -i) shift ;;
+        -w|-e) shift 2 ;;
+        *) break ;;
+        esac
+    done
+    shift
+    exec "$@" ;;
+container) echo running ;;
+esac
+"""
 
 
 def _record(monkeypatch: pytest.MonkeyPatch, sink: list[str]) -> None:
@@ -241,6 +262,62 @@ class TestOperationRecordsFollowTheOutcome:
         second = asyncio.run(provider.teardown(first.finalization.retained))
         assert second.finalization.state == "completed"
         assert forgotten == ["ws-1"]
+
+    def test_records_from_the_real_producer_replay_until_completed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # The spy above pins the call; this pins what the call does to records
+        # `DockerOperations.start` actually wrote, and that a neighbour's stay.
+        docker = tmp_path / "docker"
+        docker.write_text(_FAKE_DOCKER)
+        docker.chmod(0o755)
+        provider = _provider()
+        provider._operations = ops = DockerOperations(
+            credentials=None, retention_bytes=1024, max_page_bytes=1024, docker=str(docker)
+        )
+        d = tmp_path / "ws"
+        d.mkdir()
+        ws = _Workspace(workspace_dir=str(d))
+        other = _Workspace(handle="container-other")
+        other.id = "ws-2"
+        spec = OperationSpec.model_validate(
+            {
+                "execution_id": "exec-1",
+                "operation_key": "k1",
+                "argv": ("true",),
+                "working_directory": ".",
+                "environment": {},
+                "credential_bindings": (),
+                "timeout_seconds": 60,
+                "metadata": {},
+            }
+        )
+
+        async def _fails() -> None:
+            raise RuntimeError("store unreachable")
+
+        async def _scenario() -> None:
+            ref = await ops.start(ws, spec)
+            other_ref = await ops.start(other, spec)
+            await drain_operation(ops, ref)
+            await drain_operation(ops, other_ref)
+            _record(monkeypatch, [])
+
+            first = await provider.teardown(ws, before_delete=_fails)
+            assert first.finalization.state == "retained"
+            assert ref.operation_id in ops._operations
+            # Same key, same spec: still a replay of the original, not a launch.
+            assert await ops.start(ws, spec) == ref
+
+            assert first.finalization.retained is not MISSING
+            second = await provider.teardown(first.finalization.retained)
+            assert second.finalization.state == "completed"
+            assert ref.operation_id not in ops._operations
+            assert ("ws-1", "k1") not in ops._by_key
+            assert ops._by_key[("ws-2", "k1")].ref == other_ref
+            assert other_ref.operation_id in ops._operations
+
+        asyncio.run(_scenario())
 
 
 class TestRegistryIsNotLeaked:
