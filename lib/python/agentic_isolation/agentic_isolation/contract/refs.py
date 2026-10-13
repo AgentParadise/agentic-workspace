@@ -11,7 +11,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field
 
-from agentic_isolation.contract._base import MISSING, ContractModel, NonEmptyStr
+from agentic_isolation.contract._base import MISSING, ContractModel, JsonInt, NonEmptyStr
 
 
 class CredentialRef(ContractModel):
@@ -35,7 +35,7 @@ class ContentRef(ContractModel):
 
     schema_: Literal["apss.content-ref/v1"] | MISSING = Field(MISSING, alias="schema")
     digest: Annotated[str, Field(pattern=r"^sha256:[a-f0-9]{64}$")]
-    size_bytes: Annotated[int, Field(ge=0)]
+    size_bytes: Annotated[JsonInt, Field(ge=0)]
     media_type: NonEmptyStr | MISSING = MISSING
     locator: NonEmptyStr
     authority: CredentialRef | MISSING = MISSING

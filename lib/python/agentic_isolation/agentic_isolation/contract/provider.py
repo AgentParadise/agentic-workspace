@@ -6,7 +6,13 @@ from typing import Annotated, Literal
 
 from pydantic import AfterValidator, Field
 
-from agentic_isolation.contract._base import MISSING, ContractModel, NonEmptyStr, unique_items
+from agentic_isolation.contract._base import (
+    MISSING,
+    ContractModel,
+    JsonInt,
+    NonEmptyStr,
+    unique_items,
+)
 
 UniqueNames = Annotated[tuple[NonEmptyStr, ...], AfterValidator(unique_items)]
 
@@ -24,8 +30,8 @@ class EnforceableLimits(ContractModel):
 class ObservationDescriptor(ContractModel):
     """How much output the provider retains and how it reports loss."""
 
-    retention_bytes: Annotated[int, Field(ge=1)]
-    max_page_bytes: Annotated[int, Field(ge=1)]
+    retention_bytes: Annotated[JsonInt, Field(ge=1)]
+    max_page_bytes: Annotated[JsonInt, Field(ge=1)]
     integrity: Literal["exact", "continuity_detected"]
 
 

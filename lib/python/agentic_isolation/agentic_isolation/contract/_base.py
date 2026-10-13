@@ -11,13 +11,14 @@ from __future__ import annotations
 import re
 from typing import Annotated, TypeVar
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field
 from pydantic.experimental.missing_sentinel import MISSING
 
 __all__ = [
     "MISSING",
     "ContractModel",
     "CredentialFreeStringMap",
+    "JsonInt",
     "NonEmptyStr",
     "RelativePath",
     "unique_items",
@@ -25,9 +26,32 @@ __all__ = [
 
 
 class ContractModel(BaseModel):
-    """Base for every contract model: immutable, closed, strict."""
+    """Base for every contract model: immutable, closed, strict.
 
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True, serialize_by_alias=True)
+    `pattern` uses Python's `re`, the engine the schemas are validated with, so
+    an anchored pattern means the same thing to the model and the schema.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        strict=True,
+        serialize_by_alias=True,
+        regex_engine="python-re",
+    )
+
+
+def _integral_number(value: object) -> object:
+    # JSON Schema's "integer" is any number with a zero fractional part, so
+    # `1.0` is an integer. Booleans and fractional numbers are left for the
+    # strict int check to reject.
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+# A JSON Schema "integer": strict int, plus integral JSON numbers such as `1.0`.
+JsonInt = Annotated[int, BeforeValidator(_integral_number)]
 
 
 NonEmptyStr = Annotated[str, Field(min_length=1)]

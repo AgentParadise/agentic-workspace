@@ -6,7 +6,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
 
-from agentic_isolation.contract._base import MISSING, ContractModel, NonEmptyStr
+from agentic_isolation.contract._base import MISSING, ContractModel, JsonInt, NonEmptyStr
 from agentic_isolation.contract.operation import OperationRef
 from agentic_isolation.contract.status import TERMINAL_STATES, OperationState
 
@@ -16,7 +16,7 @@ _BASE64 = r"^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
 class ObservationGap(ContractModel):
     """Bytes lost before this page. `None` means the extent is unknown."""
 
-    lost_bytes: Annotated[int, Field(ge=1)] | None
+    lost_bytes: Annotated[JsonInt, Field(ge=1)] | None
 
 
 class ObservationPage(ContractModel):

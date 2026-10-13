@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from typing import Literal, Self, get_args
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import Field, model_validator
 
 from agentic_isolation.contract._base import (
     MISSING,
     ContractModel,
     CredentialFreeStringMap,
+    JsonInt,
     NonEmptyStr,
 )
 from agentic_isolation.contract.operation import OperationRef
@@ -38,10 +39,12 @@ class OperationStatus(ContractModel):
     schema_: Literal["apss.workspace-status/v1"] | MISSING = Field(MISSING, alias="schema")
     ref: OperationRef
     state: OperationState
-    exit_code: int | None | MISSING = MISSING
+    exit_code: JsonInt | None | MISSING = MISSING
     signal: str | None | MISSING = MISSING
-    started_at: AwareDatetime | MISSING = MISSING
-    ended_at: AwareDatetime | MISSING = MISSING
+    # `format: date-time` is an annotation the schemas do not assert, so the
+    # timestamp is kept as the string the producer wrote.
+    started_at: str | MISSING = MISSING
+    ended_at: str | MISSING = MISSING
     execution_id: NonEmptyStr
     metadata: CredentialFreeStringMap
 

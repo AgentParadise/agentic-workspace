@@ -10,6 +10,7 @@ from agentic_isolation.contract._base import (
     MISSING,
     ContractModel,
     CredentialFreeStringMap,
+    JsonInt,
     NonEmptyStr,
     RelativePath,
 )
@@ -34,7 +35,7 @@ class OperationSpec(ContractModel):
     environment: CredentialFreeStringMap
     credential_bindings: tuple[CredentialBinding, ...]
     launch_marker: LaunchMarker | MISSING = MISSING
-    timeout_seconds: Annotated[int, Field(ge=1)]
+    timeout_seconds: Annotated[JsonInt, Field(ge=1)]
     metadata: CredentialFreeStringMap
 
 
