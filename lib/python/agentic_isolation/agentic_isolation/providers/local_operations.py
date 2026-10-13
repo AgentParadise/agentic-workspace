@@ -27,6 +27,14 @@ the process-group cancel. It mirrors `DockerOperations` without a container:
   its own outcome, since nothing was cancelled.
   Processes are owned by pid plus start time; a pid whose start time changed
   is a replacement and is never signalled.
+- There is no containment: a descendant that leaves the session, the
+  environment and the pipe, then loses its parent chain when the leader exits,
+  owns nothing that marks it. So an empty owned set is not taken as proof.
+  Every orphan a reaper (init, or an ancestor of this process) adopted after
+  the operation began may be such an escapee; while any is alive, cancel and
+  timeout settle `failed`, never `cancelled`, and name them without signalling
+  them, since they may be unrelated. The descriptor declares this as the
+  `CANCEL_POLICY` capability.
 - Cancel refuses a group numbered <= 1 or equal to the caller's own group: the
   caller's namespace IS the workload's here, so the own-group check from
   `DockerOperations._unsafe_leader` is always real. A refusal still kills every
@@ -79,6 +87,9 @@ MAX_PAGE_BYTES = 16384
 # After a timeout or cancel, how long KILL is given to clear the group.
 _KILL_WAIT_SECONDS = 2.0
 
+# Declared in the descriptor: without containment, unprovable cancels fail.
+CANCEL_POLICY = "cancel-fails-closed-uncontained"
+
 # Inherited by every process an operation starts; its value is per operation.
 OWNER_VARIABLE = "AGENTIC_LOCAL_OPERATION"
 
@@ -87,6 +98,7 @@ _SHELL = "/bin/sh"
 _LAUNCHER = 'printf "%s\\n" "$1"; shift; exec "$@"'
 
 _PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
 _libc = ctypes.CDLL(None, use_errno=True)
 
 
@@ -150,6 +162,31 @@ def _proc_table() -> dict[int, tuple[int, int, int]]:
         if fields and fields[0] != "Z":
             table[int(entry.name)] = (int(fields[1]), int(fields[2]), int(fields[19]))
     return table
+
+
+def _uptime_ticks() -> int:
+    """Now, in the clock ticks since boot that /proc start times use."""
+    uptime = float(Path("/proc/uptime").read_text().split()[0])
+    return int(uptime * os.sysconf("SC_CLK_TCK"))
+
+
+def _reapers() -> set[int]:
+    """Every pid an orphan of this process's descendants can be adopted by.
+
+    The nearest subreaper ancestor of the dead parent adopts it, else init.
+    Only this process can ask whether it is a subreaper, so every ancestor
+    counts as one.
+    """
+    reapers = {1}
+    flag = ctypes.c_int()
+    if _libc.prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(flag), 0, 0, 0) == 0 and flag.value:
+        reapers.add(os.getpid())
+    pid = os.getppid()
+    while pid > 1 and pid not in reapers:
+        reapers.add(pid)
+        fields = _stat_fields(pid)
+        pid = int(fields[1]) if fields else 0
+    return reapers
 
 
 def _carries(pid: int, token: str) -> bool:
@@ -236,6 +273,8 @@ class _Operation:
     started_at: str
     process: asyncio.subprocess.Process
     token: str
+    # Clock ticks since boot before launch; every descendant started later.
+    born: int
     # Inode of the output pipe; whoever still holds it keeps the operation open.
     pipe: int | None = None
     changed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -281,7 +320,7 @@ class LocalOperations:
             enforceable_limits=EnforceableLimits(
                 cpu=False, memory=False, disk=False, network=False, timeout=True
             ),
-            capabilities=(),
+            capabilities=(CANCEL_POLICY,),
             observation=ObservationDescriptor(
                 retention_bytes=self._retention,
                 max_page_bytes=self._max_page,
@@ -358,6 +397,7 @@ class LocalOperations:
             raise _error("provider_unavailable", f"could not launch {spec.argv[0]!r}")
         token = secrets.token_hex(16)
         env[OWNER_VARIABLE] = token
+        born = _uptime_ticks() - 1
         read_end, write_end = os.pipe()
         inode = os.fstat(read_end).st_ino
         try:
@@ -395,6 +435,7 @@ class LocalOperations:
             started_at=_now(),
             process=process,
             token=token,
+            born=born,
             pipe=inode,
         )
         operation.collector = asyncio.create_task(self._collect(operation, output, transport))
@@ -550,6 +591,15 @@ class LocalOperations:
                         "the workload leader exited before cancel; descendants that "
                         "left its output pipe and environment cannot be confirmed gone",
                     )
+                if orphans := self._unattributed(operation):
+                    operation.unconfirmed = True
+                    self._note(
+                        operation,
+                        f"processes {orphans} were orphaned to a reaper after the "
+                        "operation began and may be its descendants; without "
+                        "containment they cannot be confirmed unrelated, so they "
+                        "were not signalled",
+                    )
                 return
         survivors = sorted(self._owned(operation))
         operation.unconfirmed = True
@@ -589,6 +639,20 @@ class LocalOperations:
                     found[pid] = start
                     grew = True
         return {pid: s for pid, s in found.items() if pid > 1 and pid != os.getpid()}
+
+    @staticmethod
+    def _unattributed(operation: _Operation) -> list[int]:
+        """Live orphans adopted by a reaper that started after the operation.
+
+        Once nothing owned is left, any escaped descendant's topmost survivor
+        was adopted by a reaper, since every workload parent above it is gone.
+        """
+        reapers = _reapers()
+        return sorted(
+            pid
+            for pid, (ppid, _, start) in _proc_table().items()
+            if ppid in reapers and start >= operation.born and pid != os.getpid()
+        )
 
     @classmethod
     async def _gone(cls, operation: _Operation, *, within: float) -> bool:

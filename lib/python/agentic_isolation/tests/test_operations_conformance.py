@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import signal
@@ -350,8 +351,14 @@ async def test_agentic_workspace_runs_on_an_opted_in_local_provider(tmp_path: Pa
 
 
 def test_local_describe_matches_the_published_local_descriptor() -> None:
-    """Local is not `exact`: its workload shares our uid and pid namespace."""
+    """Local is not `exact`: its workload shares our uid and pid namespace.
+
+    The vendored fixture is pinned upstream, so the one declared difference is
+    the uncontained cancel policy, added to its otherwise empty capabilities.
+    """
     published = json.loads((FIXTURES / "local.json").read_text())
+    assert published["capabilities"] == []
+    published["capabilities"] = [local_operations.CANCEL_POLICY]
     described = WorkspaceLocalProvider(allow_insecure=True).describe()
     assert described.model_dump(mode="json", by_alias=True) == published
     assert described.observation.integrity == "continuity_detected"
@@ -500,6 +507,46 @@ async def test_local_cancel_after_the_leader_exited_fails_closed(tmp_path: Path)
     await provider.destroy(workspace)
 
 
+async def test_local_cancel_never_confirms_a_descendant_that_escaped_during_term(
+    tmp_path: Path,
+) -> None:
+    """The leader is alive when cancel starts. Its TERM handler starts a clean
+    environment child in a new session with no output pipe, waits for it, and
+    exits: nothing marks the child, so cancel must not claim `cancelled`.
+    The handler ignores further TERMs, so exactly one child escapes."""
+    provider = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
+    assert local_operations.CANCEL_POLICY in provider.describe().capabilities
+    workspace = await provider.create(WorkspaceConfig())
+    ready, child = tmp_path / "ready", tmp_path / "child"
+    script = (
+        f'trap \'trap "" TERM; env -i setsid sh -c "echo \\$\\$ > {child}; exec sleep 300" '
+        f">/dev/null 2>&1 & while [ ! -s {child} ]; do :; done; exit 0' TERM; "
+        f"echo ready > {ready}; while :; do :; done"
+    )
+    try:
+        async with _bounded():
+            ref = await provider.start(workspace, _spec(script))
+            while not ready.exists():
+                await asyncio.sleep(0.01)
+            cancelled = await provider.cancel(ref, grace_seconds=0.5)
+            (child_pid,) = await _wait_for_pids(child, 1)
+            assert _alive(child_pid)
+            assert os.getsid(child_pid) == child_pid
+            environ = Path(f"/proc/{child_pid}/environ").read_bytes()
+            assert b"AGENTIC_LOCAL_OPERATION=" not in environ
+            assert os.readlink(f"/proc/{child_pid}/fd/1") == "/dev/null"
+            assert cancelled.state == "failed"
+            assert str(child_pid) in cancelled.metadata["cancel_signal_failure"]
+            assert (await provider.status(ref)).state == "failed"
+            assert (await provider.cancel(ref, grace_seconds=0.5)).state == "failed"
+    finally:
+        # The child leads its own session and group: kill everything in it.
+        if child.exists() and child.read_text().strip():
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(int(child.read_text()), signal.SIGKILL)
+        await provider.destroy(workspace)
+
+
 async def test_local_cancel_with_a_surviving_orphan_settles_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -561,6 +608,8 @@ def _scripted_operation(leader: int, *, reaped: bool, tracked: dict[int, int]) -
         started_at="",
         process=process,  # type: ignore[arg-type]
         token="scripted",
+        # The scripted table's processes all predate the operation.
+        born=1 << 62,
         tracked=tracked,
     )
 
