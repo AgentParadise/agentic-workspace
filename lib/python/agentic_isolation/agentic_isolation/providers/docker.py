@@ -285,7 +285,7 @@ class WorkspaceDockerProvider(BaseProvider):
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **credential_env} if credential_env else None,
+                env=None,
             )
             stdout, stderr = await proc.communicate()
 
