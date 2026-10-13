@@ -18,6 +18,10 @@ from scripted_agent.profile import SCRIPTED_AGENT_MODEL, ScriptedStream
 Event = dict[str, Any]
 
 _OFFSET: Final = "_offset_ms"
+_TERMINAL: Final = "result"
+SUBAGENT_TOOL_NAMES: Final = frozenset({"Task", "Agent"})
+"""Tools the session observer records as a subagent start, not a tool execution
+(``agentic_isolation``'s ``EventParser``), so they cannot be counted in ``tool_uses``."""
 
 
 @dataclass(frozen=True)
@@ -28,9 +32,11 @@ class Recording:
     """Everything the CLI printed except its closing ``result`` event."""
     offsets_ms: tuple[int, ...]
     """When each event was printed, relative to the start of the session."""
-    result: Event | None
+    result: Event
     """The closing ``result`` event, held back so the stub's own
     ``TASK_RESULT`` replaces the recording's as the last message."""
+    result_offset_ms: int
+    """When the closing event was printed; the stub's verdict is never sooner."""
 
     @classmethod
     def load(cls, stream: ScriptedStream) -> Recording:
@@ -43,21 +49,34 @@ class Recording:
             )
         path = Path(stream.recording)
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = path.read_bytes().decode("utf-8").splitlines()
         except OSError as e:
             raise RecordingRefused(f"recording {path} cannot be read: {e}") from e
+        except UnicodeDecodeError as e:
+            raise RecordingRefused(f"recording {path} is not UTF-8: {e}") from e
         try:
-            header, *records = (json.loads(line) for line in lines if line.strip())
-        except (json.JSONDecodeError, ValueError) as e:
-            raise RecordingRefused(f"recording {path} is not JSONL with a header: {e}") from e
+            rows = [json.loads(line) for line in lines if line.strip()]
+        except json.JSONDecodeError as e:
+            raise RecordingRefused(f"recording {path} is not JSONL: {e}") from e
+        header, records = _structure(path, rows)
 
-        recorded_version = header.get("_recording", {}).get("cli_version")
+        recorded_version = header["_recording"].get("cli_version")
         if recorded_version != stream.cli_version:
             raise RecordingRefused(
                 f"recording {path} was captured from CLI {recorded_version!r} but the "
                 f"profile declares cli_version {stream.cli_version!r}"
             )
-        tool_uses = sum(_tool_uses(event) for event in records)
+        subagents = sorted(
+            SUBAGENT_TOOL_NAMES & {str(b.get("name")) for e in records for b in _tool_blocks(e)}
+        )
+        if subagents:
+            raise RecordingRefused(
+                f"recording {path} launches subagents ({', '.join(subagents)}); the session "
+                "observer records those as subagent starts, not tool executions, so no "
+                "tool_uses count can match what the driver reads back. Use a recording "
+                "without subagents."
+            )
+        tool_uses = sum(len(_tool_blocks(event)) for event in records)
         if tool_uses != stream.tool_uses:
             raise RecordingRefused(
                 f"recording {path} has {tool_uses} tool_use events but the profile "
@@ -65,22 +84,47 @@ class Recording:
                 "the difference as dropped observations"
             )
 
-        result = next((e for e in records if e.get("type") == "result"), None)
-        replayed = [e for e in records if e is not result]
+        *replayed, result = records
         return cls(
             events=tuple(_rewrite(e) for e in replayed),
-            offsets_ms=tuple(int(e.get(_OFFSET, 0)) for e in replayed),
-            result=_rewrite(result) if result is not None else None,
+            offsets_ms=tuple(_offset(e) for e in replayed),
+            result=_rewrite(result),
+            result_offset_ms=_offset(result),
         )
 
 
-def _tool_uses(event: Event) -> int:
+def _structure(path: Path, rows: list[Any]) -> tuple[Event, list[Event]]:
+    """The header and the events, refused unless every row is an object, the header
+    carries ``_recording``, and exactly one ``result`` closes the session."""
+    if not rows or not isinstance(rows[0], dict) or not isinstance(rows[0].get("_recording"), dict):
+        raise RecordingRefused(
+            f'recording {path} must open with a {{"_recording": {{...}}}} header object'
+        )
+    header, *records = rows
+    for number, row in enumerate(records, start=2):
+        if not isinstance(row, dict):
+            raise RecordingRefused(f"recording {path} line {number} is not a JSON object")
+    terminals = [n for n, e in enumerate(records) if e.get("type") == _TERMINAL]
+    if terminals != [len(records) - 1]:
+        raise RecordingRefused(
+            f"recording {path} must end with exactly one {_TERMINAL!r} event; found "
+            f"{len(terminals)} at event(s) {[n + 1 for n in terminals]} of {len(records)}"
+        )
+    return header, records
+
+
+def _offset(event: Event) -> int:
+    return int(event.get(_OFFSET, 0))
+
+
+def _tool_blocks(event: Event) -> list[Event]:
     if event.get("type") != "assistant":
-        return 0
-    content = event.get("message", {}).get("content", [])
-    return sum(
-        1 for block in content if isinstance(block, dict) and block.get("type") == "tool_use"
-    )
+        return []
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
 
 
 def _rewrite(event: Event) -> Event:

@@ -21,7 +21,12 @@ dev = [
     "ruff==0.16.1",
     "mypy==2.3.0",
     "jsonschema>=4.23",
+    "agentic-isolation",
 ]
+
+[tool.uv.sources]
+# Test only: the session observer whose tool-start count the profile declares.
+agentic-isolation = { path = "../agentic_isolation", editable = true }
 
 [build-system]
 requires = ["hatchling"]

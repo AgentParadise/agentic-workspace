@@ -16,10 +16,15 @@ never part of a production image.
 2. Picks the phase and execution from the `phase_id:` and `execution_id:`
    entries of `AGENTIC_SESSION_STORE_TAGS`, the only place syntropic137 hands
    either to a workspace today.
-3. Refuses the phase's recording unless its `_recording.cli_version` and its
-   `tool_use` count equal the profile's `cli_version` and `tool_uses`.
+3. Refuses the phase's recording unless it is UTF-8 JSONL of objects opening
+   with a `_recording` header and closing with exactly one `result` event, and
+   its `_recording.cli_version` and `tool_use` count equal the profile's
+   `cli_version` and `tool_uses`.
 4. Prints the recording's events at recorded timing x `pacing_factor`, every
-   `model` (and `modelUsage` key) rewritten to `syn-scripted-agent`.
+   `model` (and `modelUsage` key) rewritten to `syn-scripted-agent`, then
+   sleeps the recorded delay before the closing event. The phase's work runs
+   after that delay rather than inside it, so the verdict is never earlier
+   than its scaled schedule.
 5. Runs the workload (`none`, `synthetic`, or `just preflight-agent` in the
    cloned fixture repo), performs the side effect with git/gh, writes
    `artifacts/output/<phase_id>.md` via `render_artifact`, and prints the
@@ -35,13 +40,16 @@ repository, with the workspace's credential.
 |---|---|
 | 0 | the phase ran |
 | 78 | no profile, an invalid one, or no phase/execution id to read it for |
-| 65 | the recording is not the declared stream (version, tool uses, unreadable, codex) |
+| 65 | the recording is not the declared stream (malformed, version, tool uses, subagents, codex) |
 | 69 | a workload or git/gh step failed |
 
 ## Limits
 
 - `harness: codex` is refused: there is no codex recording yet to define what a
   codex tool-use event is, so the declared count could not be checked.
+- Recordings that launch subagents (`Task` or `Agent` tool uses) are refused.
+  The session observer records those as subagent starts, not tool executions,
+  so the driver's read-back count could never equal `tool_uses`.
 - Recordings ship at `/opt/scripted-agent/recordings/` in the image; a profile's
   `stream.recording` names a path there.
 

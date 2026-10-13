@@ -7,6 +7,27 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "agentic-isolation"
+version = "0.12.1"
+source = { editable = "../agentic_isolation" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "agentic-session-store", marker = "extra == 'dev'", editable = "../agentic_session_store" },
+    { name = "docker", marker = "extra == 'docker'", specifier = ">=7.0.0" },
+    { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.23" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = "==2.3.0" },
+    { name = "pydantic", specifier = "==2.13.4" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.16.1" },
+]
+provides-extras = ["docker", "dev"]
+
+[[package]]
 name = "annotated-types"
 version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -663,6 +684,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "agentic-isolation" },
     { name = "jsonschema" },
     { name = "mypy" },
     { name = "pytest" },
@@ -671,6 +693,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agentic-isolation", marker = "extra == 'dev'", editable = "../agentic_isolation" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.23" },
     { name = "mypy", marker = "extra == 'dev'", specifier = "==2.3.0" },
     { name = "pydantic", specifier = "==2.13.4" },

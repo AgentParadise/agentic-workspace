@@ -34,11 +34,16 @@ FROM ${CLAUDE_IMAGE}
 
 USER root
 
-ENV UV_PYTHON_INSTALL_DIR=/opt/scripted-agent/python \
-    UV_PROJECT_ENVIRONMENT=/opt/scripted-agent/venv
+# The install locations are scoped to this RUN, never ENV: an exported
+# UV_PROJECT_ENVIRONMENT would make every fixture `uv sync` (the gates
+# workload) target the replayer's environment instead of its own .venv. The
+# shims below name the replayer's executable by path, so nothing at runtime
+# needs these variables.
 COPY lib/python/scripted_agent /opt/scripted-agent/src
 RUN cd /opt/scripted-agent/src \
-    && uv sync --locked --no-dev --no-editable \
+    && UV_PYTHON_INSTALL_DIR=/opt/scripted-agent/python \
+       UV_PROJECT_ENVIRONMENT=/opt/scripted-agent/venv \
+       uv sync --locked --no-dev --no-editable \
     && rm -rf /root/.cache/uv
 
 # The recordings a profile's stream.recording may name.

@@ -31,7 +31,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, TextIO
+from typing import BinaryIO, Final, TextIO
 from urllib.parse import unquote
 
 from pydantic import ValidationError
@@ -89,6 +89,10 @@ def replay(
         sleep(max(offset - previous, 0) / 1000 * phase.stream.pacing_factor)
         previous = offset
         _emit(out, event)
+    # The recorded delay before the closing event is slept here, before the work,
+    # so the verdict can never precede its scaled schedule; the phase's own work
+    # comes on top of it rather than overlapping it.
+    sleep(max(recording.result_offset_ms - previous, 0) / 1000 * phase.stream.pacing_factor)
 
     repo = workspace / "repos" / profile.fixture_repo.split("/")[1]
     _run_workload(phase, repo, run)
@@ -99,9 +103,7 @@ def replay(
     output.write_text(artifact, encoding="utf-8")
 
     verdict = profile.task_result(target.phase_id)
-    _emit(
-        out, {**(recording.result or {"type": "result", "subtype": "success"}), "result": verdict}
-    )
+    _emit(out, {**recording.result, "result": verdict})
 
 
 def cli_version(environ: Mapping[str, str]) -> str:
@@ -118,9 +120,11 @@ def load_profile(environ: Mapping[str, str]) -> ScriptedAgentProfile:
     elif PROFILE_PATH_ENV in environ:
         source = environ[PROFILE_PATH_ENV]
         try:
-            raw = Path(source).read_text(encoding="utf-8")
+            raw = Path(source).read_bytes().decode("utf-8")
         except OSError as e:
             raise ProfileRefused(f"{PROFILE_PATH_ENV}={source} cannot be read: {e}") from e
+        except UnicodeDecodeError as e:
+            raise ProfileRefused(f"{PROFILE_PATH_ENV}={source} is not UTF-8: {e}") from e
     else:
         raise ProfileRefused(
             f"neither {SCRIPTED_AGENT_PROFILE_ENV} nor {PROFILE_PATH_ENV} is set; "
@@ -165,16 +169,27 @@ def _run_workload(phase: ScriptedPhase, repo: Path, run: Run) -> None:
     if isinstance(workload, GatesWorkload):
         run(["just", "preflight-agent"], repo)
     elif isinstance(workload, SyntheticWorkload):
-        held = bytearray(workload.mem_bytes)
-        with tempfile.TemporaryFile() as disk:
-            for offset in range(0, workload.disk_bytes, _CHUNK):
-                disk.write(bytes(min(_CHUNK, workload.disk_bytes - offset)))
-            disk.flush()
-            os.fsync(disk.fileno())
-            start = time.process_time()
-            while time.process_time() - start < workload.cpu_seconds:
-                pass
-        del held
+        _synthetic(workload)
+
+
+def _synthetic(
+    workload: SyntheticWorkload,
+    clock: Callable[[], float] = time.process_time,
+    allocate: Callable[[int], object] = bytearray,
+    scratch: Callable[[], BinaryIO] = tempfile.TemporaryFile,
+) -> None:
+    """Write ``disk_bytes`` outside the repo and flush them, then burn ``cpu_seconds``
+    of CPU while holding ``mem_bytes``."""
+    held = allocate(workload.mem_bytes)
+    with scratch() as disk:
+        for offset in range(0, workload.disk_bytes, _CHUNK):
+            disk.write(bytes(min(_CHUNK, workload.disk_bytes - offset)))
+        disk.flush()
+        os.fsync(disk.fileno())
+        start = clock()
+        while clock() - start < workload.cpu_seconds:
+            pass
+    del held
 
 
 def _side_effect(

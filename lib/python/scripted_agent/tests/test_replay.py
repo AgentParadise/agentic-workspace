@@ -185,11 +185,45 @@ def test_every_replayed_model_is_the_scripted_one(tmp_path: Path) -> None:
     assert set(models) == {SCRIPTED_AGENT_MODEL}
 
 
-def test_replays_at_recorded_timing_times_the_pacing_factor(tmp_path: Path) -> None:
-    _, slept, _ = _replay(_env("review"), tmp_path)
+@pytest.mark.parametrize(
+    ("factor", "expected"),
+    [
+        # offsets 0 x6, 2837 ms, then the held-back result at 2926 ms (89 ms later)
+        (0.5, [0, 0, 0, 0, 0, 0, 1.4185, 0.0445]),
+        (0.0, [0, 0, 0, 0, 0, 0, 0, 0]),
+    ],
+)
+def test_replays_at_recorded_timing_times_the_pacing_factor(
+    tmp_path: Path, factor: float, expected: list[float]
+) -> None:
+    _, slept, _ = _replay(_env("review", _profile_paced(factor)), tmp_path)
 
-    # offsets 0 x6 then 2837 ms (the held-back result at 2926 is not paced); factor 0.5
-    assert slept == pytest.approx([0, 0, 0, 0, 0, 0, 1.4185])
+    assert slept == pytest.approx(expected)
+
+
+def test_the_verdict_waits_for_the_recorded_terminal_delay(tmp_path: Path) -> None:
+    """Every sleep comes before the verdict, the terminal one included."""
+    out = io.StringIO()
+    timeline: list[str] = []
+
+    def sleep(seconds: float) -> None:
+        timeline.append(f"sleep {seconds:.4f}")
+
+    def emit_spy(text: str) -> int:
+        timeline.extend(json.loads(line)["type"] for line in text.splitlines())
+        return len(text)
+
+    out.write = emit_spy  # type: ignore[method-assign]
+    (tmp_path / "repos" / "loadtest-fixture").mkdir(parents=True)
+    replay(_env("review"), tmp_path, FakeGit(), sleep, out)
+
+    assert timeline[-2:] == ["sleep 0.0445", "result"]
+
+
+def _profile_paced(factor: float) -> dict[str, Any]:
+    profile = _profile()
+    profile["phases"]["review"]["stream"]["pacing_factor"] = factor
+    return profile
 
 
 # --- the phase's work ---------------------------------------------------------
@@ -262,7 +296,82 @@ def test_gates_workload_runs_the_repositorys_gates(tmp_path: Path) -> None:
     assert (["just", "preflight-agent"], tmp_path / "repos" / "loadtest-fixture") in git.calls
 
 
-def test_synthetic_workload_runs(tmp_path: Path) -> None:
+_SYNTHETIC = {"kind": "synthetic", "cpu_seconds": 2.5, "mem_bytes": 4096, "disk_bytes": 3 << 20}
+
+
+class _Held:
+    """A spy allocation: knows its size and whether it has been released."""
+
+    def __init__(self, size: int, log: list[str]) -> None:
+        self.size, self.log = size, log
+        log.append(f"alloc {size}")
+
+    def __del__(self) -> None:
+        self.log.append("free")
+
+
+def _run_synthetic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[list[str], list[float], Path]:
+    """The phase's synthetic workload under a fake clock, allocator and scratch file."""
+    log: list[str] = []
+    ticks: list[float] = []
+    scratch = tmp_path / "scratch.bin"
+
+    def clock() -> float:
+        ticks.append(len(ticks) * 0.5)
+        log.append("tick")
+        return ticks[-1]
+
+    def synthetic(workload: Any) -> None:
+        real_synthetic(
+            workload,
+            clock=clock,
+            allocate=lambda n: _Held(n, log),
+            scratch=lambda: scratch.open("w+b"),
+        )
+
+    real_synthetic = cli._synthetic
+    monkeypatch.setattr("scripted_agent.cli._synthetic", synthetic)
+    _replay(_env("implement", _profile(workload=_SYNTHETIC)), tmp_path)
+    return log, ticks, scratch
+
+
+def test_synthetic_workload_burns_the_configured_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, ticks, _ = _run_synthetic(tmp_path, monkeypatch)
+
+    # the clock is read until cpu_seconds have passed on it, and no longer
+    assert ticks[-1] - ticks[0] >= _SYNTHETIC["cpu_seconds"]
+    assert ticks[-2] - ticks[0] < _SYNTHETIC["cpu_seconds"]
+
+
+def test_synthetic_workload_holds_its_memory_through_the_cpu_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log, _, _ = _run_synthetic(tmp_path, monkeypatch)
+
+    assert log[0] == f"alloc {_SYNTHETIC['mem_bytes']}"
+    assert log.count("tick") > 1
+    assert log[-1] == "free"
+    assert "free" not in log[:-1]
+
+
+def test_synthetic_workload_writes_and_flushes_its_disk_bytes_outside_the_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, scratch = _run_synthetic(tmp_path, monkeypatch)
+
+    assert scratch.stat().st_size == _SYNTHETIC["disk_bytes"]
+    repo = tmp_path / "repos" / "loadtest-fixture"
+    # the only file in the fixture tree is the side effect's marker
+    assert [p.relative_to(repo) for p in repo.rglob("*") if p.is_file()] == [
+        Path("loadtest/implement.txt")
+    ]
+
+
+def test_synthetic_workload_really_runs(tmp_path: Path) -> None:
     workload = {"kind": "synthetic", "cpu_seconds": 0.01, "mem_bytes": 1024, "disk_bytes": 1024}
     _replay(_env("implement", _profile(workload=workload)), tmp_path)
 
@@ -293,7 +402,9 @@ def _exit(
     with pytest.raises(SystemExit) as stopped:
         cli.main()
     assert isinstance(stopped.value.code, int)
-    return stopped.value.code, capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert captured.out == "", "a refusal replays nothing"
+    return stopped.value.code, captured.err
 
 
 def test_refuses_without_a_profile(
@@ -358,6 +469,70 @@ def test_refuses_a_recording_that_is_not_the_declared_stream(
     assert reason in err
 
 
+def _capture(tmp_path: Path, rows: list[Any], *, raw: bytes | None = None) -> str:
+    path = tmp_path / "capture.jsonl"
+    if raw is None:
+        path.write_text("\n".join(json.dumps(row) for row in rows))
+    else:
+        path.write_bytes(raw)
+    return str(path)
+
+
+def _rows() -> list[dict[str, Any]]:
+    return [json.loads(line) for line in RECORDING.read_text().splitlines()]
+
+
+def _terminal_duplicated() -> list[dict[str, Any]]:
+    rows = _rows()
+    return [*rows, dict(rows[-1], result="TASK_RESULT: {}\nTASK_RESULT_END")]
+
+
+def _terminal_reordered() -> list[dict[str, Any]]:
+    rows = _rows()
+    return [*rows[:-2], rows[-1], rows[-2]]
+
+
+@pytest.mark.parametrize(
+    ("rows", "raw", "reason"),
+    [
+        ([[]], None, "must open with a"),
+        ([None], None, "must open with a"),
+        ([{"_recording": []}], None, "must open with a"),
+        ([{"_recording": {"cli_version": "2.0.74"}}, []], None, "line 2 is not a JSON object"),
+        ([], b"\xff\n", "is not UTF-8"),
+        ([], b"{not json\n", "is not JSONL"),
+        (_terminal_duplicated(), None, "exactly one 'result' event; found 2"),
+        (_terminal_reordered(), None, "exactly one 'result' event; found 1 at event(s) [7] of 8"),
+        (_rows()[:-1], None, "exactly one 'result' event; found 0"),
+    ],
+    ids=[
+        "array-header",
+        "null-header",
+        "non-object-metadata",
+        "non-object-event",
+        "invalid-utf8",
+        "not-json",
+        "duplicate-result",
+        "result-before-last",
+        "no-result",
+    ],
+)
+def test_refuses_a_malformed_recording_before_replaying_anything(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    rows: list[Any],
+    raw: bytes | None,
+    reason: str,
+) -> None:
+    stream = _stream(recording=_capture(tmp_path, rows, raw=raw))
+    code, err = _exit(monkeypatch, capsys, _env("implement", _profile(stream=stream)))
+
+    assert code == RecordingRefused.exit_code
+    assert reason in err
+    assert "Traceback" not in err
+
+
 def test_a_refused_recording_replays_nothing(tmp_path: Path) -> None:
     out = io.StringIO()
     with pytest.raises(RecordingRefused):
@@ -397,6 +572,20 @@ def test_the_env_var_wins_over_the_file(
     code, err = _exit(monkeypatch, capsys, environ)
     assert code == 78
     assert f"profile from {SCRIPTED_AGENT_PROFILE_ENV} is not a valid" in err
+
+
+def test_refuses_a_profile_file_that_is_not_utf8(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    path = tmp_path / "loadtest-profile.json"
+    path.write_bytes(b"\xff")
+    environ = _env("review")
+    del environ[SCRIPTED_AGENT_PROFILE_ENV]
+    environ[PROFILE_PATH_ENV] = str(path)
+
+    code, err = _exit(monkeypatch, capsys, environ)
+    assert code == 78
+    assert f"{PROFILE_PATH_ENV}={path} is not UTF-8" in err
 
 
 def test_refuses_an_unreadable_profile_file(
