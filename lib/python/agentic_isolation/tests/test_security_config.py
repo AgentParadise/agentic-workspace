@@ -100,7 +100,20 @@ class TestSecurityConfig:
 
 RUNC = {"io.containerd.runc.v2": {"path": "runc"}, "runc": {"path": "runc"}}
 RUNSC = {"runsc": {"path": "/usr/local/bin/runsc"}}
-KATA_SHIM_V2 = {"kata": {"runtimeType": "io.containerd.kata.v2"}}
+KATA = {"kata": {"path": "/opt/kata/bin/kata-runtime"}}
+
+
+def _docker_info_runtimes(configured: Mapping[str, Mapping[str, object]]) -> dict[str, object]:
+    """What ``docker info`` reports for daemon.json ``runtimes`` on a runc host.
+
+    Moby's daemon/info_unix.go copies only Path and Args into each entry and
+    the JSON tags omit empty fields, so a ``runtimeType`` never reaches us and
+    a runtimeType-only runtime is reported as ``{}``.
+    """
+    reported: dict[str, object] = {**RUNC}
+    for alias, spec in configured.items():
+        reported[alias] = {key: spec[key] for key in ("path", "runtimeArgs") if spec.get(key)}
+    return reported
 
 
 def _runtime_args(args: list[str]) -> list[str]:
@@ -135,7 +148,7 @@ class TestResolveRuntime:
     def test_kata_registered_emits_its_alias(
         self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
-        docker_host({**RUNC, **KATA_SHIM_V2})
+        docker_host({**RUNC, **KATA})
         config = SecurityConfig(runtime=WorkspaceRuntime.KATA)
 
         assert _runtime_args(config.to_docker_run_args()) == ["--runtime=kata"]
@@ -143,7 +156,50 @@ class TestResolveRuntime:
             requested=WorkspaceRuntime.KATA,
             effective=WorkspaceRuntime.KATA,
             alias="kata",
-            runtime_path="io.containerd.kata.v2",
+            runtime_path="/opt/kata/bin/kata-runtime",
+        )
+
+    def test_runtime_type_only_kata_is_unverifiable_and_raises(
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
+    ) -> None:
+        docker_host(_docker_info_runtimes({"kata": {"runtimeType": "io.containerd.kata.v2"}}))
+        config = SecurityConfig(runtime=WorkspaceRuntime.KATA)
+
+        with pytest.raises(DockerDetectionError, match=r"kata \(no path\).*cannot be verified"):
+            config.resolve_runtime()
+
+    @pytest.mark.parametrize(
+        "path", ["/usr/bin/not-kata-runtime", "/usr/bin/runc-kata", "io.containerd.notkata.v2"]
+    )
+    def test_names_merely_containing_kata_raise(
+        self, docker_host: Callable[[Mapping[str, object]], list[str]], path: str
+    ) -> None:
+        docker_host({**RUNC, "kata": {"path": path}})
+
+        with pytest.raises(DockerDetectionError, match="refusing to fall back to runc"):
+            SecurityConfig(runtime=WorkspaceRuntime.KATA).resolve_runtime()
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/usr/bin/kata-runtime",
+            "/opt/kata/bin/containerd-shim-kata-v2",
+            "/opt/kata/bin/containerd-shim-kata-qemu-v2",
+            "/opt/kata/bin/containerd-shim-kata-clh-v2",
+            "/opt/kata/bin/containerd-shim-kata-fc-v2",
+        ],
+    )
+    def test_kata_binary_and_vmm_shims_are_recognised(
+        self, docker_host: Callable[[Mapping[str, object]], list[str]], path: str
+    ) -> None:
+        docker_host({**RUNC, "vm": {"path": path}})
+
+        resolved = SecurityConfig(runtime=WorkspaceRuntime.KATA).resolve_runtime()
+
+        assert (resolved.effective, resolved.alias, resolved.runtime_path) == (
+            WorkspaceRuntime.KATA,
+            "vm",
+            path,
         )
 
     def test_kata_under_a_custom_alias_is_found_by_its_shim(
@@ -234,9 +290,31 @@ class TestResolveRuntime:
     def test_auto_ignores_kata(
         self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
-        docker_host({**RUNC, **KATA_SHIM_V2})
+        docker_host({**RUNC, **KATA})
 
         assert _runtime_args(SecurityConfig().to_docker_run_args()) == []
+
+    def test_auto_with_runtime_type_only_runsc_uses_runsc(
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
+    ) -> None:
+        # Docker's documented gVisor setup; docker info reports it as {"runsc": {}}.
+        docker_host(_docker_info_runtimes({"runsc": {"runtimeType": "io.containerd.runsc.v1"}}))
+        config = SecurityConfig()
+
+        assert _runtime_args(config.to_docker_run_args()) == ["--runtime=runsc"]
+        assert config.resolve_runtime() == ResolvedRuntime(
+            requested=None,
+            effective=WorkspaceRuntime.GVISOR,
+            alias="runsc",
+            runtime_path="",
+        )
+
+    def test_auto_with_runsc_alias_running_runc_is_runc(
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
+    ) -> None:
+        docker_host({**RUNC, "runsc": {"path": "/usr/bin/runc"}})
+
+        assert SecurityConfig().resolve_runtime().effective is WorkspaceRuntime.RUNC
 
     def test_auto_without_docker_cli_is_runc(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(SecurityConfig, "_docker_runtimes", None)
@@ -261,8 +339,8 @@ class TestResolveRuntime:
         docker_host(
             {
                 **RUNC,
-                "kata-clh": {"runtimeType": "io.containerd.kata-clh.v2"},
-                "kata-qemu": {"runtimeType": "io.containerd.kata-qemu.v2"},
+                "kata-clh": {"path": "/opt/kata/bin/containerd-shim-kata-clh-v2"},
+                "kata-qemu": {"path": "/opt/kata/bin/containerd-shim-kata-qemu-v2"},
             }
         )
 

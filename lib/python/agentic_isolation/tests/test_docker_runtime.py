@@ -16,7 +16,7 @@ from agentic_isolation.config import (
 from agentic_isolation.providers.docker import WorkspaceDockerProvider
 
 RUNC = {"runc": {"path": "runc"}}
-KATA = {"kata-clh": {"runtimeType": "io.containerd.kata-clh.v2"}}
+KATA = {"kata-clh": {"path": "/opt/kata/bin/containerd-shim-kata-clh-v2"}}
 
 
 class Created:
