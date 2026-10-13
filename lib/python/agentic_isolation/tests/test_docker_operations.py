@@ -14,6 +14,7 @@ import asyncio
 import base64
 import hashlib
 import os
+import signal
 import stat
 import time
 from pathlib import Path
@@ -40,8 +41,9 @@ from agentic_isolation.providers.docker_operations import DockerOperations
 from agentic_isolation.providers.operation_spool import OperationFailure
 
 # `exec` drops docker's own flags and runs the command here. `container
-# inspect` answers from $FAKE_DOCKER_STATE: absent = running, `gone`, or
-# `down` (daemon unreachable). Every argv is appended to $FAKE_DOCKER_LOG.
+# inspect` answers from $FAKE_DOCKER_STATE: absent = running, `removing` or
+# `exited` (reported as `.State.Status`), `gone`, or `down` (daemon
+# unreachable). Every argv is appended to $FAKE_DOCKER_LOG.
 FAKE_DOCKER = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
 state=$(cat "$FAKE_DOCKER_STATE" 2>/dev/null)
@@ -62,7 +64,8 @@ container)
     case "$state" in
     gone) echo "Error: No such container: c1" >&2; exit 1 ;;
     down) echo "Cannot connect to the Docker daemon" >&2; exit 1 ;;
-    *) echo true ;;
+    removing|exited) echo "$state" ;;
+    *) echo running ;;
     esac ;;
 stop) exit 0 ;;
 esac
@@ -300,6 +303,42 @@ async def test_l_destroyed_container_is_lost(docker_env: Path) -> None:
     ref = await ops.start(_workspace(), _spec("exit 137"))
     await drain_operation(ops, ref)
     assert (await ops.status(ref)).state == "lost"
+
+
+async def test_l_container_removed_under_a_running_operation_is_lost(
+    docker_env: Path,
+) -> None:
+    """`docker rm -f`: the kill ends the exec client while the daemon still says `removing`."""
+    ops = _ops(docker_env)
+    pid_file = docker_env / "pid"
+    ref = await ops.start(_workspace(), _spec(f"echo $$ > {pid_file}; exec sleep 60"))
+    for _ in range(100):
+        if pid_file.exists() and pid_file.read_text().strip():
+            break
+        await asyncio.sleep(0.05)
+    assert (await ops.status(ref)).state == "running"
+    state = docker_env / "state"
+    state.write_text("removing")
+    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+    for _ in range(10):
+        await asyncio.sleep(0.05)
+        assert (await ops.status(ref)).state == "running"
+    state.write_text("gone")
+    await drain_operation(ops, ref)
+    assert (await ops.status(ref)).state == "lost"
+
+
+async def test_l_killed_workload_in_a_stopped_container_keeps_its_status(
+    docker_env: Path,
+) -> None:
+    ops = _ops(docker_env)
+    (docker_env / "state").write_text("exited")
+    ref = await ops.start(_workspace(), _spec("kill -KILL $$"))
+    await drain_operation(ops, ref)
+    status = await ops.status(ref)
+    assert (status.state, status.exit_code, status.signal) == ("failed", 137, "SIGKILL")
+    (docker_env / "state").write_text("gone")
+    assert (await ops.status(ref)).state == "failed"
 
 
 async def test_l_unreachable_daemon_is_provider_unavailable(docker_env: Path) -> None:

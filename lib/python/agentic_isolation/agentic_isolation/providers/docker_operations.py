@@ -79,7 +79,13 @@ _GROUP_ALIVE = (
     "done; echo gone"
 )
 
-_Presence = Literal["running", "stopped", "gone"]
+_Presence = Literal["running", "removing", "stopped", "gone"]
+
+# `docker rm -f` kills the container, which ends the exec client with the
+# kill's status, before the daemon finishes removing it. While the daemon
+# reports `removing`, that status is no recorded outcome, so settlement waits
+# this long for the container to be gone before leaving `status` to re-probe.
+_REMOVAL_WAIT_SECONDS = 30.0
 
 
 @dataclass
@@ -272,15 +278,27 @@ class DockerOperations:
         finally:
             operation.leader_known.set()
         operation.client_finished = True
-        await self._settle(operation, process.returncode, timed_out=timed_out)
+        await self._settle(operation, process.returncode, timed_out=timed_out, wait=True)
 
-    async def _settle(self, operation: _Operation, code: int | None, *, timed_out: bool) -> None:
+    async def _settle(
+        self, operation: _Operation, code: int | None, *, timed_out: bool, wait: bool
+    ) -> None:
+        """Decide the terminal state; `wait` waits out a removal in progress."""
         if operation.state in TERMINAL_STATES:
             return
         try:
-            presence = await self._presence(operation.container)
+            presence = await (
+                self._settled_presence(operation.container)
+                if wait
+                else self._presence(operation.container)
+            )
         except OperationFailure:
             # Cannot tell yet; `status` re-probes and answers provider_unavailable.
+            operation.exit_code = code
+            operation.changed.set()
+            return
+        if presence == "removing":
+            # Still being destroyed; `status` re-probes until it is gone.
             operation.exit_code = code
             operation.changed.set()
             return
@@ -302,7 +320,7 @@ class DockerOperations:
         operation = self._lookup(ref)
         if operation.client_finished and operation.state not in TERMINAL_STATES:
             await self._presence(operation.container)  # raises provider_unavailable
-            await self._settle(operation, operation.exit_code, timed_out=False)
+            await self._settle(operation, operation.exit_code, timed_out=False, wait=False)
         return self._status(operation)
 
     def _status(self, operation: _Operation) -> OperationStatus:
@@ -398,12 +416,28 @@ class DockerOperations:
         out, _ = await process.communicate()
         return process.returncode or 0, out.decode(errors="replace")
 
+    async def _settled_presence(self, container: str) -> _Presence:
+        """Presence, waiting out a removal in progress up to `_REMOVAL_WAIT_SECONDS`."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _REMOVAL_WAIT_SECONDS
+        while (presence := await self._presence(container)) == "removing":
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(0.1)
+        return presence
+
     async def _presence(self, container: str) -> _Presence:
         code, out = await self._docker_cmd(
-            "container", "inspect", "-f", "{{.State.Running}}", container
+            "container", "inspect", "-f", "{{.State.Status}}", container
         )
         if code == 0:
-            return "running" if out.strip() == "true" else "stopped"
+            match out.strip():
+                case "running" | "paused" | "restarting":
+                    return "running"
+                case "removing":
+                    return "removing"
+                case _:
+                    return "stopped"
         if "no such" in out.lower():
             return "gone"
         raise _error(
