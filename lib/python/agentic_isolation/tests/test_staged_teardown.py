@@ -26,8 +26,9 @@ from typing import Any
 
 import pytest
 
-from agentic_isolation import SupportsStagedTeardown
-from agentic_isolation.providers.docker import WorkspaceDockerProvider
+from agentic_isolation import SupportsStagedTeardown, TeardownReport, TeardownUsage
+from agentic_isolation.contract import MISSING, WorkspaceRef
+from agentic_isolation.providers.docker import WorkspaceDockerProvider, _usage_from_cgroup
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 
 
@@ -62,6 +63,7 @@ def _provider() -> Any:
     p = WorkspaceDockerProvider.__new__(WorkspaceDockerProvider)
     p._log_snapshots = {}
     p._workspaces = {}
+    p._retained = {}
     p._lock = asyncio.Lock()
     p._teardown_locks = {}
     return p
@@ -138,6 +140,8 @@ class TestHooksRunAtTheSafePoints:
         )
         assert seq == [
             "HOOK while_running",
+            "docker exec",
+            "docker inspect",
             "docker stop",
             "docker logs",
             "docker rm",
@@ -159,11 +163,11 @@ class TestFailedArchiveRetainsTheData:
         async def _fails() -> None:
             raise RuntimeError("store unreachable")
 
-        with pytest.raises(RuntimeError):
-            asyncio.run(
-                _provider().teardown(_Workspace(workspace_dir=str(d)), before_delete=_fails)
-            )
+        report = asyncio.run(
+            _provider().teardown(_Workspace(workspace_dir=str(d)), before_delete=_fails)
+        )
 
+        assert report.finalization.state == "retained"
         # Deleting anyway would turn a retryable upload failure into permanent
         # loss, which is exactly what this capability exists to prevent.
         assert (d / "spool.jsonl").exists()
@@ -179,10 +183,7 @@ class TestFailedArchiveRetainsTheData:
         async def _fails() -> None:
             raise RuntimeError("store unreachable")
 
-        with pytest.raises(RuntimeError):
-            asyncio.run(
-                _provider().teardown(_Workspace(workspace_dir=str(d)), before_delete=_fails)
-            )
+        asyncio.run(_provider().teardown(_Workspace(workspace_dir=str(d)), before_delete=_fails))
 
         # Retaining data must not come at the cost of stranding a container.
         assert "docker stop" in seq and "docker rm" in seq
@@ -196,11 +197,13 @@ class TestFailedArchiveRetainsTheData:
         async def _fails() -> None:
             raise RuntimeError("exporter blew up")
 
-        with pytest.raises(RuntimeError):
-            asyncio.run(_provider().teardown(_Workspace(), while_running=_fails))
+        report = asyncio.run(_provider().teardown(_Workspace(), while_running=_fails))
 
         # Recoverable: nothing has been destroyed yet, so a caller can retry.
         assert seq == [], seq
+        assert report.finalization.state == "failed"
+        assert report.finalization.stage == "while_running"
+        assert "exporter blew up" in report.finalization.error.message
 
 
 class TestRegistryIsNotLeaked:
@@ -229,15 +232,17 @@ class TestRegistryIsNotLeaked:
         async def _fails() -> None:
             raise RuntimeError("exporter blew up")
 
-        with pytest.raises(RuntimeError):
-            asyncio.run(provider.teardown(ws, while_running=_fails))
+        asyncio.run(provider.teardown(ws, while_running=_fails))
         assert provider._workspaces == {ws.id: ws}
 
-    def test_deregisters_when_a_before_delete_hook_fails(
+    def test_a_failed_before_delete_KEEPS_the_workspace_resolvable(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
     ) -> None:
-        # By this point the container is genuinely gone, so keeping the
-        # registration would leak. Only the DIRECTORY is retained.
+        # Reverses an earlier version of this test, which asserted the
+        # registration was DROPPED here (plan finding B2). The container is
+        # gone, but the directory is not, and dropping the registration left a
+        # retained directory nobody could name. It moves to the retained
+        # registry instead, under the ref the report carries.
         _record(monkeypatch, [])
         provider = _provider()
         d = tmp_path / "ws"
@@ -248,10 +253,80 @@ class TestRegistryIsNotLeaked:
         async def _fails() -> None:
             raise RuntimeError("store unreachable")
 
-        with pytest.raises(RuntimeError):
-            asyncio.run(provider.teardown(ws, before_delete=_fails))
+        report = asyncio.run(provider.teardown(ws, before_delete=_fails))
+        assert report.finalization.retained == WorkspaceRef(
+            provider="docker", resource_id="container-abc"
+        )
         assert provider._workspaces == {}
+        assert provider._resolve_teardown_target(report.finalization.retained) is ws
         assert d.exists()
+
+
+class TestRetainedThenRetried:
+    """Plan section 7 row 6: retain on a failed archive, then retry by ref."""
+
+    def test_retry_by_ref_completes_and_deletes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        seq: list[str] = []
+        _record(monkeypatch, seq)
+        provider = _provider()
+        d = tmp_path / "ws"
+        d.mkdir()
+        (d / "spool.jsonl").write_text("transcript")
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+
+        async def _fails() -> None:
+            raise RuntimeError("store unreachable")
+
+        first = asyncio.run(provider.teardown(ws, before_delete=_fails))
+        assert first.finalization.state == "retained"
+        assert first.finalization.stage == "before_delete"
+        assert d.exists()
+        commands_after_first = list(seq)
+
+        archived: list[bool] = []
+
+        async def _archives() -> None:
+            archived.append((d / "spool.jsonl").exists())
+
+        assert first.finalization.retained is not MISSING
+        second = asyncio.run(
+            provider.teardown(first.finalization.retained, before_delete=_archives)
+        )
+        assert second.finalization.state == "completed"
+        assert archived == [True], "the retry archives the spool the first attempt kept"
+        assert not d.exists()
+        # The container went with the first attempt: nothing to stop again.
+        assert seq == commands_after_first, seq
+        with pytest.raises(LookupError):
+            provider._resolve_teardown_target(first.finalization.retained)
+
+    def test_a_ref_to_a_live_workspace_resolves_after_a_failed_while_running(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        seq: list[str] = []
+        _record(monkeypatch, seq)
+        provider = _provider()
+        d = tmp_path / "ws"
+        d.mkdir()
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+
+        async def _fails() -> None:
+            raise RuntimeError("exporter blew up")
+
+        asyncio.run(provider.teardown(ws, while_running=_fails))
+        ref = WorkspaceRef(provider="docker", resource_id=ws._handle)
+        report = asyncio.run(provider.teardown(ref))
+        assert report.finalization.state == "completed"
+        assert "docker rm" in seq
+        assert not d.exists()
+
+    def test_an_unknown_ref_is_refused(self) -> None:
+        with pytest.raises(LookupError):
+            asyncio.run(_provider().teardown(WorkspaceRef(provider="docker", resource_id="nope")))
 
 
 class TestDestroyIsUnchanged:
@@ -266,9 +341,10 @@ class TestDestroyIsUnchanged:
         ws = _Workspace(workspace_dir=str(d))
         provider._workspaces[ws.id] = ws
 
-        asyncio.run(provider.destroy(ws))
+        report = asyncio.run(provider.destroy(ws))
 
-        assert seq == ["docker stop", "docker logs", "docker rm"], seq
+        assert seq == ["docker exec", "docker inspect", "docker stop", "docker logs", "docker rm"]
+        assert report.finalization.state == "completed"
         assert not d.exists()
         assert provider._workspaces == {}
 
@@ -368,6 +444,108 @@ class TestAsyncFailureModes:
             assert observed["spool_present"], (
                 "a concurrent teardown deleted the workspace mid-archive"
             )
-            assert isinstance(results[0], RuntimeError)
+            first_report, second_report = results
+            assert isinstance(first_report, TeardownReport)
+            assert isinstance(second_report, TeardownReport)
+            assert first_report.finalization.state == "retained"
+            # The second caller waited, then found the workspace retained.
+            assert second_report.finalization.state == "completed"
+            assert not d.exists()
 
         asyncio.run(_main())
+
+
+class _Reader:
+    def __init__(self, out: bytes) -> None:
+        self._out = [out]
+
+    async def read(self, _n: int) -> bytes:
+        return self._out.pop() if self._out else b""
+
+
+class _OutputProc(_Proc):
+    """A finished `docker` call that printed `out`."""
+
+    def __init__(self, out: bytes) -> None:
+        self._reader = _Reader(out)
+
+    @property
+    def stdout(self) -> _Reader:
+        return self._reader
+
+
+_CGROUP_OUTPUT = (
+    b"memory.events.low 0\n"
+    b"memory.events.oom 3\n"
+    b"memory.events.oom_kill 2\n"
+    b"cpu.stat.usage_usec 4250000\n"
+    b"cpu.stat.nr_throttled 7\n"
+    b"cpu.stat.throttled_usec 1500000\n"
+    b"memory.peak 67108864\n"
+)
+
+
+class TestUsageReachesTheReport:
+    """Usage is read before `docker stop` and arrives in what `destroy()` returns.
+
+    PC-162/PC-152: two phases died with exit 137 and nothing recorded whether
+    they were OOM-killed. `destroy()` is the call Syntropic137 reads the
+    report from, so that is the hop asserted here.
+    """
+
+    def _docker(self, monkeypatch: pytest.MonkeyPatch, oom_killed: bytes) -> list[str]:
+        seq: list[str] = []
+
+        async def _spawn(*argv: str, **_k: object) -> _Proc:
+            seq.append(" ".join(argv[:2]))
+            if argv[1] == "exec":
+                return _OutputProc(_CGROUP_OUTPUT)
+            if argv[1] == "inspect":
+                return _OutputProc(oom_killed)
+            return _Proc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+        return seq
+
+    def test_destroy_reports_cgroup_usage(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._docker(monkeypatch, b"false\n")
+        report = asyncio.run(_provider().destroy(_Workspace()))
+        assert report.usage == TeardownUsage(
+            cpu_usage_seconds=4.25,
+            cpu_throttled_seconds=1.5,
+            nr_throttled=7,
+            memory_peak_bytes=67108864,
+            oom_kills=2,
+            oom_killed=True,
+        )
+
+    def test_a_retry_reports_the_usage_measured_before_the_container_went(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        self._docker(monkeypatch, b"false\n")
+        provider = _provider()
+        d = tmp_path / "ws"
+        d.mkdir()
+
+        async def _fails() -> None:
+            raise RuntimeError("store unreachable")
+
+        first = asyncio.run(
+            provider.teardown(_Workspace(workspace_dir=str(d)), before_delete=_fails)
+        )
+        assert first.finalization.retained is not MISSING
+        second = asyncio.run(provider.teardown(first.finalization.retained))
+        assert second.usage.oom_kills == 2
+        assert second.usage == first.usage
+
+    def test_docker_oom_flag_counts_when_the_cgroup_is_unreadable(self) -> None:
+        usage = _usage_from_cgroup("", oom_killed=True)
+        assert usage.oom_killed is True
+        assert usage.oom_kills is None
+
+    def test_nothing_read_is_unknown_not_zero(self) -> None:
+        assert _usage_from_cgroup("", oom_killed=None) == TeardownUsage()
+
+    def test_no_kills_counted_is_false(self) -> None:
+        usage = _usage_from_cgroup("memory.events.oom_kill 0\n", oom_killed=None)
+        assert (usage.oom_kills, usage.oom_killed) == (0, False)
