@@ -11,13 +11,20 @@ the process-group cancel. It mirrors `DockerOperations` without a container:
   runs as our own uid in our own pid namespace, so unlike Docker it could in
   principle reach into this process; the descriptor therefore claims
   `continuity_detected`, not `exact` (fixture `workspace-provider/local.json`).
-- The launch marker line is appended to the spool by this process before the
-  workload exists, so it is always first and cannot be forged into first place.
-  Its argv0 names the wrapper in Docker; Local has no wrapper, so it is unused.
+- A launch marker is printed by a transient `sh` named by the marker's argv0,
+  which the workload then replaces in place (the `_INNER` shape of Docker), so
+  the line is first and is in neither the workload's argv nor its environment.
+- Every process the workload starts inherits an ownership token in its
+  environment, so a descendant that left the group and lost its parent is still
+  found. Processes are owned by pid plus start time; a pid whose start time
+  changed is a replacement and is never signalled.
 - Cancel refuses a group numbered <= 1 or equal to the caller's own group: the
   caller's namespace IS the workload's here, so the own-group check from
-  `DockerOperations._unsafe_leader` is always real. A refusal still kills the
-  leader by its handle, and reports the refusal in the status metadata.
+  `DockerOperations._unsafe_leader` is always real. A refusal still kills every
+  owned process one by one, and reports the refusal in the status metadata. A
+  group is only signalled while the leader is unreaped, so its id is still ours.
+- If an owned process survives KILL, the operation settles `failed`, never
+  `cancelled`, with the survivors named in the status metadata.
 - Credential values reach only the workload's environment, never an argv.
 - Records live until `forget_workspace`; Local workspaces are short-lived and
   test-only, so there is no retention window.
@@ -28,6 +35,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import secrets
+import shutil
 import signal
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -57,6 +66,13 @@ MAX_PAGE_BYTES = 16384
 
 # After a timeout or cancel, how long KILL is given to clear the group.
 _KILL_WAIT_SECONDS = 2.0
+
+# Inherited by every process an operation starts; its value is per operation.
+OWNER_VARIABLE = "AGENTIC_LOCAL_OPERATION"
+
+# The named launcher: $0 is the marker's argv0, $1 its line, the rest the argv.
+_SHELL = "/bin/sh"
+_LAUNCHER = 'printf "%s\\n" "$1"; shift; exec "$@"'
 
 
 def unsafe_group(pgid: int) -> str | None:
@@ -88,38 +104,85 @@ def _error(
     return OperationFailure(OperationError(kind=kind, message=message, ref=ref))
 
 
-def _proc_table() -> dict[int, tuple[int, int]]:
-    """pid -> (ppid, pgrp) for every live, non-zombie process."""
-    table: dict[int, tuple[int, int]] = {}
+def _stat_fields(pid: int) -> list[str] | None:
+    """The fields of /proc/<pid>/stat after the command name, or None."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return stat[stat.rfind(")") + 2 :].split()
+
+
+def _start_time(pid: int) -> int | None:
+    """The start time (field 22) that tells a pid's process from a replacement."""
+    fields = _stat_fields(pid)
+    return int(fields[19]) if fields and fields[0] != "Z" else None
+
+
+def _proc_table() -> dict[int, tuple[int, int, int]]:
+    """pid -> (ppid, pgrp, start time) for every live, non-zombie process."""
+    table: dict[int, tuple[int, int, int]] = {}
     for entry in Path("/proc").iterdir():
         if not entry.name.isdecimal():
             continue
-        try:
-            stat = (entry / "stat").read_text()
-        except OSError:
-            continue
-        fields = stat[stat.rfind(")") + 2 :].split()
+        fields = _stat_fields(int(entry.name))
         if fields and fields[0] != "Z":
-            table[int(entry.name)] = (int(fields[1]), int(fields[2]))
+            table[int(entry.name)] = (int(fields[1]), int(fields[2]), int(fields[19]))
     return table
 
 
-def _members(pgid: int, tracked: set[int]) -> set[int]:
-    """The group, every process still tracked, and all their descendants.
+def _carries(pid: int, token: str) -> bool:
+    """Whether `pid` was started with this operation's ownership token."""
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    return f"{OWNER_VARIABLE}={token}".encode() in environ.split(b"\0")
 
-    A descendant that left the group (`setsid`) is found through its parent
-    chain, and once seen stays tracked after its parent dies.
+
+def _send(pid: int, start: int, sig: signal.Signals) -> None:
+    """Signal `pid` only if it is still the process that started at `start`.
+
+    Where the platform has pidfds, the pidfd pins the process before the
+    check, so a pid reused after it cannot receive the signal. Without them
+    the window is the gap between reading the start time and `kill`.
     """
-    table = _proc_table()
-    found = {pid for pid, (_, pgrp) in table.items() if pgrp == pgid} | (tracked & table.keys())
-    grew = True
-    while grew:
-        grew = False
-        for pid, (ppid, _) in table.items():
-            if pid not in found and ppid in found:
-                found.add(pid)
-                grew = True
-    return {pid for pid in found if pid > 1 and pid != os.getpid()}
+    if not hasattr(os, "pidfd_open"):
+        if _start_time(pid) == start:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, sig)
+        return
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        if _start_time(pid) == start:
+            signal.pidfd_send_signal(fd, sig)
+    except ProcessLookupError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _invalid_launch(spec: OperationSpec, env: dict[str, str]) -> str | None:
+    """Why the OS cannot launch this argv and environment, or None."""
+    if any("\0" in arg for arg in spec.argv):
+        return "argv contains a NUL byte"
+    for name, value in env.items():
+        if not name or "=" in name or "\0" in name:
+            return f"environment variable name {name!r} is not valid"
+        if "\0" in value:
+            return f"environment variable {name!r} contains a NUL byte"
+    return None
+
+
+def _resolvable(program: str, cwd: Path, env: dict[str, str]) -> bool:
+    """Whether exec would find `program`, checked before the launcher runs it."""
+    if "/" in program:
+        path = cwd / program
+        return path.is_file() and os.access(path, os.X_OK)
+    return shutil.which(program, path=env.get("PATH", os.defpath)) is not None
 
 
 @dataclass
@@ -130,6 +193,7 @@ class _Operation:
     spool: OperationSpool
     started_at: str
     process: asyncio.subprocess.Process
+    token: str
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     state: OperationState = "running"
     exit_code: int | None = None
@@ -137,8 +201,10 @@ class _Operation:
     ended_at: str | None = None
     cancel_requested: bool = False
     timed_out: bool = False
-    tracked: set[int] = field(default_factory=set)
+    # pid -> start time of every process seen owned, kept after it reparents.
+    tracked: dict[int, int] = field(default_factory=dict)
     signal_failure: str | None = None
+    unconfirmed: bool = False
     collector: asyncio.Task[None] | None = None
 
 
@@ -228,19 +294,27 @@ class LocalOperations:
                     "credential bindings need a CredentialResolver; none was injected",
                 )
             env[binding.target] = await self._credentials.resolve(binding.ref)
-        self._sequence += 1
-        ref = OperationRef(
-            workspace=WorkspaceRef(provider="local", resource_id=workspace.id),
-            operation_id=f"{workspace.id}-op{self._sequence}",
-            operation_key=spec.operation_key,
-        )
-        spool = OperationSpool(retention_bytes=self._retention)
+        if reason := _invalid_launch(spec, env):
+            raise _error("rejected_policy", f"cannot launch {spec.argv[0]!r}: {reason}")
+        try:
+            cwd.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise _error(
+                "rejected_policy",
+                f"working_directory {spec.working_directory!r} cannot be prepared: {e}",
+            ) from e
+        argv: tuple[str, ...] = spec.argv
         if isinstance(spec.launch_marker, LaunchMarker):
-            spool.append(f"{spec.launch_marker.line}\n".encode())
-        cwd.mkdir(parents=True, exist_ok=True)
+            # The launcher reports exec failure as exit 127, after acceptance.
+            if not _resolvable(spec.argv[0], cwd, env):
+                raise _error("provider_unavailable", f"could not launch {spec.argv[0]!r}")
+            marker = spec.launch_marker
+            argv = (_SHELL, "-c", _LAUNCHER, marker.argv0, marker.line, *spec.argv)
+        token = secrets.token_hex(16)
+        env[OWNER_VARIABLE] = token
         try:
             process = await asyncio.create_subprocess_exec(
-                *spec.argv,
+                *argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -250,13 +324,20 @@ class LocalOperations:
             )
         except OSError as e:
             raise _error("provider_unavailable", f"could not launch {spec.argv[0]!r}: {e}") from e
+        self._sequence += 1
+        ref = OperationRef(
+            workspace=WorkspaceRef(provider="local", resource_id=workspace.id),
+            operation_id=f"{workspace.id}-op{self._sequence}",
+            operation_key=spec.operation_key,
+        )
         operation = _Operation(
             ref=ref,
             spec=spec,
             workspace_id=workspace.id,
-            spool=spool,
+            spool=OperationSpool(retention_bytes=self._retention),
             started_at=_now(),
             process=process,
+            token=token,
         )
         operation.collector = asyncio.create_task(self._collect(operation))
         self._operations[ref.operation_id] = operation
@@ -299,7 +380,9 @@ class LocalOperations:
             operation.signal = signal.Signals(-code).name
             code = 128 - code
         operation.exit_code = code
-        if operation.cancel_requested:
+        if operation.unconfirmed:
+            operation.state = "failed"
+        elif operation.cancel_requested:
             operation.state = "cancelled"
         elif operation.timed_out:
             operation.state = "timed_out"
@@ -363,33 +446,64 @@ class LocalOperations:
         return self._status(operation)
 
     async def _terminate(self, operation: _Operation, *, grace_seconds: float) -> None:
-        """TERM the group and its escaped descendants, then KILL after the grace.
+        """TERM the group and every owned process, then KILL after the grace.
 
-        A refused group (init, or our own) is never signalled; the leader is
-        then killed through its handle alone, and the refusal is recorded.
+        A refused group (init, or our own) is never signalled as a group; its
+        owned processes are signalled one by one and the refusal is recorded.
+        Survivors of KILL mark the operation unconfirmed, so it settles failed.
         """
         pgid = operation.process.pid
         if refusal := unsafe_group(pgid):
             self._note(operation, refusal)
-            with contextlib.suppress(ProcessLookupError):
-                operation.process.kill()
-            return
         for sig, wait in ((signal.SIGTERM, grace_seconds), (signal.SIGKILL, _KILL_WAIT_SECONDS)):
-            operation.tracked |= _members(pgid, operation.tracked)
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(pgid, sig)
-            for pid in operation.tracked:
+            owned = self._owned(operation)
+            operation.tracked.update(owned)
+            # An unreaped leader holds its pid, so the group id is still ours.
+            if refusal is None and operation.process.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, sig)
-            if await self._gone(operation, pgid, within=wait):
+                    os.killpg(pgid, sig)
+            for pid, start in owned.items():
+                _send(pid, start, sig)
+            if await self._gone(operation, within=wait):
                 return
-        self._note(operation, f"process group {pgid} survived SIGKILL")
+        survivors = sorted(self._owned(operation))
+        operation.unconfirmed = True
+        self._note(operation, f"owned processes {survivors} survived SIGKILL")
 
     @staticmethod
-    async def _gone(operation: _Operation, pgid: int, *, within: float) -> bool:
+    def _owned(operation: _Operation) -> dict[int, int]:
+        """pid -> start time of every live process this operation owns.
+
+        Owned: a tracked process whose start time still matches, the leader's
+        group while the leader is unreaped, anything carrying the ownership
+        token, and every descendant of those through the parent chain. A
+        refused group is never counted, since it may hold the caller.
+        """
+        table = _proc_table()
+        pgid = operation.process.pid
+        ours = operation.process.returncode is None and unsafe_group(pgid) is None
+        leader = pgid if ours else None
+        found = {
+            pid: start
+            for pid, (_, pgrp, start) in table.items()
+            if operation.tracked.get(pid) == start
+            or pgrp == leader
+            or _carries(pid, operation.token)
+        }
+        grew = True
+        while grew:
+            grew = False
+            for pid, (ppid, _, start) in table.items():
+                if pid not in found and ppid in found:
+                    found[pid] = start
+                    grew = True
+        return {pid: s for pid, s in found.items() if pid > 1 and pid != os.getpid()}
+
+    @classmethod
+    async def _gone(cls, operation: _Operation, *, within: float) -> bool:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + within
-        while _members(pgid, operation.tracked):
+        while cls._owned(operation):
             if loop.time() >= deadline:
                 return False
             await asyncio.sleep(0.05)

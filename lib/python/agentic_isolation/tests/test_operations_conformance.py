@@ -17,11 +17,14 @@ import asyncio
 import base64
 import json
 import os
+import signal
 import stat
+import subprocess
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -432,4 +435,195 @@ async def test_local_credential_binding_reaches_env_but_never_argv(tmp_path: Pat
         _, output = await run_to_completion(provider, workspace, spec)
     assert (workspace.path / "token").read_text() == "s3cr3t-local-9a1"
     assert b"s3cr3t" not in output
+    await provider.destroy(workspace)
+
+
+async def test_local_cancel_kills_an_orphan_that_detached_before_cancel(tmp_path: Path) -> None:
+    """A daemon whose intermediate parent exited before cancel is still owned."""
+    provider = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
+    workspace = await provider.create(WorkspaceConfig())
+    orphan, middle, bystander = tmp_path / "orphan", tmp_path / "middle", tmp_path / "bystander"
+    script = (
+        f"sh -c 'echo $$ > {middle}; setsid sleep 300 >/dev/null 2>&1 & echo $! > {orphan}'; "
+        "exec sleep 300"
+    )
+    async with _bounded():
+        other = await provider.start(
+            workspace, _spec(f"echo $$ > {bystander}; exec sleep 300", key="k2")
+        )
+        ref = await provider.start(workspace, _spec(script))
+        (orphan_pid,) = await _wait_for_pids(orphan, 1)
+        (middle_pid,) = await _wait_for_pids(middle, 1)
+        (bystander_pid,) = await _wait_for_pids(bystander, 1)
+        while _alive(middle_pid):
+            await asyncio.sleep(0.05)
+        assert _alive(orphan_pid)
+        assert (await provider.cancel(ref, grace_seconds=0.5)).state == "cancelled"
+        assert not _alive(orphan_pid)
+        assert (await provider.cancel(ref, grace_seconds=0.5)).state == "cancelled"
+        assert _alive(bystander_pid)
+        assert (await provider.status(other)).state == "running"
+    await provider.destroy(workspace)
+
+
+def _sleeper() -> subprocess.Popen[bytes]:
+    return subprocess.Popen(["sleep", "300"], start_new_session=True)
+
+
+def _reap(process: subprocess.Popen[bytes]) -> None:
+    """Kill through the `kill` binary: the `signals` fixture replaces `os.kill`."""
+    subprocess.run(["kill", "-KILL", str(process.pid)], check=False)
+    process.wait(timeout=10)
+
+
+def _scripted_operation(leader: int, *, reaped: bool, tracked: dict[int, int]) -> object:
+    """An operation record whose leader and tracked set the test controls."""
+    process = SimpleNamespace(pid=leader, returncode=0 if reaped else None)
+    return local_operations._Operation(
+        ref=None,  # type: ignore[arg-type]
+        spec=_spec("true"),
+        workspace_id="ws",
+        spool=None,  # type: ignore[arg-type]
+        started_at="",
+        process=process,  # type: ignore[arg-type]
+        token="scripted",
+        tracked=tracked,
+    )
+
+
+@pytest.fixture
+def signals(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+    """Record every group and pid signal instead of sending it."""
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(local_operations.os, "killpg", lambda g, s: sent.append((-g, s)))
+    monkeypatch.setattr(local_operations.os, "kill", lambda p, s: sent.append((p, s)))
+    if hasattr(local_operations.signal, "pidfd_send_signal"):
+        by_fd: dict[int, int] = {}
+        real_open = os.pidfd_open
+
+        def pidfd_open(pid: int) -> int:
+            fd = real_open(pid)
+            by_fd[fd] = pid
+            return fd
+
+        monkeypatch.setattr(local_operations.os, "pidfd_open", pidfd_open)
+        monkeypatch.setattr(
+            local_operations.signal, "pidfd_send_signal", lambda fd, s: sent.append((by_fd[fd], s))
+        )
+    monkeypatch.setattr(local_operations, "_KILL_WAIT_SECONDS", 0.2)
+    return sent
+
+
+async def test_local_never_signals_a_reused_leader_or_tracked_pid(
+    monkeypatch: pytest.MonkeyPatch, signals: list[tuple[int, int]]
+) -> None:
+    """Replacements keep their pid but not their start time; survivors keep both."""
+    reused_leader, reused_child, survivor = _sleeper(), _sleeper(), _sleeper()
+    try:
+        table = {
+            reused_leader.pid: (1, reused_leader.pid, 900),
+            reused_child.pid: (1, reused_child.pid, 901),
+            survivor.pid: (1, survivor.pid, 300),
+        }
+        starts = {pid: start for pid, (_, _, start) in table.items()}
+        monkeypatch.setattr(local_operations, "_proc_table", lambda: table)
+        monkeypatch.setattr(local_operations, "_start_time", starts.get)
+        operation = _scripted_operation(
+            reused_leader.pid, reaped=True, tracked={reused_child.pid: 100, survivor.pid: 300}
+        )
+
+        def term_kills_survivor(pid: int, start: int, sig: signal.Signals) -> None:
+            real_send(pid, start, sig)
+            if pid == survivor.pid:
+                table.pop(survivor.pid)
+
+        real_send = local_operations._send
+        monkeypatch.setattr(local_operations, "_send", term_kills_survivor)
+        ops = LocalOperations(credentials=None)
+        async with _bounded():
+            await ops._terminate(operation, grace_seconds=0.2)  # type: ignore[arg-type]
+        assert signals == [(survivor.pid, signal.SIGTERM)]
+        assert not operation.unconfirmed  # type: ignore[attr-defined]
+    finally:
+        for process in (reused_leader, reused_child, survivor):
+            _reap(process)
+
+
+async def test_local_never_signals_a_pid_reused_between_term_and_kill(
+    monkeypatch: pytest.MonkeyPatch, signals: list[tuple[int, int]]
+) -> None:
+    """Ownership is rechecked at each signal, so KILL skips a replacement."""
+    child = _sleeper()
+    try:
+        monkeypatch.setattr(
+            local_operations, "_proc_table", lambda: {child.pid: (1, child.pid, 300)}
+        )
+        monkeypatch.setattr(
+            local_operations, "_start_time", lambda pid: 300 if not signals else 400
+        )
+        operation = _scripted_operation(child.pid + 1, reaped=True, tracked={child.pid: 300})
+        ops = LocalOperations(credentials=None)
+        async with _bounded():
+            await ops._terminate(operation, grace_seconds=0.2)  # type: ignore[arg-type]
+        assert signals == [(child.pid, signal.SIGTERM)]
+        operation.cancel_requested = True  # type: ignore[attr-defined]
+        LocalOperations._settle(operation, -9)  # type: ignore[arg-type]
+        assert operation.state == "failed"  # type: ignore[attr-defined]
+    finally:
+        _reap(child)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"argv": ("sh", "\u0000")},
+        {"environment": {"A=B": "C"}},
+        {"working_directory": "file"},
+    ],
+    ids=["nul-argv", "env-name-with-equals", "cwd-is-a-file"],
+)
+async def test_local_unlaunchable_spec_is_a_typed_rejection(
+    tmp_path: Path, overrides: dict[str, object]
+) -> None:
+    provider = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
+    workspace = await provider.create(WorkspaceConfig())
+    (workspace.path / "file").write_text("in the way")
+    bad = OperationSpec.model_validate_json(_spec("echo bad", **overrides).model_dump_json())
+    async with _bounded():
+        with pytest.raises(OperationFailure) as caught:
+            await provider.start(workspace, bad)
+        assert caught.value.error.kind == "rejected_policy"
+        assert provider._operations._operations == {}
+        _, output = await run_to_completion(provider, workspace, _spec("echo fixed"))
+    assert output == b"fixed\n"
+    await provider.destroy(workspace)
+
+
+async def test_local_marker_comes_from_a_named_launcher_the_workload_replaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launcher runs under argv0 with the line; the same pid then holds neither."""
+    seen = tmp_path / "launcher"
+    wrapper = tmp_path / "sh"
+    wrapper.write_text(f'#!/bin/sh\nprintf "%s\\n" "$$" "$@" > {seen}\nexec /bin/sh "$@"\n')
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(local_operations, "_SHELL", str(wrapper))
+    provider = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
+    workspace = await provider.create(WorkspaceConfig())
+    marker = LaunchMarker(argv0="aw-launch-5d2", line="AW_LAUNCH nonce-77e")
+    script = (
+        'echo "pid $$"; tr "\\0" " " < /proc/$$/cmdline; echo; tr "\\0" "\\n" < /proc/$$/environ'
+    )
+    async with _bounded():
+        _, output = await run_to_completion(
+            provider, workspace, _spec(script, launch_marker=marker)
+        )
+    launcher = seen.read_text().splitlines()
+    assert launcher[1] == "-c" and launcher[3:5] == [marker.argv0, marker.line]
+    lines = output.decode().splitlines()
+    assert lines[0] == marker.line
+    assert lines[1] == f"pid {launcher[0]}"
+    assert lines[2].split()[:2] == ["sh", "-c"]
+    assert marker.line not in "\n".join(lines[2:])
+    assert marker.argv0 not in "\n".join(lines[2:])
     await provider.destroy(workspace)

@@ -41,7 +41,7 @@ Python rows are claimed by these tests in `lib/python/agentic_isolation/tests/`:
 | Idempotent teardown | `test_staged_teardown.py` |
 | Process execution and timeout | `test_docker_operations.py::test_regression_execute_runs_through_the_operation_contract`, `::test_run_to_completion_returns_terminal_status_and_bytes` |
 | Credential and resource enforcement | `test_docker_operations.py::test_d_binding_reaches_env_but_never_argv_or_pages` |
-| Operation start, idempotency and conflict | `test_docker_operations.py::test_a_*`, `::test_b_*`, `::test_c_*`, `::test_unknown_ref_is_unknown_operation` |
+| Operation start, idempotency and conflict | `test_docker_operations.py::test_a_*`, `::test_b_*`, `::test_c_*`, `::test_unknown_ref_is_unknown_operation`, `::test_local_unlaunchable_spec_is_a_typed_rejection` |
 | Operation status from a trusted channel | `test_docker_operations.py::test_l_*`, `::test_m_*` |
 | Operation observation pages, gaps and cursors | `test_docker_operations.py::test_e_*`, `::test_f_*`, `::test_g_*`, `::test_h_*`, `::test_i_*`, `::test_j_*`; `test_contract_schemas.py::test_behaviour_document_accepted_by_schema_and_model` |
 | Operation cancellation of the process tree | `test_docker_operations.py::test_k_*` |
@@ -52,10 +52,10 @@ protocol-level tests run parametrised for both Docker and Local:
 | Row | Test ids (Local parameter, `[local]`) |
 |---|---|
 | Production rejects Local | `::test_local_without_an_explicit_insecure_opt_in_raises`, `::test_agentic_workspace_cannot_reach_local_implicitly` |
-| Operation start, idempotency and conflict | `::test_a_*`, `::test_b_*`, `::test_c_*`, `::test_unknown_ref_is_unknown_operation` |
+| Operation start, idempotency and conflict | `::test_a_*`, `::test_b_*`, `::test_c_*`, `::test_unknown_ref_is_unknown_operation`, `::test_local_unlaunchable_spec_is_a_typed_rejection` |
 | Operation status from a trusted channel | `::test_m_*`, `::test_a_signalled_workload_reports_its_signal`, `::test_timeout_settles_as_timed_out_with_the_final_output` |
-| Operation observation pages, gaps and cursors | `::test_e_*`, `::test_f_*`, `::test_g_*`, `::test_h_*`, `::test_i_*`, `::test_j_*`, `::test_local_describe_matches_the_published_local_descriptor` |
-| Operation cancellation of the process tree | `::test_k_*`, `::test_local_cancel_kills_a_descendant_that_left_the_group`, `::test_cancel_never_signals_a_refused_group`, `::test_unsafe_group_*` |
+| Operation observation pages, gaps and cursors | `::test_e_*`, `::test_f_*`, `::test_g_*`, `::test_h_*`, `::test_i_*`, `::test_j_*`, `::test_local_describe_matches_the_published_local_descriptor`, `::test_local_marker_comes_from_a_named_launcher_the_workload_replaces` |
+| Operation cancellation of the process tree | `::test_k_*`, `::test_local_cancel_kills_a_descendant_that_left_the_group`, `::test_cancel_never_signals_a_refused_group`, `::test_unsafe_group_*`, `::test_local_cancel_kills_an_orphan_that_detached_before_cancel`, `::test_local_never_signals_a_reused_leader_or_tracked_pid`, `::test_local_never_signals_a_pid_reused_between_term_and_kill` |
 
 Python Local publishes `integrity: continuity_detected`, not `exact`: its
 workload runs as the caller's uid in the caller's pid namespace, so the spool
