@@ -601,7 +601,28 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&script);
         script
+    }
+
+    /// A test that forks while `fs::write` holds the script open hands the
+    /// write descriptor to its child until that child execs, and executing the
+    /// script meanwhile fails with ETXTBSY. Our descriptor is already closed,
+    /// so once one exec succeeds no process can hold it for writing again.
+    #[cfg(unix)]
+    fn wait_until_executable(script: &Path) {
+        for _ in 0..200 {
+            match std::process::Command::new(script).output() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                result => {
+                    result.unwrap();
+                    return;
+                }
+            }
+        }
+        panic!("{} stayed busy", script.display());
     }
 
     #[cfg(unix)]
@@ -783,6 +804,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
         }
+        wait_until_executable(&docker);
         let provider = DockerProvider::new(dir.path().join("root"), "image", NetworkPolicy::None)
             .unwrap()
             .with_docker_binary(docker);
