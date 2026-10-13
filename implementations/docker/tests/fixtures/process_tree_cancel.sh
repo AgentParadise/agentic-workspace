@@ -137,10 +137,16 @@ run_case() {
 FORKS_GRANDCHILD='(sh -c "echo \$\$ > \"\$0.tmp\" && mv \"\$0.tmp\" \"\$0\" && exec sleep 300" "$0" &); exec sleep 300'
 # Ignored signals are inherited, so TERM reaches nobody and only KILL ends it.
 TRAPS_TERM='trap "" TERM; sh -c "echo \$\$ > \"\$0.tmp\" && mv \"\$0.tmp\" \"\$0\" && exec sleep 300" "$0" & wait'
+# The leader obeys TERM but its child ignores it (trap set before the child is
+# recorded), so only the second recorded pid can demand the KILL escalation.
+# The child's output goes to /dev/null so a survivor cannot hold the caller's
+# capture pipes open.
+CHILD_TRAPS_TERM='sh -c "trap \"\" TERM; echo \$\$ > \"\$0.tmp\" && mv \"\$0.tmp\" \"\$0\" && exec sleep 300" "$0" >/dev/null 2>&1 & exec sleep 300'
 
 status=0
 run_case forks_grandchild "$FORKS_GRANDCHILD" || status=1
 run_case traps_term "$TRAPS_TERM" || status=1
+run_case child_traps_term "$CHILD_TRAPS_TERM" || status=1
 
 # The start-time comparison must reject a live pid recorded with another start
 # time, which is what a reused pid looks like.
