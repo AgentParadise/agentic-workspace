@@ -81,3 +81,16 @@ def invalid_fixtures() -> Iterator[Path]:
 def invalid_document(path: Path) -> Json:
     case = json.loads(path.read_text())
     return apply_edits(load(case["base"]), case["set"], case["remove"])
+
+
+def behaviour_documents() -> Iterator[tuple[str, Json]]:
+    """Every schema-tagged document a behaviour fixture expects, as `(id, document)`.
+
+    Untagged expectations (`operationRef`, a `$defs` fragment) have no
+    top-level schema to dispatch on and are not contract documents.
+    """
+    for path in sorted((FIXTURES / "behaviour").glob("*.json")):
+        for index, step in enumerate(json.loads(path.read_text())["steps"]):
+            document = step.get("expect", {}).get("document")
+            if isinstance(document, dict) and "schema" in document:
+                yield f"{path.stem}/step{index}", document
