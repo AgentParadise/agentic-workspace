@@ -21,7 +21,9 @@ from agentic_isolation.contract import (
     OperationSpec,
     OperationStatus,
     ProviderDescriptor,
+    WorkspaceRef,
 )
+from agentic_isolation.providers.teardown_report import TeardownReport
 
 if TYPE_CHECKING:
     from agentic_isolation.harnesses import TranscriptSource
@@ -161,11 +163,15 @@ class WorkspaceProvider(Protocol):
         """
         ...
 
-    async def destroy(self, workspace: Workspace) -> None:
+    async def destroy(self, workspace: Workspace) -> TeardownReport | None:
         """Destroy a workspace and clean up resources.
 
         Args:
             workspace: Workspace to destroy
+
+        Returns:
+            What the teardown measured, or None for a provider that measures
+            nothing
         """
         ...
 
@@ -325,25 +331,29 @@ class SupportsStagedTeardown(Protocol):
 
     async def teardown(
         self,
-        workspace: Workspace,
+        target: Workspace | WorkspaceRef,
         *,
         while_running: Callable[[], Awaitable[None]] | None = None,
         before_delete: Callable[[], Awaitable[None]] | None = None,
-    ) -> None:
+    ) -> TeardownReport:
         """Tear the workspace down, running the hooks at their safe points.
 
         Args:
-            workspace: Workspace to tear down
+            target: The workspace, or the `WorkspaceRef` a `retained` report
+                named. Passing the ref back is how a failed archive is retried.
             while_running: Awaited BEFORE the container is stopped, so it may
-                still exec into it. Raising aborts teardown with the container
-                intact, which is recoverable; a caller that would rather
-                proceed should catch its own errors.
+                still exec into it. If it raises, nothing is destroyed and the
+                report is `failed` at `while_running`: the workspace stays
+                registered, and the same call can be retried.
             before_delete: Awaited after the container is gone but BEFORE the
                 workspace directory is deleted. This is where a durable
                 archive belongs. **If it raises, the workspace directory is
-                NOT deleted**, so the data it failed to archive is still there
-                for a retry. That retention is the point: deleting anyway
-                would convert a failed upload into permanent loss.
+                NOT deleted** and the report is `retained`, naming the ref to
+                retry with. Deleting anyway would convert a failed upload into
+                permanent loss.
+
+        A hook's `Exception` is reported, not raised. Cancellation is not a
+        hook failure and propagates.
 
         Implementations MUST NOT delete the workspace directory when
         `before_delete` raises, and MUST leave the container stopped and
@@ -516,8 +526,8 @@ class BaseProvider(ABC):
         ...
 
     @abstractmethod
-    async def destroy(self, workspace: Workspace) -> None:
-        """Destroy a workspace."""
+    async def destroy(self, workspace: Workspace) -> TeardownReport | None:
+        """Destroy a workspace. None when the provider measures nothing."""
         ...
 
     @abstractmethod

@@ -69,6 +69,8 @@ from agentic_isolation.providers import (
     InteractiveSession,
     SupportsStagedTeardown,
     SupportsWorkspaceLogs,
+    TeardownReport,
+    TeardownUsage,
     TranscriptExtractionResult,
     TranscriptSource,
     Workspace,
@@ -124,6 +126,8 @@ __all__ = [
     # Providers
     "WorkspaceProvider",
     "SupportsStagedTeardown",
+    "TeardownReport",
+    "TeardownUsage",
     "SupportsWorkspaceLogs",
     "Workspace",
     "ExecuteResult",
