@@ -134,7 +134,7 @@ def _members(table: _Table, leader: str, start: str, tracked: dict[str, str]) ->
         if (row[1] == leader and not _leader_reused(table, leader, start))
         or tracked.get(pid) == row[2]
     }
-    grew = True
+    grew = False  # MUTATION: descendant closure disabled
     while grew:
         grew = False
         for pid, (ppid, _, child_start) in table.items():
