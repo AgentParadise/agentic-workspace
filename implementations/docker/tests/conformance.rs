@@ -1,3 +1,6 @@
+#[path = "support/process_tree_cancel.rs"]
+mod process_tree_cancel;
+
 use agentic_workspace_conformance::{assert_basic_lifecycle, minimal_manifest};
 use agentic_workspace_core::{CommandSpec, SecurityProfile, WorkspaceProvider};
 use agentic_workspace_docker::{CODEX_IMAGE_LABEL, DockerProvider, NetworkPolicy};
@@ -47,6 +50,41 @@ fn passes_shared_functional_conformance() {
         "work/artifact.txt",
     )
     .unwrap();
+}
+
+/// The workspace images Syntropic137 pins, by digest. This repo publishes the
+/// images but not the pins: they are copied from syntropic137
+/// `packages/syn-shared/src/syn_shared/settings/workspace_images.py`
+/// (`PINNED_DIGESTS`, with the repository names from `workspace_image_name`).
+/// The claude-cli image is published as `agentic-workspace-claude`.
+const PINNED_WORKSPACE_IMAGES: [&str; 3] = [
+    "ghcr.io/agentparadise/agentic-workspace-claude@sha256:927641f9e7f1d18a19fce9c11f9923ef68e2e498ca48105cc32de21122614843",
+    "ghcr.io/agentparadise/agentic-workspace-omni-agent@sha256:2cabc694d450807ca953ea634ca0d50d53fcfdb6864be58c91464ab5008fe6e4",
+    "ghcr.io/agentparadise/agentic-workspace-toolchain@sha256:4a76c184a8d36b8663a0f0191842410304ea1e10b0e719516817949ae8c862f8",
+];
+
+/// Feasibility gate for cancelling an agent's whole process tree inside each
+/// pinned image: `setsid` and `kill` are on PATH, and the trusted-pid wrapper
+/// plus group TERM -> KILL leaves no recorded pid alive. A missing binary
+/// fails here with `MISSING <binary>` in the message.
+#[test]
+fn pinned_images_can_cancel_the_whole_process_tree() {
+    if !require_or_skip_docker() {
+        return;
+    }
+    for image in PINNED_WORKSPACE_IMAGES {
+        let output = Command::new("docker")
+            .args(["run", "--rm", "--network", "none", "--entrypoint", "sh"])
+            .args([
+                image,
+                "-c",
+                process_tree_cancel::SCRIPT,
+                "process_tree_cancel",
+            ])
+            .output()
+            .unwrap();
+        process_tree_cancel::assert_cancels_whole_tree(&output, image);
+    }
 }
 
 #[test]
