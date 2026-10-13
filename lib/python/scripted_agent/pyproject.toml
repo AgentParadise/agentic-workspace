@@ -1,0 +1,53 @@
+[project]
+name = "scripted-agent"
+version = "0.1.0"
+description = "Token-free replayer that stands in for the claude CLI in load-test workspaces"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Agentic Primitives Team" }
+]
+dependencies = [
+    "pydantic==2.13.4",
+]
+
+[project.scripts]
+scripted-agent = "scripted_agent.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff==0.16.1",
+    "mypy==2.3.0",
+    "jsonschema>=4.23",
+    "agentic-isolation",
+]
+
+[tool.uv.sources]
+# Test only: the session observer whose tool-start count the profile declares.
+agentic-isolation = { path = "../agentic_isolation", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scripted_agent"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
