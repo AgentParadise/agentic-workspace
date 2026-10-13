@@ -6,6 +6,8 @@ drives the provider and asserts on what reached the subprocess boundary.
 """
 
 import asyncio
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -18,7 +20,7 @@ from agentic_isolation.providers.base import (
     UnsupportedLimitError,
     Workspace,
 )
-from agentic_isolation.providers.docker import WorkspaceDockerProvider
+from agentic_isolation.providers.docker import EXEC_ID_ENV, WorkspaceDockerProvider
 
 LIVE_VALUE = "sk-live-7f3a9c-must-never-appear-in-argv"
 
@@ -246,6 +248,24 @@ async def test_write_file_refuses_a_symlink_that_leaves_the_workspace(tmp_path: 
     assert not (outside / "x").exists()
 
 
+async def test_dot_dot_after_a_symlink_is_refused_not_folded(tmp_path: Path) -> None:
+    """`link/../x` means "beside wherever link points", so it is an escape."""
+    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
+    workspace = _workspace(tmp_path)
+    root = Path(workspace.metadata["workspace_dir"])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="escapes"):
+        await provider.write_file(workspace, "link/../x", "escaped")
+    assert not (tmp_path / "x").exists()
+    assert not (root / "x").exists()
+
+    await provider.write_file(workspace, "nested/../inside", "ok")
+    assert (root / "inside").read_text() == "ok"
+
+
 async def test_write_file_still_writes_nested_paths_inside(tmp_path: Path) -> None:
     provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
     workspace = _workspace(tmp_path)
@@ -279,6 +299,215 @@ async def test_limits_timeout_seconds_ends_execute_timed_out(
     provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
     workspace = _workspace(tmp_path, ResourceLimits(timeout_seconds=1))
 
+    started = time.monotonic()
     result = await provider.execute(workspace, "sleep 5")
+    elapsed = time.monotonic() - started
 
     assert result.timed_out is True
+    # 1s limit plus the 2s cleanup bound; `sleep 5` running out would be 5s.
+    assert elapsed < 3, f"one-second limit returned after {elapsed:.2f}s"
+
+
+async def test_timed_out_operation_tree_is_killed_and_cannot_act_later(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A descendant of the timed-out command must not perform its delayed write."""
+    real_spawn = asyncio.create_subprocess_exec
+    spawned: list[list[str]] = []
+
+    async def run_locally(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        argv = [str(arg) for arg in args]
+        spawned.append(argv)
+        return await real_spawn(*argv[argv.index("sh") :], **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", run_locally)
+    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
+    workspace = _workspace(tmp_path, ResourceLimits(timeout_seconds=1))
+    marker = tmp_path / "late-side-effect"
+
+    result = await provider.execute(workspace, f"(sleep 2; echo late > '{marker}') & sleep 5")
+    await asyncio.sleep(2.5)
+
+    assert result.timed_out is True
+    assert not marker.exists(), "a descendant of the timed-out command kept running"
+    # The in-container kill targets the id this execute exported to its tree.
+    exec_argv, kill_argv = spawned
+    assert kill_argv[:3] == ["docker", "exec", "agentic-ws-test"]
+    assert kill_argv[-2] == EXEC_ID_ENV
+    assert f"{EXEC_ID_ENV}={kill_argv[-1]}" in exec_argv
+
+
+# W-6.3-a: bindings are validated as contract references with deliverable targets
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "PATH",
+        "DOCKER_HOST",
+        "DOCKER_CONFIG",
+        "LD_PRELOAD",
+        "HTTPS_PROXY",
+        "path",
+        "API_KEY=x",
+        "1X",
+    ],
+)
+async def test_binding_target_that_steers_the_host_client_is_refused_before_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spawned: Spawned, target: str
+) -> None:
+    resolved: list[CredentialRef] = []
+
+    class Vault:
+        async def resolve(self, ref: CredentialRef) -> str:
+            resolved.append(ref)
+            return LIVE_VALUE
+
+    provider = _provider(monkeypatch, tmp_path, credentials=Vault())
+    binding = CredentialBinding(
+        ref=CredentialRef(name="workload/key", scope="vault"), delivery="env", target=target
+    )
+
+    with pytest.raises(CredentialPolicyError):
+        WorkspaceConfig(provider="docker", credentials=[binding])
+    config = WorkspaceConfig(provider="docker")
+    config.credentials.append(binding)
+    with pytest.raises(CredentialPolicyError):
+        await provider.create(config)
+    assert resolved == []
+    assert spawned.calls == []
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_workload_credential_cannot_choose_the_host_docker_binary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    attacker_bin = tmp_path / "attacker-bin"
+    attacker_bin.mkdir()
+    marker = tmp_path / "host-code-executed"
+    fake_docker = attacker_bin / "docker"
+    fake_docker.write_text(f"#!/bin/sh\nprintf executed > '{marker}'\n")
+    fake_docker.chmod(0o755)
+
+    class Vault:
+        async def resolve(self, ref: CredentialRef) -> str:
+            return str(attacker_bin)
+
+    provider = _provider(monkeypatch, tmp_path, credentials=Vault())
+    config = WorkspaceConfig(provider="docker")
+    config.credentials.append(
+        CredentialBinding(
+            ref=CredentialRef(name="workload/path", scope="vault"), delivery="env", target="PATH"
+        )
+    )
+
+    with pytest.raises(CredentialPolicyError, match="reserved"):
+        await provider.create(config)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"API_KEY": LIVE_VALUE},
+        LIVE_VALUE,
+        {
+            "ref": {"name": "k", "scope": "vault"},
+            "delivery": "env",
+            "target": "K",
+            "value": LIVE_VALUE,
+        },
+    ],
+)
+async def test_raw_credential_values_are_refused_everywhere_they_can_enter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spawned: Spawned, raw: object
+) -> None:
+    resolved: list[CredentialRef] = []
+
+    class Vault:
+        async def resolve(self, ref: CredentialRef) -> str:
+            resolved.append(ref)
+            return LIVE_VALUE
+
+    with pytest.raises(CredentialPolicyError) as constructed:
+        WorkspaceConfig(credentials=[raw])  # type: ignore[list-item]
+    with pytest.raises(CredentialPolicyError) as fluent:
+        WorkspaceConfig().with_credential(raw)  # type: ignore[arg-type]
+    for refused in (constructed, fluent):
+        assert LIVE_VALUE not in str(refused.value)
+
+    config = WorkspaceConfig(provider="docker")
+    config.credentials.append(raw)  # type: ignore[arg-type]
+    provider = _provider(monkeypatch, tmp_path, credentials=Vault())
+    with pytest.raises(CredentialPolicyError) as consumed:
+        await provider.create(config)
+    assert LIVE_VALUE not in str(consumed.value)
+    assert resolved == []
+    assert spawned.calls == []
+
+
+# W-3.2-b: containment holds when the workload swaps a symlink in mid-write
+
+
+def _swap_on_open(
+    monkeypatch: pytest.MonkeyPatch, name: str, outside: Path, *, replace_dir: bool = False
+) -> None:
+    """Turn workspace entry `name` into a symlink to `outside` just before it is opened."""
+    real_open = os.open
+
+    def racing_open(
+        path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if dir_fd is not None and path == name:
+            if replace_dir:
+                os.rmdir(name, dir_fd=dir_fd)
+            os.symlink(outside, name, dir_fd=dir_fd)
+        return real_open(path, flags, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", racing_open)
+
+
+@pytest.mark.parametrize("content", ["escaped", b"escaped"])
+async def test_symlink_swapped_in_before_the_final_open_is_not_followed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str | bytes
+) -> None:
+    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
+    workspace = _workspace(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("preserve")
+    _swap_on_open(monkeypatch, "target.txt", outside)
+
+    with pytest.raises(ValueError, match="escapes"):
+        await provider.write_file(workspace, "target.txt", content)
+    assert outside.read_text() == "preserve"
+
+
+async def test_parent_directory_swapped_for_a_symlink_is_not_followed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
+    workspace = _workspace(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _swap_on_open(monkeypatch, "sub", outside, replace_dir=True)
+
+    with pytest.raises(ValueError, match="escapes"):
+        await provider.write_file(workspace, "sub/new.txt", "escaped")
+    assert list(outside.iterdir()) == []
+
+
+async def test_read_and_exists_do_not_follow_a_swapped_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
+    workspace = _workspace(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text(LIVE_VALUE)
+    root = Path(workspace.metadata["workspace_dir"])
+    _swap_on_open(monkeypatch, "a.txt", outside)
+    with pytest.raises(ValueError, match="escapes"):
+        await provider.read_file(workspace, "a.txt")
+    (root / "a.txt").unlink()
+    _swap_on_open(monkeypatch, "b.txt", outside)
+    with pytest.raises(ValueError, match="escapes"):
+        await provider.file_exists(workspace, "b.txt")

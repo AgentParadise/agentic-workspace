@@ -10,7 +10,8 @@ from agentic_isolation import (
     WorkspaceLocalProvider,
 )
 from agentic_isolation.config import host_env_credential
-from agentic_isolation.providers import CredentialPolicyError, HostEnvironmentCredentials
+from agentic_isolation.contract import CredentialBinding, CredentialRef
+from agentic_isolation.providers import CredentialPolicyError
 
 
 class TestWorkspaceLocalProvider:
@@ -80,18 +81,35 @@ class TestWorkspaceLocalProvider:
     async def test_execute_with_credentials(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A bound credential is resolved at create and delivered to the command."""
-        monkeypatch.setenv("SECRET_KEY", "secret123")
-        provider = WorkspaceLocalProvider(
-            base_dir=tmp_path, credentials=HostEnvironmentCredentials()
+        """A bound credential is resolved at create and delivered to the command.
+
+        The target is absent from the host environment and the ref name differs
+        from it, so only the provider's credential overlay can supply it.
+        """
+        monkeypatch.delenv("BOUND_TARGET", raising=False)
+
+        class Vault:
+            async def resolve(self, ref: CredentialRef) -> str:
+                assert ref == CredentialRef(name="team/api-key", scope="vault")
+                return "synthetic-credential-123"
+
+        provider = WorkspaceLocalProvider(base_dir=tmp_path, credentials=Vault())
+        config = WorkspaceConfig(
+            provider="local",
+            credentials=[
+                CredentialBinding(
+                    ref=CredentialRef(name="team/api-key", scope="vault"),
+                    delivery="env",
+                    target="BOUND_TARGET",
+                )
+            ],
         )
-        config = WorkspaceConfig(provider="local", credentials=[host_env_credential("SECRET_KEY")])
         workspace = await provider.create(config)
 
         try:
-            result = await provider.execute(workspace, "echo $SECRET_KEY")
+            result = await provider.execute(workspace, "printf '%s' \"$BOUND_TARGET\"")
 
-            assert "secret123" in result.stdout
+            assert result.stdout == "synthetic-credential-123"
         finally:
             await provider.destroy(workspace)
 

@@ -13,7 +13,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from agentic_isolation.config import HOST_ENV_CREDENTIAL_SCOPE, WorkspaceConfig
+from agentic_isolation.config import (
+    HOST_ENV_CREDENTIAL_SCOPE,
+    CredentialPolicyError,
+    WorkspaceConfig,
+    check_credential_bindings,
+)
 from agentic_isolation.contract import CredentialBinding, CredentialRef
 
 if TYPE_CHECKING:
@@ -357,10 +362,6 @@ class CredentialResolver(Protocol):
         ...
 
 
-class CredentialPolicyError(ValueError):
-    """A credential binding the provider refuses to deliver (fails closed)."""
-
-
 class UnsupportedLimitError(ValueError):
     """A requested hard limit the provider cannot enforce (APSS W-3.8-d)."""
 
@@ -394,8 +395,10 @@ async def resolve_env_credentials(
 ) -> dict[str, str]:
     """Resolve env-delivered bindings to `{target: value}`, or refuse.
 
-    Refuses file delivery and a missing resolver before anything is launched.
+    Refuses raw values, unsafe targets, file delivery and a missing resolver
+    before anything is resolved or launched.
     """
+    bindings = check_credential_bindings(bindings)
     if not bindings:
         return {}
     if resolver is None:

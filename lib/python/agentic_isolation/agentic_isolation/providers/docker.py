@@ -13,10 +13,13 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
 import json
 import logging
 import os
 import shutil
+import signal
 import tempfile
 import time
 import uuid
@@ -55,6 +58,19 @@ logger = logging.getLogger(__name__)
 
 # Default network for workspace containers
 DEFAULT_NETWORK = "agentic-workspace-net"
+
+# Every process an execute() starts inherits this variable, so a timed-out
+# operation's whole tree can be found and killed inside the container: killing
+# the local `docker exec` client alone leaves the workload running.
+EXEC_ID_ENV = "AGENTIC_EXEC_ID"
+_KILL_EXEC_TREE = (
+    "for d in /proc/[0-9]*; do "
+    'if tr "\\0" "\\n" < "$d/environ" 2>/dev/null | grep -qx "$0=$1"; then '
+    'kill -KILL "${d#/proc/}" 2>/dev/null; fi; done; true'
+)
+# How long a timed-out operation may take to be torn down before execute()
+# returns anyway.
+_TIMEOUT_CLEANUP_SECONDS = 2.0
 
 
 class WorkspaceDockerProvider(BaseProvider):
@@ -610,29 +626,65 @@ class WorkspaceDockerProvider(BaseProvider):
                 duration_ms=0,
             )
 
+        exec_id = uuid.uuid4().hex
         exec_cmd = self._build_docker_exec_cmd(
             container_name,
             ["sh", "-c", command],
             cwd=cwd,
-            env=env,
+            env={**(env or {}), EXEC_ID_ENV: exec_id},
         )
+
+        async def kill_in_container() -> None:
+            await self._kill_exec_tree(container_name, exec_id)
+
         return await self._run_exec(
-            exec_cmd, timeout=timeout or workspace.config.limits.timeout_seconds
+            exec_cmd,
+            timeout=timeout or workspace.config.limits.timeout_seconds,
+            on_timeout=kill_in_container,
         )
+
+    async def _kill_exec_tree(self, container_name: str, exec_id: str) -> None:
+        """SIGKILL every container process carrying `exec_id`, within the cleanup bound."""
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "exec",
+            container_name,
+            "sh",
+            "-c",
+            _KILL_EXEC_TREE,
+            EXEC_ID_ENV,
+            exec_id,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_TIMEOUT_CLEANUP_SECONDS)
+        except TimeoutError:
+            proc.kill()
+            logger.warning(
+                "Could not confirm timed-out exec %s was killed in %s", exec_id, container_name
+            )
 
     async def _run_exec(
         self,
         exec_cmd: list[str],
         *,
         timeout: float,
+        on_timeout: Callable[[], Awaitable[None]] | None = None,
     ) -> ExecuteResult:
-        """Run a docker exec command and return the result."""
+        """Run a docker exec command and return the result.
+
+        On timeout the client's whole process group is killed, `on_timeout`
+        stops the operation where it actually runs, and cleanup is bounded so
+        the call returns close to its deadline.
+        """
         start_time = time.perf_counter()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *exec_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
             try:
                 stdout, stderr = await asyncio.wait_for(
@@ -640,8 +692,12 @@ class WorkspaceDockerProvider(BaseProvider):
                     timeout=timeout,
                 )
             except TimeoutError:
-                proc.kill()
-                await proc.wait()
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                if on_timeout is not None:
+                    await on_timeout()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(proc.wait(), timeout=_TIMEOUT_CLEANUP_SECONDS)
                 duration_ms = (time.perf_counter() - start_time) * 1000
                 return ExecuteResult(
                     exit_code=-1,
@@ -730,15 +786,12 @@ class WorkspaceDockerProvider(BaseProvider):
         if not workspace_dir:
             raise RuntimeError("Workspace directory not available")
 
-        file_path = _contained_path(Path(workspace_dir), path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        # mkdir may have followed a symlinked parent created since the check.
-        file_path = _contained_path(Path(workspace_dir), path)
-
-        if isinstance(content, str):
-            file_path.write_text(content)
-        else:
-            file_path.write_bytes(content)
+        data = content.encode() if isinstance(content, str) else content
+        fd = _open_contained(
+            Path(workspace_dir), path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, create_parents=True
+        )
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
 
     async def read_file(
         self,
@@ -750,11 +803,12 @@ class WorkspaceDockerProvider(BaseProvider):
         if not workspace_dir:
             raise RuntimeError("Workspace directory not available")
 
-        file_path = _contained_path(Path(workspace_dir), path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {path}")
-
-        return file_path.read_text()
+        try:
+            fd = _open_contained(Path(workspace_dir), path, os.O_RDONLY)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"File not found: {path}") from None
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read().decode()
 
     async def file_exists(
         self,
@@ -766,7 +820,12 @@ class WorkspaceDockerProvider(BaseProvider):
         if not workspace_dir:
             return False
 
-        return _contained_path(Path(workspace_dir), path).exists()
+        try:
+            fd = _open_contained(Path(workspace_dir), path, os.O_RDONLY)
+        except FileNotFoundError:
+            return False
+        os.close(fd)
+        return True
 
     def transcript_source(self, workspace: Workspace, agent: str) -> TranscriptSource | None:
         """Return a `TranscriptSource` for `agent` in `workspace`.
@@ -975,18 +1034,50 @@ class WorkspaceDockerProvider(BaseProvider):
         await self._remove(container_name)
 
 
-def _contained_path(root: Path, path: str) -> Path:
-    """`path` under the workspace directory `root`, or raise (APSS W-3.2-b).
+def _open_contained(root: Path, path: str, flags: int, *, create_parents: bool = False) -> int:
+    """Open `path` under `root` and return its descriptor, or raise (APSS W-3.2-b).
 
-    Refuses absolute paths and any path that, once `..` and symlinks are
-    resolved, leaves `root`. A symlink inside the workspace that points out
-    of it is an escape, whatever wrote it.
+    Every component, including each `..`, is resolved against a descriptor
+    this walk opened itself with O_NOFOLLOW, so the check and the use are the
+    same system call: a symlink the workload swaps in at any moment is
+    refused, never followed, and `..` can never climb above `root`.
     """
-    relative = Path(path)
-    if relative.is_absolute():
+    if Path(path).is_absolute():
         raise ValueError(f"workspace path {path!r} must be relative to the workspace")
-    resolved_root = root.resolve()
-    resolved = (resolved_root / relative).resolve()
-    if not resolved.is_relative_to(resolved_root):
-        raise ValueError(f"workspace path {path!r} escapes the workspace directory")
-    return resolved
+    *parents, name = PurePosixPath(path).parts or (".",)
+    if name in (".", ".."):
+        raise ValueError(f"workspace path {path!r} names no file in the workspace")
+
+    def escapes() -> ValueError:
+        return ValueError(f"workspace path {path!r} escapes the workspace directory")
+
+    nofollow = os.O_NOFOLLOW | os.O_CLOEXEC
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
+    # The root itself is the provider's own path; only what lies beneath it
+    # is writable by the workload.
+    stack = [os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)]
+    try:
+        for part in parents:
+            if part == "..":
+                if len(stack) == 1:
+                    raise escapes()
+                os.close(stack.pop())
+                continue
+            if create_parents:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, 0o755, dir_fd=stack[-1])
+            try:
+                stack.append(os.open(part, directory_flags, dir_fd=stack[-1]))
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise escapes() from e
+                raise
+        try:
+            return os.open(name, flags | nofollow, 0o644, dir_fd=stack[-1])
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                raise escapes() from e
+            raise
+    finally:
+        for fd in stack:
+            os.close(fd)

@@ -61,6 +61,72 @@ def host_env_credential(name: str) -> CredentialBinding:
     )
 
 
+class CredentialPolicyError(ValueError):
+    """A credential binding the provider refuses to deliver (fails closed)."""
+
+
+# An env delivery target is a bare POSIX variable name: never `NAME=value`.
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Targets a workload credential may not take. A provider delivers env
+# credentials through its own client process (the docker CLI copies them
+# with `-e NAME`), so these would let a workload value steer that host
+# process: executable lookup, loader injection, docker client controls,
+# proxies, TLS trust, Go runtime switches, and the shell's startup files.
+_RESERVED_ENV_TARGETS = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "IFS",
+        "ENV",
+        "BASH_ENV",
+        "SHELL",
+        "TMPDIR",
+        "GODEBUG",
+        "GOTRACEBACK",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "WORKSPACE_ID",
+    }
+)
+_RESERVED_ENV_PREFIXES = ("DOCKER_", "LD_", "DYLD_", "XDG_", "BUILDKIT_", "NOTARY_")
+
+
+def _check_env_target(target: str, ref_name: str) -> None:
+    if not _ENV_NAME.match(target):
+        raise CredentialPolicyError(
+            f"credential {ref_name!r} has env target that is not a variable name; "
+            "use a bare NAME matching [A-Za-z_][A-Za-z0-9_]*"
+        )
+    upper = target.upper()
+    if upper in _RESERVED_ENV_TARGETS or upper.startswith(_RESERVED_ENV_PREFIXES):
+        raise CredentialPolicyError(
+            f"credential {ref_name!r} targets reserved variable {target!r}, which "
+            "controls the provider's host client; deliver it under another name"
+        )
+
+
+def check_credential_bindings(bindings: list[CredentialBinding]) -> list[CredentialBinding]:
+    """Every entry is a contract `CredentialBinding` with a deliverable target.
+
+    Raw values, mappings and anything else are refused without echoing them,
+    so a credential value never reaches the error message.
+    """
+    for index, binding in enumerate(bindings):
+        if not isinstance(binding, CredentialBinding):
+            raise CredentialPolicyError(
+                f"credentials[{index}] is a {type(binding).__name__}, not a "
+                "CredentialBinding; bind credentials by reference, never by value"
+            )
+        if binding.delivery == "env":
+            _check_env_target(binding.target, binding.ref.name)
+    return list(bindings)
+
+
 # The contract's credential-key heuristic, plus AUTH as a whole underscore
 # word: AGENTIC_SESSION_STORE_AUTH is a live credential the contract pattern
 # misses, and GIT_AUTHOR_NAME must still pass.
@@ -680,6 +746,15 @@ class WorkspaceConfig:
 
     def __post_init__(self) -> None:
         _reject_credential_environment(self.environment)
+        check_credential_bindings(self.credentials)
+
+    def checked_credentials(self) -> list[CredentialBinding]:
+        """`credentials`, re-validated at the point a provider consumes them.
+
+        The list is mutable after construction, so a raw value appended later
+        is refused here rather than resolved or delivered.
+        """
+        return check_credential_bindings(self.credentials)
 
     def checked_environment(self) -> dict[str, str]:
         """`environment`, re-validated at the point a provider consumes it.
@@ -752,6 +827,7 @@ class WorkspaceConfig:
 
     def with_credential(self, binding: CredentialBinding) -> WorkspaceConfig:
         """Add a credential binding and return self for chaining."""
+        check_credential_bindings([binding])
         self.credentials.append(binding)
         return self
 
