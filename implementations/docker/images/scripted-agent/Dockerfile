@@ -38,12 +38,14 @@ USER root
 # UV_PROJECT_ENVIRONMENT would make every fixture `uv sync` (the gates
 # workload) target the replayer's environment instead of its own .venv. The
 # shims below name the replayer's executable by path, so nothing at runtime
-# needs these variables.
+# needs these variables. --frozen, not --locked: the lock names the test-only
+# ../agentic_isolation source, which is not copied, and --locked would read its
+# metadata. tests/test_image_environment.py checks the lock in the full checkout.
 COPY lib/python/scripted_agent /opt/scripted-agent/src
 RUN cd /opt/scripted-agent/src \
     && UV_PYTHON_INSTALL_DIR=/opt/scripted-agent/python \
        UV_PROJECT_ENVIRONMENT=/opt/scripted-agent/venv \
-       uv sync --locked --no-dev --no-editable \
+       uv sync --frozen --no-dev --no-editable \
     && rm -rf /root/.cache/uv
 
 # The recordings a profile's stream.recording may name.
