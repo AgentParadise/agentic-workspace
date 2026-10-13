@@ -1,0 +1,29 @@
+# Scripted-Agent Workspace Image Manifest (load tests only)
+# claude-cli with claude/codex replaced by the token-free scripted-agent
+# replayer (lib/python/scripted_agent, #44). Never a production image.
+#
+# Built FROM a claude-cli digest with the repository root as context, so
+# scripts/build-provider.py does not stage it; see the Dockerfile header.
+
+name: scripted-agent
+version: "0.1.0"
+description: >-
+  claude-cli with claude and codex replaced by the scripted-agent replayer,
+  for syntropic137 load tests that must not spend a token.
+
+base:
+  image: claude-cli
+
+image:
+  dockerfile: ./Dockerfile
+  tag: agentic-workspace-scripted-agent
+  context: ../../../..
+  args:
+    # No default on purpose: pass a ghcr.io/agentparadise/agentic-workspace-claude@sha256:... digest.
+    CLAUDE_IMAGE: ""
+
+runtime:
+  agent: claude
+  agents:
+    - claude
+    - codex
