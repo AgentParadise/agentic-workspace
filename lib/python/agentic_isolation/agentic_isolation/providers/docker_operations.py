@@ -34,7 +34,7 @@ import posixpath
 import signal
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from agentic_isolation.contract import (
     TERMINAL_STATES,
@@ -70,18 +70,71 @@ _INNER = (
     'printf "%s %s\\n" "$$" "$(cut -d" " -f22 /proc/$$/stat)"; '
     '[ -n "$1" ] && printf "%s\\n" "$1"; shift; exec "$@"'
 )
-# Prints `alive` while the recorded leader (same start time, not a zombie) or
-# any non-zombie member of its process group remains, else `gone`.
-_GROUP_ALIVE = (
-    "leader=$1; start=$2; "
+# Prints `pid ppid pgrp start` for every process that is not a zombie. Run
+# with the shell's builtins and /proc only: slim images ship no `kill` or `ps`.
+_PROCESSES = (
     "for s in /proc/[0-9]*/stat; do "
     'st=$(cat "$s" 2>/dev/null) || continue; set -- ${st##*) }; '
-    "pid=${s#/proc/}; pid=${pid%/stat}; "
     '[ "$1" = Z ] && continue; '
-    '[ "$pid" = "$leader" ] && [ "${20}" != "$start" ] && continue; '
-    'if [ "$3" = "$leader" ]; then echo alive; exit 0; fi; '
-    "done; echo gone"
+    'pid=${s#/proc/}; echo "${pid%/stat} $2 $3 ${20}"; '
+    "done"
 )
+# Sends signal $1 to group $2 (skipped when empty) and to each following
+# `pid start` pair, each only while its pid still has the recorded start
+# time, so a reused pid is never signalled. A group whose leader has exited
+# is still signalled: Linux keeps a pgid's number from reuse while any member
+# lives. The shell's builtin `kill` needs no binary in the image.
+_SIGNAL = (
+    "start_of() { st=$(cat /proc/$1/stat 2>/dev/null) || return 0; "
+    'set -- ${st##*) }; echo "${20}"; }; '
+    "sig=$1; group=$2; group_start=$3; shift 3; "
+    'if [ -n "$group" ]; then cur=$(start_of "$group"); '
+    'if [ -z "$cur" ] || [ "$cur" = "$group_start" ]; then '
+    'kill -s "$sig" -- "-$group" 2>/dev/null; fi; fi; '
+    'while [ $# -ge 2 ]; do cur=$(start_of "$1"); '
+    '[ "$cur" = "$2" ] && kill -s "$sig" "$1" 2>/dev/null; shift 2; done; exit 0'
+)
+
+# pid -> (ppid, pgrp, start), as `_PROCESSES` reports it.
+_Table = dict[str, tuple[str, str, str]]
+
+
+def _parse_table(out: str) -> _Table:
+    table: _Table = {}
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) == 4 and all(f.isdecimal() for f in fields):
+            table[fields[0]] = (fields[1], fields[2], fields[3])
+    return table
+
+
+def _leader_reused(table: _Table, leader: str, start: str) -> bool:
+    """The leader's pid now names another process, so its group is empty."""
+    return leader in table and table[leader][2] != start
+
+
+def _members(table: _Table, leader: str, start: str, tracked: dict[str, str]) -> dict[str, str]:
+    """Every live process of the operation: its group, then their descendants.
+
+    A descendant that left the group (`setsid`, `setpgid`) is still found
+    through its parent chain, and once seen stays tracked by pid and start
+    time even after its parent dies.
+    """
+    found = {
+        pid: row[2]
+        for pid, row in table.items()
+        if (row[1] == leader and not _leader_reused(table, leader, start))
+        or tracked.get(pid) == row[2]
+    }
+    grew = True
+    while grew:
+        grew = False
+        for pid, (ppid, _, child_start) in table.items():
+            if pid not in found and ppid in found:
+                found[pid] = child_start
+                grew = True
+    return {pid: s for pid, s in found.items() if int(pid) > 1}
+
 
 _Presence = Literal["running", "removing", "stopped", "gone"]
 
@@ -111,6 +164,10 @@ class _Operation:
     ended_at: str | None = None
     cancel_requested: bool = False
     escalated: bool = False
+    # Every process seen as part of the operation at cancel, pid -> start.
+    tracked: dict[str, str] = field(default_factory=dict)
+    # Why signalling could not be done, when cancel had to stop the container.
+    signal_failure: str | None = None
     collector: asyncio.Task[None] | None = None
     leader_known: asyncio.Event = field(default_factory=asyncio.Event)
     client_finished: bool = False
@@ -237,7 +294,7 @@ class DockerOperations:
                 started_at=_now(),
                 channels=(bytearray(), bytearray()) if separate_channels else None,
             )
-            process = await asyncio.create_subprocess_exec(
+            process = await self._spawn(
                 *self.client_argv(container, spec, secret_names=tuple(secrets)),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -381,6 +438,8 @@ class DockerOperations:
         metadata = dict(operation.spec.metadata)
         if operation.escalated:
             metadata["cancel_escalation"] = "container_stopped"
+        if operation.signal_failure is not None:
+            metadata["cancel_signal_failure"] = operation.signal_failure
         if operation.state not in TERMINAL_STATES:
             return OperationStatus(
                 schema="apss.workspace-status/v1",
@@ -433,7 +492,12 @@ class DockerOperations:
         return self._status(operation)
 
     async def _terminate_group(self, operation: _Operation, *, grace_seconds: float) -> None:
-        """TERM the group, KILL after the grace, confirm; else stop the container."""
+        """TERM the operation, KILL after the grace, confirm; else stop the container.
+
+        Each round re-reads the process table, refuses to signal the group of
+        a leader whose pid was reused, and signals by pid every descendant
+        that escaped the group, so a confirmed cancel means all of them died.
+        """
         if operation.leader is not None:
             pid, start = operation.leader
             # The host-side stand-in executes these signals in our namespace.
@@ -443,22 +507,48 @@ class DockerOperations:
                     "provider_unavailable", f"refusing unsafe process group {pid!r}", operation.ref
                 )
             for sig, wait in (("TERM", grace_seconds), ("KILL", 2.0)):
-                await self._exec(operation.container, "kill", f"-{sig}", "--", f"-{pid}")
-                if await self._group_gone(operation.container, pid, start, within=wait):
+                code, out = await self._exec(
+                    operation.container, "sh", "-c", _PROCESSES, "aw-processes"
+                )
+                if code != 0:
+                    operation.signal_failure = f"process table: exit {code}: {out.strip()}"
+                    break
+                table = _parse_table(out)
+                operation.tracked.update(_members(table, pid, start, operation.tracked))
+                group = "" if _leader_reused(table, pid, start) else pid
+                pairs = [part for item in operation.tracked.items() for part in item]
+                code, out = await self._exec(
+                    operation.container, "sh", "-c", _SIGNAL, "aw-signal", sig, group, start, *pairs
+                )
+                if code != 0:
+                    operation.signal_failure = f"kill -{sig}: exit {code}: {out.strip()}"
+                    break
+                if await self._group_gone(operation, within=wait):
                     return
-        # No trusted pid, or the group would not die: escalate, and say so.
+        # No trusted pid, or the operation would not die: escalate, and say so.
         operation.escalated = True
         await self._docker_cmd("stop", "-t", "0", operation.container)
 
-    async def _group_gone(self, container: str, pid: str, start: str, *, within: float) -> bool:
+    async def _group_gone(self, operation: _Operation, *, within: float) -> bool:
+        """Whether the group and every tracked process are gone; a failed probe is not."""
+        assert operation.leader is not None
+        pid, start = operation.leader
         loop = asyncio.get_running_loop()
         deadline = loop.time() + within
         while True:
             code, out = await self._exec(
-                container, "sh", "-c", _GROUP_ALIVE, "aw-probe", pid, start
+                operation.container, "sh", "-c", _PROCESSES, "aw-processes"
             )
-            if code == 0 and out.strip() == "gone":
-                return True
+            if code == 0:
+                table = _parse_table(out)
+                group = not _leader_reused(table, pid, start) and any(
+                    row[1] == pid for row in table.values()
+                )
+                tracked = any(
+                    table.get(p, ("", "", ""))[2] == s for p, s in operation.tracked.items()
+                )
+                if not group and not tracked:
+                    return True
             if loop.time() >= deadline:
                 return False
             await asyncio.sleep(0.1)
@@ -466,8 +556,15 @@ class DockerOperations:
     async def _exec(self, container: str, *argv: str) -> tuple[int, str]:
         return await self._docker_cmd("exec", container, *argv)
 
+    async def _spawn(self, *argv: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        """Start a docker client process; a client that cannot launch is provider_unavailable."""
+        try:
+            return await asyncio.create_subprocess_exec(*argv, **kwargs)
+        except OSError as e:
+            raise _error("provider_unavailable", f"could not launch {argv[0]!r}: {e}") from e
+
     async def _docker_cmd(self, *argv: str) -> tuple[int, str]:
-        process = await asyncio.create_subprocess_exec(
+        process = await self._spawn(
             self._docker,
             *argv,
             stdout=asyncio.subprocess.PIPE,

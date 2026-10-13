@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import os
 import signal
@@ -179,6 +180,113 @@ async def test_cancel_refuses_unsafe_process_group(pid: str, docker_env: Path) -
         await ops.cancel(ref, grace_seconds=0)
     assert caught.value.error.kind == "provider_unavailable"
     command.assert_not_awaited()
+
+
+def _scripted(ops: DockerOperations, tables: list[str]) -> list[tuple[str, ...]]:
+    """Answer `_exec` from canned process tables; record every argv, signal nothing."""
+    calls: list[tuple[str, ...]] = []
+
+    async def command(container: str, *argv: str) -> tuple[int, str]:
+        calls.append(argv)
+        if argv[3] == "aw-processes":
+            return 0, tables.pop(0) if len(tables) > 1 else tables[0]
+        return 0, ""
+
+    ops._exec = command  # type: ignore[method-assign]
+    ops._docker_cmd = AsyncMock(return_value=(0, ""))  # type: ignore[method-assign]
+    return calls
+
+
+def _held_operation(leader: tuple[str, str]) -> _Operation:
+    ref = OperationRef(
+        workspace={"provider": "docker", "resource_id": "c1"},
+        operation_id="held",
+        operation_key="held",
+    )
+    return _Operation(
+        ref=ref,
+        spec=_spec("true"),
+        container="c1",
+        spool=OperationSpool(retention_bytes=1024),
+        started_at="now",
+        leader=leader,
+    )
+
+
+async def test_cancel_never_signals_the_group_of_a_reused_leader(docker_env: Path) -> None:
+    ops = _ops(docker_env)
+    # pid 999999 now belongs to a process with another start time.
+    calls = _scripted(ops, ["999999 1 999999 777\n"])
+    operation = _held_operation(("999999", "123"))
+    await ops._terminate_group(operation, grace_seconds=0)
+    signals = [argv for argv in calls if argv[3] == "aw-signal"]
+    assert signals == [("sh", "-c", signals[0][2], "aw-signal", "TERM", "", "123")]
+    assert not operation.escalated
+
+
+async def test_cancel_signals_survivors_of_an_exited_leader(docker_env: Path) -> None:
+    ops = _ops(docker_env)
+    # The leader 999999 is gone; its child 999998 is still in its group.
+    calls = _scripted(ops, ["999998 1 999999 456\n", ""])
+    operation = _held_operation(("999999", "123"))
+    await ops._terminate_group(operation, grace_seconds=0)
+    signals = [argv[4:] for argv in calls if argv[3] == "aw-signal"]
+    assert signals == [("TERM", "999999", "123", "999998", "456")]
+
+
+async def test_cancel_escalates_and_reports_a_failed_signal(docker_env: Path) -> None:
+    ops = _ops(docker_env)
+
+    async def command(container: str, *argv: str) -> tuple[int, str]:
+        if argv[3] == "aw-processes":
+            return 0, "999999 1 999999 123\n"
+        return 126, "sh: not found"
+
+    ops._exec = command  # type: ignore[method-assign]
+    ops._docker_cmd = AsyncMock(return_value=(0, ""))  # type: ignore[method-assign]
+    operation = _held_operation(("999999", "123"))
+    await ops._terminate_group(operation, grace_seconds=0)
+    metadata = ops._status(operation).metadata
+    assert metadata["cancel_escalation"] == "container_stopped"
+    assert metadata["cancel_signal_failure"] == "kill -TERM: exit 126: sh: not found"
+    ops._docker_cmd.assert_awaited_once_with("stop", "-t", "0", "c1")
+
+
+async def test_cancel_kills_a_descendant_that_left_the_group(docker_env: Path) -> None:
+    ops = _ops(docker_env)
+    pid_file = docker_env / "escaped.pid"
+    script = f"setsid sh -c 'echo $$ > {pid_file}; exec sleep 300' >/dev/null 2>&1 & exec sleep 300"
+    ref = await ops.start(_workspace(), _spec(script))
+    for _ in range(100):
+        if pid_file.exists() and pid_file.read_text().strip():
+            break
+        await asyncio.sleep(0.05)
+    escaped = int(pid_file.read_text())
+    leader = int(ops._operations[ref.operation_id].leader[0])  # type: ignore[index]
+    assert os.getpgid(escaped) not in (leader, os.getpgrp())
+    try:
+        status = await ops.cancel(ref, grace_seconds=0.5)
+        assert status.state == "cancelled"
+        assert "cancel_escalation" not in status.metadata, status.metadata
+        assert not _alive(escaped)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(escaped, signal.SIGKILL)
+
+
+async def test_missing_client_is_typed_and_execute_keeps_its_error_result(
+    docker_env: Path,
+) -> None:
+    ops = _ops(docker_env)
+    ops._docker = str(docker_env / "missing-docker")
+    with pytest.raises(OperationFailure) as caught:
+        await ops.start(_workspace(), _spec("true"))
+    assert caught.value.error.kind == "provider_unavailable"
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
+    provider = WorkspaceDockerProvider()
+    provider._operations = ops
+    result = await provider.execute(_workspace(), "true")
+    assert result.exit_code == -1 and "missing-docker" in result.stderr
 
 
 async def test_a_start_returns_promptly_while_running(docker_env: Path) -> None:

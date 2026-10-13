@@ -142,6 +142,34 @@ async def test_k_cancel_kills_leader_grandchild_and_term_trapper(
         assert (result.exit_code, result.stdout) == (0, "dead\n"), (name, pid, result)
 
 
+async def test_k_cancel_kills_a_descendant_that_left_the_group(
+    live: tuple[WorkspaceDockerProvider, Workspace],
+) -> None:
+    provider, workspace = live
+    script = (
+        "setsid sh -c 'echo escaped=$$; exec sleep 300' & sleep 0.2; echo leader=$$; exec sleep 300"
+    )
+    ref = await provider.start(workspace, _spec(script))
+    seen: dict[str, str] = {}
+    cursor: str | None = None
+    while len(seen) < 2:
+        page = await provider.observe(ref, cursor=cursor, max_bytes=1 << 16, wait_seconds=1.0)
+        cursor = page.next_cursor
+        for line in base64.b64decode(page.data_b64).decode().splitlines():
+            name, _, pid = line.partition("=")
+            seen[name] = pid
+    status = await provider.cancel(ref, grace_seconds=1)
+    assert status.state == "cancelled"
+    assert "cancel_escalation" not in status.metadata, status.metadata
+    probe = (
+        'st=$(cat /proc/"$1"/stat 2>/dev/null) || { echo dead; exit 0; }; '
+        'set -- ${st##*) }; [ "$1" = Z ] && echo dead || echo alive'
+    )
+    for name, pid in seen.items():
+        result = await provider.execute(workspace, f"sh -c '{probe}' probe {pid}")
+        assert (result.exit_code, result.stdout) == (0, "dead\n"), (name, pid, result)
+
+
 async def test_l_destroyed_container_is_lost(
     live: tuple[WorkspaceDockerProvider, Workspace],
 ) -> None:
