@@ -1,0 +1,15 @@
+{
+  "description": "A status response is a status or an error, never both.",
+  "base": "valid/workspace-status/running.json",
+  "set": [
+    {
+      "path": "/kind",
+      "value": "internal"
+    },
+    {
+      "path": "/message",
+      "value": "x"
+    }
+  ],
+  "remove": []
+}

@@ -1,0 +1,155 @@
+{
+  "description": "A read after the terminal state returns the remaining bytes with complete false, then an empty complete page.",
+  "steps": [
+    {
+      "call": "start",
+      "args": {
+        "spec": {
+          "schema": "apss.workspace-operation/v1",
+          "execution_id": "exec-42",
+          "operation_key": "exec-42:phase-1:fence-9:agent",
+          "argv": [
+            "agent",
+            "--print",
+            "--output-format",
+            "stream-json"
+          ],
+          "working_directory": "repo",
+          "environment": {
+            "LANG": "C.UTF-8"
+          },
+          "credential_bindings": [
+            {
+              "ref": {
+                "name": "github-app",
+                "scope": "repo:acme/widgets"
+              },
+              "delivery": "env",
+              "target": "GH_TOKEN"
+            }
+          ],
+          "launch_marker": {
+            "argv0": "agent-launch",
+            "line": "APSS-LAUNCH 6f1e9c"
+          },
+          "timeout_seconds": 3600,
+          "metadata": {
+            "phase_id": "phase-1"
+          }
+        }
+      },
+      "expect": {
+        "schema": "workspace-operation.schema.json#/$defs/operationRef",
+        "document": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "status",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        }
+      },
+      "expect": {
+        "schema": "workspace-status.schema.json",
+        "document": {
+          "schema": "apss.workspace-status/v1",
+          "ref": {
+            "workspace": {
+              "provider": "docker",
+              "resource_id": "ws-7f3a"
+            },
+            "operation_id": "op-0001",
+            "operation_key": "exec-42:phase-1:fence-9:agent"
+          },
+          "state": "succeeded",
+          "execution_id": "exec-42",
+          "metadata": {},
+          "exit_code": 0
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "observe",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        },
+        "cursor": "g1:0"
+      },
+      "expect": {
+        "schema": "workspace-observation.schema.json",
+        "document": {
+          "schema": "apss.workspace-observation/v1",
+          "ref": {
+            "workspace": {
+              "provider": "docker",
+              "resource_id": "ws-7f3a"
+            },
+            "operation_id": "op-0001",
+            "operation_key": "exec-42:phase-1:fence-9:agent"
+          },
+          "state": "succeeded",
+          "cursor": "g1:0",
+          "next_cursor": "g1:12",
+          "data_b64": "aGVsbG8gd29ybGQK",
+          "complete": false
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "observe",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        },
+        "cursor": "g1:12"
+      },
+      "expect": {
+        "schema": "workspace-observation.schema.json",
+        "document": {
+          "schema": "apss.workspace-observation/v1",
+          "ref": {
+            "workspace": {
+              "provider": "docker",
+              "resource_id": "ws-7f3a"
+            },
+            "operation_id": "op-0001",
+            "operation_key": "exec-42:phase-1:fence-9:agent"
+          },
+          "state": "succeeded",
+          "cursor": "g1:12",
+          "next_cursor": "g1:12",
+          "data_b64": "",
+          "complete": true
+        }
+      },
+      "launches": 1
+    }
+  ]
+}

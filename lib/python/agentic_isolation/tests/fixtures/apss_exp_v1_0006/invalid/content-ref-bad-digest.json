@@ -1,0 +1,11 @@
+{
+  "description": "Content identity is a sha256 digest.",
+  "base": "valid/content-ref/with-authority.json",
+  "set": [
+    {
+      "path": "/digest",
+      "value": "md5:abc"
+    }
+  ],
+  "remove": []
+}

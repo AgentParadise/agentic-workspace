@@ -1,0 +1,154 @@
+{
+  "description": "A cursor older than retention returns the oldest retained bytes plus an exact gap derived from seeded output, then the next page continues without loss.",
+  "provider": "valid/workspace-provider/docker.json",
+  "output": {
+    "generation": 1,
+    "produced_bytes": 16777216
+  },
+  "steps": [
+    {
+      "call": "start",
+      "args": {
+        "spec": {
+          "schema": "apss.workspace-operation/v1",
+          "execution_id": "exec-42",
+          "operation_key": "exec-42:phase-1:fence-9:agent",
+          "argv": [
+            "agent",
+            "--print",
+            "--output-format",
+            "stream-json"
+          ],
+          "working_directory": "repo",
+          "environment": {
+            "LANG": "C.UTF-8"
+          },
+          "credential_bindings": [
+            {
+              "ref": {
+                "name": "github-app",
+                "scope": "repo:acme/widgets"
+              },
+              "delivery": "env",
+              "target": "GH_TOKEN"
+            }
+          ],
+          "launch_marker": {
+            "argv0": "agent-launch",
+            "line": "APSS-LAUNCH 6f1e9c"
+          },
+          "timeout_seconds": 3600,
+          "metadata": {
+            "phase_id": "phase-1"
+          }
+        }
+      },
+      "expect": {
+        "schema": "workspace-operation.schema.json#/$defs/operationRef",
+        "document": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "observe",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        },
+        "cursor": "g1:0"
+      },
+      "expect": {
+        "schema": "workspace-observation.schema.json",
+        "document": {
+          "schema": "apss.workspace-observation/v1",
+          "ref": {
+            "workspace": {
+              "provider": "docker",
+              "resource_id": "ws-7f3a"
+            },
+            "operation_id": "op-0001",
+            "operation_key": "exec-42:phase-1:fence-9:agent"
+          },
+          "state": "running",
+          "cursor": "g1:0",
+          "next_cursor": "g1:8388614",
+          "data_b64": "b2xkZXN0",
+          "complete": false,
+          "gap": {
+            "lost_bytes": 8388608
+          }
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "observe",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        },
+        "cursor": "g1:8388614"
+      },
+      "expect": {
+        "schema": "workspace-observation.schema.json",
+        "document": {
+          "schema": "apss.workspace-observation/v1",
+          "ref": {
+            "workspace": {
+              "provider": "docker",
+              "resource_id": "ws-7f3a"
+            },
+            "operation_id": "op-0001",
+            "operation_key": "exec-42:phase-1:fence-9:agent"
+          },
+          "state": "running",
+          "cursor": "g1:8388614",
+          "next_cursor": "g1:8388624",
+          "data_b64": "LXJldGFpbmVkCg==",
+          "complete": false
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "observe",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        },
+        "cursor": "g0:0"
+      },
+      "expect": {
+        "schema": "workspace-status.schema.json",
+        "document": {
+          "schema": "apss.workspace-status/v1",
+          "kind": "unknown_operation",
+          "message": "cursor generation g0 does not belong to op-0001"
+        }
+      },
+      "launches": 1
+    }
+  ]
+}

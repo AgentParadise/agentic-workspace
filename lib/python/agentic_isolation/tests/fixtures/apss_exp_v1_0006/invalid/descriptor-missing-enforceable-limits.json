@@ -1,0 +1,8 @@
+{
+  "description": "A provider descriptor must publish what it can enforce.",
+  "base": "valid/workspace-provider/docker.json",
+  "set": [],
+  "remove": [
+    "/enforceable_limits"
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "description": "complete is true only for a terminal state.",
+  "base": "valid/workspace-observation/complete.json",
+  "set": [
+    {
+      "path": "/state",
+      "value": "pending"
+    }
+  ],
+  "remove": []
+}

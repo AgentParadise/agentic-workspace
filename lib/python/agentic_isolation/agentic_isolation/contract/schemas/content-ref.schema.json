@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://standards.agentparadise.dev/experimental/v1/workspace/content-ref.schema.json",
+  "title": "APSS Content Reference",
+  "description": "Immutable content identified by digest. The locator is opaque to core consumers.",
+  "$ref": "#/$defs/contentRef",
+  "required": [
+    "schema"
+  ],
+  "$defs": {
+    "contentRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "digest",
+        "size_bytes",
+        "locator"
+      ],
+      "properties": {
+        "schema": {
+          "const": "apss.content-ref/v1"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "media_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "locator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "authority": {
+          "$ref": "credential-ref.schema.json#/$defs/credentialRef"
+        }
+      }
+    }
+  }
+}

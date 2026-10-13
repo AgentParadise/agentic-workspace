@@ -1,0 +1,6 @@
+{
+  "schema": "apss.environment-ref/v1",
+  "kind": "oci-image",
+  "identifier": "ghcr.io/acme/agent-runtime:1.4.2",
+  "digest": "sha256:abababababababababababababababababababababababababababababababab"
+}

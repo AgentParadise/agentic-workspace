@@ -1,0 +1,8 @@
+{
+  "description": "Every limit is declared enforceable or not.",
+  "base": "valid/workspace-provider/docker.json",
+  "set": [],
+  "remove": [
+    "/enforceable_limits/disk"
+  ]
+}

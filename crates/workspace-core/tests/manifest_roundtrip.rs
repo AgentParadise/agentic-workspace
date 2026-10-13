@@ -9,7 +9,7 @@ const APSS_FIXTURE: &str =
 #[test]
 fn apss_fixture_round_trips_without_loss() {
     assert_eq!(APSS_WORKSPACE_STANDARD_ID, "EXP-V1-0006");
-    assert_eq!(APSS_WORKSPACE_STANDARD_VERSION, "0.1.0");
+    assert_eq!(APSS_WORKSPACE_STANDARD_VERSION, "0.2.0");
     let original: serde_json::Value = serde_json::from_str(APSS_FIXTURE).unwrap();
     let manifest: LaunchManifest = serde_json::from_value(original.clone()).unwrap();
     manifest.validate_boundary().unwrap();
@@ -21,7 +21,7 @@ fn apss_semantics_reject_unpinned_skills() {
     let mut manifest: LaunchManifest = serde_json::from_str(APSS_FIXTURE).unwrap();
     manifest.skills[0].digest.clear();
     let error = manifest.validate_boundary().unwrap_err().to_string();
-    assert!(error.contains("EXP-V1-0006 v0.1.0"), "{error}");
+    assert!(error.contains("EXP-V1-0006 v0.2.0"), "{error}");
     assert!(
         error.contains("skill revision and digest are required"),
         "{error}"

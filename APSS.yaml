@@ -7,7 +7,7 @@ project:
 standards:
   workspace:
     id: EXP-V1-0006
-    version: "=0.1.0"
+    version: "=0.2.0"
 
 tool:
   bin_dir: .apss/bin

@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://standards.agentparadise.dev/experimental/v1/workspace/workspace-provider.schema.json",
+  "title": "APSS Workspace Provider Descriptor",
+  "description": "What a provider can enforce and offer, published before launch.",
+  "$ref": "#/$defs/providerDescriptor",
+  "required": [
+    "schema"
+  ],
+  "$defs": {
+    "providerDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "security_profile",
+        "enforceable_limits",
+        "capabilities",
+        "observation",
+        "interactive",
+        "environment_kinds"
+      ],
+      "properties": {
+        "schema": {
+          "const": "apss.workspace-provider/v1"
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "security_profile": {
+          "enum": [
+            "insecure-local",
+            "isolated"
+          ]
+        },
+        "enforceable_limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cpu",
+            "memory",
+            "disk",
+            "network",
+            "timeout"
+          ],
+          "properties": {
+            "cpu": {
+              "type": "boolean"
+            },
+            "memory": {
+              "type": "boolean"
+            },
+            "disk": {
+              "type": "boolean"
+            },
+            "network": {
+              "type": "boolean"
+            },
+            "timeout": {
+              "type": "boolean"
+            }
+          }
+        },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "observation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "retention_bytes",
+            "max_page_bytes",
+            "integrity"
+          ],
+          "properties": {
+            "retention_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_page_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "integrity": {
+              "enum": [
+                "exact",
+                "continuity_detected"
+              ]
+            }
+          }
+        },
+        "interactive": {
+          "type": "boolean"
+        },
+        "environment_kinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

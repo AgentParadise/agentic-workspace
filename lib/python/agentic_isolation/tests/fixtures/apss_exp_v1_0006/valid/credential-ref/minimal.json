@@ -1,0 +1,5 @@
+{
+  "schema": "apss.credential-ref/v1",
+  "name": "github-app",
+  "scope": "repo:acme/widgets"
+}
