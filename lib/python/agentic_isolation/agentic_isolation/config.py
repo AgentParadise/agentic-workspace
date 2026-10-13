@@ -16,6 +16,9 @@ from importlib import resources
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Literal
 
+from agentic_isolation.contract import CredentialBinding, CredentialRef
+from agentic_isolation.contract._base import _CREDENTIAL_KEY
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +45,103 @@ def _resolve_single_env_var(
             raise ValueError(f"Plugin '{plugin_name}' requires env var {var_name}: {description}")
         return "", False
     return value, True
+
+
+# Scope of a credential the provider's resolver reads from its own process
+# environment under the ref's name. Plugin `secret=true` variables use it.
+HOST_ENV_CREDENTIAL_SCOPE = "host-env"
+
+
+def host_env_credential(name: str) -> CredentialBinding:
+    """Bind host environment variable `name` to the same name in the workspace."""
+    return CredentialBinding(
+        ref=CredentialRef(name=name, scope=HOST_ENV_CREDENTIAL_SCOPE),
+        delivery="env",
+        target=name,
+    )
+
+
+class CredentialPolicyError(ValueError):
+    """A credential binding the provider refuses to deliver (fails closed)."""
+
+
+# An env delivery target is a bare POSIX variable name: never `NAME=value`.
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Targets a workload credential may not take. A provider delivers env
+# credentials through its own client process (the docker CLI copies them
+# with `-e NAME`), so these would let a workload value steer that host
+# process: executable lookup, loader injection, docker client controls,
+# proxies, TLS trust, Go runtime switches, and the shell's startup files.
+_RESERVED_ENV_TARGETS = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "IFS",
+        "ENV",
+        "BASH_ENV",
+        "SHELL",
+        "TMPDIR",
+        "GODEBUG",
+        "GOTRACEBACK",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "WORKSPACE_ID",
+    }
+)
+_RESERVED_ENV_PREFIXES = ("DOCKER_", "LD_", "DYLD_", "XDG_", "BUILDKIT_", "NOTARY_")
+
+
+def _check_env_target(target: str, ref_name: str) -> None:
+    if not _ENV_NAME.match(target):
+        raise CredentialPolicyError(
+            f"credential {ref_name!r} has env target that is not a variable name; "
+            "use a bare NAME matching [A-Za-z_][A-Za-z0-9_]*"
+        )
+    upper = target.upper()
+    if upper in _RESERVED_ENV_TARGETS or upper.startswith(_RESERVED_ENV_PREFIXES):
+        raise CredentialPolicyError(
+            f"credential {ref_name!r} targets reserved variable {target!r}, which "
+            "controls the provider's host client; deliver it under another name"
+        )
+
+
+def check_credential_bindings(bindings: list[CredentialBinding]) -> list[CredentialBinding]:
+    """Every entry is a contract `CredentialBinding` with a deliverable target.
+
+    Raw values, mappings and anything else are refused without echoing them,
+    so a credential value never reaches the error message.
+    """
+    for index, binding in enumerate(bindings):
+        if not isinstance(binding, CredentialBinding):
+            raise CredentialPolicyError(
+                f"credentials[{index}] is a {type(binding).__name__}, not a "
+                "CredentialBinding; bind credentials by reference, never by value"
+            )
+        if binding.delivery == "env":
+            _check_env_target(binding.target, binding.ref.name)
+    return list(bindings)
+
+
+# The contract's credential-key heuristic, plus AUTH as a whole underscore
+# word: AGENTIC_SESSION_STORE_AUTH is a live credential the contract pattern
+# misses, and GIT_AUTHOR_NAME must still pass.
+_AUTH_WORD = re.compile(r"(^|_)AUTH(_|$)", re.IGNORECASE)
+
+
+def _reject_credential_environment(environment: dict[str, str]) -> None:
+    named = sorted(
+        key for key in environment if _CREDENTIAL_KEY.search(key) or _AUTH_WORD.search(key)
+    )
+    if named:
+        raise ValueError(
+            f"environment keys {named} name a credential; bind them with "
+            "WorkspaceConfig.credentials (a CredentialBinding) instead of passing the value"
+        )
 
 
 CODEX_SANDBOX_SECCOMP_PROFILE_NAME = "codex-sandbox.json"
@@ -535,6 +635,10 @@ class ResourceLimits:
     network: bool = True  # Allow network access
     timeout_seconds: int = 3600  # Max execution time (1 hour default)
 
+    def __post_init__(self) -> None:
+        if self.timeout_seconds <= 0:
+            raise ValueError(f"timeout_seconds must be > 0, got {self.timeout_seconds}")
+
     def to_docker_args(self) -> dict[str, Any]:
         """Convert to Docker run arguments."""
         args: dict[str, Any] = {
@@ -612,25 +716,16 @@ class WorkspaceConfig:
     # Mounts
     mounts: list[MountConfig] = field(default_factory=list)
 
-    # Secrets (injected as environment variables).
-    #
-    # `repr=False` because the generated `__repr__` renders values in plaintext,
-    # and a config is rendered far more often than anyone intends: a failed
-    # assertion in any test that compares configs, a debugger frame, an
-    # exception whose message interpolates the object, a DEBUG log line. One
-    # assertion failure is enough to put a live credential in CI output.
-    secrets: dict[str, str] = field(default_factory=dict, repr=False)
+    # Credentials, by reference only (APSS EXP-V1-0006 W-6.3-a). The provider
+    # resolves each ref through its injected CredentialResolver at create time
+    # and delivers the value without writing it into any argv. No field of
+    # this config can hold a credential value.
+    credentials: list[CredentialBinding] = field(default_factory=list)
 
-    # Environment variables.
-    #
-    # Historically documented as "non-secret", and that is no longer true of how
-    # this field is used. A capability contract delivered through here can carry
-    # a credential (AGENTIC_SESSION_STORE_AUTH is the live example), so this
-    # field is treated as secret-bearing and gets the same `repr=False`.
-    #
-    # Moving credentials into `secrets` is NOT an alternative to this: that
-    # field had the identical exposure until this change, so the advice "put
-    # secrets in `secrets`" was a mitigation that did nothing.
+    # Environment variables. Non-secret only: a key that names a credential
+    # is refused at construction, so a credential cannot ride in here. Key
+    # names are a heuristic, so `repr=False` stays: a value under an
+    # innocuous key must still not reach a failed assertion or a log line.
     environment: dict[str, str] = field(default_factory=dict, repr=False)
 
     # Resource limits
@@ -649,6 +744,27 @@ class WorkspaceConfig:
     # Plugin directories to load via --plugin-dir (ADR-033)
     plugins: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        _reject_credential_environment(self.environment)
+        check_credential_bindings(self.credentials)
+
+    def checked_credentials(self) -> list[CredentialBinding]:
+        """`credentials`, re-validated at the point a provider consumes them.
+
+        The list is mutable after construction, so a raw value appended later
+        is refused here rather than resolved or delivered.
+        """
+        return check_credential_bindings(self.credentials)
+
+    def checked_environment(self) -> dict[str, str]:
+        """`environment`, re-validated at the point a provider consumes it.
+
+        The dict is mutable after construction, so a credential added by
+        direct assignment is caught here rather than delivered.
+        """
+        _reject_credential_environment(self.environment)
+        return dict(self.environment)
+
     def with_plugin(self, plugin_path: str | Path) -> WorkspaceConfig:
         """Add a plugin directory and return self for chaining."""
         self.plugins.append(str(plugin_path))
@@ -660,8 +776,12 @@ class WorkspaceConfig:
         spec: dict[str, Any],
         plugin_name: str,
     ) -> None:
-        """Resolve and store a single environment variable from a plugin manifest."""
-        if var_name in self.secrets or var_name in self.environment:
+        """Resolve and store a single environment variable from a plugin manifest.
+
+        A secret variable becomes a host-environment credential binding; its
+        value is read by the provider's resolver, never copied into the config.
+        """
+        if var_name in self.environment or any(b.target == var_name for b in self.credentials):
             return
 
         value, resolved = _resolve_single_env_var(var_name, spec, plugin_name)
@@ -669,16 +789,16 @@ class WorkspaceConfig:
             return
 
         if spec.get("secret", False):
-            self.secrets[var_name] = value
+            self.credentials.append(host_env_credential(var_name))
         else:
-            self.environment[var_name] = value
+            self.with_env(var_name, value)
 
     def resolve_plugin_env(self) -> None:
-        """Read requires_env from plugin manifests and populate secrets/environment.
+        """Read requires_env from plugin manifests and populate credentials/environment.
 
         For each plugin directory, reads .claude-plugin/plugin.json and
         looks for a requires_env field. For each declared env var:
-        - secret=true vars are added to self.secrets (if set in host env)
+        - secret=true vars are bound in self.credentials (if set in host env)
         - secret=false vars are added to self.environment (if set in host env)
         - required=true vars raise ValueError if not set
 
@@ -705,12 +825,14 @@ class WorkspaceConfig:
         self.mounts.append(MountConfig(host_path, container_path, read_only))
         return self
 
-    def with_secret(self, name: str, value: str) -> WorkspaceConfig:
-        """Add a secret and return self for chaining."""
-        self.secrets[name] = value
+    def with_credential(self, binding: CredentialBinding) -> WorkspaceConfig:
+        """Add a credential binding and return self for chaining."""
+        check_credential_bindings([binding])
+        self.credentials.append(binding)
         return self
 
     def with_env(self, name: str, value: str) -> WorkspaceConfig:
-        """Add an environment variable and return self for chaining."""
+        """Add a non-secret environment variable and return self for chaining."""
+        _reject_credential_environment({name: value})
         self.environment[name] = value
         return self
