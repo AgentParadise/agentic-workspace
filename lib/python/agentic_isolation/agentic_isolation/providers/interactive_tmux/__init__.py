@@ -153,8 +153,8 @@ def _unsupported_config_fields(config: WorkspaceConfig) -> list[str]:
         unsupported.append("dockerfile")
     if config.mounts:
         unsupported.append("mounts")
-    if config.secrets:
-        unsupported.append("secrets")
+    if config.credentials:
+        unsupported.append("credentials")
     if config.environment:
         unsupported.append("environment")
     if config.security != defaults.security:
@@ -260,7 +260,7 @@ class InteractiveTmuxProvider(BaseProvider):
           * `config.auto_cleanup` / `config.keep_on_error`: handled by
             `AgenticWorkspace`, not this provider.
 
-        Unsupported fields (`image`, `mounts`, `secrets`, `environment`,
+        Unsupported fields (`image`, `mounts`, `credentials`, `environment`,
         `security`, `limits`, `plugins`, `dockerfile`) are rejected loudly
         when set to non-default values: the interactive-tmux driver does
         its own bind-mount layout for credentials and runs a fixed

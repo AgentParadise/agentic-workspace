@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -13,8 +14,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from agentic_isolation.config import WorkspaceConfig
+from agentic_isolation.config import (
+    HOST_ENV_CREDENTIAL_SCOPE,
+    CredentialPolicyError,
+    WorkspaceConfig,
+    check_credential_bindings,
+)
 from agentic_isolation.contract import (
+    CredentialBinding,
     CredentialRef,
     ObservationPage,
     OperationRef,
@@ -362,6 +369,73 @@ class SupportsStagedTeardown(Protocol):
         ...
 
 
+class CredentialResolver(Protocol):
+    """Port the host implements to turn a `CredentialRef` into its value.
+
+    The value is delivered only into the workload's environment. A provider
+    must never write it into an argv, a spool, a status or a page.
+    """
+
+    async def resolve(self, ref: CredentialRef) -> str:
+        """The current value of `ref`; raise to refuse the launch."""
+        ...
+
+
+class UnsupportedLimitError(ValueError):
+    """A requested hard limit the provider cannot enforce (APSS W-3.8-d)."""
+
+
+class HostEnvironmentCredentials:
+    """Resolves `host-env` refs from this process's environment, by ref name.
+
+    Any other scope is refused, so injecting this resolver never widens what
+    a binding can reach beyond the host variables it names.
+    """
+
+    async def resolve(self, ref: CredentialRef) -> str:
+        if ref.scope != HOST_ENV_CREDENTIAL_SCOPE:
+            raise CredentialPolicyError(
+                f"credential {ref.name!r} has scope {ref.scope!r}; "
+                f"HostEnvironmentCredentials resolves only {HOST_ENV_CREDENTIAL_SCOPE!r}"
+            )
+        value = os.environ.get(ref.name)
+        if value is None:
+            raise CredentialPolicyError(
+                f"credential {ref.name!r} is not set in the host environment"
+            )
+        return value
+
+
+async def resolve_env_credentials(
+    bindings: list[CredentialBinding],
+    resolver: CredentialResolver | None,
+    *,
+    provider: str,
+) -> dict[str, str]:
+    """Resolve env-delivered bindings to `{target: value}`, or refuse.
+
+    Refuses raw values, unsafe targets, file delivery and a missing resolver
+    before anything is resolved or launched.
+    """
+    bindings = check_credential_bindings(bindings)
+    if not bindings:
+        return {}
+    if resolver is None:
+        raise CredentialPolicyError(
+            f"{provider} provider has credential bindings but no CredentialResolver; "
+            "inject one (e.g. credentials=HostEnvironmentCredentials())"
+        )
+    resolved: dict[str, str] = {}
+    for binding in bindings:
+        if binding.delivery != "env":
+            raise CredentialPolicyError(
+                f"credential delivery {binding.delivery!r} for {binding.ref.name!r} "
+                f"is not supported by the {provider} provider"
+            )
+        resolved[binding.target] = await resolver.resolve(binding.ref)
+    return resolved
+
+
 @runtime_checkable
 class SupportsOperations(Protocol):
     """Optional capability: the APSS EXP-V1-0006 0.2.0 operation contract.
@@ -419,18 +493,6 @@ class SupportsOperations(Protocol):
         Returns `cancelled` only once they are confirmed gone. An operation
         that already ended keeps its terminal state.
         """
-        ...
-
-
-class CredentialResolver(Protocol):
-    """Port the host implements to turn a `CredentialRef` into its value.
-
-    The value is delivered only into the workload's environment. A provider
-    must never write it into an argv, a spool, a status or a page.
-    """
-
-    async def resolve(self, ref: CredentialRef) -> str:
-        """The current value of `ref`; raise to refuse the launch."""
         ...
 
 

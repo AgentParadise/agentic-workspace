@@ -17,6 +17,7 @@ from agentic_isolation.config import (
     SecurityConfig,
     WorkspaceConfig,
 )
+from agentic_isolation.contract import CredentialBinding
 from agentic_isolation.providers.base import (
     ExecuteResult,
     Workspace,
@@ -129,7 +130,7 @@ class AgenticWorkspace:
         provider: str = "local",
         image: str = "python:3.12-slim",
         working_dir: str = "/workspace",
-        secrets: dict[str, str] | None = None,
+        credentials: list[CredentialBinding] | None = None,
         environment: dict[str, str] | None = None,
         mounts: list[tuple[str, str, bool]] | None = None,
         plugins: list[str] | None = None,
@@ -144,7 +145,8 @@ class AgenticWorkspace:
             provider: Provider name ("local", "docker", "interactive-tmux")
             image: Docker image (for docker provider)
             working_dir: Working directory inside workspace
-            secrets: Secrets to inject as environment variables
+            credentials: Credential bindings, by reference; the provider's
+                CredentialResolver supplies the values
             environment: Non-secret environment variables
             mounts: List of (host_path, container_path, read_only) tuples
             plugins: Plugin directories to load via --plugin-dir (ADR-033)
@@ -169,7 +171,7 @@ class AgenticWorkspace:
             provider=provider,
             image=image,
             working_dir=working_dir,
-            secrets=secrets or {},
+            credentials=credentials or [],
             environment=environment or {},
             mounts=mount_configs,
             plugins=plugins or [],

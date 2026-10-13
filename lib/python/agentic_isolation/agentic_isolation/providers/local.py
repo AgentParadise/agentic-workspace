@@ -19,8 +19,10 @@ from pathlib import Path
 from agentic_isolation.config import WorkspaceConfig
 from agentic_isolation.providers.base import (
     BaseProvider,
+    CredentialResolver,
     ExecuteResult,
     Workspace,
+    resolve_env_credentials,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,16 +49,23 @@ class WorkspaceLocalProvider(BaseProvider):
         self,
         base_dir: str | Path | None = None,
         shell: str = "/bin/bash",
+        credentials: CredentialResolver | None = None,
     ):
         """Initialize local provider.
 
         Args:
             base_dir: Base directory for workspaces (default: system temp)
             shell: Shell to use for command execution
+            credentials: Resolves `WorkspaceConfig.credentials`. Without one,
+                a config that binds a credential is refused.
         """
         self._base_dir = Path(base_dir) if base_dir else Path(tempfile.gettempdir())
         self._shell = shell
         self._workspaces: dict[str, Workspace] = {}
+        self._credentials = credentials
+        # Resolved credential values per workspace id, kept off the Workspace
+        # (whose metadata is rendered and serialised) and dropped on destroy.
+        self._credential_env: dict[str, dict[str, str]] = {}
 
     @property
     def name(self) -> str:
@@ -65,6 +74,9 @@ class WorkspaceLocalProvider(BaseProvider):
 
     async def create(self, config: WorkspaceConfig) -> Workspace:
         """Create a local workspace directory."""
+        credential_env = await resolve_env_credentials(
+            config.credentials, self._credentials, provider=self.name
+        )
         workspace_id = f"ws-{uuid.uuid4().hex[:12]}"
         workspace_path = self._base_dir / "agentic-workspaces" / workspace_id
 
@@ -88,12 +100,14 @@ class WorkspaceLocalProvider(BaseProvider):
         )
 
         self._workspaces[workspace_id] = workspace
+        self._credential_env[workspace_id] = credential_env
         return workspace
 
     async def destroy(self, workspace: Workspace) -> None:
         """Remove the workspace directory."""
         if workspace.id in self._workspaces:
             del self._workspaces[workspace.id]
+        self._credential_env.pop(workspace.id, None)
 
         if workspace.path.exists():
             shutil.rmtree(workspace.path, ignore_errors=True)
@@ -209,8 +223,8 @@ class WorkspaceLocalProvider(BaseProvider):
     ) -> dict[str, str]:
         """Build environment variables for command execution."""
         exec_env = os.environ.copy()
-        exec_env.update(workspace.config.environment)
-        exec_env.update(workspace.config.secrets)
+        exec_env.update(workspace.config.checked_environment())
+        exec_env.update(self._credential_env.get(workspace.id, {}))
         if env:
             exec_env.update(env)
         exec_env["WORKSPACE_ID"] = workspace.id

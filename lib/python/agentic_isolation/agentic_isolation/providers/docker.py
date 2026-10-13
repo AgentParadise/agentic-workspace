@@ -13,6 +13,8 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
 import json
 import logging
 import math
@@ -49,8 +51,10 @@ from agentic_isolation.providers.base import (
     BaseProvider,
     CredentialResolver,
     ExecuteResult,
+    UnsupportedLimitError,
     Workspace,
     drain_operation,
+    resolve_env_credentials,
 )
 from agentic_isolation.providers.docker_operations import DockerOperations
 from agentic_isolation.providers.operation_spool import OperationFailure
@@ -123,8 +127,9 @@ class WorkspaceDockerProvider(BaseProvider):
             workspace_host_dir: Base directory for Docker volume mounts (host path).
                 Required when running inside a container (Docker-in-Docker).
                 If not set, uses workspace_base_dir for mounts.
-            credentials: Resolves `OperationSpec.credential_bindings`. Without
-                one, a spec that names a credential is refused.
+            credentials: Resolves `WorkspaceConfig.credentials` and
+                `OperationSpec.credential_bindings`. Without one, a config or
+                spec that binds a credential is refused.
             observation_retention_bytes: Output retained per operation.
             observation_max_page_bytes: Largest serialised observation page.
         """
@@ -138,6 +143,7 @@ class WorkspaceDockerProvider(BaseProvider):
         # *host* filesystem, not this process's filesystem.  When running inside
         # a container (DinD), resolve() would map to the container's CWD — wrong.
         self._workspace_host_dir = Path(workspace_host_dir) if workspace_host_dir else None
+        self._credentials = credentials
         self._workspaces: dict[str, Workspace] = {}
         # Workspaces whose container is gone but whose directory is kept,
         # keyed by container name (the `WorkspaceRef.resource_id`). An entry
@@ -216,9 +222,23 @@ class WorkspaceDockerProvider(BaseProvider):
 
     async def create(self, config: WorkspaceConfig) -> Workspace:
         """Create a Docker container workspace with security hardening."""
+        # Docker run has no portable per-container disk quota (--storage-opt
+        # works only on some storage drivers), so a hard disk limit is refused
+        # rather than accepted and silently ignored (APSS W-3.8-d).
+        if config.limits.disk is not None:
+            raise UnsupportedLimitError(
+                f"disk limit {config.limits.disk!r} cannot be enforced by the docker "
+                "provider; remove ResourceLimits.disk"
+            )
+
         # Resolve plugin env vars before creating container
         if config.plugins:
             config.resolve_plugin_env()
+
+        # Resolved before anything is created; a refused binding leaves nothing.
+        credential_env = await resolve_env_credentials(
+            config.credentials, self._credentials, provider=self.name
+        )
 
         # The Codex sandbox policy comes from the image's own declaration, and
         # is settled before anything is created so a mismatch leaves nothing.
@@ -264,6 +284,7 @@ class WorkspaceDockerProvider(BaseProvider):
             image=image_id,  # the inspected image, not whatever the tag is now
             config=config,
             security=security,
+            credential_names=tuple(credential_env),
         )
 
         logger.info(
@@ -277,10 +298,13 @@ class WorkspaceDockerProvider(BaseProvider):
         )
 
         try:
+            # Credential values reach docker through its own environment;
+            # `-e NAME` makes the CLI copy them, so no value is in the argv.
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, **credential_env} if credential_env else None,
             )
             stdout, stderr = await proc.communicate()
 
@@ -340,8 +364,13 @@ class WorkspaceDockerProvider(BaseProvider):
         image: str,
         config: WorkspaceConfig,
         security: SecurityConfig,
+        credential_names: tuple[str, ...] = (),
     ) -> list[str]:
-        """Build docker run command with security hardening."""
+        """Build docker run command with security hardening.
+
+        `credential_names` are passed as bare `-e NAME`; their values must be
+        in the docker client's environment, never in this argv.
+        """
         cmd = [
             "docker",
             "run",
@@ -394,11 +423,12 @@ class WorkspaceDockerProvider(BaseProvider):
         # Environment variables
         env_vars = {
             "WORKSPACE_ID": workspace_id,
-            **config.environment,
-            **config.secrets,
+            **config.checked_environment(),
         }
         for key, value in env_vars.items():
             cmd.extend(["-e", f"{key}={value}"])
+        for name in credential_names:
+            cmd.extend(["-e", name])
 
         # Labels
         cmd.extend(
@@ -624,7 +654,7 @@ class WorkspaceDockerProvider(BaseProvider):
             working_directory=_relative_workdir(cwd),
             environment={},
             credential_bindings=(),
-            timeout_seconds=max(1, math.ceil(timeout or 3600)),
+            timeout_seconds=max(1, math.ceil(timeout or workspace.config.limits.timeout_seconds)),
             metadata={},
         )
         try:
@@ -754,13 +784,12 @@ class WorkspaceDockerProvider(BaseProvider):
         if not workspace_dir:
             raise RuntimeError("Workspace directory not available")
 
-        file_path = Path(workspace_dir) / path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if isinstance(content, str):
-            file_path.write_text(content)
-        else:
-            file_path.write_bytes(content)
+        data = content.encode() if isinstance(content, str) else content
+        fd = _open_contained(
+            Path(workspace_dir), path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, create_parents=True
+        )
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
 
     async def read_file(
         self,
@@ -772,11 +801,12 @@ class WorkspaceDockerProvider(BaseProvider):
         if not workspace_dir:
             raise RuntimeError("Workspace directory not available")
 
-        file_path = Path(workspace_dir) / path
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {path}")
-
-        return file_path.read_text()
+        try:
+            fd = _open_contained(Path(workspace_dir), path, os.O_RDONLY)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"File not found: {path}") from None
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read().decode()
 
     async def file_exists(
         self,
@@ -788,7 +818,12 @@ class WorkspaceDockerProvider(BaseProvider):
         if not workspace_dir:
             return False
 
-        return (Path(workspace_dir) / path).exists()
+        try:
+            fd = _open_contained(Path(workspace_dir), path, os.O_RDONLY)
+        except FileNotFoundError:
+            return False
+        os.close(fd)
+        return True
 
     def transcript_source(self, workspace: Workspace, agent: str) -> TranscriptSource | None:
         """Return a `TranscriptSource` for `agent` in `workspace`.
@@ -1208,6 +1243,55 @@ def _usage_from_cgroup(text: str, *, oom_killed: bool | None) -> TeardownUsage:
         oom_kills=oom_kills,
         oom_killed=oom_killed,
     )
+
+
+def _open_contained(root: Path, path: str, flags: int, *, create_parents: bool = False) -> int:
+    """Open `path` under `root` and return its descriptor, or raise (APSS W-3.2-b).
+
+    Every component, including each `..`, is resolved against a descriptor
+    this walk opened itself with O_NOFOLLOW, so the check and the use are the
+    same system call: a symlink the workload swaps in at any moment is
+    refused, never followed, and `..` can never climb above `root`.
+    """
+    if Path(path).is_absolute():
+        raise ValueError(f"workspace path {path!r} must be relative to the workspace")
+    *parents, name = PurePosixPath(path).parts or (".",)
+    if name in (".", ".."):
+        raise ValueError(f"workspace path {path!r} names no file in the workspace")
+
+    def escapes() -> ValueError:
+        return ValueError(f"workspace path {path!r} escapes the workspace directory")
+
+    nofollow = os.O_NOFOLLOW | os.O_CLOEXEC
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
+    # The root itself is the provider's own path; only what lies beneath it
+    # is writable by the workload.
+    stack = [os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)]
+    try:
+        for part in parents:
+            if part == "..":
+                if len(stack) == 1:
+                    raise escapes()
+                os.close(stack.pop())
+                continue
+            if create_parents:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, 0o755, dir_fd=stack[-1])
+            try:
+                stack.append(os.open(part, directory_flags, dir_fd=stack[-1]))
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise escapes() from e
+                raise
+        try:
+            return os.open(name, flags | nofollow, 0o644, dir_fd=stack[-1])
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                raise escapes() from e
+            raise
+    finally:
+        for fd in stack:
+            os.close(fd)
 
 
 def _relative_workdir(cwd: str | None) -> str:

@@ -11,7 +11,9 @@ from agentic_isolation.config import (
     WorkspaceConfig,
     _load_plugin_manifest,
     _resolve_single_env_var,
+    host_env_credential,
 )
+from agentic_isolation.contract import CredentialBinding, CredentialRef
 
 
 class TestResourceLimits:
@@ -82,12 +84,12 @@ class TestWorkspaceConfig:
         config = (
             WorkspaceConfig()
             .with_mount("/host", "/container")
-            .with_secret("API_KEY", "secret")
+            .with_credential(host_env_credential("API_KEY"))
             .with_env("DEBUG", "true")
         )
 
         assert len(config.mounts) == 1
-        assert config.secrets["API_KEY"] == "secret"
+        assert config.credentials == [host_env_credential("API_KEY")]
         assert config.environment["DEBUG"] == "true"
 
     def test_with_mount(self) -> None:
@@ -99,12 +101,13 @@ class TestWorkspaceConfig:
         assert config.mounts[0].host_path == "/host"
         assert config.mounts[0].read_only is True
 
-    def test_with_secret(self) -> None:
-        """Should add secrets."""
+    def test_with_credential_holds_a_ref_not_a_value(self) -> None:
+        """A credential is bound by name and scope; the config holds no value."""
         config = WorkspaceConfig()
-        config.with_secret("TOKEN", "abc123")
+        config.with_credential(host_env_credential("TOKEN"))
 
-        assert config.secrets["TOKEN"] == "abc123"
+        assert config.credentials[0].ref.name == "TOKEN"
+        assert config.credentials[0].ref.scope == "host-env"
 
     def test_with_env(self) -> None:
         """Should add environment variables."""
@@ -182,7 +185,7 @@ class TestResolvePluginEnv:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Should add secret env vars to secrets dict."""
+        """A secret env var becomes a host-env binding; its value is not copied."""
         plugin_dir = tmp_path / ".claude-plugin"
         plugin_dir.mkdir()
         manifest = {
@@ -196,7 +199,8 @@ class TestResolvePluginEnv:
         config.plugins.append(str(tmp_path))
         config.resolve_plugin_env()
 
-        assert config.secrets["API_KEY"] == "s3cret"
+        assert config.credentials == [host_env_credential("API_KEY")]
+        assert "s3cret" not in repr(config.credentials)
         assert "API_KEY" not in config.environment
 
     def test_resolves_non_secret_env_var(
@@ -219,7 +223,7 @@ class TestResolvePluginEnv:
         config.resolve_plugin_env()
 
         assert config.environment["LOG_LEVEL"] == "debug"
-        assert "LOG_LEVEL" not in config.secrets
+        assert config.credentials == []
 
     def test_skips_already_set_vars(
         self,
@@ -237,11 +241,14 @@ class TestResolvePluginEnv:
         monkeypatch.setenv("API_KEY", "new-value")
 
         config = WorkspaceConfig()
-        config.secrets["API_KEY"] = "original"
+        explicit = CredentialBinding(
+            ref=CredentialRef(name="VAULT_API_KEY", scope="vault"), delivery="env", target="API_KEY"
+        )
+        config.credentials.append(explicit)
         config.plugins.append(str(tmp_path))
         config.resolve_plugin_env()
 
-        assert config.secrets["API_KEY"] == "original"
+        assert config.credentials == [explicit]
 
     def test_skips_missing_manifest(self, tmp_path: Path) -> None:
         """Should silently skip plugins without manifests."""
@@ -269,7 +276,7 @@ class TestResolvePluginEnv:
         config.resolve_plugin_env()
         config.resolve_plugin_env()  # Second call should be safe
 
-        assert config.secrets["TOKEN"] == "abc"
+        assert config.credentials == [host_env_credential("TOKEN")]
 
 
 class TestWorkspaceConfigDoesNotReprCredentials:
@@ -294,11 +301,7 @@ class TestWorkspaceConfigDoesNotReprCredentials:
         return WorkspaceConfig(provider="docker", image="x", **kw)  # type: ignore[arg-type]
 
     def test_environment_value_is_not_in_repr(self) -> None:
-        cfg = self._cfg(environment={"AGENTIC_SESSION_STORE_AUTH": self.TOKEN})
-        assert self.TOKEN not in repr(cfg)
-
-    def test_secrets_value_is_not_in_repr(self) -> None:
-        cfg = self._cfg(secrets={"TOKEN": self.TOKEN})
+        cfg = self._cfg(environment={"SESSION_STORE_URL": self.TOKEN})
         assert self.TOKEN not in repr(cfg)
 
     def test_str_and_format_are_covered_too(self) -> None:
@@ -309,7 +312,6 @@ class TestWorkspaceConfigDoesNotReprCredentials:
         """
         cfg = self._cfg(
             environment={"A": self.TOKEN},
-            secrets={"B": self.TOKEN},
         )
         assert self.TOKEN not in str(cfg)
         assert self.TOKEN not in f"{cfg}"
@@ -317,9 +319,8 @@ class TestWorkspaceConfigDoesNotReprCredentials:
 
     def test_keys_still_appear_nowhere_but_config_is_still_usable(self) -> None:
         """`repr=False` hides the field, so the values remain readable in code."""
-        cfg = self._cfg(environment={"K": self.TOKEN}, secrets={"S": self.TOKEN})
+        cfg = self._cfg(environment={"K": self.TOKEN})
         assert cfg.environment["K"] == self.TOKEN
-        assert cfg.secrets["S"] == self.TOKEN
 
     def test_asdict_still_exposes_values_and_that_is_the_documented_boundary(
         self,

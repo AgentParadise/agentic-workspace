@@ -23,10 +23,14 @@ from agentic_isolation.harnesses import (
 )
 from agentic_isolation.providers.base import (
     AwaitResult,
+    CredentialPolicyError,
+    CredentialResolver,
     ExecuteResult,
+    HostEnvironmentCredentials,
     InteractiveSession,
     SupportsStagedTeardown,
     SupportsWorkspaceLogs,
+    UnsupportedLimitError,
     Workspace,
     WorkspaceProvider,
 )
@@ -67,6 +71,10 @@ __all__ = [
     "ExecuteResult",
     "InteractiveSession",
     "AwaitResult",
+    "CredentialResolver",
+    "HostEnvironmentCredentials",
+    "CredentialPolicyError",
+    "UnsupportedLimitError",
     # Providers
     "WorkspaceLocalProvider",
     "WorkspaceDockerProvider",
