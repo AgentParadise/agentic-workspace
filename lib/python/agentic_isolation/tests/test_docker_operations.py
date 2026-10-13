@@ -796,9 +796,10 @@ async def test_a_running_operation_outlives_the_retention_window(docker_env: Pat
         record_retention_seconds=0.0,
     )
     ref = await ops.start(_workspace(), _spec("sleep 1; echo late"))
-    await ops.start(_workspace(), _spec("true", key="other"))
+    other = await ops.start(_workspace(), _spec("true", key="other"))
     assert await ops.start(_workspace(), _spec("sleep 1; echo late")) == ref
     assert (await drain_operation(ops, ref))[1] == b"late\n"
+    await drain_operation(ops, other)
 
 
 async def test_release_keeps_a_running_record(docker_env: Path) -> None:
