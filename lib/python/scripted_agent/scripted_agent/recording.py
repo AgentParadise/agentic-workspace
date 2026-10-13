@@ -31,6 +31,11 @@ TASK_RESULT_MARKER: Final = "TASK_RESULT:"
 every message the agent says. It settles all of them by precedence, FAILURE over
 SUCCESS, not by which came last, so a recorded report anywhere in the stream would
 outrank the profile's verdict whenever the recorded run failed."""
+CLAUDE_SUCCESS: Final = {"is_error": False, "subtype": "success"}
+"""The status the profile's closing ``result`` always carries. syntropic137's
+``_handle_result_event`` (``EventStreamProcessor.py`` @ 1017ec7b) reads an
+``is_error`` result as the harness's own failure text and never hands it to
+``VerdictReader``, so a recorded harness error would otherwise swallow the verdict."""
 WITHHELD_REPORT: Final = "[scripted-agent replay: the recorded run's own verdict is withheld]"
 """What a recorded message carrying a report says instead, so the only report the
 consumer reads is the one ``closing`` writes."""
@@ -113,9 +118,10 @@ class Recording:
     def closing(self, verdict: str) -> tuple[Event, ...]:
         """The events that end the replay, carrying ``verdict`` where the consumer reads
         it: claude's ``result`` field, or a last codex ``agent_message`` before
-        ``turn.completed``."""
+        ``turn.completed``. The recorded run's harness status is history, not the
+        profile's: claude's closing result always reports success (``CLAUDE_SUCCESS``)."""
         if self.harness == "claude":
-            return ({**self.result, "result": verdict},)
+            return ({**self.result, **CLAUDE_SUCCESS, "result": verdict},)
         message = {"id": CODEX_VERDICT_ITEM_ID, "type": "agent_message", "text": verdict}
         return ({"type": "item.completed", "item": message}, self.result)
 

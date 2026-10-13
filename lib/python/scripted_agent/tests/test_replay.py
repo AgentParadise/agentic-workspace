@@ -15,6 +15,7 @@ from scripted_agent import cli
 from scripted_agent.cli import PROFILE_PATH_ENV, TAGS_ENV, replay
 from scripted_agent.errors import RecordingRefused, SideEffectFailed
 from scripted_agent.profile import SCRIPTED_AGENT_MODEL, SCRIPTED_AGENT_PROFILE_ENV
+from tests.fixtures.consumer_verdict import claude_verdict, phase_verdict, read_verdict
 
 REPO = Path(__file__).resolve().parents[4]
 RECORDING = (
@@ -213,33 +214,72 @@ def test_last_message_is_the_profiles_task_result_not_the_recordings(tmp_path: P
     assert all("result" not in e or e["type"] != "result" for e in events[:-1])
 
 
+RECORDED_SUCCESS = 'TASK_RESULT: {"success": true, "comments": "fine"}\nTASK_RESULT_END'
+RECORDED_FAILURE = 'TASK_RESULT: {"success": false, "comments": "tests failed"}\nTASK_RESULT_END'
+
+
+def _recorded(tmp_path: Path, edit: Any) -> dict[str, Any]:
+    """The reverify profile replaying the shipped recording with ``edit`` applied to its
+    rows; the edits keep its version, tool uses and terminal, so it is accepted."""
+    rows = [json.loads(line) for line in RECORDING.read_text().splitlines()]
+    edit(rows)
+    edited = tmp_path / "edited-run.jsonl"
+    edited.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    profile = _profile()
+    profile["phases"]["reverify"]["stream"]["recording"] = str(edited)
+    return profile
+
+
+def _is_the_profiles(verdict: Any) -> bool:
+    """The reverify phase's profile verdict: SUCCESS, review certified."""
+    return bool(
+        verdict.status == phase_verdict.VerdictStatus.SUCCESS
+        and verdict.reported_review_verdict == "certified"
+    )
+
+
+def test_the_consumers_verdict_rules_are_syntropic137s() -> None:
+    # The oracle every verdict test below runs, held to the rules it was vendored for.
+    status = phase_verdict.VerdictStatus
+    assert read_verdict('TASK_RESULT: {"success": true}').status == status.UNREADABLE
+    assert read_verdict(RECORDED_SUCCESS).status == status.SUCCESS
+    assert read_verdict(f"{RECORDED_SUCCESS}\n{RECORDED_FAILURE}").status == status.FAILURE
+    assert read_verdict(RECORDED_FAILURE, RECORDED_SUCCESS).status == status.FAILURE
+    assert read_verdict("done").status == status.NOT_REPORTED
+
+
 def test_the_recorded_runs_own_verdict_never_reaches_the_consumer(tmp_path: Path) -> None:
     # EventStreamProcessor feeds every assistant text block to VerdictReader, which ranks
     # FAILURE over SUCCESS whatever the order; only the profile's report may carry one.
-    failure = 'TASK_RESULT: {"success": false, "comments": "tests failed"}\nTASK_RESULT_END'
-    rows = [json.loads(line) for line in RECORDING.read_text().splitlines()]
-    said = [b for r in rows if r.get("type") == "assistant" for b in r["message"]["content"]]
-    next(b for b in said if b["type"] == "text")["text"] += f"\n{failure}"
-    failed = tmp_path / "failed-run.jsonl"
-    failed.write_text("".join(json.dumps(row) + "\n" for row in rows))
-    profile = _profile()
-    profile["phases"]["reverify"]["stream"]["recording"] = str(failed)
+    # Each text block reports: a closed success first, so a replay that withholds only
+    # the first report leaves the failure after it for the consumer to read.
+    def fail(rows: list[dict[str, Any]]) -> None:
+        said = [b for r in rows if r.get("type") == "assistant" for b in r["message"]["content"]]
+        texts = [b for b in said if b["type"] == "text"]
+        assert len(texts) >= 2
+        texts[0]["text"] += f"\n{RECORDED_SUCCESS}"
+        for block in texts[1:]:
+            block["text"] += f"\n{RECORDED_FAILURE}"
+        assert claude_verdict(rows[1:]).status == phase_verdict.VerdictStatus.FAILURE
 
-    events, _, _ = _replay(_env("reverify", profile), tmp_path)
+    events, _, _ = _replay(_env("reverify", _recorded(tmp_path, fail)), tmp_path)
 
-    reports = [
-        text
-        for e in events
-        for text in (
-            [b.get("text", "") for b in e["message"]["content"]]
-            if e["type"] == "assistant"
-            else [e.get("result", "")]
-        )
-        if "TASK_RESULT:" in str(text)
-    ]
-    assert reports == [events[-1]["result"]]
-    assert '"success":true' in reports[0]
+    assert _is_the_profiles(claude_verdict(events))
     assert all("tests failed" not in json.dumps(e) for e in events)
+
+
+def test_a_recorded_harness_error_does_not_swallow_the_profiles_verdict(
+    tmp_path: Path,
+) -> None:
+    # The consumer reads an is_error result as the harness's failure text and never
+    # hands it to VerdictReader; the profile's closing result is not the recording's.
+    def harness_error(rows: list[dict[str, Any]]) -> None:
+        rows[-1].update(is_error=True, subtype="error_during_execution", result="API Error")
+
+    events, _, _ = _replay(_env("reverify", _recorded(tmp_path, harness_error)), tmp_path)
+
+    assert _is_the_profiles(claude_verdict(events))
+    assert (events[-1]["is_error"], events[-1]["subtype"]) == (False, "success")
 
 
 def test_open_draft_pushes_the_execution_branch_and_opens_the_pr(tmp_path: Path) -> None:

@@ -6,11 +6,9 @@ way syntropic137's ``CodexStreamProcessor`` reads it.
 processor's rules from the same commit: the first top-level ``model`` is the model
 (``_process_line``), an ``item.started`` of a command or file change is a tool start
 (``_handle_item_started``), and every ``agent_message`` text is fed to ``VerdictReader``
-(``_handle_item_completed``). That reader settles the messages by precedence (FAILURE >
-SUCCESS > UNREADABLE > NOT_REPORTED, ``phase_verdict._settle``), not by order, and a
-message with no ``TASK_RESULT:`` marker reads as NOT_REPORTED, the weakest. So the
-consumed verdict is the profile's exactly when the profile's report is the only message
-carrying the marker, which is what ``_observed`` returns for the tests to check.
+(``_handle_item_completed``), which is syntropic137's own ``VerdictReader`` from
+``fixtures/consumer_verdict.py``, so the verdict the tests check is the one the
+consumer settles, not a restatement of its grammar or its precedence.
 """
 
 from __future__ import annotations
@@ -27,8 +25,9 @@ from scripted_agent import cli
 from scripted_agent.cli import replay
 from scripted_agent.errors import RecordingRefused
 from scripted_agent.profile import SCRIPTED_AGENT_MODEL
-from scripted_agent.recording import CODEX_TOOL_ITEM_TYPES, TASK_RESULT_MARKER
+from scripted_agent.recording import CODEX_TOOL_ITEM_TYPES
 from tests.fixtures.codex_stream import CodexItemType, CodexStreamType
+from tests.fixtures.consumer_verdict import phase_verdict, read_verdict
 from tests.test_replay import RECORDING, FakeGit, _env, _exit, _models, _profile, _stream
 
 CODEX_RECORDING = RECORDING.parent / "v0.160.1_codex_exec_two-commands.jsonl"
@@ -63,12 +62,12 @@ def _replay_codex(
     return [json.loads(line) for line in out.getvalue().splitlines()], slept
 
 
-def _observed(events: list[dict[str, Any]]) -> tuple[str | None, int, list[str]]:
-    """The model, the tool-start count, and every agent message carrying a report, all
-    of which the processor's ``VerdictReader`` settles together."""
+def _observed(events: list[dict[str, Any]]) -> tuple[str | None, int, Any]:
+    """The model, the tool-start count, and the ``AgentVerdict`` the processor's
+    ``VerdictReader`` settles from every agent message."""
     model: str | None = None
     starts = 0
-    reports: list[str] = []
+    said: list[str] = []
     for event in events:
         if model is None and isinstance(event.get("model"), str):
             model = event["model"]
@@ -83,10 +82,17 @@ def _observed(events: list[dict[str, Any]]) -> tuple[str | None, int, list[str]]
         if (
             event["type"] == CodexStreamType.ITEM_COMPLETED
             and item.get("type") == CodexItemType.AGENT_MESSAGE
-            and TASK_RESULT_MARKER in str(item.get("text", ""))
         ):
-            reports.append(str(item["text"]))
-    return model, starts, reports
+            said.append(str(item.get("text", "")))
+    return model, starts, read_verdict(*said)
+
+
+def _is_the_profiles(verdict: Any) -> bool:
+    """The reverify phase's profile verdict: SUCCESS, review certified."""
+    return bool(
+        verdict.status == phase_verdict.VerdictStatus.SUCCESS
+        and verdict.reported_review_verdict == "certified"
+    )
 
 
 def test_the_vendored_consumer_vocabulary_is_upstreams() -> None:
@@ -98,21 +104,18 @@ def test_the_vendored_consumer_vocabulary_is_upstreams() -> None:
 def test_the_capture_is_what_the_consumer_reads_before_replay() -> None:
     rows = [json.loads(line) for line in CODEX_RECORDING.read_text().splitlines()]
     assert rows[0]["_recording"]["cli_version"] == "0.160.1"
-    model, starts, reports = _observed(rows[1:])
-    assert (model, starts, reports) == (None, 2, [])
+    model, starts, verdict = _observed(rows[1:])
+    assert (model, starts) == (None, 2)
+    assert verdict.status == phase_verdict.VerdictStatus.NOT_REPORTED
 
 
 def test_a_codex_phase_is_observed_as_the_profile_declares(tmp_path: Path) -> None:
     events, _ = _replay_codex(tmp_path)
 
-    model, starts, reports = _observed(events)
+    model, starts, verdict = _observed(events)
     assert model == SCRIPTED_AGENT_MODEL
     assert starts == 2
-    assert reports == [
-        'TASK_RESULT: {"success":true,"side_effects":"none",'
-        '"comments":"Load-test stub for phase reverify; no agent ran.",'
-        '"review_verdict":"certified"}\nTASK_RESULT_END'
-    ]
+    assert _is_the_profiles(verdict)
     assert [e["type"] for e in events[-2:]] == ["item.completed", "turn.completed"]
     assert sum(e["type"] == "turn.completed" for e in events) == 1
     assert {m for e in events for m in _models(e)} == {SCRIPTED_AGENT_MODEL}
@@ -130,17 +133,13 @@ def test_the_recorded_runs_own_verdict_never_reaches_the_consumer(tmp_path: Path
             row["item"]["text"] = f"Two commands ran.\n{RECORDED_FAILURE}"
     failed = tmp_path / "failed-run.jsonl"
     failed.write_text("".join(json.dumps(row) + "\n" for row in rows))
-    assert _observed(rows[1:])[2] == [f"Two commands ran.\n{RECORDED_FAILURE}"]
+    assert _observed(rows[1:])[2].status == phase_verdict.VerdictStatus.FAILURE
 
     events, slept = _replay_codex(tmp_path, recording=str(failed), pacing_factor=1.0)
 
-    _, starts, reports = _observed(events)
+    _, starts, verdict = _observed(events)
     assert starts == 2
-    assert reports == [
-        'TASK_RESULT: {"success":true,"side_effects":"none",'
-        '"comments":"Load-test stub for phase reverify; no agent ran.",'
-        '"review_verdict":"certified"}\nTASK_RESULT_END'
-    ]
+    assert _is_the_profiles(verdict)
     assert all("tests failed" not in json.dumps(e) for e in events)
     assert len(slept) == 8
     assert sum(slept) == pytest.approx(1.356)
