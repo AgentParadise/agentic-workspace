@@ -869,6 +869,8 @@ class WorkspaceDockerProvider(BaseProvider):
             await self._teardown_locked(
                 workspace, while_running=while_running, before_delete=before_delete
             )
+            # The workspace is gone, so its idempotency records may go too.
+            self._operations.forget_workspace(workspace.id)
         # Drop the lock entry only once nobody else holds or wants it. Removing
         # it any earlier - in particular inside the teardown, which an earlier
         # version did - lets the next caller build a FRESH lock and run

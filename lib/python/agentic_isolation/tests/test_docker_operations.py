@@ -32,6 +32,7 @@ from agentic_isolation.contract import (
     OperationRef,
     OperationSpec,
 )
+from agentic_isolation.providers import docker_operations
 from agentic_isolation.providers.base import (
     SupportsOperations,
     Workspace,
@@ -39,7 +40,6 @@ from agentic_isolation.providers.base import (
     drain_operation,
     run_to_completion,
 )
-from agentic_isolation.providers import docker_operations
 from agentic_isolation.providers.docker import WorkspaceDockerProvider
 from agentic_isolation.providers.docker_operations import DockerOperations, _Operation
 from agentic_isolation.providers.operation_spool import OperationFailure, OperationSpool
@@ -764,9 +764,10 @@ async def test_resolver_failure_releases_the_key_for_a_retry(docker_env: Path) -
     assert (await drain_operation(ops, ref))[1] == b"bound\n"
 
 
-async def test_same_key_replays_inside_the_retention_window_then_starts_fresh(
+async def test_same_key_replays_for_the_workspace_lifetime_after_output_is_reclaimed(
     docker_env: Path,
 ) -> None:
+    """EXP-V1-0006 5.1.3: the key's record lives as long as the workspace."""
     ops = DockerOperations(
         credentials=_Resolver(),
         retention_bytes=1 << 20,
@@ -779,12 +780,20 @@ async def test_same_key_replays_inside_the_retention_window_then_starts_fresh(
     assert await ops.start(_workspace(), _spec("echo once")) == first
     assert (await ops.status(first)).state == "succeeded"
     await asyncio.sleep(1.1)
-    fresh = await ops.start(_workspace(), _spec("echo once"))
-    assert fresh != first and fresh.operation_key == first.operation_key
+    # Past the window: the output is reclaimed but the key still replays.
+    assert await ops.start(_workspace(), _spec("echo once")) == first
+    assert ops._operations == {}
     with pytest.raises(OperationFailure) as caught:
         await ops.status(first)
     assert caught.value.error.kind == "unknown_operation"
-    assert (await drain_operation(ops, fresh))[1] == b"once\n"
+    with pytest.raises(OperationFailure) as caught:
+        await ops.start(_workspace(), _spec("echo twice"))
+    assert caught.value.error.kind == "conflict"
+    launches = (docker_env / "docker.log").read_text().count("aw-operation")
+    assert launches == 1
+    # Once the workspace is destroyed nothing of it is kept.
+    ops.forget_workspace("ws1")
+    assert (ops._operations, ops._by_key, ops._launching) == ({}, {}, {})
 
 
 async def test_a_running_operation_outlives_the_retention_window(docker_env: Path) -> None:
@@ -818,3 +827,178 @@ async def test_a_thousand_sequential_executes_leave_the_maps_empty(docker_env: P
         result = await provider.execute(_workspace(), f"echo {i}")
         assert result.stdout == f"{i}\n"
     assert (ops._operations, ops._by_key, ops._launching) == ({}, {}, {})
+
+
+async def _kill_leader(operation: _Operation) -> None:
+    """Cleanup only, after the assertions: end a workload the test left running."""
+    if operation.leader is not None:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(int(operation.leader[0]), signal.SIGKILL)
+    if operation.collector is not None:
+        await asyncio.wait_for(operation.collector, timeout=10)
+
+
+@pytest.mark.parametrize(
+    "stop",
+    [
+        docker_operations._error("provider_unavailable", "stop client cannot spawn"),
+        (1, "Cannot connect to the Docker daemon"),
+    ],
+    ids=["unspawnable", "failed-exit"],
+)
+async def test_timeout_settles_when_a_persistent_workload_survives_a_failed_stop(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch, stop: object
+) -> None:
+    """The workload never exits; the timeout still settles within the documented bound."""
+    monkeypatch.setattr(docker_operations, "_FINAL_OUTPUT_SECONDS", 0.1)
+    monkeypatch.setattr(docker_operations, "_CLIENT_EXIT_SECONDS", 0.5)
+    ops = _ops(docker_env)
+    ref = await ops.start(_workspace(), _spec("exec sleep 60", timeout_seconds=1))
+    operation = ops._operations[ref.operation_id]
+    await operation.leader_known.wait()
+    assert operation.leader is not None
+    leader = int(operation.leader[0])
+    real = ops._docker_cmd
+
+    async def command(*argv: str) -> tuple[int, str]:
+        if argv[0] == "stop":
+            if isinstance(stop, OperationFailure):
+                raise stop
+            return stop  # type: ignore[return-value]
+        return await real(*argv)
+
+    monkeypatch.setattr(ops, "_docker_cmd", command)
+    monkeypatch.setattr(docker_operations.os, "getpgrp", lambda: leader)
+    try:
+        status, _ = await asyncio.wait_for(drain_operation(ops, ref), timeout=10)
+        assert status.state == "timed_out"
+        assert status.metadata["cancel_escalation"] == "container_stop_failed"
+        failure = status.metadata["cancel_signal_failure"]
+        assert "caller's own group" in failure
+        assert ("cannot spawn" in failure) or ("Cannot connect" in failure)
+        assert "detached, the workload may still be running" in failure
+        assert _alive(leader)  # truthfully not claimed stopped
+    finally:
+        await _kill_leader(operation)
+
+
+async def test_execute_returns_when_a_persistent_workload_survives_a_failed_stop(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(docker_operations, "_FINAL_OUTPUT_SECONDS", 0.1)
+    monkeypatch.setattr(docker_operations, "_CLIENT_EXIT_SECONDS", 0.5)
+    provider = WorkspaceDockerProvider()
+    provider._operations = ops = _ops(docker_env)
+    real = ops._docker_cmd
+    seen: list[_Operation] = []
+
+    async def command(*argv: str) -> tuple[int, str]:
+        if argv[0] == "stop":
+            return 1, "Cannot connect to the Docker daemon"
+        return await real(*argv)
+
+    async def refused(operation: _Operation) -> str:
+        seen.append(operation)
+        return "refused for the test"
+
+    monkeypatch.setattr(ops, "_docker_cmd", command)
+    monkeypatch.setattr(ops, "_unsafe_leader", refused)
+    try:
+        result = await asyncio.wait_for(
+            provider.execute(_workspace(), "exec sleep 60", timeout=1), timeout=10
+        )
+        assert result.exit_code != 0
+        assert seen and seen[0].state == "timed_out"
+        assert _alive(int(seen[0].leader[0]))  # type: ignore[index]
+    finally:
+        for operation in seen:
+            await _kill_leader(operation)
+
+
+async def test_namespace_probe_that_cannot_run_escalates_to_stop(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ops = _ops(docker_env)
+    ref = await ops.start(_workspace(), _spec("exec sleep 60"))
+    operation = ops._operations[ref.operation_id]
+    await operation.leader_known.wait()
+    assert operation.leader is not None
+    leader = int(operation.leader[0])
+    real = ops._docker_cmd
+    calls: list[tuple[str, ...]] = []
+
+    async def command(*argv: str) -> tuple[int, str]:
+        calls.append(argv)
+        if "aw-pidns" in argv:
+            raise docker_operations._error("provider_unavailable", "probe cannot spawn")
+        if argv[0] == "stop":
+            os.kill(leader, signal.SIGKILL)  # what a real stop does to the workload
+            return 0, "c1"
+        return await real(*argv)
+
+    monkeypatch.setattr(ops, "_docker_cmd", command)
+    monkeypatch.setattr(docker_operations.os, "getpgrp", lambda: leader)
+    try:
+        status = await asyncio.wait_for(ops.cancel(ref, grace_seconds=0), timeout=10)
+        assert status.state == "cancelled"
+        assert status.metadata["cancel_escalation"] == "container_stopped"
+        assert "probe cannot spawn" in status.metadata["cancel_signal_failure"]
+        assert not any("aw-signal" in c for c in calls)
+        assert ("stop", "-t", "0", "c1") in calls
+    finally:
+        await _kill_leader(operation)
+
+
+async def test_signalling_client_that_cannot_run_escalates_to_stop(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ops = _ops(docker_env)
+    ref = await ops.start(_workspace(), _spec("exec sleep 60"))
+    operation = ops._operations[ref.operation_id]
+    await operation.leader_known.wait()
+    assert operation.leader is not None
+    leader = int(operation.leader[0])
+    real = ops._docker_cmd
+
+    async def command(*argv: str) -> tuple[int, str]:
+        if "aw-processes" in argv:
+            raise docker_operations._error("provider_unavailable", "exec cannot spawn")
+        if argv[0] == "stop":
+            os.kill(leader, signal.SIGKILL)
+            return 0, "c1"
+        return await real(*argv)
+
+    monkeypatch.setattr(ops, "_docker_cmd", command)
+    try:
+        status = await asyncio.wait_for(ops.cancel(ref, grace_seconds=0), timeout=10)
+        assert status.state == "cancelled"
+        assert status.metadata["cancel_escalation"] == "container_stopped"
+        assert "exec cannot spawn" in status.metadata["cancel_signal_failure"]
+    finally:
+        await _kill_leader(operation)
+
+
+async def test_timeout_survives_an_unreachable_daemon_and_its_recovery(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(docker_operations, "_FINAL_OUTPUT_SECONDS", 0.1)
+    ops = _ops(docker_env)
+    ref = await ops.start(_workspace(), _spec("exec sleep 2", timeout_seconds=1))
+    operation = ops._operations[ref.operation_id]
+    await operation.leader_known.wait()
+    (docker_env / "state").write_text("down")
+
+    async def unavailable(operation: _Operation, *, grace_seconds: float) -> None:
+        raise docker_operations._error("provider_unavailable", "docker is gone")
+
+    monkeypatch.setattr(ops, "_terminate_group", unavailable)
+    try:
+        await asyncio.wait_for(operation.collector, timeout=10)  # type: ignore[arg-type]
+        with pytest.raises(OperationFailure) as caught:
+            await ops.status(ref)
+        assert caught.value.error.kind == "provider_unavailable"
+        (docker_env / "state").write_text("running")
+        assert (await ops.status(ref)).state == "timed_out"
+        assert (await ops.status(ref)).state == "timed_out"
+    finally:
+        await _kill_leader(operation)

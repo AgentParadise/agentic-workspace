@@ -182,3 +182,26 @@ async def test_l_destroyed_container_is_lost(
         assert time.monotonic() < deadline
         await asyncio.sleep(0.2)
     assert status.state == "lost"
+
+
+async def test_k_leader_numbered_like_our_group_is_still_signalled_in_its_namespace(
+    live: tuple[WorkspaceDockerProvider, Workspace], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production collision: the in-container leader pid equals the caller's pgrp.
+
+    The real exec runs in the container's pid namespace, so the probe differs
+    from ours and the group cancel proceeds without stopping the container.
+    """
+    from agentic_isolation.providers import docker_operations
+
+    provider, workspace = live
+    ref = await provider.start(workspace, _spec("echo started; exec sleep 300"))
+    operation = provider._operations._operations[ref.operation_id]
+    await asyncio.wait_for(operation.leader_known.wait(), timeout=30)
+    assert operation.leader is not None
+    monkeypatch.setattr(docker_operations.os, "getpgrp", lambda: int(operation.leader[0]))
+    status = await asyncio.wait_for(provider.cancel(ref, grace_seconds=1), timeout=60)
+    assert status.state == "cancelled"
+    assert "cancel_escalation" not in status.metadata, status.metadata
+    result = await provider.execute(workspace, "echo alive")
+    assert (result.exit_code, result.stdout) == (0, "alive\n")

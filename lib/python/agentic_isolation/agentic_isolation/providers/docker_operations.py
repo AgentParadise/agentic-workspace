@@ -22,11 +22,14 @@ provider delegates to it, so the decisions below are made in one place.
   the workload as `docker exec -e NAME`; they are never in an argv.
 - The idempotency record is in-process infrastructure state, like the
   container handles, and is lost with the process, which also loses the
-  workspace (no reattach). A record is kept for `record_retention_seconds`
-  after it reaches a terminal state: inside that window a same-key start
-  replays the original ref and `status`/`observe` still answer; after it the
-  record is pruned, the old ref is `unknown_operation`, and the key starts
-  fresh. A caller that has collected the result can `release` it at once.
+  workspace (no reattach). EXP-V1-0006 5.1.3 requires it to live at least
+  as long as the workspace, so it is split in two. The replay record, the
+  key's spec and ref, is kept until `forget_workspace`: a same-key start
+  always replays the original ref and launches nothing. The operation itself,
+  its spool and buffers, is kept for `record_retention_seconds` after it
+  reaches a terminal state, so `status`/`observe` answer inside that window
+  and the old ref is `unknown_operation` after it. A caller that has
+  collected the result of a key nobody else can replay can `release` both.
 """
 
 from __future__ import annotations
@@ -160,8 +163,13 @@ _REMOVAL_WAIT_SECONDS = 30.0
 # workload's final output (a TERM handler's last words) before giving up.
 _FINAL_OUTPUT_SECONDS = 5.0
 
-# How long a terminal record keeps answering same-key starts, status and
-# observe before it is pruned. See the module docstring.
+# Then the exec client is given this long to exit before it is killed, so a
+# timeout settles even when the workload outlives a failed stop: at most
+# timeout + grace + 2s KILL wait + stop + these two windows after the start.
+_CLIENT_EXIT_SECONDS = 5.0
+
+# How long a terminal operation keeps answering status and observe before its
+# spool is reclaimed. Same-key replay outlives it; see the module docstring.
 RECORD_RETENTION_SECONDS = 3600.0
 
 # Prints the pid namespace of wherever `docker exec` runs, to compare with ours.
@@ -174,6 +182,14 @@ class _KeyLock:
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
+
+
+@dataclass(frozen=True)
+class _Replay:
+    """What a same-key start needs, kept for the workspace's lifetime."""
+
+    spec: OperationSpec
+    ref: OperationRef
 
 
 @dataclass
@@ -193,9 +209,13 @@ class _Operation:
     ended_at: str | None = None
     cancel_requested: bool = False
     escalated: bool = False
+    # The escalation's `docker stop` could not be run or reported failure.
+    stop_failed: bool = False
+    # The spec's timeout fired; kept here so a settlement retry still knows.
+    timed_out: bool = False
     # Every process seen as part of the operation at cancel, pid -> start.
     tracked: dict[str, str] = field(default_factory=dict)
-    # Why signalling could not be done, when cancel had to stop the container.
+    # Why signalling or stopping could not be done, `; `-joined.
     signal_failure: str | None = None
     collector: asyncio.Task[None] | None = None
     leader_known: asyncio.Event = field(default_factory=asyncio.Event)
@@ -238,7 +258,7 @@ class DockerOperations:
         self._docker = docker
         self._record_retention = record_retention_seconds
         self._operations: dict[str, _Operation] = {}
-        self._by_key: dict[tuple[str, str], _Operation] = {}
+        self._by_key: dict[tuple[str, str], _Replay] = {}
         # One lock per (workspace, operation_key) with a start in flight: a slow
         # credential resolver holds back only racing starts of the same key.
         self._launching: dict[tuple[str, str], _KeyLock] = {}
@@ -364,7 +384,7 @@ class DockerOperations:
             process.stdin.close()
         operation.collector = asyncio.create_task(self._collect(operation, process))
         self._operations[ref.operation_id] = operation
-        self._by_key[key] = operation
+        self._by_key[key] = _Replay(spec=spec, ref=ref)
         return ref
 
     def client_argv(
@@ -388,26 +408,32 @@ class DockerOperations:
         return bytes(operation.channels[0]), bytes(operation.channels[1])
 
     def release(self, ref: OperationRef) -> None:
-        """Drop a terminal record whose result the caller has collected.
+        """Drop a terminal operation and its replay record once collected.
 
-        For keys no other caller can replay, such as `execute`'s private ones;
-        a record that is not terminal yet is left to the retention window.
+        Only for keys no other caller can replay, such as `execute`'s private
+        ones; an operation that is not terminal yet is left to the retention
+        window and its replay record to `forget_workspace`.
         """
         operation = self._lookup(ref)
         if operation.state in TERMINAL_STATES:
-            self._forget(operation)
+            del self._operations[operation.ref.operation_id]
+            if (replay := self._by_key.get(operation.key)) is not None and replay.ref == ref:
+                del self._by_key[operation.key]
+
+    def forget_workspace(self, workspace_id: str) -> None:
+        """Drop every record of a destroyed workspace, replay records included."""
+        for operation in list(self._operations.values()):
+            if operation.key[0] == workspace_id:
+                del self._operations[operation.ref.operation_id]
+        for key in [key for key in self._by_key if key[0] == workspace_id]:
+            del self._by_key[key]
 
     def _prune_expired(self) -> None:
-        """Drop terminal records older than the retention window."""
+        """Reclaim terminal operations older than the window; replay records stay."""
         cutoff = asyncio.get_running_loop().time() - self._record_retention
         for operation in list(self._operations.values()):
             if operation.settled_at is not None and operation.settled_at <= cutoff:
-                self._forget(operation)
-
-    def _forget(self, operation: _Operation) -> None:
-        del self._operations[operation.ref.operation_id]
-        if self._by_key.get(operation.key) is operation:
-            del self._by_key[operation.key]
+                del self._operations[operation.ref.operation_id]
 
     async def _collect(self, operation: _Operation, process: asyncio.subprocess.Process) -> None:
         assert process.stdout is not None and process.stderr is not None  # both PIPE
@@ -417,25 +443,37 @@ class DockerOperations:
             self._read_stdout(operation, process.stdout),
             self._pump(operation, process.stderr, channel=1),
         )
-        timed_out = False
         try:
             async with asyncio.timeout(operation.spec.timeout_seconds):
                 await asyncio.shield(readers)
                 await process.wait()
         except TimeoutError:
-            timed_out = True
+            operation.timed_out = True
             try:
                 await self._terminate_group(operation, grace_seconds=1.0)
             except OperationFailure as e:
-                # Even `docker stop` could not be run. Record why and settle
-                # anyway: an unsettled operation would hold every drain forever.
-                operation.signal_failure = e.error.message
+                # Even `docker stop` failed. Record why and settle anyway: an
+                # unsettled operation would hold every drain forever.
+                self._note(operation, e.error.message)
             try:
                 async with asyncio.timeout(_FINAL_OUTPUT_SECONDS):
                     await asyncio.shield(readers)
             except TimeoutError:
                 pass
-            await process.wait()
+            try:
+                async with asyncio.timeout(_CLIENT_EXIT_SECONDS):
+                    await process.wait()
+            except TimeoutError:
+                # The workload outlived the stop. Detach from it, and say so.
+                # `wait` also waits for the pipes, which the workload still
+                # holds; closing the transport kills the client and drops them.
+                process._transport.close()  # type: ignore[attr-defined]  # noqa: SLF001
+                await process.wait()
+                self._note(
+                    operation,
+                    f"exec client still attached {_CLIENT_EXIT_SECONDS:g}s after the "
+                    "timeout's termination; detached, the workload may still be running",
+                )
         finally:
             if not readers.done():
                 readers.cancel()
@@ -443,7 +481,7 @@ class DockerOperations:
                     await readers
             operation.leader_known.set()
         operation.client_finished = True
-        await self._settle(operation, process.returncode, timed_out=timed_out, wait=True)
+        await self._settle(operation, process.returncode, wait=True)
 
     async def _read_stdout(self, operation: _Operation, stream: asyncio.StreamReader) -> None:
         try:
@@ -471,9 +509,15 @@ class DockerOperations:
             operation.channels[channel].extend(chunk)
         operation.changed.set()
 
-    async def _settle(
-        self, operation: _Operation, code: int | None, *, timed_out: bool, wait: bool
-    ) -> None:
+    @staticmethod
+    def _note(operation: _Operation, failure: str) -> None:
+        """Add to the recorded signalling and stopping failures."""
+        if operation.signal_failure is None:
+            operation.signal_failure = failure
+        else:
+            operation.signal_failure = f"{operation.signal_failure}; {failure}"
+
+    async def _settle(self, operation: _Operation, code: int | None, *, wait: bool) -> None:
         """Decide the terminal state; `wait` waits out a removal in progress."""
         if operation.state in TERMINAL_STATES:
             return
@@ -496,7 +540,7 @@ class DockerOperations:
         operation.ended_at = _now()
         if operation.cancel_requested:
             operation.state = "cancelled"
-        elif timed_out:
+        elif operation.timed_out:
             operation.state = "timed_out"
         elif presence == "gone":
             operation.state = "lost"
@@ -512,13 +556,15 @@ class DockerOperations:
         operation = self._lookup(ref)
         if operation.client_finished and operation.state not in TERMINAL_STATES:
             await self._presence(operation.container)  # raises provider_unavailable
-            await self._settle(operation, operation.exit_code, timed_out=False, wait=False)
+            await self._settle(operation, operation.exit_code, wait=False)
         return self._status(operation)
 
     def _status(self, operation: _Operation) -> OperationStatus:
         metadata = dict(operation.spec.metadata)
         if operation.escalated:
-            metadata["cancel_escalation"] = "container_stopped"
+            metadata["cancel_escalation"] = (
+                "container_stop_failed" if operation.stop_failed else "container_stopped"
+            )
         if operation.signal_failure is not None:
             metadata["cancel_signal_failure"] = operation.signal_failure
         if operation.state not in TERMINAL_STATES:
@@ -578,35 +624,59 @@ class DockerOperations:
         Each round re-reads the process table, refuses to signal the group of
         a leader whose pid was reused, and signals by pid every descendant
         that escaped the group, so a confirmed cancel means all of them died.
+        A docker client that cannot run while signalling also escalates. A
+        stop that cannot run or fails is recorded and raised as
+        provider_unavailable: the operation may still be running.
         """
         if operation.leader is not None and (refusal := await self._unsafe_leader(operation)):
             # Never signal init or our own group; stopping the container still
             # ends the operation, so a refusal escalates rather than raising.
-            operation.signal_failure = refusal
+            self._note(operation, refusal)
         elif operation.leader is not None:
-            pid, start = operation.leader
-            for sig, wait in (("TERM", grace_seconds), ("KILL", 2.0)):
-                code, out = await self._exec(
-                    operation.container, "sh", "-c", _PROCESSES, "aw-processes"
-                )
-                if code != 0:
-                    operation.signal_failure = f"process table: exit {code}: {out.strip()}"
-                    break
-                table = _parse_table(out)
-                operation.tracked.update(_members(table, pid, start, operation.tracked))
-                group = "" if _leader_reused(table, pid, start) else pid
-                pairs = [part for item in operation.tracked.items() for part in item]
-                code, out = await self._exec(
-                    operation.container, "sh", "-c", _SIGNAL, "aw-signal", sig, group, start, *pairs
-                )
-                if code != 0:
-                    operation.signal_failure = f"kill -{sig}: exit {code}: {out.strip()}"
-                    break
-                if await self._group_gone(operation, within=wait):
+            try:
+                if await self._signal_group(operation, *operation.leader, grace_seconds):
                     return
+            except OperationFailure as e:
+                self._note(operation, f"signalling: {e.error.message}")
         # No trusted or safe pid, or the operation would not die: escalate, and say so.
         operation.escalated = True
-        await self._docker_cmd("stop", "-t", "0", operation.container)
+        try:
+            code, out = await self._docker_cmd("stop", "-t", "0", operation.container)
+        except OperationFailure:
+            operation.stop_failed = True
+            raise
+        if code != 0:
+            operation.stop_failed = True
+            raise _error(
+                "provider_unavailable",
+                f"docker stop {operation.container}: exit {code}: {out.strip()}",
+                operation.ref,
+            )
+
+    async def _signal_group(
+        self, operation: _Operation, pid: str, start: str, grace_seconds: float
+    ) -> bool:
+        """TERM, then KILL; whether every process of the operation is confirmed gone."""
+        for sig, wait in (("TERM", grace_seconds), ("KILL", 2.0)):
+            code, out = await self._exec(
+                operation.container, "sh", "-c", _PROCESSES, "aw-processes"
+            )
+            if code != 0:
+                self._note(operation, f"process table: exit {code}: {out.strip()}")
+                return False
+            table = _parse_table(out)
+            operation.tracked.update(_members(table, pid, start, operation.tracked))
+            group = "" if _leader_reused(table, pid, start) else pid
+            pairs = [part for item in operation.tracked.items() for part in item]
+            code, out = await self._exec(
+                operation.container, "sh", "-c", _SIGNAL, "aw-signal", sig, group, start, *pairs
+            )
+            if code != 0:
+                self._note(operation, f"kill -{sig}: exit {code}: {out.strip()}")
+                return False
+            if await self._group_gone(operation, within=wait):
+                return True
+        return False
 
     async def _unsafe_leader(self, operation: _Operation) -> str | None:
         """Why the leader's group must not be signalled, or None when it may be.
@@ -614,19 +684,28 @@ class DockerOperations:
         Init and malformed pids are refused everywhere. Our own group is a
         hazard only where the signal lands in our pid namespace; in a
         container's own namespace an equal number names another process. A
-        namespace that cannot be read counts as ours, so doubt costs a
-        container stop, never a stray kill.
+        namespace that cannot be read, on either side, counts as ours, so
+        doubt costs a container stop, never a stray kill.
         """
         assert operation.leader is not None
         pid = operation.leader[0]
         if not pid.isdecimal() or int(pid) <= 1:
             return f"refusing unsafe process group {pid!r}"
-        if int(pid) == os.getpgrp():
+        if int(pid) != os.getpgrp():
+            return None
+        refusal = f"refusing unsafe process group {pid!r}: it is the caller's own group"
+        try:
+            ours = os.readlink("/proc/self/ns/pid")
+        except OSError as e:
+            return f"{refusal} (our pid namespace is unreadable: {e})"
+        try:
             code, out = await self._exec(
                 operation.container, "sh", "-c", _PID_NAMESPACE, "aw-pidns"
             )
-            if code != 0 or not out.strip() or out.strip() == os.readlink("/proc/self/ns/pid"):
-                return f"refusing unsafe process group {pid!r}: it is the caller's own group"
+        except OperationFailure as e:
+            return f"{refusal} (namespace probe failed: {e.error.message})"
+        if code != 0 or not out.strip() or out.strip() == ours:
+            return refusal
         return None
 
     async def _group_gone(self, operation: _Operation, *, within: float) -> bool:

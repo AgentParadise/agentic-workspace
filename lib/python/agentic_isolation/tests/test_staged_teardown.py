@@ -28,6 +28,7 @@ import pytest
 
 from agentic_isolation import SupportsStagedTeardown
 from agentic_isolation.providers.docker import WorkspaceDockerProvider
+from agentic_isolation.providers.docker_operations import DockerOperations
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 
 
@@ -64,6 +65,7 @@ def _provider() -> Any:
     p._workspaces = {}
     p._lock = asyncio.Lock()
     p._teardown_locks = {}
+    p._operations = DockerOperations(credentials=None, retention_bytes=1024, max_page_bytes=1024)
     return p
 
 
