@@ -184,20 +184,25 @@ class TestWorkspaceLocalProvider:
             await provider.destroy(workspace)
 
 
+def _local(workspace: AgenticWorkspace) -> AgenticWorkspace:
+    """The workspace on an opted-in Local provider; the registry's default refuses (W-6.2)."""
+    return AgenticWorkspace(workspace._config, provider=WorkspaceLocalProvider(allow_insecure=True))
+
+
 class TestAgenticWorkspaceLocal:
     """Tests for AgenticWorkspace with local provider."""
 
     @pytest.mark.asyncio
     async def test_context_manager(self) -> None:
         """Should work as async context manager."""
-        async with AgenticWorkspace.create(provider="local") as workspace:
+        async with _local(AgenticWorkspace.create(provider="local")) as workspace:
             assert workspace.id is not None
             assert workspace.path.exists()
 
     @pytest.mark.asyncio
     async def test_auto_cleanup(self) -> None:
         """Should cleanup workspace on exit."""
-        async with AgenticWorkspace.create(provider="local") as workspace:
+        async with _local(AgenticWorkspace.create(provider="local")) as workspace:
             path = workspace.path
             assert path.exists()
 
@@ -206,14 +211,14 @@ class TestAgenticWorkspaceLocal:
     @pytest.mark.asyncio
     async def test_execute_shorthand(self) -> None:
         """Should provide execute shorthand."""
-        async with AgenticWorkspace.create(provider="local") as workspace:
+        async with _local(AgenticWorkspace.create(provider="local")) as workspace:
             result = await workspace.execute("echo test")
             assert "test" in result.stdout
 
     @pytest.mark.asyncio
     async def test_file_operations(self) -> None:
         """Should provide file operation shorthands."""
-        async with AgenticWorkspace.create(provider="local") as workspace:
+        async with _local(AgenticWorkspace.create(provider="local")) as workspace:
             await workspace.write_file("test.py", "print('hello')")
             assert await workspace.file_exists("test.py")
 
@@ -224,16 +229,18 @@ class TestAgenticWorkspaceLocal:
     async def test_credentials_without_a_resolver_are_refused(self) -> None:
         """No resolver injected means a bound credential fails closed at create."""
         with pytest.raises(CredentialPolicyError, match="no CredentialResolver"):
-            async with AgenticWorkspace.create(
-                provider="local",
-                credentials=[host_env_credential("MY_SECRET")],
+            async with _local(
+                AgenticWorkspace.create(
+                    provider="local",
+                    credentials=[host_env_credential("MY_SECRET")],
+                )
             ):
                 pass
 
     @pytest.mark.asyncio
     async def test_to_dict(self) -> None:
         """Should convert to dictionary."""
-        async with AgenticWorkspace.create(provider="local") as workspace:
+        async with _local(AgenticWorkspace.create(provider="local")) as workspace:
             data = workspace.to_dict()
             assert "id" in data
             assert "provider" in data
