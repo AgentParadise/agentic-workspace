@@ -18,6 +18,7 @@ import signal
 import stat
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -37,8 +38,8 @@ from agentic_isolation.providers.base import (
     run_to_completion,
 )
 from agentic_isolation.providers.docker import WorkspaceDockerProvider
-from agentic_isolation.providers.docker_operations import DockerOperations
-from agentic_isolation.providers.operation_spool import OperationFailure
+from agentic_isolation.providers.docker_operations import DockerOperations, _Operation
+from agentic_isolation.providers.operation_spool import OperationFailure, OperationSpool
 
 # `exec` drops docker's own flags and runs the command here. `container
 # inspect` answers from $FAKE_DOCKER_STATE: absent = running, `removing` or
@@ -152,6 +153,32 @@ def _alive(pid: int) -> bool:
 def test_docker_provider_supports_operations_without_widening_the_base() -> None:
     assert isinstance(WorkspaceDockerProvider(), SupportsOperations)
     assert "start" not in WorkspaceProvider.__dict__
+
+
+@pytest.mark.parametrize("pid", ["0", "1", "-1", "bad", str(os.getpgrp())])
+async def test_cancel_refuses_unsafe_process_group(pid: str, docker_env: Path) -> None:
+    ops = _ops(docker_env)
+    ref = OperationRef(
+        workspace={"provider": "docker", "resource_id": "c1"},
+        operation_id="unsafe",
+        operation_key="unsafe",
+    )
+    operation = _Operation(
+        ref=ref,
+        spec=_spec("true"),
+        container="c1",
+        spool=OperationSpool(retention_bytes=1024),
+        started_at="now",
+        leader=(pid, "123"),
+    )
+    operation.leader_known.set()
+    ops._operations[ref.operation_id] = operation
+    command = AsyncMock()
+    ops._docker_cmd = command
+    with pytest.raises(OperationFailure, match="refusing unsafe process group") as caught:
+        await ops.cancel(ref, grace_seconds=0)
+    assert caught.value.error.kind == "provider_unavailable"
+    command.assert_not_awaited()
 
 
 async def test_a_start_returns_promptly_while_running(docker_env: Path) -> None:

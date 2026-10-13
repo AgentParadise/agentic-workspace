@@ -436,6 +436,12 @@ class DockerOperations:
         """TERM the group, KILL after the grace, confirm; else stop the container."""
         if operation.leader is not None:
             pid, start = operation.leader
+            # The host-side stand-in executes these signals in our namespace.
+            # Never let a malformed/reused leader target init or our own group.
+            if not pid.isdecimal() or int(pid) <= 1 or int(pid) == os.getpgrp():
+                raise _error(
+                    "provider_unavailable", f"refusing unsafe process group {pid!r}", operation.ref
+                )
             for sig, wait in (("TERM", grace_seconds), ("KILL", 2.0)):
                 await self._exec(operation.container, "kill", f"-{sig}", "--", f"-{pid}")
                 if await self._group_gone(operation.container, pid, start, within=wait):
