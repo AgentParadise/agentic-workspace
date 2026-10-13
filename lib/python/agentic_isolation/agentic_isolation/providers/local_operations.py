@@ -14,17 +14,21 @@ the process-group cancel. It mirrors `DockerOperations` without a container:
 - A launch marker is printed by a transient `sh` named by the marker's argv0,
   which the workload then replaces in place (the `_INNER` shape of Docker), so
   the line is first and is in neither the workload's argv nor its environment.
-- Every process the workload starts inherits an ownership token in its
-  environment, so a descendant that left the group and lost its parent is still
-  found. Processes are owned by pid plus start time; a pid whose start time
-  changed is a replacement and is never signalled.
+- The leader is a child subreaper (`PR_SET_CHILD_SUBREAPER`, kept across the
+  launcher's exec), so a descendant whose parent exits is reparented to the
+  leader, not to init, and stays on the leader's parent chain whatever its
+  session or environment. Every process the workload starts also inherits an
+  ownership token in its environment, for descendants that outlive the leader.
+  Processes are owned by pid plus start time; a pid whose start time changed
+  is a replacement and is never signalled.
 - Cancel refuses a group numbered <= 1 or equal to the caller's own group: the
   caller's namespace IS the workload's here, so the own-group check from
   `DockerOperations._unsafe_leader` is always real. A refusal still kills every
   owned process one by one, and reports the refusal in the status metadata. A
   group is only signalled while the leader is unreaped, so its id is still ours.
 - If an owned process survives KILL, the operation settles `failed`, never
-  `cancelled`, with the survivors named in the status metadata.
+  `cancelled`, with the survivors named in the status metadata. The collector
+  settles only once any cancel in progress has confirmed or failed.
 - Credential values reach only the workload's environment, never an argv.
 - Records live until `forget_workspace`; Local workspaces are short-lived and
   test-only, so there is no retention window.
@@ -34,10 +38,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import os
 import secrets
 import shutil
 import signal
+import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -73,6 +79,15 @@ OWNER_VARIABLE = "AGENTIC_LOCAL_OPERATION"
 # The named launcher: $0 is the marker's argv0, $1 its line, the rest the argv.
 _SHELL = "/bin/sh"
 _LAUNCHER = 'printf "%s\\n" "$1"; shift; exec "$@"'
+
+_PR_SET_CHILD_SUBREAPER = 36
+_libc = ctypes.CDLL(None, use_errno=True)
+
+
+def _become_subreaper() -> None:
+    """Run in the forked child before exec: orphaned descendants come to it."""
+    if _libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER) failed")
 
 
 def unsafe_group(pgid: int) -> str | None:
@@ -165,9 +180,9 @@ def _send(pid: int, start: int, sig: signal.Signals) -> None:
         os.close(fd)
 
 
-def _invalid_launch(spec: OperationSpec, env: dict[str, str]) -> str | None:
+def _invalid_launch(argv: tuple[str, ...], env: dict[str, str]) -> str | None:
     """Why the OS cannot launch this argv and environment, or None."""
-    if any("\0" in arg for arg in spec.argv):
+    if any("\0" in arg for arg in argv):
         return "argv contains a NUL byte"
     for name, value in env.items():
         if not name or "=" in name or "\0" in name:
@@ -178,11 +193,18 @@ def _invalid_launch(spec: OperationSpec, env: dict[str, str]) -> str | None:
 
 
 def _resolvable(program: str, cwd: Path, env: dict[str, str]) -> bool:
-    """Whether exec would find `program`, checked before the launcher runs it."""
+    """Whether exec would find `program`, checked before the launcher runs it.
+
+    Relative and empty PATH entries are taken from `cwd`, where the launcher
+    runs, not from this process's own working directory.
+    """
     if "/" in program:
         path = cwd / program
         return path.is_file() and os.access(path, os.X_OK)
-    return shutil.which(program, path=env.get("PATH", os.defpath)) is not None
+    search = os.pathsep.join(
+        str(cwd / entry) for entry in env.get("PATH", os.defpath).split(os.pathsep)
+    )
+    return shutil.which(program, path=search) is not None
 
 
 @dataclass
@@ -205,6 +227,8 @@ class _Operation:
     tracked: dict[int, int] = field(default_factory=dict)
     signal_failure: str | None = None
     unconfirmed: bool = False
+    # Held while a cancel or timeout signals and confirms; settling waits on it.
+    stopping: asyncio.Lock = field(default_factory=asyncio.Lock)
     collector: asyncio.Task[None] | None = None
 
 
@@ -294,7 +318,11 @@ class LocalOperations:
                     "credential bindings need a CredentialResolver; none was injected",
                 )
             env[binding.target] = await self._credentials.resolve(binding.ref)
-        if reason := _invalid_launch(spec, env):
+        argv: tuple[str, ...] = spec.argv
+        if isinstance(spec.launch_marker, LaunchMarker):
+            marker = spec.launch_marker
+            argv = (_SHELL, "-c", _LAUNCHER, marker.argv0, marker.line, *spec.argv)
+        if reason := _invalid_launch(argv, env):
             raise _error("rejected_policy", f"cannot launch {spec.argv[0]!r}: {reason}")
         try:
             cwd.mkdir(parents=True, exist_ok=True)
@@ -303,13 +331,9 @@ class LocalOperations:
                 "rejected_policy",
                 f"working_directory {spec.working_directory!r} cannot be prepared: {e}",
             ) from e
-        argv: tuple[str, ...] = spec.argv
-        if isinstance(spec.launch_marker, LaunchMarker):
-            # The launcher reports exec failure as exit 127, after acceptance.
-            if not _resolvable(spec.argv[0], cwd, env):
-                raise _error("provider_unavailable", f"could not launch {spec.argv[0]!r}")
-            marker = spec.launch_marker
-            argv = (_SHELL, "-c", _LAUNCHER, marker.argv0, marker.line, *spec.argv)
+        # The launcher reports exec failure as exit 127, after acceptance.
+        if argv is not spec.argv and not _resolvable(spec.argv[0], cwd, env):
+            raise _error("provider_unavailable", f"could not launch {spec.argv[0]!r}")
         token = secrets.token_hex(16)
         env[OWNER_VARIABLE] = token
         try:
@@ -321,8 +345,9 @@ class LocalOperations:
                 cwd=str(cwd),
                 env=env,
                 start_new_session=True,
+                preexec_fn=_become_subreaper,
             )
-        except OSError as e:
+        except (OSError, subprocess.SubprocessError) as e:
             raise _error("provider_unavailable", f"could not launch {spec.argv[0]!r}: {e}") from e
         self._sequence += 1
         ref = OperationRef(
@@ -365,7 +390,9 @@ class LocalOperations:
                 reader.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await reader
-        self._settle(operation, process.returncode)
+        # A cancel still confirming decides between cancelled and failed.
+        async with operation.stopping:
+            self._settle(operation, process.returncode)
 
     async def _pump(self, operation: _Operation, stream: asyncio.StreamReader) -> None:
         while chunk := await stream.read(65536):
@@ -452,6 +479,10 @@ class LocalOperations:
         owned processes are signalled one by one and the refusal is recorded.
         Survivors of KILL mark the operation unconfirmed, so it settles failed.
         """
+        async with operation.stopping:
+            await self._signal_and_confirm(operation, grace_seconds=grace_seconds)
+
+    async def _signal_and_confirm(self, operation: _Operation, *, grace_seconds: float) -> None:
         pgid = operation.process.pid
         if refusal := unsafe_group(pgid):
             self._note(operation, refusal)

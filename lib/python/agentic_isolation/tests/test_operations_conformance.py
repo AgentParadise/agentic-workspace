@@ -438,14 +438,18 @@ async def test_local_credential_binding_reaches_env_but_never_argv(tmp_path: Pat
     await provider.destroy(workspace)
 
 
-async def test_local_cancel_kills_an_orphan_that_detached_before_cancel(tmp_path: Path) -> None:
-    """A daemon whose intermediate parent exited before cancel is still owned."""
+@pytest.mark.parametrize("launch", ["", "env -i "], ids=["inherited-env", "clean-env"])
+async def test_local_cancel_kills_an_orphan_that_detached_before_cancel(
+    tmp_path: Path, launch: str
+) -> None:
+    """A daemon whose intermediate parent exited before cancel is still owned,
+    even when it was started without the workload's environment."""
     provider = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
     workspace = await provider.create(WorkspaceConfig())
     orphan, middle, bystander = tmp_path / "orphan", tmp_path / "middle", tmp_path / "bystander"
     script = (
-        f"sh -c 'echo $$ > {middle}; setsid sleep 300 >/dev/null 2>&1 & echo $! > {orphan}'; "
-        "exec sleep 300"
+        f"sh -c 'echo $$ > {middle}; {launch}setsid sleep 300 >/dev/null 2>&1 & "
+        f"echo $! > {orphan}'; exec sleep 300"
     )
     async with _bounded():
         other = await provider.start(
@@ -463,6 +467,46 @@ async def test_local_cancel_kills_an_orphan_that_detached_before_cancel(tmp_path
         assert (await provider.cancel(ref, grace_seconds=0.5)).state == "cancelled"
         assert _alive(bystander_pid)
         assert (await provider.status(other)).state == "running"
+    await provider.destroy(workspace)
+
+
+async def test_local_cancel_with_a_surviving_orphan_settles_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The collector sees the leader die first, yet cancel and status say failed."""
+    provider = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
+    workspace = await provider.create(WorkspaceConfig())
+    orphan, middle = tmp_path / "orphan", tmp_path / "middle"
+    script = (
+        f"sh -c 'echo $$ > {middle}; setsid sleep 300 >/dev/null 2>&1 & echo $! > {orphan}'; "
+        "exec sleep 300"
+    )
+    real_send = local_operations._send
+    orphan_pid = 0
+    try:
+        async with _bounded():
+            ref = await provider.start(workspace, _spec(script))
+            (orphan_pid,) = await _wait_for_pids(orphan, 1)
+            (middle_pid,) = await _wait_for_pids(middle, 1)
+            while _alive(middle_pid):
+                await asyncio.sleep(0.05)
+            # The orphan cannot be signalled; the leader's group still can.
+            monkeypatch.setattr(
+                local_operations,
+                "_send",
+                lambda pid, start, sig: None if pid == orphan_pid else real_send(pid, start, sig),
+            )
+            monkeypatch.setattr(local_operations, "_KILL_WAIT_SECONDS", 0.2)
+            cancelled = await provider.cancel(ref, grace_seconds=0.2)
+            assert _alive(orphan_pid)
+            assert cancelled.state == "failed"
+            assert str(orphan_pid) in cancelled.metadata["cancel_signal_failure"]
+            assert (await provider.status(ref)).state == "failed"
+            assert (await provider.cancel(ref, grace_seconds=0.2)).state == "failed"
+    finally:
+        monkeypatch.setattr(local_operations, "_send", real_send)
+        if orphan_pid and _alive(orphan_pid):
+            os.kill(orphan_pid, signal.SIGKILL)
     await provider.destroy(workspace)
 
 
@@ -626,4 +670,47 @@ async def test_local_marker_comes_from_a_named_launcher_the_workload_replaces(
     assert lines[2].split()[:2] == ["sh", "-c"]
     assert marker.line not in "\n".join(lines[2:])
     assert marker.argv0 not in "\n".join(lines[2:])
+    await provider.destroy(workspace)
+
+
+@pytest.mark.parametrize("field", ["argv0", "line"])
+async def test_local_unlaunchable_marker_is_a_typed_rejection(tmp_path: Path, field: str) -> None:
+    provider = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
+    workspace = await provider.create(WorkspaceConfig())
+    values = {"argv0": "aw-launch", "line": "AW_LAUNCH"}
+    values[field] += "\u0000"
+    bad = _spec("echo bad", launch_marker=LaunchMarker(**values))
+    bad = OperationSpec.model_validate_json(bad.model_dump_json())
+    async with _bounded():
+        with pytest.raises(OperationFailure) as caught:
+            await provider.start(workspace, bad)
+        assert caught.value.error.kind == "rejected_policy"
+        assert provider._operations._operations == {}
+        fixed = _spec("echo fixed", launch_marker=LaunchMarker(argv0="aw-launch", line="AW_LAUNCH"))
+        _, output = await run_to_completion(provider, workspace, fixed)
+    assert output == b"AW_LAUNCH\nfixed\n"
+    await provider.destroy(workspace)
+
+
+async def test_local_marker_finds_a_program_on_a_workspace_relative_path(tmp_path: Path) -> None:
+    """Relative PATH entries resolve in the operation's directory, marked or not."""
+    provider = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
+    workspace = await provider.create(WorkspaceConfig())
+    program = workspace.path / "bin" / "aw-program"
+    program.parent.mkdir()
+    program.write_text("#!/bin/sh\necho ran\n")
+    program.chmod(0o755)
+    marker = LaunchMarker(argv0="aw-launch", line="AW_LAUNCH")
+    async with _bounded():
+        plain = _spec("", key="plain", argv=("aw-program",), environment={"PATH": "bin"})
+        _, output = await run_to_completion(provider, workspace, plain)
+        assert output == b"ran\n"
+        marked = _spec("", key="marked", argv=("aw-program",), environment={"PATH": "bin"})
+        marked = marked.model_copy(update={"launch_marker": marker})
+        _, output = await run_to_completion(provider, workspace, marked)
+        assert output == b"AW_LAUNCH\nran\n"
+        missing = _spec("", key="missing", argv=("aw-absent",), launch_marker=marker)
+        with pytest.raises(OperationFailure) as caught:
+            await provider.start(workspace, missing)
+        assert caught.value.error.kind == "provider_unavailable"
     await provider.destroy(workspace)
