@@ -53,6 +53,7 @@ from scripted_agent.recording import Recording
 
 PROFILE_PATH_ENV: Final = "SYN_SCRIPTED_AGENT_PROFILE_PATH"
 TAGS_ENV: Final = "AGENTIC_SESSION_STORE_TAGS"
+_CHUNK: Final = 1 << 20
 
 Run = Callable[[Sequence[str], Path | None], str]
 """Run a command in a directory and return its stdout; raise ``SideEffectFailed``."""
@@ -165,7 +166,8 @@ def _run_workload(phase: ScriptedPhase, repo: Path, run: Run) -> None:
     elif isinstance(workload, SyntheticWorkload):
         held = bytearray(workload.mem_bytes)
         with tempfile.TemporaryFile() as disk:
-            disk.write(bytes(workload.disk_bytes))
+            for offset in range(0, workload.disk_bytes, _CHUNK):
+                disk.write(bytes(min(_CHUNK, workload.disk_bytes - offset)))
             disk.flush()
             os.fsync(disk.fileno())
             start = time.process_time()
