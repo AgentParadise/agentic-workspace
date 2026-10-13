@@ -44,11 +44,16 @@ class TeardownReport:
 
     `finalization.state` is what a caller dispatches on:
     - `completed`: the workspace is gone.
-    - `retained`: `before_delete` failed after the container was removed. The
-      workspace directory is kept, and `finalization.retained` is the ref a
-      retry passes back to `teardown`.
+    - `retained`: the container is removed but the workspace directory is
+      not, because `before_delete` failed or the directory could not be
+      deleted (then `usage.delete_failures` names what remained).
+      `finalization.retained` is the ref a retry passes back to `teardown`.
     - `failed` at `while_running`: nothing was destroyed and the workspace is
       still registered, so the same call can be retried.
+
+    `completed` is only reported once the directory is confirmed absent. A
+    provider that cannot remove the workspace's compute (Docker: `docker rm`
+    failing) raises instead, leaving the workspace registered as live.
     """
 
     finalization: FinalizationOutcome

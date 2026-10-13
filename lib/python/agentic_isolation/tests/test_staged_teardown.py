@@ -22,13 +22,19 @@ Hermetic - no Docker daemon.
 from __future__ import annotations
 
 import asyncio
+import shutil
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from agentic_isolation import SupportsStagedTeardown, TeardownReport, TeardownUsage
 from agentic_isolation.contract import MISSING, WorkspaceRef
-from agentic_isolation.providers.docker import WorkspaceDockerProvider, _usage_from_cgroup
+from agentic_isolation.providers.docker import (
+    ContainerRemovalError,
+    WorkspaceDockerProvider,
+    _usage_from_cgroup,
+)
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 
 
@@ -101,7 +107,7 @@ class TestHooksRunAtTheSafePoints:
         assert seq.index("HOOK while_running") < seq.index("docker stop")
 
     def test_before_delete_runs_after_removal_and_before_deletion(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         seq: list[str] = []
         _record(monkeypatch, seq)
@@ -119,7 +125,7 @@ class TestHooksRunAtTheSafePoints:
         assert seen["spool_present"], "the archive hook must still see the spool"
         assert not d.exists(), "the workspace is deleted once archiving succeeded"
 
-    def test_full_order(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    def test_full_order(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         seq: list[str] = []
         _record(monkeypatch, seq)
         d = tmp_path / "ws"
@@ -153,7 +159,7 @@ class TestFailedArchiveRetainsTheData:
     """The property the whole design exists for."""
 
     def test_workspace_survives_a_failing_before_delete(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         _record(monkeypatch, [])
         d = tmp_path / "ws"
@@ -173,7 +179,7 @@ class TestFailedArchiveRetainsTheData:
         assert (d / "spool.jsonl").exists()
 
     def test_container_is_still_torn_down_when_archiving_fails(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         seq: list[str] = []
         _record(monkeypatch, seq)
@@ -236,7 +242,7 @@ class TestRegistryIsNotLeaked:
         assert provider._workspaces == {ws.id: ws}
 
     def test_a_failed_before_delete_KEEPS_the_workspace_resolvable(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         # Reverses an earlier version of this test, which asserted the
         # registration was DROPPED here (plan finding B2). The container is
@@ -266,7 +272,7 @@ class TestRetainedThenRetried:
     """Plan section 7 row 6: retain on a failed archive, then retry by ref."""
 
     def test_retry_by_ref_completes_and_deletes(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         seq: list[str] = []
         _record(monkeypatch, seq)
@@ -304,7 +310,7 @@ class TestRetainedThenRetried:
             provider._resolve_teardown_target(first.finalization.retained)
 
     def test_a_ref_to_a_live_workspace_resolves_after_a_failed_while_running(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         seq: list[str] = []
         _record(monkeypatch, seq)
@@ -328,10 +334,78 @@ class TestRetainedThenRetried:
         with pytest.raises(LookupError):
             asyncio.run(_provider().teardown(WorkspaceRef(provider="docker", resource_id="nope")))
 
+    def test_a_directory_that_cannot_be_deleted_is_retained_not_completed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _record(monkeypatch, [])
+        provider = _provider()
+        d = tmp_path / "ws"
+        d.mkdir()
+        (d / "spool.jsonl").write_text("transcript")
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+
+        real_rmtree = shutil.rmtree
+
+        def _denied(path: str) -> None:
+            raise PermissionError(f"cannot delete {path}")
+
+        monkeypatch.setattr(shutil, "rmtree", _denied)
+        first = asyncio.run(provider.teardown(ws))
+        assert first.finalization.state == "retained", first
+        assert first.finalization.stage == "before_delete"
+        assert first.usage.delete_failures is not None
+        assert "PermissionError" in first.usage.delete_failures[0]
+        assert d.exists()
+        ref = WorkspaceRef(provider="docker", resource_id=ws._handle)
+        assert first.finalization.retained == ref
+        assert provider._resolve_teardown_target(ref) is ws
+
+        monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+        second = asyncio.run(provider.teardown(ref))
+        assert second.finalization.state == "completed"
+        assert not d.exists(), "completed must mean the directory is gone"
+        with pytest.raises(LookupError):
+            provider._resolve_teardown_target(ref)
+
+    def test_failed_container_removal_archives_and_deletes_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        rm_exit = [1]
+
+        async def _spawn(*argv: str, **_k: object) -> _Proc:
+            return _ExitProc(rm_exit[0]) if argv[1] == "rm" else _Proc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+        provider = _provider()
+        d = tmp_path / "ws"
+        d.mkdir()
+        (d / "spool.jsonl").write_text("transcript")
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+        archived: list[bool] = []
+
+        async def _archives() -> None:
+            archived.append(True)
+
+        with pytest.raises(ContainerRemovalError):
+            asyncio.run(provider.teardown(ws, before_delete=_archives))
+        assert archived == [], "before_delete ran while the container may still exist"
+        assert d.exists()
+        assert provider._workspaces == {ws.id: ws}, "the live registration was dropped"
+        assert provider._retained == {}
+
+        rm_exit[0] = 0
+        ref = WorkspaceRef(provider="docker", resource_id=ws._handle)
+        report = asyncio.run(provider.teardown(ref, before_delete=_archives))
+        assert report.finalization.state == "completed"
+        assert archived == [True]
+        assert not d.exists()
+
 
 class TestDestroyIsUnchanged:
     def test_destroy_still_stops_removes_and_deletes(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         seq: list[str] = []
         _record(monkeypatch, seq)
@@ -404,7 +478,7 @@ class TestAsyncFailureModes:
 
         asyncio.run(_main())
 
-    def test_concurrent_teardown_cannot_delete_during_an_archive(self, tmp_path: Any) -> None:
+    def test_concurrent_teardown_cannot_delete_during_an_archive(self, tmp_path: Path) -> None:
         """A second teardown must wait, not race the first one's archive."""
 
         async def _main() -> None:
@@ -453,6 +527,72 @@ class TestAsyncFailureModes:
             assert not d.exists()
 
         asyncio.run(_main())
+
+    def test_a_third_caller_waits_for_the_second_archive(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The lock entry survives while a woken waiter has not yet resumed."""
+        _record(monkeypatch, [])
+
+        async def _main() -> None:
+            provider = _provider()
+            d = tmp_path / "ws"
+            d.mkdir()
+            (d / "spool.jsonl").write_text("transcript")
+            ws = _Workspace(workspace_dir=str(d))
+            provider._workspaces[ws.id] = ws
+            first_started = asyncio.Event()
+            first_release = asyncio.Event()
+            second_started = asyncio.Event()
+            second_release = asyncio.Event()
+            order: list[str] = []
+
+            async def _first_archive() -> None:
+                first_started.set()
+                await first_release.wait()
+                raise RuntimeError("store unreachable")
+
+            async def _second_archive() -> None:
+                second_started.set()
+                await second_release.wait()
+                order.append("second archived")
+
+            first = asyncio.create_task(provider.teardown(ws, before_delete=_first_archive))
+            await first_started.wait()
+            second = asyncio.create_task(provider.teardown(ws, before_delete=_second_archive))
+            await asyncio.sleep(0)
+            first_release.set()
+            first_report = await first
+            assert first_report.finalization.retained is not MISSING
+            await second_started.wait()
+            third = asyncio.create_task(provider.teardown(first_report.finalization.retained))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert not third.done(), "the third caller ran during the second archive"
+            assert (d / "spool.jsonl").exists(), "the spool was deleted mid-archive"
+            second_release.set()
+            second_report = await second
+            order.append("second done")
+            # The third caller resolved its ref before waiting, then finds the
+            # directory already gone: deletion is idempotent.
+            third_report = await third
+            assert second_report.finalization.state == "completed"
+            assert third_report.finalization.state == "completed"
+            assert order == ["second archived", "second done"]
+            assert not d.exists()
+            assert provider._teardown_locks == {}
+
+        asyncio.run(_main())
+
+
+class _ExitProc(_Proc):
+    """A finished `docker` call that exited with `code`."""
+
+    def __init__(self, code: int) -> None:
+        self.returncode = code
+
+    async def wait(self) -> int:
+        return self.returncode
 
 
 class _Reader:
@@ -520,7 +660,7 @@ class TestUsageReachesTheReport:
         )
 
     def test_a_retry_reports_the_usage_measured_before_the_container_went(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         self._docker(monkeypatch, b"false\n")
         provider = _provider()

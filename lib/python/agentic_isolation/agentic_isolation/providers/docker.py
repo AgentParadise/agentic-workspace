@@ -23,7 +23,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -150,7 +150,7 @@ class WorkspaceDockerProvider(BaseProvider):
         # One teardown at a time per workspace. Concurrent teardowns would
         # otherwise race, and one could delete a directory another is still
         # archiving from.
-        self._teardown_locks: dict[str, asyncio.Lock] = {}
+        self._teardown_locks: dict[str, _TeardownLock] = {}
         self._lock = asyncio.Lock()
         self._operations = DockerOperations(
             credentials=credentials,
@@ -874,19 +874,25 @@ class WorkspaceDockerProvider(BaseProvider):
         # is still inside a slow `before_delete` - which would break the
         # retention guarantee from the outside rather than from a bug in this
         # function.
-        lock = self._teardown_lock_for(workspace.id)
-        async with lock:
-            report = await self._teardown_locked(
-                workspace, while_running=while_running, before_delete=before_delete
-            )
-        # Drop the lock entry only once nobody else holds or wants it. Removing
-        # it any earlier - in particular inside the teardown, which an earlier
-        # version did - lets the next caller build a FRESH lock and run
-        # concurrently, which defeats the whole point: it could delete the
-        # workspace directory while this call was still archiving from it.
-        if not lock.locked():
-            self._teardown_locks.pop(workspace.id, None)
-        return report
+        entry = self._teardown_locks.get(workspace.id)
+        if entry is None:
+            entry = self._teardown_locks[workspace.id] = _TeardownLock()
+        entry.users += 1
+        try:
+            async with entry.lock:
+                return await self._teardown_locked(
+                    workspace, while_running=while_running, before_delete=before_delete
+                )
+        finally:
+            # Drop the entry only once no caller holds it or waits on it.
+            # `lock.locked()` cannot tell: a waiter woken by `release()` does
+            # not hold the lock until it resumes, so a third caller arriving in
+            # that gap would build a FRESH lock and could delete the directory
+            # while the second was still archiving from it. The count includes
+            # waiters and is decremented on cancellation too.
+            entry.users -= 1
+            if entry.users == 0:
+                self._teardown_locks.pop(workspace.id, None)
 
     def _resolve_teardown_target(self, target: Workspace | WorkspaceRef) -> Workspace:
         """The workspace a ref names: a retained one first, else a live one."""
@@ -900,14 +906,6 @@ class WorkspaceDockerProvider(BaseProvider):
                 if workspace._handle == target.resource_id:
                     return workspace
         raise LookupError(f"no workspace for {target.provider}:{target.resource_id}")
-
-    def _teardown_lock_for(self, workspace_id: str) -> asyncio.Lock:
-        """One lock per workspace id, created on first use."""
-        lock = self._teardown_locks.get(workspace_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._teardown_locks[workspace_id] = lock
-        return lock
 
     async def _teardown_locked(
         self,
@@ -939,6 +937,7 @@ class WorkspaceDockerProvider(BaseProvider):
 
             # Before the stop: the container's cgroup goes with it.
             usage = await self._measure_usage(container_name)
+            removed = False
             try:
                 await self._stop(container_name)
             finally:
@@ -954,14 +953,25 @@ class WorkspaceDockerProvider(BaseProvider):
                 # SECOND cancellation arriving while removal is in flight,
                 # which is cheap to hold onto and would otherwise leak a
                 # container.
-                await asyncio.shield(self._remove(container_name))
+                removed = await asyncio.shield(self._remove(container_name))
                 # The registration MOVES rather than drops: the container is
                 # gone, but the directory is not until the delete below. A
                 # failed or cancelled `before_delete` leaves the entry here, so
                 # the ref it is reported under still resolves for a retry.
-                async with self._lock:
-                    self._workspaces.pop(workspace.id, None)
-                    self._retained[container_name] = _Retained(workspace, usage)
+                # Only once removal is confirmed: a container `docker rm`
+                # failed on may still be running against the directory.
+                if removed:
+                    async with self._lock:
+                        self._workspaces.pop(workspace.id, None)
+                        self._retained[container_name] = _Retained(workspace, usage)
+            if not removed:
+                # Still registered as live, so `teardown(ref)` retries the
+                # whole sequence. Nothing was archived or deleted.
+                raise ContainerRemovalError(
+                    f"docker rm -f {container_name} failed; the container may still "
+                    f"exist and workspace {workspace.id} was kept. Retry teardown by "
+                    "ref once the Docker daemon is reachable."
+                )
 
         if before_delete is not None:
             # The container is gone but the spool is still on disk. Any
@@ -982,7 +992,25 @@ class WorkspaceDockerProvider(BaseProvider):
                     usage=usage,
                 )
 
-        self._delete_workspace_dir(workspace)
+        delete_failures = self._delete_workspace_dir(workspace)
+        if delete_failures:
+            # `completed` would claim a directory that is still on disk, so the
+            # workspace stays retained under the same ref for a retry.
+            logger.warning(
+                "teardown could not delete workspace %s: %s", workspace.id, delete_failures
+            )
+            return TeardownReport(
+                finalization=FinalizationOutcome(
+                    state="retained",
+                    stage="before_delete",
+                    error=OperationError(
+                        kind="internal",
+                        message=f"workspace directory deletion failed: {delete_failures[0]}",
+                    ),
+                    retained=ref,
+                ),
+                usage=replace(usage, delete_failures=delete_failures),
+            )
         async with self._lock:
             self._retained.pop(container_name, None)
         return TeardownReport(finalization=FinalizationOutcome(state="completed"), usage=usage)
@@ -1038,11 +1066,23 @@ class WorkspaceDockerProvider(BaseProvider):
             return None
         return out.decode(errors="replace")
 
-    def _delete_workspace_dir(self, workspace: Workspace) -> None:
-        """Delete the host workspace directory. Irreversible."""
+    def _delete_workspace_dir(self, workspace: Workspace) -> tuple[str, ...]:
+        """Delete the host workspace directory. Irreversible.
+
+        Returns what could not be deleted, empty when the directory is gone. An
+        already absent directory is success, so a retry is idempotent.
+        """
         workspace_dir = workspace.metadata.get("workspace_dir")
-        if workspace_dir:
-            shutil.rmtree(workspace_dir, ignore_errors=True)
+        if not workspace_dir:
+            return ()
+        error: OSError | None = None
+        try:
+            shutil.rmtree(workspace_dir)
+        except OSError as exc:
+            error = exc
+        if not os.path.lexists(workspace_dir):
+            return ()
+        return (f"{workspace_dir}: {error!r}" if error else f"{workspace_dir}: still present",)
 
     async def _stop(self, container_name: str) -> None:
         """`docker stop`, then snapshot the logs it caused to be written."""
@@ -1074,8 +1114,13 @@ class WorkspaceDockerProvider(BaseProvider):
             container_name, await self._read_container_logs(container_name, tail=200)
         )
 
-    async def _remove(self, container_name: str) -> None:
-        """`docker rm -f`."""
+    async def _remove(self, container_name: str) -> bool:
+        """`docker rm -f`. True when the container is gone.
+
+        `rm -f` exits 0 for a container that is already absent, so a nonzero
+        exit is a real failure (daemon unreachable, removal refused), not a
+        missing container.
+        """
         proc = await asyncio.create_subprocess_exec(
             "docker",
             "rm",
@@ -1084,7 +1129,7 @@ class WorkspaceDockerProvider(BaseProvider):
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        await proc.wait()
+        return await proc.wait() == 0
 
     async def _cleanup_container(self, container_name: str) -> None:
         """Stop and remove a container.
@@ -1094,7 +1139,20 @@ class WorkspaceDockerProvider(BaseProvider):
         differently.
         """
         await self._stop(container_name)
-        await self._remove(container_name)
+        if not await self._remove(container_name):
+            logger.warning("docker rm -f %s failed; the container may still exist", container_name)
+
+
+class ContainerRemovalError(RuntimeError):
+    """`docker rm` failed during teardown. The workspace is still registered."""
+
+
+@dataclass
+class _TeardownLock:
+    """A workspace's teardown lock and how many callers hold or await it."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
 
 
 @dataclass(frozen=True)
