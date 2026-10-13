@@ -398,7 +398,6 @@ class _TaskResult(_Contract):
     review_verdict: ReviewVerdictName | None = None
 
 
-
 def _walk(
     verdicts: Mapping[str, ReviewVerdictName | None],
 ) -> tuple[tuple[str, ...], ReviewVerdictName | None]:

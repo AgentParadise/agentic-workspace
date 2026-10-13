@@ -1,0 +1,405 @@
+"""The replayer, driven end to end the way a load-test workspace runs it."""
+
+from __future__ import annotations
+
+import io
+import json
+import socket
+from collections.abc import Iterator, Sequence
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+import pytest
+
+from scripted_agent import cli
+from scripted_agent.cli import PROFILE_PATH_ENV, TAGS_ENV, replay
+from scripted_agent.errors import RecordingRefused, SideEffectFailed
+from scripted_agent.profile import SCRIPTED_AGENT_MODEL, SCRIPTED_AGENT_PROFILE_ENV
+
+REPO = Path(__file__).resolve().parents[4]
+RECORDING = (
+    REPO
+    / "implementations/docker/images/claude-cli/fixtures/recordings"
+    / "v2.0.74_claude-sonnet-4-5_multi-tool.jsonl"
+)
+"""Captured from CLI 2.0.74; two tool uses; models claude-sonnet-4-5 and claude-haiku-4-5."""
+
+FIXTURE = "example-org/loadtest-fixture"
+HEAD = "3b7f2bd49a4609f24a516bb4617aadbc1edf751e"
+PR_URL = f"https://github.com/{FIXTURE}/pull/4217"
+BASE_URL = "http://envoy-sink.internal:10000"
+
+
+def _stream(**overrides: Any) -> dict[str, Any]:
+    return {
+        "harness": "claude",
+        "recording": str(RECORDING),
+        "cli_version": "2.0.74",
+        "tool_uses": 2,
+        "pacing_factor": 0.5,
+        **overrides,
+    }
+
+
+def _phase(side_effect: str, artifact: str, **overrides: Any) -> dict[str, Any]:
+    return {
+        "stream": _stream(),
+        "workload": {"kind": "none"},
+        "side_effect": {"kind": side_effect},
+        "artifact": artifact,
+        **overrides,
+    }
+
+
+def _profile(**phase_overrides: Any) -> dict[str, Any]:
+    return {
+        "tier": "node",
+        "fixture_repo": FIXTURE,
+        "phases": {
+            "implement": _phase(
+                "open_draft_pull_request",
+                "Pushed {branch} at {head_sha}, PR {pull_request}.",
+                **phase_overrides,
+            ),
+            "review": _phase("report_only", "Verdict {review_verdict}.", review_verdict="blocked"),
+            "fix": _phase("push_branch", "Fixed on {branch}."),
+            "reverify": _phase(
+                "report_only", "Verdict {review_verdict}.", review_verdict="certified"
+            ),
+            "fix_2": _phase("push_branch", "Never runs."),
+            "finalize_pr": _phase(
+                "mark_pull_request_ready",
+                "{outcome} after {repair_rounds} repair round(s); {pull_request}.",
+            ),
+        },
+    }
+
+
+class FakeGit:
+    """Git and gh as the fixture repository answers them; records every call."""
+
+    def __init__(self, *, branch_exists: bool = True) -> None:
+        self.calls: list[tuple[list[str], Path | None]] = []
+        self.branch_exists = branch_exists
+
+    def __call__(self, argv: Sequence[str], cwd: Path | None) -> str:
+        self.calls.append((list(argv), cwd))
+        match list(argv):
+            case ["git", "ls-remote", *_]:
+                return f"{HEAD}\trefs/heads/x\n" if self.branch_exists else ""
+            case ["git", "push", *_]:
+                self.branch_exists = True
+            case ["gh", "pr", "create", *_]:
+                return f"Creating draft pull request\n{PR_URL}\n"
+            case ["gh", "pr", "view", *_]:
+                return f"{PR_URL}\n"
+        return ""
+
+    def argvs(self) -> list[list[str]]:
+        return [argv for argv, _ in self.calls]
+
+
+def _env(phase_id: str, profile: dict[str, Any] | None = None) -> dict[str, str]:
+    return {
+        SCRIPTED_AGENT_PROFILE_ENV: json.dumps(profile or _profile()),
+        TAGS_ENV: f"execution_id:exec-1a2b,workspace_id:ws-1,phase_id:{phase_id}",
+        "ANTHROPIC_BASE_URL": BASE_URL,
+    }
+
+
+def _replay(
+    environ: dict[str, str], tmp_path: Path, git: FakeGit | None = None
+) -> tuple[list[dict[str, Any]], list[float], FakeGit]:
+    git = git or FakeGit()
+    slept: list[float] = []
+    out = io.StringIO()
+    (tmp_path / "repos" / "loadtest-fixture").mkdir(parents=True, exist_ok=True)
+    replay(environ, tmp_path, git, slept.append, out)
+    return [json.loads(line) for line in out.getvalue().splitlines()], slept, git
+
+
+def _models(value: Any) -> Iterator[str]:
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k == "model" and isinstance(v, str):
+                yield v
+            if k == "modelUsage" and isinstance(v, dict):
+                yield from v
+            yield from _models(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _models(v)
+
+
+# --- zero tokens -------------------------------------------------------------
+
+
+@pytest.fixture
+def no_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Fail on any connection to a host other than ANTHROPIC_BASE_URL's."""
+    allowed = urlsplit(BASE_URL).hostname
+    contacted: list[str] = []
+
+    def guard(host: object) -> None:
+        contacted.append(str(host))
+        if host != allowed:
+            raise AssertionError(f"replayer contacted {host}; only {allowed} is allowed")
+
+    real_connect = socket.socket.connect
+
+    def connect(self: socket.socket, address: Any) -> None:
+        if self.family in (socket.AF_INET, socket.AF_INET6):
+            guard(address[0])
+        real_connect(self, address)
+
+    def getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
+        guard(host)
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    return contacted
+
+
+def test_the_network_guard_trips_on_a_model_provider(no_network: list[str]) -> None:
+    with pytest.raises(AssertionError, match=r"api\.anthropic\.com"):
+        socket.create_connection(("api.anthropic.com", 443))
+
+
+@pytest.mark.parametrize("phase_id", ["implement", "review", "finalize_pr"])
+def test_a_full_phase_contacts_no_host(
+    no_network: list[str], tmp_path: Path, phase_id: str
+) -> None:
+    _replay(_env(phase_id), tmp_path)
+    assert no_network == []
+
+
+def test_every_replayed_model_is_the_scripted_one(tmp_path: Path) -> None:
+    events, _, _ = _replay(_env("review"), tmp_path)
+
+    models = [m for event in events for m in _models(event)]
+    assert len(events) == 8
+    # the recording reports claude-sonnet-4-5 in five places and two modelUsage keys
+    assert len(models) >= 6
+    assert set(models) == {SCRIPTED_AGENT_MODEL}
+
+
+def test_replays_at_recorded_timing_times_the_pacing_factor(tmp_path: Path) -> None:
+    _, slept, _ = _replay(_env("review"), tmp_path)
+
+    # offsets 0 x6 then 2837 ms (the held-back result at 2926 is not paced); factor 0.5
+    assert slept == pytest.approx([0, 0, 0, 0, 0, 0, 1.4185])
+
+
+# --- the phase's work ---------------------------------------------------------
+
+
+def test_last_message_is_the_profiles_task_result_not_the_recordings(tmp_path: Path) -> None:
+    events, _, _ = _replay(_env("reverify"), tmp_path)
+
+    assert events[-1]["type"] == "result"
+    assert events[-1]["result"] == (
+        'TASK_RESULT: {"success":true,"side_effects":"none",'
+        '"comments":"Load-test stub for phase reverify; no agent ran.",'
+        '"review_verdict":"certified"}\nTASK_RESULT_END'
+    )
+    assert all("result" not in e or e["type"] != "result" for e in events[:-1])
+
+
+def test_open_draft_pushes_the_execution_branch_and_opens_the_pr(tmp_path: Path) -> None:
+    _, _, git = _replay(_env("implement"), tmp_path, FakeGit(branch_exists=False))
+
+    repo = tmp_path / "repos" / "loadtest-fixture"
+    assert (repo / "loadtest" / "implement.txt").read_text() == "exec-1a2b implement\n"
+    argvs = git.argvs()
+    assert ["git", "checkout", "-B", "loadtest/exec-1a2b"] in argvs
+    assert ["git", "push", "origin", "HEAD:refs/heads/loadtest/exec-1a2b"] in argvs
+    create = next(a for a in argvs if a[:3] == ["gh", "pr", "create"])
+    assert "--draft" in create and FIXTURE in create
+    assert all(
+        cwd == repo for argv, cwd in git.calls if argv[0] == "git" and argv[1] != "ls-remote"
+    )
+
+
+def test_artifact_is_rendered_from_the_side_effects_results(tmp_path: Path) -> None:
+    _replay(_env("implement"), tmp_path)
+
+    artifact = (tmp_path / "artifacts" / "output" / "implement.md").read_text()
+    assert artifact == f"Pushed loadtest/exec-1a2b at {HEAD}, PR #4217 {PR_URL}."
+
+
+def test_finalize_marks_ready_and_reports_the_planned_run(tmp_path: Path) -> None:
+    _, _, git = _replay(_env("finalize_pr"), tmp_path)
+
+    assert ["gh", "pr", "ready", "loadtest/exec-1a2b", "--repo", FIXTURE] in git.argvs()
+    artifact = (tmp_path / "artifacts" / "output" / "finalize_pr.md").read_text()
+    # implement, review, fix, reverify(certified) -> finalize_pr: fix_2 is skipped,
+    # so two pushing phases ran and that is one repair round.
+    assert artifact == f"READY after 1 repair round(s); #4217 {PR_URL}."
+
+
+def test_push_branch_builds_on_the_branch_an_earlier_phase_pushed(tmp_path: Path) -> None:
+    _, _, git = _replay(_env("fix"), tmp_path)
+
+    argvs = git.argvs()
+    assert ["git", "fetch", "origin", "loadtest/exec-1a2b"] in argvs
+    assert ["git", "checkout", "-B", "loadtest/exec-1a2b", "FETCH_HEAD"] in argvs
+    assert not any(a[:2] == ["gh", "pr"] for a in argvs)
+
+
+def test_report_only_leaves_the_tree_alone(tmp_path: Path) -> None:
+    _, _, git = _replay(_env("review"), tmp_path)
+
+    assert git.argvs() == []
+    assert not (tmp_path / "repos" / "loadtest-fixture" / "loadtest").exists()
+
+
+def test_gates_workload_runs_the_repositorys_gates(tmp_path: Path) -> None:
+    profile = _profile(workload={"kind": "gates"})
+    _, _, git = _replay(_env("implement", profile), tmp_path)
+
+    assert (["just", "preflight-agent"], tmp_path / "repos" / "loadtest-fixture") in git.calls
+
+
+def test_synthetic_workload_runs(tmp_path: Path) -> None:
+    workload = {"kind": "synthetic", "cpu_seconds": 0.01, "mem_bytes": 1024, "disk_bytes": 1024}
+    _replay(_env("implement", _profile(workload=workload)), tmp_path)
+
+
+def test_platform_verify_refuses_an_absent_branch(tmp_path: Path) -> None:
+    profile = {
+        "tier": "platform",
+        "fixture_repo": FIXTURE,
+        "phases": {"verify": _phase("verify_remote_branch", "Checked {branch}.")},
+    }
+    with pytest.raises(SideEffectFailed, match="loadtest/exec-1a2b is not on"):
+        _replay(_env("verify", profile), tmp_path, FakeGit(branch_exists=False))
+
+
+# --- refusals: exit non-zero with the reason ----------------------------------
+
+
+def _exit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], environ: dict[str, str]
+) -> tuple[int, str]:
+    monkeypatch.setattr(cli.os, "environ", environ)
+    with pytest.raises(SystemExit) as stopped:
+        cli.main()
+    assert isinstance(stopped.value.code, int)
+    return stopped.value.code, capsys.readouterr().err
+
+
+def test_refuses_without_a_profile(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, err = _exit(monkeypatch, capsys, {TAGS_ENV: "execution_id:e,phase_id:implement"})
+
+    assert code == 78
+    assert SCRIPTED_AGENT_PROFILE_ENV in err and PROFILE_PATH_ENV in err
+
+
+def test_refuses_an_invalid_profile(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    profile = _profile()
+    profile["fixture_repo"] = "syntropic137/syntropic137"
+    code, err = _exit(monkeypatch, capsys, _env("implement", profile))
+
+    assert code == 78
+    assert "not a valid ScriptedAgentProfile" in err
+    assert "cannot be the load-test fixture repository" in err
+
+
+def test_refuses_without_phase_and_execution_tags(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    environ = _env("implement")
+    environ[TAGS_ENV] = "execution_id:exec-1a2b"
+    code, err = _exit(monkeypatch, capsys, environ)
+
+    assert code == 78
+    assert "phase_id: and execution_id:" in err
+
+
+def test_refuses_a_phase_the_profile_does_not_have(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, err = _exit(monkeypatch, capsys, _env("research"))
+
+    assert code == 78
+    assert "phase 'research' is not in the profile" in err
+
+
+@pytest.mark.parametrize(
+    ("stream", "reason"),
+    [
+        ({"tool_uses": 3}, "has 2 tool_use events but the profile declares tool_uses 3"),
+        ({"cli_version": "2.1.29"}, "captured from CLI '2.0.74' but the profile declares"),
+        ({"harness": "codex"}, "harness 'codex' cannot be replayed yet"),
+        ({"recording": "/nonexistent.jsonl"}, "cannot be read"),
+    ],
+)
+def test_refuses_a_recording_that_is_not_the_declared_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    stream: dict[str, Any],
+    reason: str,
+) -> None:
+    code, err = _exit(monkeypatch, capsys, _env("implement", _profile(stream=_stream(**stream))))
+
+    assert code == RecordingRefused.exit_code == 65
+    assert reason in err
+
+
+def test_a_refused_recording_replays_nothing(tmp_path: Path) -> None:
+    out = io.StringIO()
+    with pytest.raises(RecordingRefused):
+        replay(
+            _env("implement", _profile(stream=_stream(tool_uses=1))),
+            tmp_path,
+            FakeGit(),
+            lambda _: None,
+            out,
+        )
+    assert out.getvalue() == ""
+
+
+# --- where the profile comes from ---------------------------------------------
+
+
+def test_reads_the_profile_from_the_mounted_file(tmp_path: Path) -> None:
+    path = tmp_path / "loadtest-profile.json"
+    path.write_text(json.dumps(_profile()))
+    environ = _env("review")
+    del environ[SCRIPTED_AGENT_PROFILE_ENV]
+    environ[PROFILE_PATH_ENV] = str(path)
+
+    events, _, _ = _replay(environ, tmp_path)
+    assert "phase review" in events[-1]["result"]
+
+
+def test_the_env_var_wins_over_the_file(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    path = tmp_path / "loadtest-profile.json"
+    path.write_text(json.dumps(_profile()))
+    environ = _env("review")
+    environ[SCRIPTED_AGENT_PROFILE_ENV] = "{}"
+    environ[PROFILE_PATH_ENV] = str(path)
+
+    code, err = _exit(monkeypatch, capsys, environ)
+    assert code == 78
+    assert f"profile from {SCRIPTED_AGENT_PROFILE_ENV} is not a valid" in err
+
+
+def test_refuses_an_unreadable_profile_file(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    environ = _env("review")
+    del environ[SCRIPTED_AGENT_PROFILE_ENV]
+    environ[PROFILE_PATH_ENV] = str(tmp_path / "absent.json")
+
+    code, err = _exit(monkeypatch, capsys, environ)
+    assert code == 78
+    assert "cannot be read" in err

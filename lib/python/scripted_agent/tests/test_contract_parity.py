@@ -16,7 +16,8 @@ PROVENANCE = CONTRACT / "PROVENANCE.md"
 
 def test_vendored_schema_matches_its_recorded_digest() -> None:
     recorded = re.search(
-        r"^\| `scripted_agent/contract/scripted_agent_profile\.schema\.json` \| `([0-9a-f]{64})` \|$",
+        r"^\| `scripted_agent/contract/scripted_agent_profile\.schema\.json` "
+        r"\| `([0-9a-f]{64})` \|$",
         PROVENANCE.read_text(),
         re.M,
     )
