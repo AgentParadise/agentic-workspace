@@ -1,11 +1,10 @@
 """Unit tests for SecurityConfig."""
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import pytest
 
-from agentic_isolation import config as config_module
 from agentic_isolation.config import (
     DockerDetectionError,
     ResolvedRuntime,
@@ -109,16 +108,16 @@ def _runtime_args(args: list[str]) -> list[str]:
 
 
 @pytest.fixture
-def docker_host(monkeypatch: pytest.MonkeyPatch) -> Callable[[dict[str, object]], list[str]]:
+def docker_host(monkeypatch: pytest.MonkeyPatch) -> Callable[[Mapping[str, object]], list[str]]:
     """Stub the ``_docker_info`` seam with a host whose Runtimes are given.
 
     Returns the list of templates queried, so a test can see whether Docker was probed.
     """
     queries: list[str] = []
     monkeypatch.setattr(SecurityConfig, "_docker_runtimes", None)
-    monkeypatch.setattr(config_module.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/docker")
 
-    def install(runtimes: dict[str, object]) -> list[str]:
+    def install(runtimes: Mapping[str, object]) -> list[str]:
         def docker_info(template: str) -> str:
             queries.append(template)
             assert template == "{{json .Runtimes}}"
@@ -134,7 +133,7 @@ class TestResolveRuntime:
     """One resolver: explicit runtimes fail closed, auto keeps today's default."""
 
     def test_kata_registered_emits_its_alias(
-        self, docker_host: Callable[[dict[str, object]], list[str]]
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         docker_host({**RUNC, **KATA_SHIM_V2})
         config = SecurityConfig(runtime=WorkspaceRuntime.KATA)
@@ -148,7 +147,7 @@ class TestResolveRuntime:
         )
 
     def test_kata_under_a_custom_alias_is_found_by_its_shim(
-        self, docker_host: Callable[[dict[str, object]], list[str]]
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         docker_host({**RUNC, "kata-clh": {"path": "/opt/kata/bin/containerd-shim-kata-v2"}})
         config = SecurityConfig(runtime=WorkspaceRuntime.KATA)
@@ -156,7 +155,7 @@ class TestResolveRuntime:
         assert _runtime_args(config.to_docker_run_args()) == ["--runtime=kata-clh"]
 
     def test_kata_missing_raises(
-        self, docker_host: Callable[[dict[str, object]], list[str]]
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         docker_host(RUNC)
         config = SecurityConfig(runtime=WorkspaceRuntime.KATA)
@@ -165,7 +164,7 @@ class TestResolveRuntime:
             config.to_docker_run_args()
 
     def test_alias_named_kata_that_runs_runc_raises(
-        self, docker_host: Callable[[dict[str, object]], list[str]]
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         docker_host({**RUNC, "kata": {"path": "/usr/bin/runc"}})
         config = SecurityConfig(runtime=WorkspaceRuntime.KATA)
@@ -174,7 +173,7 @@ class TestResolveRuntime:
             config.resolve_runtime()
 
     def test_gvisor_missing_raises_at_resolution(
-        self, docker_host: Callable[[dict[str, object]], list[str]]
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         docker_host(RUNC)
         config = SecurityConfig(runtime=WorkspaceRuntime.GVISOR)
@@ -186,13 +185,13 @@ class TestResolveRuntime:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(SecurityConfig, "_docker_runtimes", None)
-        monkeypatch.setattr(config_module.shutil, "which", lambda _name: None)
+        monkeypatch.setattr("shutil.which", lambda _name: None)
 
         with pytest.raises(DockerDetectionError, match="docker CLI not found"):
             SecurityConfig(runtime=WorkspaceRuntime.SYSBOX).resolve_runtime()
 
     def test_sysbox_registered_emits_its_alias(
-        self, docker_host: Callable[[dict[str, object]], list[str]]
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         docker_host({**RUNC, "sysbox-runc": {"path": "/usr/bin/sysbox-runc"}})
         config = SecurityConfig(runtime=WorkspaceRuntime.SYSBOX)
@@ -200,7 +199,7 @@ class TestResolveRuntime:
         assert _runtime_args(config.to_docker_run_args()) == ["--runtime=sysbox-runc"]
 
     def test_explicit_runc_never_probes_docker(
-        self, docker_host: Callable[[dict[str, object]], list[str]]
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         queries = docker_host({**RUNC, **RUNSC})
         config = SecurityConfig(runtime=WorkspaceRuntime.RUNC)
@@ -211,7 +210,7 @@ class TestResolveRuntime:
     # Regression guards: auto mode is today's default and passed before AW-1 too.
 
     def test_auto_on_runc_only_host_emits_no_runtime(
-        self, docker_host: Callable[[dict[str, object]], list[str]]
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         docker_host(RUNC)
         config = SecurityConfig()
@@ -222,7 +221,7 @@ class TestResolveRuntime:
         assert resolved.effective is WorkspaceRuntime.RUNC
 
     def test_auto_with_runsc_registered_uses_runsc(
-        self, docker_host: Callable[[dict[str, object]], list[str]]
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         docker_host({**RUNC, **RUNSC})
         config = SecurityConfig()
@@ -232,14 +231,16 @@ class TestResolveRuntime:
         assert resolved.requested is None
         assert resolved.effective is WorkspaceRuntime.GVISOR
 
-    def test_auto_ignores_kata(self, docker_host: Callable[[dict[str, object]], list[str]]) -> None:
+    def test_auto_ignores_kata(
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
+    ) -> None:
         docker_host({**RUNC, **KATA_SHIM_V2})
 
         assert _runtime_args(SecurityConfig().to_docker_run_args()) == []
 
     def test_auto_without_docker_cli_is_runc(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(SecurityConfig, "_docker_runtimes", None)
-        monkeypatch.setattr(config_module.shutil, "which", lambda _name: None)
+        monkeypatch.setattr("shutil.which", lambda _name: None)
 
         resolved = SecurityConfig().resolve_runtime()
 
@@ -247,7 +248,7 @@ class TestResolveRuntime:
         assert resolved.requested is None
 
     def test_gvisor_registered_as_gvisor_emits_that_alias(
-        self, docker_host: Callable[[dict[str, object]], list[str]]
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         # Before AW-1 this host got --runtime=runsc, which Docker rejects.
         docker_host({**RUNC, "gvisor": {"path": "/usr/local/bin/runsc"}})
@@ -255,7 +256,7 @@ class TestResolveRuntime:
         assert _runtime_args(SecurityConfig().to_docker_run_args()) == ["--runtime=gvisor"]
 
     def test_several_unconventional_aliases_are_ambiguous(
-        self, docker_host: Callable[[dict[str, object]], list[str]]
+        self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         docker_host(
             {
@@ -273,11 +274,14 @@ class TestResolveRuntime:
     ) -> None:
         """A failed docker info is an error, never "runc", and is not cached."""
         monkeypatch.setattr(SecurityConfig, "_docker_runtimes", None)
-        monkeypatch.setattr(config_module.shutil, "which", lambda _name: "/usr/bin/docker")
-        answers = iter([DockerDetectionError("daemon down"), json.dumps({**RUNC, **RUNSC})])
+        monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/docker")
+        answers: list[str | DockerDetectionError] = [
+            DockerDetectionError("daemon down"),
+            json.dumps({**RUNC, **RUNSC}),
+        ]
 
         def docker_info(_template: str) -> str:
-            answer = next(answers)
+            answer = answers.pop(0)
             if isinstance(answer, DockerDetectionError):
                 raise answer
             return answer
@@ -290,7 +294,9 @@ class TestResolveRuntime:
         assert SecurityConfig().resolve_runtime().effective is WorkspaceRuntime.GVISOR
 
     def test_unreadable_runtimes_raise(
-        self, docker_host: Callable[[dict[str, object]], list[str]], monkeypatch: pytest.MonkeyPatch
+        self,
+        docker_host: Callable[[Mapping[str, object]], list[str]],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(SecurityConfig, "_docker_info", staticmethod(lambda _t: "<no value>"))
 
