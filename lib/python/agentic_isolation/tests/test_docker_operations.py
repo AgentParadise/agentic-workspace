@@ -159,7 +159,9 @@ def test_docker_provider_supports_operations_without_widening_the_base() -> None
 
 
 @pytest.mark.parametrize("pid", ["0", "1", "-1", "bad", str(os.getpgrp())])
-async def test_cancel_refuses_unsafe_process_group(pid: str, docker_env: Path) -> None:
+async def test_cancel_never_signals_an_unsafe_process_group_and_escalates(
+    pid: str, docker_env: Path
+) -> None:
     ops = _ops(docker_env)
     ref = OperationRef(
         workspace={"provider": "docker", "resource_id": "c1"},
@@ -172,16 +174,77 @@ async def test_cancel_refuses_unsafe_process_group(pid: str, docker_env: Path) -
         container="c1",
         spool=OperationSpool(retention_bytes=1024),
         started_at="now",
+        key=("ws1", "unsafe"),
         leader=(pid, "123"),
     )
     operation.leader_known.set()
     ops._operations[ref.operation_id] = operation
-    command = AsyncMock()
-    ops._docker_cmd = command
-    with pytest.raises(OperationFailure, match="refusing unsafe process group") as caught:
-        await ops.cancel(ref, grace_seconds=0)
-    assert caught.value.error.kind == "provider_unavailable"
-    command.assert_not_awaited()
+    # The stand-in runs `exec` here, so the namespace probe reports ours.
+    own_namespace = os.readlink("/proc/self/ns/pid")
+    command = AsyncMock(return_value=(0, own_namespace))
+    ops._docker_cmd = command  # type: ignore[method-assign]
+    status = await ops.cancel(ref, grace_seconds=0)
+    assert status.metadata["cancel_escalation"] == "container_stopped"
+    assert "refusing unsafe process group" in status.metadata["cancel_signal_failure"]
+    calls = [c.args for c in command.await_args_list]
+    assert not any("aw-signal" in c or "aw-processes" in c for c in calls)
+    assert calls[-1] == ("stop", "-t", "0", "c1")
+
+
+async def test_cancel_signals_a_leader_numbered_like_our_group_in_another_namespace(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production: the caller's pgrp and the in-container leader pid collide."""
+    ops = _ops(docker_env)
+    ref = await ops.start(_workspace(), _spec("exec sleep 30"))
+    operation = ops._operations[ref.operation_id]
+    await operation.leader_known.wait()
+    assert operation.leader is not None
+    leader = int(operation.leader[0])
+    real_exec = ops._exec
+
+    async def foreign_namespace(container: str, *argv: str) -> tuple[int, str]:
+        if "aw-pidns" in argv:
+            return 0, "pid:[1]\n"
+        return await real_exec(container, *argv)
+
+    monkeypatch.setattr(ops, "_exec", foreign_namespace)
+    monkeypatch.setattr(docker_operations.os, "getpgrp", lambda: leader)
+    status = await asyncio.wait_for(ops.cancel(ref, grace_seconds=1), timeout=20)
+    assert status.state == "cancelled"
+    assert "cancel_escalation" not in status.metadata
+    assert not _alive(leader)
+
+
+async def test_timeout_settles_when_the_leader_is_refused(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused group on the timeout path escalates and still settles."""
+    ops = _ops(docker_env)
+    ref = await ops.start(_workspace(), _spec("exec sleep 3", timeout_seconds=1))
+    operation = ops._operations[ref.operation_id]
+    await operation.leader_known.wait()
+    assert operation.leader is not None
+    monkeypatch.setattr(docker_operations.os, "getpgrp", lambda: int(operation.leader[0]))
+    status, _ = await asyncio.wait_for(drain_operation(ops, ref), timeout=20)
+    assert status.state == "timed_out"
+    assert status.metadata["cancel_escalation"] == "container_stopped"
+    assert "caller's own group" in status.metadata["cancel_signal_failure"]
+
+
+async def test_timeout_settles_when_even_the_stop_cannot_run(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ops = _ops(docker_env)
+    ref = await ops.start(_workspace(), _spec("exec sleep 2", timeout_seconds=1))
+
+    async def unavailable(operation: _Operation, *, grace_seconds: float) -> None:
+        raise docker_operations._error("provider_unavailable", "docker is gone")
+
+    monkeypatch.setattr(ops, "_terminate_group", unavailable)
+    status, _ = await asyncio.wait_for(drain_operation(ops, ref), timeout=20)
+    assert status.state == "timed_out"
+    assert status.metadata["cancel_signal_failure"] == "docker is gone"
 
 
 def _scripted(ops: DockerOperations, tables: list[str]) -> list[tuple[str, ...]]:
@@ -211,6 +274,7 @@ def _held_operation(leader: tuple[str, str]) -> _Operation:
         container="c1",
         spool=OperationSpool(retention_bytes=1024),
         started_at="now",
+        key=("ws1", "held"),
         leader=leader,
     )
 
@@ -698,3 +762,58 @@ async def test_resolver_failure_releases_the_key_for_a_retry(docker_env: Path) -
         await ops.start(_workspace(), _bound_spec("retry"))
     ref = await ops.start(_workspace(), _bound_spec("retry"))
     assert (await drain_operation(ops, ref))[1] == b"bound\n"
+
+
+async def test_same_key_replays_inside_the_retention_window_then_starts_fresh(
+    docker_env: Path,
+) -> None:
+    ops = DockerOperations(
+        credentials=_Resolver(),
+        retention_bytes=1 << 20,
+        max_page_bytes=1 << 16,
+        docker=str(docker_env / "docker"),
+        record_retention_seconds=1.0,
+    )
+    first = await ops.start(_workspace(), _spec("echo once"))
+    await drain_operation(ops, first)
+    assert await ops.start(_workspace(), _spec("echo once")) == first
+    assert (await ops.status(first)).state == "succeeded"
+    await asyncio.sleep(1.1)
+    fresh = await ops.start(_workspace(), _spec("echo once"))
+    assert fresh != first and fresh.operation_key == first.operation_key
+    with pytest.raises(OperationFailure) as caught:
+        await ops.status(first)
+    assert caught.value.error.kind == "unknown_operation"
+    assert (await drain_operation(ops, fresh))[1] == b"once\n"
+
+
+async def test_a_running_operation_outlives_the_retention_window(docker_env: Path) -> None:
+    ops = DockerOperations(
+        credentials=_Resolver(),
+        retention_bytes=1 << 20,
+        max_page_bytes=1 << 16,
+        docker=str(docker_env / "docker"),
+        record_retention_seconds=0.0,
+    )
+    ref = await ops.start(_workspace(), _spec("sleep 1; echo late"))
+    await ops.start(_workspace(), _spec("true", key="other"))
+    assert await ops.start(_workspace(), _spec("sleep 1; echo late")) == ref
+    assert (await drain_operation(ops, ref))[1] == b"late\n"
+
+
+async def test_release_keeps_a_running_record(docker_env: Path) -> None:
+    ops = _ops(docker_env)
+    ref = await ops.start(_workspace(), _spec("sleep 0.5"))
+    ops.release(ref)
+    assert (await drain_operation(ops, ref))[0].state == "succeeded"
+    ops.release(ref)
+    assert ops._operations == {} and ops._by_key == {}
+
+
+async def test_a_thousand_sequential_executes_leave_the_maps_empty(docker_env: Path) -> None:
+    provider = WorkspaceDockerProvider()
+    provider._operations = ops = _ops(docker_env)
+    for i in range(1000):
+        result = await provider.execute(_workspace(), f"echo {i}")
+        assert result.stdout == f"{i}\n"
+    assert (ops._operations, ops._by_key, ops._launching) == ({}, {}, {})

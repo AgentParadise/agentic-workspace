@@ -622,6 +622,8 @@ class WorkspaceDockerProvider(BaseProvider):
             )
             status, _ = await drain_operation(self, ref)
             out, err = self._operations.channels(ref)
+            # The key is private to this call, so no replay can need the record.
+            self._operations.release(ref)
         except OperationFailure as e:
             return ExecuteResult(
                 exit_code=-1,

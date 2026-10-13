@@ -21,8 +21,12 @@ provider delegates to it, so the decisions below are made in one place.
 - Credential values travel only in the client process's environment and reach
   the workload as `docker exec -e NAME`; they are never in an argv.
 - The idempotency record is in-process infrastructure state, like the
-  container handles: it lives as long as the workspace, and is lost with the
-  process, which also loses the workspace (no reattach).
+  container handles, and is lost with the process, which also loses the
+  workspace (no reattach). A record is kept for `record_retention_seconds`
+  after it reaches a terminal state: inside that window a same-key start
+  replays the original ref and `status`/`observe` still answer; after it the
+  record is pruned, the old ref is `unknown_operation`, and the key starts
+  fresh. A caller that has collected the result can `release` it at once.
 """
 
 from __future__ import annotations
@@ -156,6 +160,21 @@ _REMOVAL_WAIT_SECONDS = 30.0
 # workload's final output (a TERM handler's last words) before giving up.
 _FINAL_OUTPUT_SECONDS = 5.0
 
+# How long a terminal record keeps answering same-key starts, status and
+# observe before it is pruned. See the module docstring.
+RECORD_RETENTION_SECONDS = 3600.0
+
+# Prints the pid namespace of wherever `docker exec` runs, to compare with ours.
+_PID_NAMESPACE = "readlink /proc/self/ns/pid"
+
+
+@dataclass
+class _KeyLock:
+    """Serialises starts of one key; dropped when its last start leaves."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
 
 @dataclass
 class _Operation:
@@ -164,6 +183,8 @@ class _Operation:
     container: str
     spool: OperationSpool
     started_at: str
+    # (workspace id, operation_key), the idempotency record's key.
+    key: tuple[str, str]
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     leader: tuple[str, str] | None = None
     state: OperationState = "running"
@@ -179,6 +200,8 @@ class _Operation:
     collector: asyncio.Task[None] | None = None
     leader_known: asyncio.Event = field(default_factory=asyncio.Event)
     client_finished: bool = False
+    # Loop time the operation reached a terminal state; retention runs from here.
+    settled_at: float | None = None
     # Per-channel copies (stdout, stderr), kept only when the caller asked.
     channels: tuple[bytearray, bytearray] | None = None
 
@@ -207,16 +230,18 @@ class DockerOperations:
         retention_bytes: int,
         max_page_bytes: int,
         docker: str = "docker",
+        record_retention_seconds: float = RECORD_RETENTION_SECONDS,
     ) -> None:
         self._credentials = credentials
         self._retention = retention_bytes
         self._max_page = max_page_bytes
         self._docker = docker
+        self._record_retention = record_retention_seconds
         self._operations: dict[str, _Operation] = {}
         self._by_key: dict[tuple[str, str], _Operation] = {}
-        # One lock per (workspace, operation_key): a slow credential resolver
-        # holds back only racing starts of the same key, never the fleet.
-        self._launching: dict[tuple[str, str], asyncio.Lock] = {}
+        # One lock per (workspace, operation_key) with a start in flight: a slow
+        # credential resolver holds back only racing starts of the same key.
+        self._launching: dict[tuple[str, str], _KeyLock] = {}
         self._sequence = 0
 
     def describe(self) -> ProviderDescriptor:
@@ -255,72 +280,94 @@ class DockerOperations:
         container = workspace._handle
         if not isinstance(container, str) or not container:
             raise _error("unknown_operation", f"workspace {workspace.id} has no container")
+        self._prune_expired()
         key = (workspace.id, spec.operation_key)
         # The key's lock spans the launch, so racing same-key starts see the
         # record of the first and launch nothing.
-        async with self._launching.setdefault(key, asyncio.Lock()):
-            existing = self._by_key.get(key)
-            if existing is not None:
-                if existing.spec != spec:
-                    raise _error(
-                        "conflict",
-                        f"operation_key {spec.operation_key!r} already started "
-                        "with a different spec",
-                        existing.ref,
+        launch = self._launching.setdefault(key, _KeyLock())
+        launch.users += 1
+        try:
+            async with launch.lock:
+                return await self._start_locked(
+                    workspace, spec, key, container, delivered_env, separate_channels
+                )
+        finally:
+            launch.users -= 1
+            if not launch.users:
+                del self._launching[key]
+
+    async def _start_locked(
+        self,
+        workspace: Workspace,
+        spec: OperationSpec,
+        key: tuple[str, str],
+        container: str,
+        delivered_env: dict[str, str] | None,
+        separate_channels: bool,
+    ) -> OperationRef:
+        existing = self._by_key.get(key)
+        if existing is not None:
+            if existing.spec != spec:
+                raise _error(
+                    "conflict",
+                    f"operation_key {spec.operation_key!r} already started "
+                    "with a different spec",
+                    existing.ref,
+                )
+            return existing.ref
+        secrets = dict(delivered_env or {})
+        for binding in spec.credential_bindings:
+            if binding.delivery != "env":
+                raise OperationFailure(
+                    OperationError(
+                        kind="unsupported_capability",
+                        message=f"credential delivery {binding.delivery!r} "
+                        "is not supported by docker",
                     )
-                return existing.ref
-            secrets = dict(delivered_env or {})
-            for binding in spec.credential_bindings:
-                if binding.delivery != "env":
-                    raise OperationFailure(
-                        OperationError(
-                            kind="unsupported_capability",
-                            message=f"credential delivery {binding.delivery!r} "
-                            "is not supported by docker",
-                        )
+                )
+            if self._credentials is None:
+                raise OperationFailure(
+                    OperationError(
+                        kind="rejected_policy",
+                        message="credential bindings need a CredentialResolver; "
+                        "none was injected",
                     )
-                if self._credentials is None:
-                    raise OperationFailure(
-                        OperationError(
-                            kind="rejected_policy",
-                            message="credential bindings need a CredentialResolver; "
-                            "none was injected",
-                        )
-                    )
-                secrets[binding.target] = await self._credentials.resolve(binding.ref)
-            self._sequence += 1
-            ref = OperationRef(
-                workspace=WorkspaceRef(provider="docker", resource_id=container),
-                operation_id=f"{workspace.id}-op{self._sequence}",
-                operation_key=spec.operation_key,
-            )
-            operation = _Operation(
-                ref=ref,
-                spec=spec,
-                container=container,
-                spool=OperationSpool(retention_bytes=self._retention),
-                started_at=_now(),
-                channels=(bytearray(), bytearray()) if separate_channels else None,
-            )
-            process = await self._spawn(
-                *self.client_argv(container, spec, secret_names=tuple(secrets)),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **secrets},
-            )
-            marker = spec.launch_marker
-            argv0, line = (
-                (marker.argv0, marker.line) if isinstance(marker, LaunchMarker) else ("sh", "")
-            )
-            if process.stdin is not None:
-                process.stdin.write(f"{argv0}\n{line}\n".encode())
-                await process.stdin.drain()
-                process.stdin.close()
-            operation.collector = asyncio.create_task(self._collect(operation, process))
-            self._operations[ref.operation_id] = operation
-            self._by_key[key] = operation
-            return ref
+                )
+            secrets[binding.target] = await self._credentials.resolve(binding.ref)
+        self._sequence += 1
+        ref = OperationRef(
+            workspace=WorkspaceRef(provider="docker", resource_id=container),
+            operation_id=f"{workspace.id}-op{self._sequence}",
+            operation_key=spec.operation_key,
+        )
+        operation = _Operation(
+            ref=ref,
+            spec=spec,
+            container=container,
+            spool=OperationSpool(retention_bytes=self._retention),
+            started_at=_now(),
+            key=key,
+            channels=(bytearray(), bytearray()) if separate_channels else None,
+        )
+        process = await self._spawn(
+            *self.client_argv(container, spec, secret_names=tuple(secrets)),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **secrets},
+        )
+        marker = spec.launch_marker
+        argv0, line = (
+            (marker.argv0, marker.line) if isinstance(marker, LaunchMarker) else ("sh", "")
+        )
+        if process.stdin is not None:
+            process.stdin.write(f"{argv0}\n{line}\n".encode())
+            await process.stdin.drain()
+            process.stdin.close()
+        operation.collector = asyncio.create_task(self._collect(operation, process))
+        self._operations[ref.operation_id] = operation
+        self._by_key[key] = operation
+        return ref
 
     def client_argv(
         self, container: str, spec: OperationSpec, *, secret_names: tuple[str, ...]
@@ -342,6 +389,28 @@ class DockerOperations:
             raise _error("unknown_operation", f"{ref.operation_id} kept no separate channels", ref)
         return bytes(operation.channels[0]), bytes(operation.channels[1])
 
+    def release(self, ref: OperationRef) -> None:
+        """Drop a terminal record whose result the caller has collected.
+
+        For keys no other caller can replay, such as `execute`'s private ones;
+        a record that is not terminal yet is left to the retention window.
+        """
+        operation = self._lookup(ref)
+        if operation.state in TERMINAL_STATES:
+            self._forget(operation)
+
+    def _prune_expired(self) -> None:
+        """Drop terminal records older than the retention window."""
+        cutoff = asyncio.get_running_loop().time() - self._record_retention
+        for operation in list(self._operations.values()):
+            if operation.settled_at is not None and operation.settled_at <= cutoff:
+                self._forget(operation)
+
+    def _forget(self, operation: _Operation) -> None:
+        del self._operations[operation.ref.operation_id]
+        if self._by_key.get(operation.key) is operation:
+            del self._by_key[operation.key]
+
     async def _collect(self, operation: _Operation, process: asyncio.subprocess.Process) -> None:
         assert process.stdout is not None and process.stderr is not None  # both PIPE
         # The readers run outside the timeout, so a timed-out operation's
@@ -357,7 +426,12 @@ class DockerOperations:
                 await process.wait()
         except TimeoutError:
             timed_out = True
-            await self._terminate_group(operation, grace_seconds=1.0)
+            try:
+                await self._terminate_group(operation, grace_seconds=1.0)
+            except OperationFailure as e:
+                # Even `docker stop` could not be run. Record why and settle
+                # anyway: an unsettled operation would hold every drain forever.
+                operation.signal_failure = e.error.message
             try:
                 async with asyncio.timeout(_FINAL_OUTPUT_SECONDS):
                     await asyncio.shield(readers)
@@ -433,6 +507,7 @@ class DockerOperations:
             if code is not None and code > 128 and code - 128 < signal.NSIG:
                 operation.signal = signal.Signals(code - 128).name
             operation.state = "succeeded" if code == 0 else "failed"
+        operation.settled_at = asyncio.get_running_loop().time()
         operation.changed.set()
 
     async def status(self, ref: OperationRef) -> OperationStatus:
@@ -506,14 +581,12 @@ class DockerOperations:
         a leader whose pid was reused, and signals by pid every descendant
         that escaped the group, so a confirmed cancel means all of them died.
         """
-        if operation.leader is not None:
+        if operation.leader is not None and (refusal := await self._unsafe_leader(operation)):
+            # Never signal init or our own group; stopping the container still
+            # ends the operation, so a refusal escalates rather than raising.
+            operation.signal_failure = refusal
+        elif operation.leader is not None:
             pid, start = operation.leader
-            # The host-side stand-in executes these signals in our namespace.
-            # Never let a malformed/reused leader target init or our own group.
-            if not pid.isdecimal() or int(pid) <= 1 or int(pid) == os.getpgrp():
-                raise _error(
-                    "provider_unavailable", f"refusing unsafe process group {pid!r}", operation.ref
-                )
             for sig, wait in (("TERM", grace_seconds), ("KILL", 2.0)):
                 code, out = await self._exec(
                     operation.container, "sh", "-c", _PROCESSES, "aw-processes"
@@ -533,9 +606,30 @@ class DockerOperations:
                     break
                 if await self._group_gone(operation, within=wait):
                     return
-        # No trusted pid, or the operation would not die: escalate, and say so.
+        # No trusted or safe pid, or the operation would not die: escalate, and say so.
         operation.escalated = True
         await self._docker_cmd("stop", "-t", "0", operation.container)
+
+    async def _unsafe_leader(self, operation: _Operation) -> str | None:
+        """Why the leader's group must not be signalled, or None when it may be.
+
+        Init and malformed pids are refused everywhere. Our own group is a
+        hazard only where the signal lands in our pid namespace; in a
+        container's own namespace an equal number names another process. A
+        namespace that cannot be read counts as ours, so doubt costs a
+        container stop, never a stray kill.
+        """
+        assert operation.leader is not None
+        pid = operation.leader[0]
+        if not pid.isdecimal() or int(pid) <= 1:
+            return f"refusing unsafe process group {pid!r}"
+        if int(pid) == os.getpgrp():
+            code, out = await self._exec(
+                operation.container, "sh", "-c", _PID_NAMESPACE, "aw-pidns"
+            )
+            if code != 0 or not out.strip() or out.strip() == os.readlink("/proc/self/ns/pid"):
+                return f"refusing unsafe process group {pid!r}: it is the caller's own group"
+        return None
 
     async def _group_gone(self, operation: _Operation, *, within: float) -> bool:
         """Whether the group and every tracked process are gone; a failed probe is not."""
