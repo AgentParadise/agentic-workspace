@@ -28,7 +28,7 @@ RECORDING = (
 FIXTURE = "example-org/loadtest-fixture"
 HEAD = "3b7f2bd49a4609f24a516bb4617aadbc1edf751e"
 PR_URL = f"https://github.com/{FIXTURE}/pull/4217"
-BASE_URL = "http://envoy-sink.internal:10000"
+BASE_URL = "http://model-sink.invalid:10000"
 
 
 def _stream(**overrides: Any) -> dict[str, Any]:
@@ -283,7 +283,7 @@ def test_platform_verify_refuses_an_absent_branch(tmp_path: Path) -> None:
 def _exit(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], environ: dict[str, str]
 ) -> tuple[int, str]:
-    monkeypatch.setattr(cli.os, "environ", environ)
+    monkeypatch.setattr("scripted_agent.cli.os.environ", environ)
     with pytest.raises(SystemExit) as stopped:
         cli.main()
     assert isinstance(stopped.value.code, int)
@@ -403,3 +403,12 @@ def test_refuses_an_unreadable_profile_file(
     code, err = _exit(monkeypatch, capsys, environ)
     assert code == 78
     assert "cannot be read" in err
+
+
+def test_version_reports_the_phases_recorded_cli(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("scripted_agent.cli.os.environ", _env("implement"))
+    monkeypatch.setattr("sys.argv", ["claude", "--version"])
+    cli.main()
+    assert capsys.readouterr().out == "2.0.74 (Claude Code)\n"

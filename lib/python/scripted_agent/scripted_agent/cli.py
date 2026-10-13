@@ -1,7 +1,9 @@
 """``claude`` in a load-test workspace: replay one phase of a ScriptedAgentProfile.
 
-Exit codes: 0 the phase ran; 78 no usable profile, phase or execution id;
-65 the recording is not the declared stream; 69 a workload or git/gh step failed.
+Arguments are ignored except ``--version``, which reports the phase's
+recorded ``cli_version``. Exit codes: 0 the phase ran; 78 no usable profile,
+phase or execution id; 65 the recording is not the declared stream; 69 a
+workload or git/gh step failed.
 
 Where the inputs come from:
 
@@ -58,6 +60,9 @@ Run = Callable[[Sequence[str], Path | None], str]
 
 def main() -> None:
     try:
+        if "--version" in sys.argv[1:]:
+            print(f"{cli_version(os.environ)} (Claude Code)")
+            return
         replay(os.environ, Path("/workspace"), _subprocess, time.sleep, sys.stdout)
     except Refusal as e:
         print(f"scripted-agent: {e}", file=sys.stderr)
@@ -95,6 +100,13 @@ def replay(
     _emit(
         out, {**(recording.result or {"type": "result", "subtype": "success"}), "result": verdict}
     )
+
+
+def cli_version(environ: Mapping[str, str]) -> str:
+    """The CLI version this workspace's phase was recorded from, for ``--version``."""
+    profile = load_profile(environ)
+    target = _Target.from_tags(environ.get(TAGS_ENV, ""), profile)
+    return profile.phases[target.phase_id].stream.cli_version
 
 
 def load_profile(environ: Mapping[str, str]) -> ScriptedAgentProfile:
