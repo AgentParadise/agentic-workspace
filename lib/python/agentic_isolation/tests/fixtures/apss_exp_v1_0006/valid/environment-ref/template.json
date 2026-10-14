@@ -1,0 +1,5 @@
+{
+  "schema": "apss.environment-ref/v1",
+  "kind": "template-version",
+  "identifier": "python-3.12@7"
+}

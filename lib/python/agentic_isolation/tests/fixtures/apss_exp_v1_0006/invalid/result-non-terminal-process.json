@@ -1,0 +1,14 @@
+{
+  "description": "A result carries only a terminal process status.",
+  "base": "valid/workspace-result/capture-required-unknown.json",
+  "set": [
+    {
+      "path": "/process/state",
+      "value": "running"
+    }
+  ],
+  "remove": [
+    "/process/exit_code",
+    "/process/ended_at"
+  ]
+}

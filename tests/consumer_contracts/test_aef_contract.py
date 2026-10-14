@@ -252,11 +252,11 @@ class TestAEFIsolationContract:
         assert prod.read_only_root is True
 
     def test_security_config_development(self) -> None:
-        from agentic_isolation import SecurityConfig
+        from agentic_isolation import SecurityConfig, WorkspaceRuntime
 
         dev = SecurityConfig.development()
         assert dev.read_only_root is False
-        assert dev.use_gvisor is False
+        assert dev.runtime is WorkspaceRuntime.RUNC
 
     # -- Enum stability -------------------------------------------------------
 

@@ -1,0 +1,11 @@
+{
+  "description": "The discriminator must match the schema.",
+  "base": "valid/workspace-ref/minimal.json",
+  "set": [
+    {
+      "path": "/schema",
+      "value": "apss.workspace-ref/v2"
+    }
+  ],
+  "remove": []
+}

@@ -23,15 +23,20 @@ from agentic_isolation.harnesses import (
 )
 from agentic_isolation.providers.base import (
     AwaitResult,
+    CredentialPolicyError,
+    CredentialResolver,
     ExecuteResult,
+    HostEnvironmentCredentials,
     InteractiveSession,
     SupportsStagedTeardown,
     SupportsWorkspaceLogs,
+    UnsupportedLimitError,
     Workspace,
     WorkspaceProvider,
 )
-from agentic_isolation.providers.docker import WorkspaceDockerProvider
+from agentic_isolation.providers.docker import ContainerRemovalError, WorkspaceDockerProvider
 from agentic_isolation.providers.local import WorkspaceLocalProvider
+from agentic_isolation.providers.teardown_report import TeardownReport, TeardownUsage
 
 if TYPE_CHECKING:
     from agentic_isolation.providers.interactive_tmux import InteractiveTmuxProvider
@@ -59,14 +64,21 @@ __all__ = [
     # Base types
     "WorkspaceProvider",
     "SupportsStagedTeardown",
+    "TeardownReport",
+    "TeardownUsage",
     "SupportsWorkspaceLogs",
     "Workspace",
     "ExecuteResult",
     "InteractiveSession",
     "AwaitResult",
+    "CredentialResolver",
+    "HostEnvironmentCredentials",
+    "CredentialPolicyError",
+    "UnsupportedLimitError",
     # Providers
     "WorkspaceLocalProvider",
     "WorkspaceDockerProvider",
+    "ContainerRemovalError",
     "InteractiveTmuxProvider",
     # Harness contract (see agentic_isolation.harnesses, issue #792)
     "AgentName",

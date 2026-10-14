@@ -29,7 +29,7 @@ def _make_workspace(provider_name: str) -> Workspace:
 
 class TestBaseProviderDefault:
     async def test_default_transcript_source_is_none(self) -> None:
-        provider = WorkspaceLocalProvider()
+        provider = WorkspaceLocalProvider(allow_insecure=True)
         workspace = _make_workspace(provider.name)
         assert provider.transcript_source(workspace, "claude") is None
 

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -12,12 +14,33 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from agentic_isolation.config import WorkspaceConfig
+from agentic_isolation.config import (
+    HOST_ENV_CREDENTIAL_SCOPE,
+    CredentialPolicyError,
+    WorkspaceConfig,
+    check_credential_bindings,
+)
+from agentic_isolation.contract import (
+    CredentialBinding,
+    CredentialRef,
+    ObservationGap,
+    ObservationPage,
+    OperationRef,
+    OperationSpec,
+    OperationStatus,
+    ProviderDescriptor,
+    WorkspaceRef,
+)
+from agentic_isolation.providers.teardown_report import TeardownReport
 
 if TYPE_CHECKING:
     from agentic_isolation.harnesses import TranscriptSource
 
 logger = logging.getLogger(__name__)
+
+# Set in the status `drain_operation` returns when output was evicted before
+# it was read: the evicted byte count, or "unknown" when a gap's extent is.
+OBSERVATION_LOST_BYTES = "observation_lost_bytes"
 
 
 @dataclass
@@ -152,11 +175,15 @@ class WorkspaceProvider(Protocol):
         """
         ...
 
-    async def destroy(self, workspace: Workspace) -> None:
+    async def destroy(self, workspace: Workspace) -> TeardownReport | None:
         """Destroy a workspace and clean up resources.
 
         Args:
             workspace: Workspace to destroy
+
+        Returns:
+            What the teardown measured, or None for a provider that measures
+            nothing
         """
         ...
 
@@ -316,31 +343,215 @@ class SupportsStagedTeardown(Protocol):
 
     async def teardown(
         self,
-        workspace: Workspace,
+        target: Workspace | WorkspaceRef,
         *,
         while_running: Callable[[], Awaitable[None]] | None = None,
         before_delete: Callable[[], Awaitable[None]] | None = None,
-    ) -> None:
+    ) -> TeardownReport:
         """Tear the workspace down, running the hooks at their safe points.
 
         Args:
-            workspace: Workspace to tear down
+            target: The workspace, or the `WorkspaceRef` a `retained` report
+                named. Passing the ref back is how a failed archive is retried.
             while_running: Awaited BEFORE the container is stopped, so it may
-                still exec into it. Raising aborts teardown with the container
-                intact, which is recoverable; a caller that would rather
-                proceed should catch its own errors.
+                still exec into it. If it raises, nothing is destroyed and the
+                report is `failed` at `while_running`: the workspace stays
+                registered, and the same call can be retried.
             before_delete: Awaited after the container is gone but BEFORE the
                 workspace directory is deleted. This is where a durable
                 archive belongs. **If it raises, the workspace directory is
-                NOT deleted**, so the data it failed to archive is still there
-                for a retry. That retention is the point: deleting anyway
-                would convert a failed upload into permanent loss.
+                NOT deleted** and the report is `retained`, naming the ref to
+                retry with. Deleting anyway would convert a failed upload into
+                permanent loss.
+
+        A hook's `Exception` is reported, not raised. Cancellation is not a
+        hook failure and propagates.
 
         Implementations MUST NOT delete the workspace directory when
         `before_delete` raises, and MUST leave the container stopped and
         removed regardless, so a failure cannot strand a running container.
         """
         ...
+
+
+class CredentialResolver(Protocol):
+    """Port the host implements to turn a `CredentialRef` into its value.
+
+    The value is delivered only into the workload's environment. A provider
+    must never write it into an argv, a spool, a status or a page.
+    """
+
+    async def resolve(self, ref: CredentialRef) -> str:
+        """The current value of `ref`; raise to refuse the launch."""
+        ...
+
+
+class UnsupportedLimitError(ValueError):
+    """A requested hard limit the provider cannot enforce (APSS W-3.8-d)."""
+
+
+class HostEnvironmentCredentials:
+    """Resolves `host-env` refs from this process's environment, by ref name.
+
+    Any other scope is refused, so injecting this resolver never widens what
+    a binding can reach beyond the host variables it names.
+    """
+
+    async def resolve(self, ref: CredentialRef) -> str:
+        if ref.scope != HOST_ENV_CREDENTIAL_SCOPE:
+            raise CredentialPolicyError(
+                f"credential {ref.name!r} has scope {ref.scope!r}; "
+                f"HostEnvironmentCredentials resolves only {HOST_ENV_CREDENTIAL_SCOPE!r}"
+            )
+        value = os.environ.get(ref.name)
+        if value is None:
+            raise CredentialPolicyError(
+                f"credential {ref.name!r} is not set in the host environment"
+            )
+        return value
+
+
+async def resolve_env_credentials(
+    bindings: list[CredentialBinding],
+    resolver: CredentialResolver | None,
+    *,
+    provider: str,
+) -> dict[str, str]:
+    """Resolve env-delivered bindings to `{target: value}`, or refuse.
+
+    Refuses raw values, unsafe targets, file delivery and a missing resolver
+    before anything is resolved or launched.
+    """
+    bindings = check_credential_bindings(bindings)
+    if not bindings:
+        return {}
+    if resolver is None:
+        raise CredentialPolicyError(
+            f"{provider} provider has credential bindings but no CredentialResolver; "
+            "inject one (e.g. credentials=HostEnvironmentCredentials())"
+        )
+    resolved: dict[str, str] = {}
+    for binding in bindings:
+        if binding.delivery != "env":
+            raise CredentialPolicyError(
+                f"credential delivery {binding.delivery!r} for {binding.ref.name!r} "
+                f"is not supported by the {provider} provider"
+            )
+        resolved[binding.target] = await resolver.resolve(binding.ref)
+    return resolved
+
+
+@runtime_checkable
+class SupportsOperations(Protocol):
+    """Optional capability: the APSS EXP-V1-0006 0.2.0 operation contract.
+
+    Separate from `WorkspaceProvider` for the reason `SupportsWorkspaceLogs`
+    gives: a provider that cannot start, observe and cancel a detached
+    operation should not grow methods it can only raise from. A caller tests
+    for it once, at wiring:
+
+        if not isinstance(provider, SupportsOperations):
+            raise ...  # fail fast, no silent fallback
+
+    Unlike `logs`, everything here is authoritative. `status` comes from a
+    channel the workload cannot write, and `observe` reads a provider-owned
+    spool whose integrity is published in `describe().observation`.
+    Failures are raised as `OperationFailure`, carrying a typed
+    `OperationError`; callers dispatch on `error.kind`.
+    """
+
+    def describe(self) -> ProviderDescriptor:
+        """What this provider can enforce, published before any launch."""
+        ...
+
+    async def start(self, workspace: Workspace, spec: OperationSpec) -> OperationRef:
+        """Accept `spec` and return without waiting for it to end.
+
+        The same `(workspace, operation_key)` with an equal spec returns the
+        original ref and launches nothing, however many callers race. The
+        same key with a different spec raises `conflict`. The key's record
+        lives at least as long as the workspace (EXP-V1-0006 5.1.3). A
+        provider may reclaim a terminal operation's output after a retention
+        window it documents; the old ref is then `unknown_operation`, but the
+        key still replays it.
+        """
+        ...
+
+    async def status(self, ref: OperationRef) -> OperationStatus:
+        """Where the operation is. Raises `unknown_operation` or `provider_unavailable`."""
+        ...
+
+    async def observe(
+        self,
+        ref: OperationRef,
+        *,
+        cursor: str | None,
+        max_bytes: int,
+        wait_seconds: float = 0,
+    ) -> ObservationPage:
+        """The next page after `cursor`, never larger than `max_bytes` serialised."""
+        ...
+
+    async def cancel(self, ref: OperationRef, *, grace_seconds: float) -> OperationStatus:
+        """Stop the operation and every descendant; idempotent.
+
+        Returns `cancelled` only once they are confirmed gone. An operation
+        that already ended keeps its terminal state.
+        """
+        ...
+
+
+async def run_to_completion(
+    provider: SupportsOperations,
+    workspace: Workspace,
+    spec: OperationSpec,
+) -> tuple[OperationStatus, bytes]:
+    """Start `spec`, drain its output and return the terminal status and bytes.
+
+    The bytes are the operation's observation stream: everything the workload
+    wrote to stdout and stderr, in arrival order, with no channel identity.
+    Callers that must parse stdout alone use `WorkspaceProvider.execute`.
+    """
+    return await drain_operation(provider, await provider.start(workspace, spec))
+
+
+async def drain_operation(
+    provider: SupportsOperations,
+    ref: OperationRef,
+    *,
+    page_bytes: int = 1 << 20,
+) -> tuple[OperationStatus, bytes]:
+    """Read `ref` to its `complete` page, then return its terminal status.
+
+    Built only on `observe` and `status`, so it behaves identically on every
+    provider. A `complete` page guarantees no retained byte up to the terminal
+    offset is left unread. Bytes evicted before they were read are never
+    passed off as complete output: every page's gap is summed into the
+    returned status's `OBSERVATION_LOST_BYTES` metadata, which is absent only
+    when nothing was lost.
+    """
+    cursor: str | None = None
+    output = bytearray()
+    lost = 0
+    unknown = False
+    while True:
+        page = await provider.observe(ref, cursor=cursor, max_bytes=page_bytes, wait_seconds=1.0)
+        if isinstance(page.gap, ObservationGap):
+            if page.gap.lost_bytes is None:
+                unknown = True
+            else:
+                lost += page.gap.lost_bytes
+        output.extend(base64.b64decode(page.data_b64))
+        cursor = page.next_cursor
+        if page.complete:
+            status = await provider.status(ref)
+            if unknown or lost:
+                metadata = {
+                    **status.metadata,
+                    OBSERVATION_LOST_BYTES: "unknown" if unknown else str(lost),
+                }
+                status = status.model_copy(update={"metadata": metadata})
+            return status, bytes(output)
 
 
 @runtime_checkable
@@ -403,8 +614,8 @@ class BaseProvider(ABC):
         ...
 
     @abstractmethod
-    async def destroy(self, workspace: Workspace) -> None:
-        """Destroy a workspace."""
+    async def destroy(self, workspace: Workspace) -> TeardownReport | None:
+        """Destroy a workspace. None when the provider measures nothing."""
         ...
 
     @abstractmethod

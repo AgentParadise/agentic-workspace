@@ -1,0 +1,11 @@
+{
+  "schema": "apss.content-ref/v1",
+  "digest": "sha256:abababababababababababababababababababababababababababababababab",
+  "size_bytes": 1048576,
+  "media_type": "application/gzip",
+  "locator": "s3://artifacts/exec-42/out.tar.gz",
+  "authority": {
+    "name": "github-app",
+    "scope": "repo:acme/widgets"
+  }
+}

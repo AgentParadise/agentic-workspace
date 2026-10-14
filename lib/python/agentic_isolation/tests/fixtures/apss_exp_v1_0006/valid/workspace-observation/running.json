@@ -1,0 +1,16 @@
+{
+  "schema": "apss.workspace-observation/v1",
+  "ref": {
+    "workspace": {
+      "provider": "docker",
+      "resource_id": "ws-7f3a"
+    },
+    "operation_id": "op-0001",
+    "operation_key": "exec-42:phase-1:fence-9:agent"
+  },
+  "state": "running",
+  "cursor": "g1:0",
+  "next_cursor": "g1:12",
+  "data_b64": "aGVsbG8gd29ybGQK",
+  "complete": false
+}

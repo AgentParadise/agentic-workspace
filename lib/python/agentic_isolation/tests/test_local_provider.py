@@ -1,5 +1,7 @@
 """Tests for WorkspaceLocalProvider."""
 
+from pathlib import Path
+
 import pytest
 
 from agentic_isolation import (
@@ -7,6 +9,9 @@ from agentic_isolation import (
     WorkspaceConfig,
     WorkspaceLocalProvider,
 )
+from agentic_isolation.config import host_env_credential
+from agentic_isolation.contract import CredentialBinding, CredentialRef
+from agentic_isolation.providers import CredentialPolicyError
 
 
 class TestWorkspaceLocalProvider:
@@ -15,7 +20,7 @@ class TestWorkspaceLocalProvider:
     @pytest.fixture
     def provider(self) -> WorkspaceLocalProvider:
         """Create a local provider."""
-        return WorkspaceLocalProvider()
+        return WorkspaceLocalProvider(allow_insecure=True)
 
     @pytest.mark.asyncio
     async def test_create_workspace(self, provider: WorkspaceLocalProvider) -> None:
@@ -73,18 +78,40 @@ class TestWorkspaceLocalProvider:
             await provider.destroy(workspace)
 
     @pytest.mark.asyncio
-    async def test_execute_with_secrets(self, provider: WorkspaceLocalProvider) -> None:
-        """Should inject secrets as environment variables."""
+    async def test_execute_with_credentials(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bound credential is resolved at create and delivered to the command.
+
+        The target is absent from the host environment and the ref name differs
+        from it, so only the provider's credential overlay can supply it.
+        """
+        monkeypatch.delenv("BOUND_TARGET", raising=False)
+
+        class Vault:
+            async def resolve(self, ref: CredentialRef) -> str:
+                assert ref == CredentialRef(name="team/api-key", scope="vault")
+                return "synthetic-credential-123"
+
+        provider = WorkspaceLocalProvider(
+            base_dir=tmp_path, credentials=Vault(), allow_insecure=True
+        )
         config = WorkspaceConfig(
             provider="local",
-            secrets={"SECRET_KEY": "secret123"},
+            credentials=[
+                CredentialBinding(
+                    ref=CredentialRef(name="team/api-key", scope="vault"),
+                    delivery="env",
+                    target="BOUND_TARGET",
+                )
+            ],
         )
         workspace = await provider.create(config)
 
         try:
-            result = await provider.execute(workspace, "echo $SECRET_KEY")
+            result = await provider.execute(workspace, "printf '%s' \"$BOUND_TARGET\"")
 
-            assert "secret123" in result.stdout
+            assert result.stdout == "synthetic-credential-123"
         finally:
             await provider.destroy(workspace)
 
@@ -157,20 +184,25 @@ class TestWorkspaceLocalProvider:
             await provider.destroy(workspace)
 
 
+def _local(workspace: AgenticWorkspace) -> AgenticWorkspace:
+    """The workspace on an opted-in Local provider; the registry's default refuses (W-6.2)."""
+    return AgenticWorkspace(workspace._config, provider=WorkspaceLocalProvider(allow_insecure=True))
+
+
 class TestAgenticWorkspaceLocal:
     """Tests for AgenticWorkspace with local provider."""
 
     @pytest.mark.asyncio
     async def test_context_manager(self) -> None:
         """Should work as async context manager."""
-        async with AgenticWorkspace.create(provider="local") as workspace:
+        async with _local(AgenticWorkspace.create(provider="local")) as workspace:
             assert workspace.id is not None
             assert workspace.path.exists()
 
     @pytest.mark.asyncio
     async def test_auto_cleanup(self) -> None:
         """Should cleanup workspace on exit."""
-        async with AgenticWorkspace.create(provider="local") as workspace:
+        async with _local(AgenticWorkspace.create(provider="local")) as workspace:
             path = workspace.path
             assert path.exists()
 
@@ -179,14 +211,14 @@ class TestAgenticWorkspaceLocal:
     @pytest.mark.asyncio
     async def test_execute_shorthand(self) -> None:
         """Should provide execute shorthand."""
-        async with AgenticWorkspace.create(provider="local") as workspace:
+        async with _local(AgenticWorkspace.create(provider="local")) as workspace:
             result = await workspace.execute("echo test")
             assert "test" in result.stdout
 
     @pytest.mark.asyncio
     async def test_file_operations(self) -> None:
         """Should provide file operation shorthands."""
-        async with AgenticWorkspace.create(provider="local") as workspace:
+        async with _local(AgenticWorkspace.create(provider="local")) as workspace:
             await workspace.write_file("test.py", "print('hello')")
             assert await workspace.file_exists("test.py")
 
@@ -194,19 +226,21 @@ class TestAgenticWorkspaceLocal:
             assert "hello" in content
 
     @pytest.mark.asyncio
-    async def test_secrets_injection(self) -> None:
-        """Should inject secrets."""
-        async with AgenticWorkspace.create(
-            provider="local",
-            secrets={"MY_SECRET": "secret_value"},
-        ) as workspace:
-            result = await workspace.execute("echo $MY_SECRET")
-            assert "secret_value" in result.stdout
+    async def test_credentials_without_a_resolver_are_refused(self) -> None:
+        """No resolver injected means a bound credential fails closed at create."""
+        with pytest.raises(CredentialPolicyError, match="no CredentialResolver"):
+            async with _local(
+                AgenticWorkspace.create(
+                    provider="local",
+                    credentials=[host_env_credential("MY_SECRET")],
+                )
+            ):
+                pass
 
     @pytest.mark.asyncio
     async def test_to_dict(self) -> None:
         """Should convert to dictionary."""
-        async with AgenticWorkspace.create(provider="local") as workspace:
+        async with _local(AgenticWorkspace.create(provider="local")) as workspace:
             data = workspace.to_dict()
             assert "id" in data
             assert "provider" in data

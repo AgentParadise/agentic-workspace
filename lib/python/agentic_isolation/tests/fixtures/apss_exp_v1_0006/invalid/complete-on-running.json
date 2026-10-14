@@ -1,0 +1,11 @@
+{
+  "description": "complete is true only for a terminal state.",
+  "base": "valid/workspace-observation/running.json",
+  "set": [
+    {
+      "path": "/complete",
+      "value": true
+    }
+  ],
+  "remove": []
+}

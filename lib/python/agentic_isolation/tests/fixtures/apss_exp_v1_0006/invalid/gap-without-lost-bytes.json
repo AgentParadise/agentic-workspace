@@ -1,0 +1,11 @@
+{
+  "description": "A gap must state lost_bytes, even if null.",
+  "base": "valid/workspace-observation/gap-exact.json",
+  "set": [
+    {
+      "path": "/gap",
+      "value": {}
+    }
+  ],
+  "remove": []
+}

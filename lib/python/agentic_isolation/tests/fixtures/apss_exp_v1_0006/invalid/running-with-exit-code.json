@@ -1,0 +1,11 @@
+{
+  "description": "A non-terminal status has no exit code.",
+  "base": "valid/workspace-status/running.json",
+  "set": [
+    {
+      "path": "/exit_code",
+      "value": 0
+    }
+  ],
+  "remove": []
+}

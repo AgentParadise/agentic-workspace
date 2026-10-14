@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://standards.agentparadise.dev/experimental/v1/workspace/workspace-status.schema.json",
+  "title": "APSS Workspace Operation Status",
+  "description": "A status response is either an OperationStatus or a typed OperationError, never both.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/operationStatus",
+      "required": [
+        "schema"
+      ]
+    },
+    {
+      "$ref": "#/$defs/operationError",
+      "required": [
+        "schema"
+      ]
+    }
+  ],
+  "$defs": {
+    "state": {
+      "enum": [
+        "pending",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "lost"
+      ]
+    },
+    "terminalState": {
+      "enum": [
+        "succeeded",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "lost"
+      ]
+    },
+    "operationStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ref",
+        "state",
+        "execution_id",
+        "metadata"
+      ],
+      "properties": {
+        "schema": {
+          "const": "apss.workspace-status/v1"
+        },
+        "ref": {
+          "$ref": "workspace-operation.schema.json#/$defs/operationRef"
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "signal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "execution_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "metadata": {
+          "$ref": "credential-ref.schema.json#/$defs/credentialFreeStringMap"
+        }
+      },
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "pending",
+              "running"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "exit_code": false,
+          "signal": false,
+          "ended_at": false
+        }
+      }
+    },
+    "operationError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "message"
+      ],
+      "properties": {
+        "schema": {
+          "const": "apss.workspace-status/v1"
+        },
+        "kind": {
+          "enum": [
+            "rejected_policy",
+            "unsupported_capability",
+            "hydration_failed",
+            "conflict",
+            "unknown_operation",
+            "timeout",
+            "cancelled",
+            "resource_lost",
+            "provider_unavailable",
+            "internal"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ref": {
+          "$ref": "workspace-operation.schema.json#/$defs/operationRef"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "description": "error.kind is closed for v1.",
+  "base": "valid/workspace-status/error-provider-unavailable.json",
+  "set": [
+    {
+      "path": "/kind",
+      "value": "quota_exceeded"
+    }
+  ],
+  "remove": []
+}

@@ -1,0 +1,8 @@
+{
+  "description": "retained must name the workspace to retry against.",
+  "base": "valid/workspace-finalization/retained.json",
+  "set": [],
+  "remove": [
+    "/retained"
+  ]
+}

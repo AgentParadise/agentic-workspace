@@ -1,0 +1,13 @@
+{
+  "schema": "apss.workspace-finalization/v1",
+  "state": "retained",
+  "stage": "before_delete",
+  "error": {
+    "kind": "internal",
+    "message": "archive upload failed: connection reset"
+  },
+  "retained": {
+    "provider": "docker",
+    "resource_id": "ws-7f3a"
+  }
+}

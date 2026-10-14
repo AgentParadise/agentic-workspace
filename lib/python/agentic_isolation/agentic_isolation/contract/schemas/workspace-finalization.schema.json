@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://standards.agentparadise.dev/experimental/v1/workspace/workspace-finalization.schema.json",
+  "title": "APSS Workspace Finalization Outcome",
+  "description": "The outcome of finalizing a workspace before it is destroyed.",
+  "$ref": "#/$defs/finalizationOutcome",
+  "required": [
+    "schema"
+  ],
+  "$defs": {
+    "finalizationOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state"
+      ],
+      "properties": {
+        "schema": {
+          "const": "apss.workspace-finalization/v1"
+        },
+        "state": {
+          "enum": [
+            "completed",
+            "retained",
+            "failed"
+          ]
+        },
+        "stage": {
+          "enum": [
+            "while_running",
+            "before_delete"
+          ]
+        },
+        "error": {
+          "$ref": "workspace-status.schema.json#/$defs/operationError"
+        },
+        "retained": {
+          "$ref": "workspace-ref.schema.json#/$defs/workspaceRef"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "completed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "error": false,
+              "retained": false,
+              "stage": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "retained"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "retained",
+              "error",
+              "stage"
+            ],
+            "properties": {
+              "stage": {
+                "const": "before_delete"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "failed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "error",
+              "stage"
+            ],
+            "properties": {
+              "retained": false
+            }
+          }
+        }
+      ]
+    }
+  }
+}

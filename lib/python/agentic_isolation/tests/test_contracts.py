@@ -3,6 +3,8 @@
 Verifies all providers implement the required interface correctly.
 """
 
+from functools import partial
+
 import pytest
 
 from agentic_isolation import (
@@ -19,7 +21,7 @@ class TestProviderContracts:
 
     @pytest.mark.parametrize(
         "provider_class",
-        [WorkspaceDockerProvider, WorkspaceLocalProvider],
+        [WorkspaceDockerProvider, partial(WorkspaceLocalProvider, allow_insecure=True)],
     )
     def test_provider_implements_workspace_provider(self, provider_class: type) -> None:
         """All providers should implement WorkspaceProvider protocol."""
@@ -28,7 +30,7 @@ class TestProviderContracts:
 
     @pytest.mark.parametrize(
         "provider_class",
-        [WorkspaceDockerProvider, WorkspaceLocalProvider],
+        [WorkspaceDockerProvider, partial(WorkspaceLocalProvider, allow_insecure=True)],
     )
     def test_provider_has_name(self, provider_class: type) -> None:
         """All providers should have a name property."""
@@ -39,7 +41,7 @@ class TestProviderContracts:
 
     @pytest.mark.parametrize(
         "provider_class",
-        [WorkspaceDockerProvider, WorkspaceLocalProvider],
+        [WorkspaceDockerProvider, partial(WorkspaceLocalProvider, allow_insecure=True)],
     )
     def test_provider_has_create_method(self, provider_class: type) -> None:
         """All providers should have async create method."""
@@ -49,7 +51,7 @@ class TestProviderContracts:
 
     @pytest.mark.parametrize(
         "provider_class",
-        [WorkspaceDockerProvider, WorkspaceLocalProvider],
+        [WorkspaceDockerProvider, partial(WorkspaceLocalProvider, allow_insecure=True)],
     )
     def test_provider_has_destroy_method(self, provider_class: type) -> None:
         """All providers should have async destroy method."""
@@ -59,7 +61,7 @@ class TestProviderContracts:
 
     @pytest.mark.parametrize(
         "provider_class",
-        [WorkspaceDockerProvider, WorkspaceLocalProvider],
+        [WorkspaceDockerProvider, partial(WorkspaceLocalProvider, allow_insecure=True)],
     )
     def test_provider_has_execute_method(self, provider_class: type) -> None:
         """All providers should have async execute method."""
@@ -69,7 +71,7 @@ class TestProviderContracts:
 
     @pytest.mark.parametrize(
         "provider_class",
-        [WorkspaceDockerProvider, WorkspaceLocalProvider],
+        [WorkspaceDockerProvider, partial(WorkspaceLocalProvider, allow_insecure=True)],
     )
     def test_provider_has_stream_method(self, provider_class: type) -> None:
         """All providers should have async stream method."""
@@ -79,7 +81,7 @@ class TestProviderContracts:
 
     @pytest.mark.parametrize(
         "provider_class",
-        [WorkspaceDockerProvider, WorkspaceLocalProvider],
+        [WorkspaceDockerProvider, partial(WorkspaceLocalProvider, allow_insecure=True)],
     )
     def test_provider_has_file_methods(self, provider_class: type) -> None:
         """All providers should have file operation methods."""
@@ -157,4 +159,4 @@ class TestSecurityConfigContract:
         dev = SecurityConfig.development()
 
         # At least one field should differ
-        assert prod.read_only_root != dev.read_only_root or prod.use_gvisor != dev.use_gvisor
+        assert prod.read_only_root != dev.read_only_root or prod.runtime != dev.runtime

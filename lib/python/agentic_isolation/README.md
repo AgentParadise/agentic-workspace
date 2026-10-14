@@ -18,8 +18,9 @@ async with AgenticWorkspace.create(provider="docker") as workspace:
     result = await workspace.execute("echo hello")
     print(result.stdout)  # "hello\n"
 
-# Local provider (development/testing)
-async with AgenticWorkspace.create(provider="local") as workspace:
+# Local provider (development/testing): an explicit, insecure opt-in
+local = WorkspaceLocalProvider(allow_insecure=True)
+async with AgenticWorkspace(WorkspaceConfig(provider="local"), provider=local) as workspace:
     result = await workspace.execute("echo hello")
     print(result.stdout)
 ```
@@ -44,12 +45,15 @@ async with AgenticWorkspace.create(
 
 ### WorkspaceLocalProvider
 
-For development and testing. Creates isolated directories but no process isolation.
+For development and testing. Creates separate directories but no process isolation.
+Construction raises `InsecureProviderError` unless you pass `allow_insecure=True`
+(APSS W-6.2), so `AgenticWorkspace.create(provider="local")` refuses on enter.
 
 ```python
-async with AgenticWorkspace.create(
-    provider="local",
-    working_dir="/workspace",
+local = WorkspaceLocalProvider(allow_insecure=True)
+async with AgenticWorkspace(
+    WorkspaceConfig(provider="local", working_dir="/workspace"),
+    provider=local,
 ) as workspace:
     await workspace.write_file("test.py", b"print('hi')")
     result = await workspace.execute("python test.py")
@@ -194,7 +198,9 @@ class SecurityConfig:
     tmpfs_tmp: bool = True
     tmpfs_home: bool = True
     pids_limit: int = 256
-    use_gvisor: bool | None = None  # None = auto-detect
+    runtime: WorkspaceRuntime | None = None  # None = auto: gVisor if registered, else runc
+
+    def resolve_runtime(self) -> ResolvedRuntime: ...  # refuses an unregistered explicit runtime
 
     @classmethod
     def production(cls) -> SecurityConfig: ...

@@ -1,0 +1,15 @@
+{
+  "description": "success must be false when the process did not succeed.",
+  "base": "valid/workspace-result/succeeded.json",
+  "set": [
+    {
+      "path": "/process/state",
+      "value": "failed"
+    },
+    {
+      "path": "/process/exit_code",
+      "value": 1
+    }
+  ],
+  "remove": []
+}

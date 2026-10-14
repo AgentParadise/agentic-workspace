@@ -21,6 +21,15 @@ from agentic_isolation import (
     WorkspaceConfig,
     WorkspaceDockerProvider,
 )
+from agentic_isolation.config import host_env_credential
+from agentic_isolation.contract import CredentialBinding, CredentialRef
+from agentic_isolation.providers import HostEnvironmentCredentials
+
+EXPLICIT = CredentialBinding(
+    ref=CredentialRef(name="FIRECRAWL_KEY_V2", scope="host-env"),
+    delivery="env",
+    target="FIRECRAWL_API_KEY",
+)
 
 # Path to the research plugin (has requires_env with FIRECRAWL_API_KEY)
 RESEARCH_PLUGIN = Path(__file__).parent.parent.parent.parent.parent.parent / "plugins" / "research"
@@ -43,37 +52,44 @@ pytestmark = [
 ]
 
 
+def _forwarding_workspace() -> AgenticWorkspace:
+    """A Docker workspace whose provider resolves host-env credential bindings."""
+    config = WorkspaceConfig(
+        provider="docker",
+        image="python:3.12-slim",
+        plugins=[str(RESEARCH_PLUGIN)],
+        security=SecurityConfig.development(),
+    )
+    return AgenticWorkspace(
+        config, provider=WorkspaceDockerProvider(credentials=HostEnvironmentCredentials())
+    )
+
+
 class TestPluginEnvForwarding:
     """Tests for requires_env auto-forwarding into Docker containers."""
 
     @pytest.mark.asyncio
-    async def test_resolve_plugin_env_populates_secrets(self) -> None:
-        """resolve_plugin_env() should read requires_env and forward matching host env vars."""
+    async def test_resolve_plugin_env_binds_credentials(self) -> None:
+        """resolve_plugin_env() should bind matching host env vars by reference."""
         config = WorkspaceConfig(
             provider="docker",
             image="python:3.12-slim",
             plugins=[str(RESEARCH_PLUGIN)],
         )
 
-        # Before: no secrets
-        assert "FIRECRAWL_API_KEY" not in config.secrets
+        # Before: no credentials
+        assert config.credentials == []
 
         # Resolve: reads plugin.json requires_env, matches host env
         config.resolve_plugin_env()
 
-        # After: secret forwarded
-        assert "FIRECRAWL_API_KEY" in config.secrets
-        assert config.secrets["FIRECRAWL_API_KEY"] == os.environ["FIRECRAWL_API_KEY"]
+        # After: bound by name; the value stays in the host environment
+        assert config.credentials == [host_env_credential("FIRECRAWL_API_KEY")]
 
     @pytest.mark.asyncio
     async def test_secret_available_inside_container(self) -> None:
         """FIRECRAWL_API_KEY should be accessible inside the Docker container."""
-        async with AgenticWorkspace.create(
-            provider="docker",
-            image="python:3.12-slim",
-            plugins=[str(RESEARCH_PLUGIN)],
-            security=SecurityConfig.development(),
-        ) as workspace:
+        async with _forwarding_workspace() as workspace:
             result = await workspace.execute("echo $FIRECRAWL_API_KEY")
 
             # Should be set and non-empty
@@ -84,12 +100,7 @@ class TestPluginEnvForwarding:
     @pytest.mark.asyncio
     async def test_firecrawl_api_call_inside_container(self) -> None:
         """Should be able to call Firecrawl API from inside the container."""
-        async with AgenticWorkspace.create(
-            provider="docker",
-            image="python:3.12-slim",
-            plugins=[str(RESEARCH_PLUGIN)],
-            security=SecurityConfig.development(),
-        ) as workspace:
+        async with _forwarding_workspace() as workspace:
             # Write a test script to avoid shell quoting issues
             await workspace.write_file(
                 "test_firecrawl.py",
@@ -130,25 +141,25 @@ class TestPluginEnvEdgeCases:
         try:
             # Should not raise (FIRECRAWL_API_KEY is required=false in plugin.json)
             config.resolve_plugin_env()
-            assert "FIRECRAWL_API_KEY" not in config.secrets
+            assert config.credentials == []
         finally:
             if original:
                 os.environ["FIRECRAWL_API_KEY"] = original
 
     @pytest.mark.asyncio
     async def test_explicit_secret_not_overwritten(self) -> None:
-        """Explicitly set secrets should not be overwritten by resolve_plugin_env()."""
+        """Explicitly bound credentials should not be overwritten by resolve_plugin_env()."""
         config = WorkspaceConfig(
             provider="docker",
             image="python:3.12-slim",
             plugins=[str(RESEARCH_PLUGIN)],
-            secrets={"FIRECRAWL_API_KEY": "explicit-value"},
+            credentials=[EXPLICIT],
         )
 
         config.resolve_plugin_env()
 
-        # Should keep the explicit value
-        assert config.secrets["FIRECRAWL_API_KEY"] == "explicit-value"
+        # Should keep the explicit binding
+        assert config.credentials == [EXPLICIT]
 
     @pytest.mark.asyncio
     async def test_plugin_without_requires_env(self) -> None:
@@ -166,4 +177,4 @@ class TestPluginEnvEdgeCases:
 
         # Should not raise
         config.resolve_plugin_env()
-        assert len(config.secrets) == 0
+        assert len(config.credentials) == 0

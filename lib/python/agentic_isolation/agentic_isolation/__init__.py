@@ -8,7 +8,7 @@ Quick Start:
 
     async with AgenticWorkspace.create(
         provider="local",  # or "docker"
-        secrets={"API_KEY": "secret"},
+        environment={"LOG_LEVEL": "debug"},
     ) as workspace:
         result = await workspace.execute("echo hello")
         print(result.stdout)
@@ -52,9 +52,11 @@ from agentic_isolation.config import (
     CodexSandboxPolicyError,
     DockerDetectionError,
     MountConfig,
+    ResolvedRuntime,
     ResourceLimits,
     SecurityConfig,
     WorkspaceConfig,
+    WorkspaceRuntime,
     codex_sandbox_apparmor_profile_path,
     codex_sandbox_seccomp_profile,
 )
@@ -67,6 +69,8 @@ from agentic_isolation.providers import (
     InteractiveSession,
     SupportsStagedTeardown,
     SupportsWorkspaceLogs,
+    TeardownReport,
+    TeardownUsage,
     TranscriptExtractionResult,
     TranscriptSource,
     Workspace,
@@ -109,6 +113,8 @@ __all__ = [
     "ResourceLimits",
     "MountConfig",
     "SecurityConfig",
+    "WorkspaceRuntime",
+    "ResolvedRuntime",
     "CODEX_SANDBOX_SECCOMP_PROFILE_NAME",
     "codex_sandbox_seccomp_profile",
     "CODEX_SANDBOX_APPARMOR_PROFILE",
@@ -120,6 +126,8 @@ __all__ = [
     # Providers
     "WorkspaceProvider",
     "SupportsStagedTeardown",
+    "TeardownReport",
+    "TeardownUsage",
     "SupportsWorkspaceLogs",
     "Workspace",
     "ExecuteResult",

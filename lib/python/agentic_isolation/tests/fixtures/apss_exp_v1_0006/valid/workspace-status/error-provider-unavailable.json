@@ -1,0 +1,13 @@
+{
+  "schema": "apss.workspace-status/v1",
+  "kind": "provider_unavailable",
+  "message": "docker daemon did not answer within 5s",
+  "ref": {
+    "workspace": {
+      "provider": "docker",
+      "resource_id": "ws-7f3a"
+    },
+    "operation_id": "op-0001",
+    "operation_key": "exec-42:phase-1:fence-9:agent"
+  }
+}

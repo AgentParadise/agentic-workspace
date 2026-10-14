@@ -1,0 +1,11 @@
+{
+  "description": "argv has at least one element.",
+  "base": "valid/workspace-operation/minimal.json",
+  "set": [
+    {
+      "path": "/argv",
+      "value": []
+    }
+  ],
+  "remove": []
+}

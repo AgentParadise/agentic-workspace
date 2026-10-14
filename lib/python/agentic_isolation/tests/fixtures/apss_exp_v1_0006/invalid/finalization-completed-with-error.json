@@ -1,0 +1,14 @@
+{
+  "description": "A completed finalization carries no error.",
+  "base": "valid/workspace-finalization/completed.json",
+  "set": [
+    {
+      "path": "/error",
+      "value": {
+        "kind": "internal",
+        "message": "x"
+      }
+    }
+  ],
+  "remove": []
+}

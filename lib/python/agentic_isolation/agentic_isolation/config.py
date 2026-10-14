@@ -10,10 +10,15 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from importlib import resources
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Literal
+
+from agentic_isolation.contract import CredentialBinding, CredentialRef
+from agentic_isolation.contract._base import _CREDENTIAL_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,113 @@ def _resolve_single_env_var(
             raise ValueError(f"Plugin '{plugin_name}' requires env var {var_name}: {description}")
         return "", False
     return value, True
+
+
+# Scope of a credential the provider's resolver reads from its own process
+# environment under the ref's name. Plugin `secret=true` variables use it.
+HOST_ENV_CREDENTIAL_SCOPE = "host-env"
+
+
+def host_env_credential(name: str) -> CredentialBinding:
+    """Bind host environment variable `name` to the same name in the workspace."""
+    return CredentialBinding(
+        ref=CredentialRef(name=name, scope=HOST_ENV_CREDENTIAL_SCOPE),
+        delivery="env",
+        target=name,
+    )
+
+
+class CredentialPolicyError(ValueError):
+    """A credential binding the provider refuses to deliver (fails closed)."""
+
+
+# An env delivery target is a bare POSIX variable name: never `NAME=value`.
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Targets a workload credential may not take. A provider delivers env
+# credentials through its own client process (the docker CLI copies them
+# with `-e NAME`), so these would let a workload value steer that host
+# process: executable lookup, loader injection, docker client controls,
+# proxies, TLS trust, Go runtime switches, and the shell's startup files.
+_RESERVED_ENV_TARGETS = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "IFS",
+        "ENV",
+        "BASH_ENV",
+        "SHELL",
+        "TMPDIR",
+        "GODEBUG",
+        "GOTRACEBACK",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "WORKSPACE_ID",
+    }
+)
+_RESERVED_ENV_PREFIXES = ("DOCKER_", "LD_", "DYLD_", "XDG_", "BUILDKIT_", "NOTARY_")
+
+
+def _check_env_target(target: str, ref_name: str) -> None:
+    if not _ENV_NAME.match(target):
+        raise CredentialPolicyError(
+            f"credential {ref_name!r} has env target that is not a variable name; "
+            "use a bare NAME matching [A-Za-z_][A-Za-z0-9_]*"
+        )
+    upper = target.upper()
+    if upper in _RESERVED_ENV_TARGETS or upper.startswith(_RESERVED_ENV_PREFIXES):
+        raise CredentialPolicyError(
+            f"credential {ref_name!r} targets reserved variable {target!r}, which "
+            "controls the provider's host client; deliver it under another name"
+        )
+
+
+def check_env_targets(names: Iterable[str]) -> None:
+    """Refuse any env delivery target that is not a safe bare variable name.
+
+    For values a caller delivers directly, outside a `CredentialBinding`; the
+    name stands in for the binding's ref in the error.
+    """
+    for name in names:
+        _check_env_target(name, name)
+
+
+def check_credential_bindings(bindings: list[CredentialBinding]) -> list[CredentialBinding]:
+    """Every entry is a contract `CredentialBinding` with a deliverable target.
+
+    Raw values, mappings and anything else are refused without echoing them,
+    so a credential value never reaches the error message.
+    """
+    for index, binding in enumerate(bindings):
+        if not isinstance(binding, CredentialBinding):
+            raise CredentialPolicyError(
+                f"credentials[{index}] is a {type(binding).__name__}, not a "
+                "CredentialBinding; bind credentials by reference, never by value"
+            )
+        if binding.delivery == "env":
+            _check_env_target(binding.target, binding.ref.name)
+    return list(bindings)
+
+
+# The contract's credential-key heuristic, plus AUTH as a whole underscore
+# word: AGENTIC_SESSION_STORE_AUTH is a live credential the contract pattern
+# misses, and GIT_AUTHOR_NAME must still pass.
+_AUTH_WORD = re.compile(r"(^|_)AUTH(_|$)", re.IGNORECASE)
+
+
+def _reject_credential_environment(environment: dict[str, str]) -> None:
+    named = sorted(
+        key for key in environment if _CREDENTIAL_KEY.search(key) or _AUTH_WORD.search(key)
+    )
+    if named:
+        raise ValueError(
+            f"environment keys {named} name a credential; bind them with "
+            "WorkspaceConfig.credentials (a CredentialBinding) instead of passing the value"
+        )
 
 
 CODEX_SANDBOX_SECCOMP_PROFILE_NAME = "codex-sandbox.json"
@@ -84,6 +196,56 @@ class DockerDetectionError(RuntimeError):
 
     Never treated as "feature absent": that would silently drop protection.
     """
+
+
+class WorkspaceRuntime(StrEnum):
+    """The OCI runtime a workspace container runs under."""
+
+    RUNC = "runc"
+    GVISOR = "gvisor"
+    KATA = "kata"
+    SYSBOX = "sysbox"
+
+
+# How each runtime is recognised from the ``path`` Docker reports for an alias:
+# the basename must be exactly one of the runtime's binary or shim names. The
+# alias name is never trusted: an alias called "kata" that points at runc is
+# runc, and neither is ``/usr/bin/not-kata-runtime``. Docker reports no path
+# for a shim-v2 runtime registered by ``runtimeType`` (``docker info`` copies
+# only Path and Args), so such an alias cannot be verified here. The second
+# entry is the conventional alias, preferred when several aliases resolve to
+# the same runtime.
+_KATA_VMMS = ("qemu", "clh", "fc", "dragonball", "stratovirt")
+_RUNTIME_BINARIES: dict[WorkspaceRuntime, tuple[re.Pattern[str], str]] = {
+    WorkspaceRuntime.GVISOR: (re.compile(r"runsc|containerd-shim-runsc-v1"), "runsc"),
+    WorkspaceRuntime.KATA: (
+        re.compile(rf"kata-runtime|containerd-shim-kata(?:-(?:{'|'.join(_KATA_VMMS)}))?-v2"),
+        "kata",
+    ),
+    WorkspaceRuntime.SYSBOX: (re.compile(r"sysbox-runc"), "sysbox-runc"),
+}
+
+
+@dataclass(frozen=True)
+class ResolvedRuntime:
+    """The runtime a workspace will run under, as verified against the Docker host.
+
+    Proves the alias is registered and points at the runtime's binary or
+    shim, not that a guest kernel booted.
+    """
+
+    requested: WorkspaceRuntime | None  # None = auto
+    effective: WorkspaceRuntime
+    alias: str  # the name Docker registered, passed as --runtime
+    runtime_path: str  # the binary or shim Docker reports for the alias ("" if none)
+
+
+_RUNC = ResolvedRuntime(
+    requested=WorkspaceRuntime.RUNC,
+    effective=WorkspaceRuntime.RUNC,
+    alias="runc",
+    runtime_path="runc",
+)
 
 
 class AppArmorProfileNotLoadedError(RuntimeError):
@@ -188,8 +350,10 @@ class SecurityConfig:
     # Process limits
     pids_limit: int = 256  # --pids-limit=256
 
-    # gVisor runtime (extra sandbox layer)
-    use_gvisor: bool | None = None  # None = auto-detect, True/False = force
+    # OCI runtime. None = auto: gVisor if Docker has it registered, else runc.
+    # An explicit runtime Docker does not have registered is refused, never
+    # replaced with runc. See resolve_runtime().
+    runtime: WorkspaceRuntime | None = None
 
     # Seccomp profile file (--security-opt=seccomp=<path>). None keeps Docker's
     # default profile. Set for Codex-capable images by resolve_for_image();
@@ -278,12 +442,12 @@ class SecurityConfig:
         """
         return cls(
             read_only_root=False,
-            use_gvisor=False,
+            runtime=WorkspaceRuntime.RUNC,
         )
 
-    # Cache for gVisor detection to avoid repeated blocking subprocess calls.
+    # Cache for Docker host detection to avoid repeated blocking subprocess calls.
     # Only successful answers are cached; a failed probe is retried next time.
-    _gvisor_available: ClassVar[bool | None] = None
+    _docker_runtimes: ClassVar[dict[str, str] | None] = None
     _apparmor_available: ClassVar[bool | None] = None
 
     @staticmethod
@@ -322,20 +486,100 @@ class SecurityConfig:
         return cls._apparmor_available
 
     @classmethod
-    def detect_gvisor(cls) -> bool:
-        """Detect if the gVisor runtime is available.
+    def _registered_runtimes(cls) -> dict[str, str]:
+        """Docker's runtime aliases, each mapped to the path it reports ("" if none).
 
-        No docker CLI means no runtime to detect (and nothing can launch).
-        A failed query raises DockerDetectionError and is not cached, so a
-        transient failure never silently drops gVisor.
+        A failed query raises DockerDetectionError and is not cached.
         """
-        if cls._gvisor_available is not None:
-            return cls._gvisor_available
-        if shutil.which("docker") is None:
-            return False
-        runtimes = cls._docker_info("{{json .Runtimes}}")
-        cls._gvisor_available = "runsc" in runtimes or "gvisor" in runtimes
-        return cls._gvisor_available
+        if cls._docker_runtimes is None:
+            raw = cls._docker_info("{{json .Runtimes}}")
+            try:
+                runtimes = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise DockerDetectionError(
+                    f"docker info returned unreadable Runtimes: {raw.strip()[:300]}"
+                ) from error
+            if not isinstance(runtimes, dict):
+                raise DockerDetectionError(
+                    f"docker info returned unreadable Runtimes: {raw.strip()[:300]}"
+                )
+            cls._docker_runtimes = {
+                str(alias): str(spec.get("path") or "") if isinstance(spec, dict) else ""
+                for alias, spec in runtimes.items()
+            }
+        return cls._docker_runtimes
+
+    @classmethod
+    def _find_alias(cls, runtime: WorkspaceRuntime) -> ResolvedRuntime | None:
+        """The registered alias whose binary or shim is ``runtime``'s, if any."""
+        binary, conventional = _RUNTIME_BINARIES[runtime]
+        matches = {
+            alias: path
+            for alias, path in cls._registered_runtimes().items()
+            if binary.fullmatch(PurePosixPath(path).name)
+        }
+        if not matches:
+            return None
+        if conventional in matches:
+            alias = conventional
+        elif len(matches) == 1:
+            (alias,) = matches
+        else:
+            raise DockerDetectionError(
+                f"Docker has several {runtime} runtimes registered "
+                f"({', '.join(sorted(matches))}) and none is named {conventional!r}; "
+                f"register the one to use as {conventional!r} in daemon.json"
+            )
+        return ResolvedRuntime(
+            requested=runtime,
+            effective=runtime,
+            alias=alias,
+            runtime_path=matches[alias],
+        )
+
+    def resolve_runtime(self) -> ResolvedRuntime:
+        """The runtime this config will run under on the current Docker host.
+
+        Explicit RUNC needs no probe. Any other explicit runtime must be
+        registered with Docker under an alias whose binary or shim is that
+        runtime's, or DockerDetectionError is raised: it never falls back to
+        runc. An alias Docker reports no path for (a shim-v2 runtime) cannot be
+        verified, so it is refused too. Auto (None) keeps the pre-AW-1 choice:
+        gVisor when registered, including a ``runsc`` alias Docker reports no
+        path for, else runc; with no docker CLI there is nothing to detect and
+        nothing can launch, so it is runc. A failed ``docker info`` raises in
+        every mode.
+        """
+        requested = self.runtime
+        if requested is WorkspaceRuntime.RUNC:
+            return _RUNC
+        if requested is None:
+            if shutil.which("docker") is None:
+                return replace(_RUNC, requested=None)
+            found = self._find_alias(WorkspaceRuntime.GVISOR)
+            if found is None and self._registered_runtimes().get("runsc") == "":
+                # gVisor's documented registration is runtimeType only, which
+                # docker info reports without a path; auto selected it by alias
+                # before AW-1 and still does.
+                found = ResolvedRuntime(
+                    requested=None,
+                    effective=WorkspaceRuntime.GVISOR,
+                    alias="runsc",
+                    runtime_path="",
+                )
+            return replace(found or _RUNC, requested=None)
+        found = self._find_alias(requested)
+        if found is None:
+            registered = self._registered_runtimes()
+            listed = ", ".join(f"{a} ({p or 'no path'})" for a, p in sorted(registered.items()))
+            raise DockerDetectionError(
+                f"runtime {requested} was requested but Docker has no runtime registered "
+                f"whose binary or shim is {requested}'s (registered: {listed or 'none'}). "
+                "Register it in the Docker daemon's runtimes by path (docker info reports "
+                "no path for a runtimeType-only runtime, so it cannot be verified), or "
+                "request another runtime; refusing to fall back to runc."
+            )
+        return found
 
     def to_docker_run_args(self) -> list[str]:
         """Convert to docker run command line arguments."""
@@ -385,12 +629,9 @@ class SecurityConfig:
                     raise AppArmorProfileNotLoadedError(name)
                 args.append(f"--security-opt=apparmor={name}")
 
-        # gVisor runtime
-        use_gvisor = self.use_gvisor
-        if use_gvisor is None:
-            use_gvisor = self.detect_gvisor()
-        if use_gvisor:
-            args.append("--runtime=runsc")
+        resolved = self.resolve_runtime()
+        if resolved.effective is not WorkspaceRuntime.RUNC:
+            args.append(f"--runtime={resolved.alias}")
 
         return args
 
@@ -404,6 +645,10 @@ class ResourceLimits:
     disk: str | None = None  # Disk space limit
     network: bool = True  # Allow network access
     timeout_seconds: int = 3600  # Max execution time (1 hour default)
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds <= 0:
+            raise ValueError(f"timeout_seconds must be > 0, got {self.timeout_seconds}")
 
     def to_docker_args(self) -> dict[str, Any]:
         """Convert to Docker run arguments."""
@@ -482,25 +727,16 @@ class WorkspaceConfig:
     # Mounts
     mounts: list[MountConfig] = field(default_factory=list)
 
-    # Secrets (injected as environment variables).
-    #
-    # `repr=False` because the generated `__repr__` renders values in plaintext,
-    # and a config is rendered far more often than anyone intends: a failed
-    # assertion in any test that compares configs, a debugger frame, an
-    # exception whose message interpolates the object, a DEBUG log line. One
-    # assertion failure is enough to put a live credential in CI output.
-    secrets: dict[str, str] = field(default_factory=dict, repr=False)
+    # Credentials, by reference only (APSS EXP-V1-0006 W-6.3-a). The provider
+    # resolves each ref through its injected CredentialResolver at create time
+    # and delivers the value without writing it into any argv. No field of
+    # this config can hold a credential value.
+    credentials: list[CredentialBinding] = field(default_factory=list)
 
-    # Environment variables.
-    #
-    # Historically documented as "non-secret", and that is no longer true of how
-    # this field is used. A capability contract delivered through here can carry
-    # a credential (AGENTIC_SESSION_STORE_AUTH is the live example), so this
-    # field is treated as secret-bearing and gets the same `repr=False`.
-    #
-    # Moving credentials into `secrets` is NOT an alternative to this: that
-    # field had the identical exposure until this change, so the advice "put
-    # secrets in `secrets`" was a mitigation that did nothing.
+    # Environment variables. Non-secret only: a key that names a credential
+    # is refused at construction, so a credential cannot ride in here. Key
+    # names are a heuristic, so `repr=False` stays: a value under an
+    # innocuous key must still not reach a failed assertion or a log line.
     environment: dict[str, str] = field(default_factory=dict, repr=False)
 
     # Resource limits
@@ -519,6 +755,27 @@ class WorkspaceConfig:
     # Plugin directories to load via --plugin-dir (ADR-033)
     plugins: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        _reject_credential_environment(self.environment)
+        check_credential_bindings(self.credentials)
+
+    def checked_credentials(self) -> list[CredentialBinding]:
+        """`credentials`, re-validated at the point a provider consumes them.
+
+        The list is mutable after construction, so a raw value appended later
+        is refused here rather than resolved or delivered.
+        """
+        return check_credential_bindings(self.credentials)
+
+    def checked_environment(self) -> dict[str, str]:
+        """`environment`, re-validated at the point a provider consumes it.
+
+        The dict is mutable after construction, so a credential added by
+        direct assignment is caught here rather than delivered.
+        """
+        _reject_credential_environment(self.environment)
+        return dict(self.environment)
+
     def with_plugin(self, plugin_path: str | Path) -> WorkspaceConfig:
         """Add a plugin directory and return self for chaining."""
         self.plugins.append(str(plugin_path))
@@ -530,8 +787,12 @@ class WorkspaceConfig:
         spec: dict[str, Any],
         plugin_name: str,
     ) -> None:
-        """Resolve and store a single environment variable from a plugin manifest."""
-        if var_name in self.secrets or var_name in self.environment:
+        """Resolve and store a single environment variable from a plugin manifest.
+
+        A secret variable becomes a host-environment credential binding; its
+        value is read by the provider's resolver, never copied into the config.
+        """
+        if var_name in self.environment or any(b.target == var_name for b in self.credentials):
             return
 
         value, resolved = _resolve_single_env_var(var_name, spec, plugin_name)
@@ -539,16 +800,16 @@ class WorkspaceConfig:
             return
 
         if spec.get("secret", False):
-            self.secrets[var_name] = value
+            self.credentials.append(host_env_credential(var_name))
         else:
-            self.environment[var_name] = value
+            self.with_env(var_name, value)
 
     def resolve_plugin_env(self) -> None:
-        """Read requires_env from plugin manifests and populate secrets/environment.
+        """Read requires_env from plugin manifests and populate credentials/environment.
 
         For each plugin directory, reads .claude-plugin/plugin.json and
         looks for a requires_env field. For each declared env var:
-        - secret=true vars are added to self.secrets (if set in host env)
+        - secret=true vars are bound in self.credentials (if set in host env)
         - secret=false vars are added to self.environment (if set in host env)
         - required=true vars raise ValueError if not set
 
@@ -575,12 +836,14 @@ class WorkspaceConfig:
         self.mounts.append(MountConfig(host_path, container_path, read_only))
         return self
 
-    def with_secret(self, name: str, value: str) -> WorkspaceConfig:
-        """Add a secret and return self for chaining."""
-        self.secrets[name] = value
+    def with_credential(self, binding: CredentialBinding) -> WorkspaceConfig:
+        """Add a credential binding and return self for chaining."""
+        check_credential_bindings([binding])
+        self.credentials.append(binding)
         return self
 
     def with_env(self, name: str, value: str) -> WorkspaceConfig:
-        """Add an environment variable and return self for chaining."""
+        """Add a non-secret environment variable and return self for chaining."""
+        _reject_credential_environment({name: value})
         self.environment[name] = value
         return self

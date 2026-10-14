@@ -1,0 +1,11 @@
+{
+  "description": "success is derived, not chosen: a succeeded process with captured output is success true.",
+  "base": "valid/workspace-result/succeeded.json",
+  "set": [
+    {
+      "path": "/success",
+      "value": false
+    }
+  ],
+  "remove": []
+}
