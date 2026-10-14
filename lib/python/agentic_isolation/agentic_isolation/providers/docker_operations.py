@@ -275,6 +275,8 @@ class DockerOperations:
         # One lock per (workspace, operation_key) with a start in flight: a slow
         # credential resolver holds back only racing starts of the same key.
         self._launching: dict[tuple[str, str], _KeyLock] = {}
+        # Workspaces being forgotten: they admit no new start.
+        self._forgetting: set[str] = set()
         self._sequence = 0
 
     def describe(self) -> ProviderDescriptor:
@@ -313,6 +315,8 @@ class DockerOperations:
         container = workspace._handle
         if not isinstance(container, str) or not container:
             raise _error("unknown_operation", f"workspace {workspace.id} has no container")
+        if workspace.id in self._forgetting:
+            raise _error("unknown_operation", f"workspace {workspace.id} is being torn down")
         self._prune_expired()
         key = (workspace.id, spec.operation_key)
         # The key's lock spans the launch, so racing same-key starts see the
@@ -441,8 +445,23 @@ class DockerOperations:
             if (replay := self._by_key.get(operation.key)) is not None and replay.ref == ref:
                 del self._by_key[operation.key]
 
-    def forget_workspace(self, workspace_id: str) -> None:
-        """Drop every record of a destroyed workspace, replay records included."""
+    async def forget_workspace(self, workspace_id: str) -> None:
+        """Drop every record of a destroyed workspace, replay records included.
+
+        New starts are refused first and starts already admitted are waited
+        out, so none records an operation after its workspace was forgotten.
+        """
+        self._forgetting.add(workspace_id)
+        try:
+            for key, launch in list(self._launching.items()):
+                if key[0] == workspace_id:
+                    async with launch.lock:
+                        pass
+            self._drop_records(workspace_id)
+        finally:
+            self._forgetting.discard(workspace_id)
+
+    def _drop_records(self, workspace_id: str) -> None:
         for operation in list(self._operations.values()):
             if operation.key[0] == workspace_id:
                 del self._operations[operation.ref.operation_id]

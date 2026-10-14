@@ -58,6 +58,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -338,6 +339,12 @@ class LocalOperations:
         `base_env` is the environment the provider's `execute` would use; the
         spec's overlay and resolved credentials are laid over it.
         """
+        if sys.platform != "linux":
+            # Ownership, confirmation and cancel all read /proc.
+            raise _error(
+                "unsupported_capability",
+                f"local operations need Linux /proc; this platform is {sys.platform!r}",
+            )
         key = (workspace.id, spec.operation_key)
         async with self._launching.setdefault(key, asyncio.Lock()):
             existing = self._by_key.get(key)

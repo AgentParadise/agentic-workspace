@@ -792,7 +792,7 @@ async def test_same_key_replays_for_the_workspace_lifetime_after_output_is_recla
     launches = (docker_env / "docker.log").read_text().count("aw-operation")
     assert launches == 1
     # Once the workspace is destroyed nothing of it is kept.
-    ops.forget_workspace("ws1")
+    await ops.forget_workspace("ws1")
     assert (ops._operations, ops._by_key, ops._launching) == ({}, {}, {})
 
 
@@ -1159,3 +1159,37 @@ async def test_unconfirmed_cancel_settles_failed_not_cancelled(
     status = await ops.status(ref)
     assert status.state == "failed"
     assert status.metadata["cancel_escalation"] == "container_stop_failed"
+
+
+async def test_forget_workspace_waits_out_an_in_flight_start(docker_env: Path) -> None:
+    """Teardown used to drop the records while a slow start was still launching."""
+    resolving = asyncio.Event()
+    release = asyncio.Event()
+
+    class _Slow:
+        async def resolve(self, ref: CredentialRef) -> str:
+            resolving.set()
+            await release.wait()
+            return SECRET
+
+    ops = _ops(docker_env)
+    ops._credentials = _Slow()
+    binding = CredentialBinding(
+        ref=CredentialRef(name="token", scope="s"), delivery="env", target="API_TOKEN"
+    )
+    start = asyncio.create_task(
+        ops.start(_workspace(), _spec("true", credential_bindings=(binding,)))
+    )
+    await asyncio.wait_for(resolving.wait(), timeout=10)
+    forget = asyncio.create_task(ops.forget_workspace("ws1"))
+    await asyncio.sleep(0.1)
+    assert not forget.done()
+    with pytest.raises(OperationFailure) as caught:
+        await ops.start(_workspace(), _spec("true", key="k2"))
+    assert caught.value.error.kind == "unknown_operation"
+    release.set()
+    ref = await asyncio.wait_for(start, timeout=10)
+    await asyncio.wait_for(forget, timeout=10)
+    assert (ops._operations, ops._by_key, ops._launching) == ({}, {}, {})
+    with pytest.raises(OperationFailure):
+        await ops.status(ref)
