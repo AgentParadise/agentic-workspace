@@ -55,7 +55,7 @@ page's bytes at the fixture's offset, exact `gap`, cursor progression, page
 state and `complete`, a result's derived `success` (and rejection of the
 opposite claim), and the launch count after each step. Docker runs all seven
 fixtures through `tests/operations.rs::behaviour_fixture_*` (`rust-test`,
-Linux leg). Two readings are made explicit, with their provenance:
+Linux leg). Three readings are made explicit, with their provenance:
 
 - Fixture offsets count the workload's output. The launch marker line the
   contract requires first on the stream (plan section 4.2) is read and
