@@ -186,6 +186,13 @@ def _writable_mount() -> dict[str, object]:
     return inventory.as_report()
 
 
+def test_a_writable_mount_is_reported_at_its_sandbox_path() -> None:
+    report = _writable_mount()
+
+    assert report["hits"] == {"/mnt/data/notes": ["ANTHROPIC_API_KEY"]}
+    assert "/mnt/data/notes" in report["files"]
+
+
 @pytest.mark.parametrize("name", sorted(CLASSES))
 @pytest.mark.parametrize(
     "contaminated",
