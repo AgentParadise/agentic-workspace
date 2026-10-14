@@ -29,8 +29,9 @@ Harness readings, where Python has no literal counterpart of a fixture call:
   Local), read as `completed`.
 
 A provider that fails a fixture is a finding: it is listed in
-`tests/conformance/COVERAGE.md` and marked `xfail(strict=True)` here, so the
-case still runs every time and a fix turns it into an unexpected pass.
+`tests/conformance/COVERAGE.md` and pinned in `FINDINGS` by its first miss's
+(step, call, outcome fields). The case still runs every time; exactly that
+miss is an expected failure, and a fix or any other miss fails.
 
 Run locally as `setsid -w uv run --extra dev pytest`; process cleanup signals
 only processes carrying this run's token.
@@ -300,8 +301,7 @@ class Subject:
                 try:
                     environ = _environ(entry)
                 except PermissionError:
-                    # A process that died after the check hides its environ too.
-                    if _zombie(entry):
+                    if _exiting(entry):
                         continue
                     raise
                 if needle not in environ.split(b"\0"):
@@ -359,6 +359,19 @@ def _started(entry: Path) -> int:
 
 def _zombie(entry: Path) -> bool:
     return "\nState:\tZ" in (entry / "status").read_text()
+
+
+def _exiting(entry: Path) -> bool:
+    """Whether a process whose environ is hidden is on its way out.
+
+    An exiting process hides its environ from the moment it drops its memory,
+    a little before it becomes a zombie, so it is given a moment to get there.
+    """
+    for _ in range(5):
+        if _zombie(entry):
+            return True
+        time.sleep(0.02)
+    return False
 
 
 def _environ(entry: Path) -> bytes:

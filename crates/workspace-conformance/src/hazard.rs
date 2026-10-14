@@ -572,9 +572,8 @@ pub fn live_processes_in(
             }
             let environ = match std::fs::read(entry.join("environ")) {
                 Ok(environ) => environ,
-                // A process that died after the check hides its environ too.
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    return if zombie(&entry)? { Ok(None) } else { Err(e) };
+                    return if exiting(&entry)? { Ok(None) } else { Err(e) };
                 }
                 Err(e) => return Err(e),
             };
@@ -613,6 +612,19 @@ fn started(entry: &Path) -> std::io::Result<u64> {
 
 fn zombie(entry: &Path) -> std::io::Result<bool> {
     Ok(std::fs::read_to_string(entry.join("status"))?.contains("\nState:\tZ"))
+}
+
+/// Whether a process whose environ is hidden is on its way out: an exiting
+/// process hides it from the moment it drops its memory, a little before it
+/// becomes a zombie, so it is given a moment to get there.
+fn exiting(entry: &Path) -> std::io::Result<bool> {
+    for _ in 0..5 {
+        if zombie(entry)? {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(false)
 }
 
 /// The process left the table between listing and reading: gone, not hidden.

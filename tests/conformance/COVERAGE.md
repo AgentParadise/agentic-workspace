@@ -137,20 +137,34 @@ One row per `behaviour/hazard-*.json` fixture per provider, from
 Each step's `given` is established for real, `descendant_alive` and
 `launches` are measured (`/proc` and launch logs), and every
 `settles_within_seconds` bound is enforced. FAIL rows are provider findings,
-held as `xfail(strict=True)` so they keep running and a fix flips them to an
-unexpected pass; this change does not alter provider behaviour. Python Docker
+each pinned to its first miss as (step, call, outcome fields): Python's
+`FINDINGS` (and `DOCKER_DAEMON_LH7`) xfail only on exactly that miss, and a
+pass or any other miss fails; Rust's `hazards::expect` asserts the same
+string as the table. This change does not alter provider behaviour. Python Docker
 runs through a stand-in `docker` that models a container (its `stop` kills
 exactly the run's processes; `removing` is sticky), not a daemon.
 
+Liveness fails closed (#68): a process that could be a workload (started
+after the harness, not a zombie, not gone) whose `/proc/<pid>/environ`
+cannot be read makes `descendant_alive` unmeasurable, and the cell is NOT
+RUN, never judged alive=false. A `given` the harness cannot establish is
+NOT RUN too, in both harnesses. A PASS records the alternative each step
+matched; where the outcome is deterministic it is asserted (Python
+`CONFIRMED`, Rust `pass [..]`), so a provider that starts answering a
+looser alternative goes red.
+
+Baseline measured at `34a4872` plus this harness change, on Linux as a
+non-root user with no Docker daemon. First miss per cell:
+
 | Hazard | Fixture | Python Docker | Python Local | Rust Docker |
 |---|---|---|---|---|
-| LH-1 | `hazard-double-fork-orphan` | PASS | PASS, or XFAIL APSS#146 (fixture gap, below) | PASS |
-| LH-2 | `hazard-interrupted-cancel` | PASS | PASS | FAIL (unattributed) |
-| LH-3 | `hazard-cancel-before-launch-header` | FAIL | NOT RUN | FAIL |
-| LH-4 | `hazard-destroy-during-start` | FAIL | PASS | FAIL |
-| LH-5 | `hazard-stuck-removal-timeout-settles` | PASS | NOT RUN | FAIL |
-| LH-6 | `hazard-drain-with-gap-reports-loss` | PASS | PASS | FAIL |
-| LH-7 | `hazard-fifo-in-workspace` | FAIL (real daemon) | PASS | FAIL |
+| LH-1 | `hazard-double-fork-orphan` | PASS, step 1 matched `cancelled` (alternative 0) | PASS, or XFAIL APSS#146 (fixture gap, below) | PASS `[0, 0, 0]` |
+| LH-2 | `hazard-interrupted-cancel` | PASS, step 3 matched `cancelled` (0) | PASS, step 3 matched `cancelled` (0) | FAIL step 3 `cancel`: `kind=provider_unavailable ref=true alive=true` (unattributed) |
+| LH-3 | `hazard-cancel-before-launch-header` | FAIL step 1 `cancel`: not settled within 30 s | NOT RUN: `given launch_header_not_seen` cannot be set up | FAIL step 1 `cancel`: `kind=provider_unavailable ref=true alive=true` |
+| LH-4 | `hazard-destroy-during-start` | FAIL step 0 `start`: returned an operation ref | PASS | FAIL step 0 `start`: returned a ref (`operation_key` the fixture's), `alive=false` |
+| LH-5 | `hazard-stuck-removal-timeout-settles` | PASS, step 1 matched `provider_unavailable` (1) | NOT RUN: `given backend_stuck_removing` cannot be set up | FAIL step 1 `observe`: not settled within 120 s |
+| LH-6 | `hazard-drain-with-gap-reports-loss` | PASS | PASS | FAIL step 2 `observe`: `state=succeeded complete=false gap={lost_bytes:8}`, no `loss_detected` |
+| LH-7 | `hazard-fifo-in-workspace` | NOT RUN here (no daemon); pinned FAIL step 2 `file_exists`: `exists=false` (real daemon, CI) | PASS | FAIL step 2 `file_exists`: not settled within 10 s |
 
 Python LH-4 drives each provider's public `destroy` (for Docker, only the
 container boundary `_measure_usage`/`_stop`/`_remove` is a logged stand-in),
@@ -185,7 +199,12 @@ Findings (each left to a follow-up):
   every page from the gap on carries `loss_detected`.)
 - Rust Docker LH-3: `cancel` before the launch header returns
   `provider_unavailable` after about 9 s, and the late workload is then
-  measured alive; neither allowed outcome.
+  measured alive; neither allowed outcome. Re-measured with a stand-in whose
+  `exec` is marked as the container's before the late-exec sleep (so `stop`
+  kills it) and which refuses an `exec` into a stopped container with 137:
+  unchanged, so the late workload is not a stand-in artefact.
+  `hazards::a_late_exec_into_a_stopped_container_is_refused` shows the
+  stand-in itself kills a held-back exec on `stop`.
 - Rust Docker LH-4: `start` blocked in credential resolution, while the
   container is lost and `finalize` runs, returns a ref and launches once
   (fixture: `resource_lost` or `cancelled`, 0 launches).
@@ -200,10 +219,13 @@ Findings (each left to a follow-up):
 - Rust Docker LH-2: the retried `cancel` returns `provider_unavailable`
   after 7 s with the TERM-ignoring workload still measured alive. Not yet
   attributed: it may be the stand-in's `stop` rather than the provider.
-- Python Docker LH-7 (real daemon, CI run 38593606789): `file_exists` on the
-  FIFO returns `exists: false, regular_file: false`; the fixture needs
-  `exists: true, regular_file: false` or `rejected_policy`. Held as
-  `xfail(strict=True)` on `test_docker_daemon_meets_lh7_fifo`.
+- Python Docker LH-7 (real daemon, CI run 38593606789, pre-merge evidence):
+  `file_exists` on the FIFO returns `exists: false, regular_file: false`; the
+  fixture needs `exists: true, regular_file: false` or `rejected_policy`.
+  `test_docker_daemon_meets_lh7_fifo` expects exactly that miss
+  (`DOCKER_DAEMON_LH7`: step 2 `file_exists`, `exists: false`); a timeout or
+  a miss elsewhere fails it. Not measured in this change's workspace, which
+  has no Docker daemon.
 - Local LH-1 is a fixture limitation, not a provider finding. When a foreign
   subreaper adopts the detached descendant (host-dependent: CI runs
   38593606789 and 38603430148; passes locally), `cancel` fails closed:
@@ -229,7 +251,12 @@ NOT RUN, and why (each ends its run as `NotRun`, never a pass):
 - Python Local LH-3 and LH-5 (#68): their `given` cannot be set up. Local
   learns its leader at spawn, so LH-3's `launch_header_not_seen` cannot
   arise; Local has no backend, so LH-5's `backend_stuck_removing` cannot
-  arise. Run without it, each passed vacuously.
+  arise. Run without it, each passed vacuously. `_unestablished` now reports
+  any `given` the harness cannot make true for a subject, at the step that
+  needs it, instead of a fixed list of cells.
+- Any cell whose `descendant_alive` is unmeasurable on the host (see above).
+  `test_an_unreadable_environ_is_not_run_not_dead` and
+  `hazard::tests::an_unreadable_environ_is_unmeasurable_not_absent` pin it.
 
 - Python Docker LH-7 through the stand-in: the probes read the host workspace
   mount, which a stand-in container lacks.
