@@ -122,7 +122,8 @@ _CANARY_SCRIPT = (
     f"printf 'whole {CANARY}\\n'; "
     f"printf 'split {CANARY[:11]}'; sleep 0.3; printf '{CANARY[11:]}\\n'; "
     f"printf '{CANARY}{CANARY} rep\\n' >&2; "
-    'printf "bound $AW_TOKEN\\n"'
+    'printf "bound $AW_TOKEN\\n"; '
+    f"printf 'tail {CANARY[:6]}'"
 )
 _BOUND = (
     CredentialBinding(
@@ -153,7 +154,10 @@ async def test_docker_pages_spool_and_channels_never_carry_the_canary(
     spool = ops._operations[ref.operation_id].spool
     for observed in (data, stdout, stderr, bytes(spool._retained)):
         _assert_clean(observed)
-    assert stdout == b"whole [REDACTED]\nsplit [REDACTED]\nbound [REDACTED]\n"
+    # The undecided prefix at EOF is stored by `finish`, not dropped.
+    assert stdout == (
+        b"whole [REDACTED]\nsplit [REDACTED]\nbound [REDACTED]\ntail " + CANARY[:6].encode()
+    )
     assert stderr == b"[REDACTED][REDACTED] rep\n"
     assert data.count(REDACTED) == 5
 
@@ -188,6 +192,7 @@ async def test_local_final_output_never_carries_the_canary(tmp_path: Path) -> No
         assert status.state == "succeeded"
         _assert_clean(data)
         assert data.count(REDACTED) == 5
+        assert data.endswith(b"tail " + CANARY[:6].encode())
         spool = next(iter(provider._operations._operations.values())).spool
         _assert_clean(bytes(spool._retained))
     finally:
