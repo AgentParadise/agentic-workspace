@@ -2,7 +2,8 @@
 
 Standard library only: it runs inside a workspace image, which carries the
 pinned CLIs but not this test tree. The host computes the presentation and
-hands it over as a JSON spec; this script plays the sandbox and the fake
+hands it over as a JSON spec on stdin, so the capability never sits in a
+sandbox file; this script plays the sandbox and the fake
 upstream at once:
 
 1. writes the presented files under a fresh $HOME,
@@ -16,7 +17,7 @@ filesystem and samples its command lines through the Docker daemon
 (`harness_credential_scan.py`), so files the agent user cannot read are
 still scanned, and the canaries it matches never enter the sandbox.
 
-Usage: python3 harness_credential_probe.py SPEC_JSON
+Usage: python3 harness_credential_probe.py < SPEC_JSON
 """
 
 from __future__ import annotations
@@ -145,8 +146,8 @@ def _serve(port: int, seen: list[dict[str, object]]) -> ThreadingHTTPServer:
     return server
 
 
-def main(spec_path: str) -> None:
-    spec = json.loads(Path(spec_path).read_text())
+def main() -> None:
+    spec = json.load(sys.stdin)
     work = Path(tempfile.mkdtemp(prefix="credential-probe-"))
     home = work / "home"
     home.mkdir()
@@ -192,4 +193,4 @@ def main(spec_path: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main()

@@ -7,19 +7,20 @@ through the Docker daemon, which reads as root:
 
 - `docker export` streams the container's whole filesystem as a tar, image
   files included; nothing is skipped for being pre-existing,
-- `docker cp CONTAINER:DEST -` streams each writable mount, which export
-  leaves out; a tmpfs cannot be read after exit, so it lands in `unscanned`,
+- `docker cp CONTAINER:DEST -` streams every mount, read-only or not,
+  which export leaves out; a tmpfs cannot be read after exit, so it lands
+  in `unscanned`,
 - `docker diff` names the paths the run added or changed,
 - `docker top` samples every process command line while the CLI runs.
 
 Matching is host-side too. Exact needles (the wire and the host's synthetic
-canaries) are searched for in every byte of every regular file. The text of
-the files the run wrote, and of every writable mount, is kept for the
-caller's credential-shape check; image files are not, because a shape regex
-over a whole image matches vendored examples. Symlinks are not followed:
-their targets are members of the same filesystem and are scanned where they
-live. A stream cut inside a member raises; one cut between members is
-caught by the docker command's exit status.
+canaries) are searched for in every byte of every regular file, mounts
+included. The text of the files the run wrote, and of every writable mount,
+is kept for the caller's credential-shape check; image files and read-only
+mounts are not, because a shape regex over them matches vendored examples.
+Symlinks are not followed: their targets are members of the same filesystem
+and are scanned where they live. A stream cut inside a member raises; one
+cut between members is caught by the docker command's exit status.
 """
 
 from __future__ import annotations
@@ -112,7 +113,7 @@ def _scan_stream(
 
 
 def scan_container(container: str, needles: Mapping[str, str]) -> dict[str, object]:
-    """Scan a stopped container's filesystem and writable mounts."""
+    """Scan a stopped container's filesystem and every mount."""
     changed = {
         line.split(" ", 1)[1]
         for line in _docker("diff", container).splitlines()
@@ -122,13 +123,12 @@ def scan_container(container: str, needles: Mapping[str, str]) -> dict[str, obje
     _scan_stream(["export", container], needles, changed.__contains__, inventory)
     (details,) = json.loads(_docker("inspect", container))
     for mount in details["Mounts"]:
-        if not mount["RW"]:
-            continue
         destination = mount["Destination"]
+        writable = bool(mount["RW"])
         _scan_stream(
             ["cp", f"{container}:{destination}", "-"],
             needles,
-            lambda _path: True,
+            lambda _path, keep=writable: keep,
             inventory,
             str(PurePosixPath(destination).parent),
         )

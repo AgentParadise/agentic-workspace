@@ -11,7 +11,7 @@ a `--network none` container running the pinned image. There
 real CLI, and reports every request and the child env. The host side
 (`harness_credential_scan.py`) samples every process command line while it
 runs and, once it exits, reads the container's whole filesystem and every
-writable mount through the daemon, as root, so files the agent user cannot
+mount through the daemon, as root, so files the agent user cannot
 read are scanned too. This side then asserts:
 
 - exactly one request reached the upstream, at the class's model path,
@@ -154,14 +154,19 @@ CLASSES = {
 }
 
 
-def _docker(mount: Path, *argv: str, name: str | None = None) -> subprocess.CompletedProcess[str]:
+def _docker(
+    mount: Path, *argv: str, name: str | None = None, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
     # Named runs are kept after exit for the host scan; the caller removes them.
     keep = ["--name", name] if name else ["--rm"]
+    # The spec carries the capability, so it travels on stdin, not in a file.
+    interactive = ["-i"] if stdin is not None else []
     return subprocess.run(
         [
             "docker",
             "run",
             *keep,
+            *interactive,
             "--network",
             "none",
             "--entrypoint",
@@ -171,6 +176,7 @@ def _docker(mount: Path, *argv: str, name: str | None = None) -> subprocess.Comp
             IMAGE,
             *argv[1:],
         ],
+        input=stdin,
         capture_output=True,
         text=True,
         timeout=180,
@@ -268,18 +274,18 @@ def test_pinned_cli_sends_only_the_wire_capability(
 
     # The image runs as its own non-root user; the mount must be readable.
     tmp_path.chmod(0o755)
-    for target, text in (
-        ("spec.json", json.dumps(_spec(harness, presented))),
-        ("probe.py", PROBE.read_text()),
-    ):
-        (tmp_path / target).write_text(text)
-        (tmp_path / target).chmod(0o644)
+    (tmp_path / "probe.py").write_text(PROBE.read_text())
+    (tmp_path / "probe.py").chmod(0o644)
     container = f"s1-credential-probe-{secrets.token_hex(6)}"
     needles = {"wire": wire.get_secret_value(), **HOST_CANARIES}
     try:
         with CommandLines(container) as cmdlines:
             run = _docker(
-                tmp_path, "python3", "/probe/probe.py", "/probe/spec.json", name=container
+                tmp_path,
+                "python3",
+                "/probe/probe.py",
+                name=container,
+                stdin=json.dumps(_spec(harness, presented)),
             )
         assert run.returncode == 0, run.stderr
         report = {

@@ -4,20 +4,23 @@
 something if its assertions reject contaminated requests and sandboxes. These
 cases feed it synthetic reports: headers built by hand, and sandbox
 filesystems built as the tar streams `docker export` and `docker cp` produce,
-read by the host scanner's real `scan_tar`.
+read by the host scanner's real `scan_tar`, and through `scan_container`
+with only the docker commands replaced.
 """
 
 from __future__ import annotations
 
 import hashlib
 import io
+import json
 import tarfile
 from collections.abc import Callable
 
 import pytest
 from pydantic import SecretStr
 
-from tests.integration.harness_credential_scan import Inventory, scan_tar
+from tests.integration import harness_credential_scan
+from tests.integration.harness_credential_scan import Inventory, scan_container, scan_tar
 from tests.integration.test_harness_credential_presentation import (
     CLASSES,
     HOST_CANARIES,
@@ -193,6 +196,51 @@ def test_a_writable_mount_is_reported_at_its_sandbox_path() -> None:
     assert "/mnt/data/notes" in report["files"]
 
 
+def _container_with_readonly_mount(
+    monkeypatch: pytest.MonkeyPatch, mounted: bytes
+) -> dict[str, object]:
+    # The exit test's `-v ...:/probe:ro`; export leaves mounts out.
+    streams = {
+        ("export", "c"): _sandbox(),
+        ("cp", "c:/probe", "-"): [("probe/spec.json", mounted, 1000, 0o644)],
+    }
+    inspect = {"Mounts": [{"RW": False, "Destination": "/probe"}], "HostConfig": {}}
+
+    def docker(*argv: str) -> str:
+        return {"diff": "", "inspect": json.dumps([inspect])}[argv[0]]
+
+    def stream(argv: list[str], needles, keep, into: Inventory, root: str = "/") -> None:
+        scan_tar(_tar(streams[tuple(argv)]), needles, keep, into, root=root)
+
+    monkeypatch.setattr(harness_credential_scan, "_docker", docker)
+    monkeypatch.setattr(harness_credential_scan, "_scan_stream", stream)
+    return scan_container("c", NEEDLES)
+
+
+@pytest.mark.parametrize("name", sorted(CLASSES))
+def test_a_readonly_mount_holding_the_wire_is_rejected(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inventory = _container_with_readonly_mount(monkeypatch, json.dumps({"env": WIRE}).encode())
+
+    assert inventory["hits"] == {"/probe/spec.json": ["wire"]}
+    with pytest.raises(AssertionError):
+        _check(name, _report(name, [_auth(name, WIRE)], inventory))
+
+
+@pytest.mark.parametrize("name", sorted(CLASSES))
+def test_a_clean_readonly_mount_is_scanned_and_passes(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A vendored example key in a read-only input is not the run's write.
+    shaped = b"sk-" + b"Q" * 32
+    inventory = _container_with_readonly_mount(monkeypatch, shaped)
+
+    assert inventory["hits"] == {}
+    assert "/probe/spec.json" not in inventory["files"]
+    _check(name, _report(name, [_auth(name, WIRE)], inventory))
+
+
 @pytest.mark.parametrize("name", sorted(CLASSES))
 @pytest.mark.parametrize(
     "contaminated",
@@ -226,7 +274,7 @@ def test_an_unscanned_location_is_rejected(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", sorted(CLASSES))
-@pytest.mark.parametrize("cmdlines", [[], ["python3 /probe/probe.py /probe/spec.json"]])
+@pytest.mark.parametrize("cmdlines", [[], ["python3 /probe/probe.py"]])
 def test_a_missing_cli_command_line_is_rejected(name: str, cmdlines: list[str]) -> None:
     report = _report(name, [_auth(name, WIRE)], _clean_inventory(), cmdlines)
 

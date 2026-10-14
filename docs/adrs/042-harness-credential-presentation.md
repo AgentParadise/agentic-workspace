@@ -103,7 +103,9 @@ pinned CLI in the `claude-cli` image with `--network none` through
 - the scan is host-side with full read access (`harness_credential_scan.py`):
   the host samples every process command line through `docker top` while
   the CLI runs, then reads the stopped container's whole filesystem through
-  `docker export` and each writable mount through `docker cp`, so a file the
+  `docker export` and every mount, read-only included, through `docker cp`
+  (the spec carrying the capability reaches the probe on stdin, never as a
+  sandbox file), so a file the
   agent user cannot read (the release image's root-owned 0600 build
   leftovers) is read in full rather than reported unscanned; the CLI's own
   command line must be among the samples and nothing may be left unscanned,
@@ -117,7 +119,7 @@ without Docker against planted contamination: a repeated auth header, and
 sandbox filesystems built as the daemon's tar streams with a canary in a
 root-owned 0600 file, a second file, past the first MiB, a writable path
 outside `$HOME` and `$TMPDIR`, or a writable mount, the wire in an image
-file, a credential-shaped string written outside `$HOME`, a missing CLI
+file or in a read-only mount collected through `scan_container`, a credential-shaped string written outside `$HOME`, a missing CLI
 command line, a canary on a command line, and an unscanned location.
 
 Run it with:
