@@ -1002,3 +1002,160 @@ async def test_timeout_survives_an_unreachable_daemon_and_its_recovery(
         assert (await ops.status(ref)).state == "timed_out"
     finally:
         await _kill_leader(operation)
+
+
+# Release review of #57, finding 1: values delivered through the docker
+# client's environment must never steer that client.
+@pytest.mark.parametrize("target", ["DOCKER_HOST", "LD_PRELOAD", "PATH"])
+async def test_a_binding_that_would_steer_the_host_client_is_refused(
+    docker_env: Path, target: str
+) -> None:
+    ops = _ops(docker_env)
+    binding = CredentialBinding(
+        ref=CredentialRef(name="token", scope="s"), delivery="env", target=target
+    )
+    with pytest.raises(OperationFailure) as caught:
+        await ops.start(_workspace(), _spec("true", credential_bindings=(binding,)))
+    assert caught.value.error.kind == "rejected_policy"
+    assert target in caught.value.error.message and SECRET not in caught.value.error.message
+    assert not Path(os.environ["FAKE_DOCKER_LOG"]).exists()  # no client launched
+    assert (ops._operations, ops._by_key) == ({}, {})
+
+
+@pytest.mark.parametrize("name", ["DOCKER_HOST", "LD_PRELOAD", "PATH"])
+async def test_execute_env_that_would_steer_the_host_client_is_refused(
+    docker_env: Path, name: str
+) -> None:
+    host_env = dict(os.environ)
+    provider = WorkspaceDockerProvider()
+    provider._operations = _ops(docker_env)
+    result = await provider.execute(_workspace(), "true", env={name: "/evil"})
+    assert result.exit_code == -1 and name in result.stderr
+    assert not Path(os.environ["FAKE_DOCKER_LOG"]).exists()
+    assert dict(os.environ) == host_env
+
+
+# Finding 2: a settlement that cannot reach the daemon must not hold a drain.
+async def test_timeout_drain_ends_when_the_daemon_stays_down_at_settlement(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(docker_operations, "_FINAL_OUTPUT_SECONDS", 0.1)
+    ops = _ops(docker_env)
+    ref = await ops.start(_workspace(), _spec("exec sleep 30", timeout_seconds=1))
+    operation = ops._operations[ref.operation_id]
+    await operation.leader_known.wait()
+    (docker_env / "state").write_text("down")
+    try:
+        with pytest.raises(OperationFailure) as caught:
+            await asyncio.wait_for(drain_operation(ops, ref), timeout=15)
+        assert caught.value.error.kind == "provider_unavailable"
+        assert operation.client_finished and operation.state == "running"
+    finally:
+        await _kill_leader(operation)
+
+
+async def test_timeout_drain_settles_once_the_daemon_recovers(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The premise reproduction: the drain blocked long after the daemon came back."""
+    monkeypatch.setattr(docker_operations, "_FINAL_OUTPUT_SECONDS", 0.1)
+    ops = _ops(docker_env)
+    ref = await ops.start(_workspace(), _spec("exec sleep 30", timeout_seconds=1))
+    operation = ops._operations[ref.operation_id]
+    await operation.leader_known.wait()
+    state = docker_env / "state"
+    state.write_text("down")
+    try:
+        await asyncio.wait_for(operation.collector, timeout=15)  # type: ignore[arg-type]
+        assert operation.state == "running"
+        state.write_text("")
+        status, _ = await asyncio.wait_for(drain_operation(ops, ref), timeout=5)
+        assert status.state == "timed_out"
+    finally:
+        await _kill_leader(operation)
+
+
+async def test_a_hung_docker_control_command_is_killed_at_its_deadline(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(docker_operations, "_CONTROL_SECONDS", 0.5)
+    pid_file = docker_env / "hung.pid"
+    hung = docker_env / "hung-docker"
+    hung.write_text(f"#!/bin/sh\necho $$ > {pid_file}\nexec sleep 60\n")
+    hung.chmod(hung.stat().st_mode | stat.S_IEXEC)
+    ops = _ops(docker_env)
+    ops._docker = str(hung)
+    began = time.monotonic()
+    with pytest.raises(OperationFailure) as caught:
+        await asyncio.wait_for(ops._presence("c1"), timeout=10)
+    assert caught.value.error.kind == "provider_unavailable"
+    assert time.monotonic() - began < 5
+    with pytest.raises(ProcessLookupError):  # killed and reaped, not left behind
+        os.kill(int(pid_file.read_text()), 0)
+
+
+# Finding 3: `cancelled` is published only once the cancel has confirmed.
+async def _cancel_with_held_confirmation(
+    ops: DockerOperations, monkeypatch: pytest.MonkeyPatch, *, confirmed: bool
+) -> tuple[OperationRef, _Operation, asyncio.Task[object]]:
+    ref = await ops.start(_workspace(), _spec("exec sleep 30"))
+    operation = ops._operations[ref.operation_id]
+    await operation.leader_known.wait()
+    release = asyncio.Event()
+    asked = asyncio.Event()
+
+    async def held(operation: _Operation, *, within: float) -> bool:
+        asked.set()
+        await release.wait()
+        return confirmed
+
+    monkeypatch.setattr(ops, "_group_gone", held)
+    cancel: asyncio.Task[object] = asyncio.create_task(ops.cancel(ref, grace_seconds=1.0))
+    await asyncio.wait_for(asked.wait(), timeout=10)
+    # TERM has ended the workload, so the client exits while the cancel is
+    # still confirming: the race the collector used to win with `cancelled`.
+    for _ in range(200):
+        if operation.client_finished:
+            break
+        await asyncio.sleep(0.05)
+    assert operation.client_finished
+    await asyncio.sleep(0.2)
+    assert (await ops.status(ref)).state == "running"
+    page = await ops.observe(ref, cursor=None, max_bytes=1024, wait_seconds=0.1)
+    assert not page.complete
+    release.set()
+    return ref, operation, cancel
+
+
+async def test_cancel_is_published_only_after_confirmation(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ops = _ops(docker_env)
+    ref, _, cancel = await _cancel_with_held_confirmation(ops, monkeypatch, confirmed=True)
+    status = await asyncio.wait_for(cancel, timeout=10)
+    assert status.state == "cancelled"  # type: ignore[attr-defined]
+    assert (await ops.status(ref)).state == "cancelled"
+
+
+async def test_unconfirmed_cancel_settles_failed_not_cancelled(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ops = _ops(docker_env)
+    real = ops._docker_cmd
+
+    async def stop_fails(*argv: str) -> tuple[int, str]:
+        if argv[0] == "stop":
+            return 1, "Cannot connect to the Docker daemon"
+        return await real(*argv)
+
+    monkeypatch.setattr(ops, "_docker_cmd", stop_fails)
+    ref, operation, cancel = await _cancel_with_held_confirmation(
+        ops, monkeypatch, confirmed=False
+    )
+    with pytest.raises(OperationFailure) as caught:
+        await asyncio.wait_for(cancel, timeout=20)
+    assert caught.value.error.kind == "provider_unavailable"
+    await asyncio.wait_for(operation.collector, timeout=10)  # type: ignore[arg-type]
+    status = await ops.status(ref)
+    assert status.state == "failed"
+    assert status.metadata["cancel_escalation"] == "container_stop_failed"
