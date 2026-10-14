@@ -205,6 +205,44 @@ async fn late_read_drains_bounded_pages_then_completes() {
     assert_eq!(String::from_utf8(data).unwrap(), expected);
 }
 
+/// A descendant holds the output open past the leader's exit and writes
+/// later: once a page is complete, nothing more may ever be read.
+#[tokio::test]
+async fn a_complete_page_stays_the_end_when_a_descendant_writes_late() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let script = "(sleep 4; echo late; echo late >&2) & echo early";
+    let op = ops
+        .start(&workspace(), spec("k1", script, 60))
+        .await
+        .unwrap();
+    let data = drain(&ops, &op, 4096).await;
+    assert_eq!(data, b"early\n");
+    let status = ops.status(&op).await.unwrap();
+    assert!(
+        status
+            .metadata
+            .get()
+            .get("signal_failure")
+            .is_some_and(|f| f.contains("stopped reading")),
+        "{status:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let page = ops
+        .observe(
+            &op,
+            ObserveRequest {
+                cursor: None,
+                max_bytes: 4096,
+                wait: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(page.complete);
+    assert_eq!(STANDARD.decode(page.data_b64.as_str()).unwrap(), b"early\n");
+}
+
 #[tokio::test]
 async fn cancel_kills_leader_grandchild_and_term_trapper_and_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();

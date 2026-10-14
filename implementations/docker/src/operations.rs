@@ -585,10 +585,21 @@ async fn collect(docker: Docker, op: Arc<Operation>, mut child: tokio::process::
             }
         }
     };
-    if tokio::time::timeout(FINAL_OUTPUT, readers).await.is_err() {
+    // Settle only once no reader can append: a page marked complete must stay
+    // the end of the output, so a still-open stream is stopped, not detached.
+    let mut readers = readers;
+    if tokio::time::timeout(FINAL_OUTPUT, &mut readers)
+        .await
+        .is_err()
+    {
+        readers.abort();
+        let _ = readers.await;
         op.update(|p| {
-            p.failures
-                .push("output still open after the client exited; detached".into())
+            p.failures.push(format!(
+                "output still open {}s after the client exited; stopped reading, \
+                 later output is not collected",
+                FINAL_OUTPUT.as_secs()
+            ))
         });
     }
     op.update(|p| {
