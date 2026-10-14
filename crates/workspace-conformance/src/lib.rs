@@ -1,5 +1,7 @@
 //! Shared black-box assertions for workspace provider implementations.
 
+pub mod hazard;
+
 use agentic_workspace_core::{
     AgentRequest, CommandSpec, ContentRequest, LaunchManifest, OutputRequest, ResourceLimits,
     SecurityProfile, ToolPolicy, TranscriptRequest, WorkspaceError, WorkspaceProvider,

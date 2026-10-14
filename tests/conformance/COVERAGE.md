@@ -72,3 +72,64 @@ the daemon), so PARTIAL rows stay PARTIAL until the Docker-backed run in
 `tests/integration/test_docker_operations_live.py` has passed in CI with
 Docker present. Cancellation is PARTIAL for the same reason, and because the
 finalize-on-cancel half of W-4-a belongs to PR 6.
+
+## Lifecycle hazards (EXP-V1-0006 0.2.1, APSS ee926c6)
+
+One row per `behaviour/hazard-*.json` fixture per provider, from
+`lib/python/agentic_isolation/tests/test_behaviour_hazards.py`, run as
+`setsid -w uv run --extra dev pytest -q -rsx tests/test_behaviour_hazards.py`.
+Each step's `given` is established for real, `descendant_alive` and
+`launches` are measured (`/proc` and launch logs), and every
+`settles_within_seconds` bound is enforced. FAIL rows are provider findings,
+held as `xfail(strict=True)` so they keep running and a fix flips them to an
+unexpected pass; this change does not alter provider behaviour. Python Docker
+runs through a stand-in `docker` that models a container (its `stop` kills
+exactly the run's processes; `removing` is sticky), not a daemon.
+
+| Hazard | Fixture | Python Docker | Python Local | Rust Docker |
+|---|---|---|---|---|
+| LH-1 | `hazard-double-fork-orphan` | PASS | PASS | NOT RUN |
+| LH-2 | `hazard-interrupted-cancel` | PASS | FAIL | NOT RUN |
+| LH-3 | `hazard-cancel-before-launch-header` | FAIL | PASS (condition N/A) | NOT RUN |
+| LH-4 | `hazard-destroy-during-start` | FAIL | FAIL | NOT RUN |
+| LH-5 | `hazard-stuck-removal-timeout-settles` | PASS | PASS (condition N/A) | NOT RUN |
+| LH-6 | `hazard-drain-with-gap-reports-loss` | FAIL | FAIL | NOT RUN |
+| LH-7 | `hazard-fifo-in-workspace` | NOT RUN | FAIL | NOT RUN |
+
+Findings (each left to a follow-up):
+
+- Docker LH-3: `cancel` waits `_LEADER_SECONDS` (30 s) for the launch header
+  before stopping the container, so it cannot settle within the 30 s bound.
+- Docker and Local LH-4: a `start` blocked in credential resolution still
+  launches after `destroy` began (measured 1 launch, fixture says 0), and a
+  later `start` fails `unknown_operation`, not `resource_lost`.
+- Docker and Local LH-6: the gap is reported correctly (`lost_bytes: 8`), but
+  no page carries the 0.2.1 `loss_detected` marker.
+- Local LH-2: after the caller abandons `cancel`, the retried `cancel`
+  settles `failed`, neither a confirmed `cancelled` nor the unconfirmed
+  `timeout` outcome.
+- Local LH-7: `read_file` opens a writer-less FIFO on the event loop and
+  blocks; the harness's watchdog thread has to open the write end to free it.
+
+Condition N/A: Local learns its leader at spawn, so LH-3's
+`launch_header_not_seen` cannot arise and the step runs as an immediate
+cancel; Local has no backend, so LH-5's `backend_stuck_removing` cannot arise
+and only `timeout_elapsed` is imposed.
+
+NOT RUN, and why:
+
+- Python Docker LH-7: `file_exists`, `read_file` and `destroy` go through the
+  Docker SDK, which the stand-in CLI does not serve. It needs a real-daemon
+  fixture.
+- Rust Docker: the Rust operations trait (`SupportsOperations`) exists only
+  in open PR #60. The provider-neutral half of the Rust harness,
+  `agentic_workspace_conformance::hazard` (fixture loader, `judge`, and
+  `/proc`-measured `live_processes`), is on main. Wiring it into #60's
+  `behaviour::drive` is the follow-up once #60 merges.
+
+No vacuous pass: `test_lh1_fails_a_cancel_confirmed_while_a_descendant_lives`
+replaces each Python provider's cancel confirmation with one that kills only
+the leader's group and reports confirmed. It asserts that the mutation ran and
+that LH-1 then fails on the cancel step, where `cancelled` comes back while a
+descendant is measured alive. The Rust `judge` has the same check:
+`hazard::tests::lh1_rejects_a_confirmed_cancel_while_a_descendant_lives`.
