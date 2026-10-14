@@ -12,8 +12,9 @@ use agentic_workspace_conformance::behaviour::{
     BehaviourHarness, Workload, behaviour_fixture, drive,
 };
 use agentic_workspace_core::operations::{
-    CredentialRef, CredentialResolver, ErrorKind, ObserveRequest, OperationError, OperationRef,
-    OperationSpec, OperationState, OperationStatus, SupportsOperations, WorkspaceRef,
+    CredentialRef, CredentialResolver, ErrorKind, FinalizationState, ObserveRequest,
+    OperationError, OperationRef, OperationSpec, OperationState, OperationStatus,
+    SupportsOperations, WorkspaceRef,
 };
 use agentic_workspace_docker::operations::DockerOperations;
 use base64::Engine as _;
@@ -814,6 +815,166 @@ async fn credential_bindings_reach_the_workload_env_but_never_the_client_argv() 
     assert!(!log.contains("secret-for"), "{log}");
     let status = serde_json::to_string(&ops.status(&op).await.unwrap()).unwrap();
     assert!(!status.contains("secret-for"), "{status}");
+}
+
+/// Resolves `slow` only once released, announcing that it has been entered;
+/// every other credential at once.
+struct Gate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+impl CredentialResolver for Gate {
+    fn resolve<'a>(
+        &'a self,
+        credential: &'a CredentialRef,
+    ) -> Pin<Box<dyn Future<Output = Result<String, OperationError>> + Send + 'a>> {
+        Box::pin(async move {
+            if credential.name.as_str() == "slow" {
+                self.entered.notify_one();
+                self.release.acquire().await.unwrap().forget();
+            }
+            Ok("value".to_owned())
+        })
+    }
+}
+
+fn with_credential(spec: OperationSpec, name: &str) -> OperationSpec {
+    let mut spec = serde_json::to_value(spec).unwrap();
+    spec["credential_bindings"] = serde_json::json!([{
+        "ref": {"name": name, "scope": "repo:acme/widgets"},
+        "delivery": "env",
+        "target": "GH_TOKEN",
+    }]);
+    serde_json::from_value(spec).unwrap()
+}
+
+fn workspace_named(container: &str) -> WorkspaceRef {
+    serde_json::from_value(serde_json::json!({"provider": "docker", "resource_id": container}))
+        .unwrap()
+}
+
+/// Fails the test if `future` is blocked; a deadlock detector, not a proof
+/// of ordering: the resolver's gate is what holds the slow start.
+async fn unblocked<T>(what: &str, future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), future)
+        .await
+        .unwrap_or_else(|_| panic!("{what} blocked behind a pending credential resolution"))
+}
+
+/// While one key's start awaits its credential, other keys, other
+/// workspaces and existing operations proceed; the slow start completes
+/// once released, and same-key starts still launch once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pending_credential_resolution_blocks_only_its_own_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Gate::default());
+    let ops = Arc::new(ops(dir.path(), 1 << 20, 1 << 16).with_credentials(gate.clone()));
+    let (existing, _) = sleeper(&ops).await;
+    let slow_spec = with_credential(spec("slow", "echo slow", 60), "slow");
+    let slow = tokio::spawn({
+        let (ops, spec) = (ops.clone(), slow_spec.clone());
+        async move { ops.start(&workspace(), spec).await }
+    });
+    unblocked("the slow start", gate.entered.notified()).await;
+    // A same-key start waits behind the first; it must not launch again.
+    let replay = tokio::spawn({
+        let ops = ops.clone();
+        async move { ops.start(&workspace(), slow_spec).await }
+    });
+    let other_key = unblocked(
+        "another key",
+        ops.start(&workspace(), spec("k2", "echo k2", 60)),
+    )
+    .await
+    .unwrap();
+    let other_workspace = unblocked(
+        "another workspace",
+        ops.start(&workspace_named("c2"), spec("slow", "echo c2", 60)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(drain(&ops, &other_key, 4096).await, b"k2\n");
+    assert_eq!(drain(&ops, &other_workspace, 4096).await, b"c2\n");
+    let status = unblocked("status", ops.status(&existing)).await.unwrap();
+    assert_eq!(status.state, OperationState::Running);
+    let request = ObserveRequest {
+        cursor: None,
+        max_bytes: 4096,
+        wait: Duration::ZERO,
+    };
+    unblocked("observe", ops.observe(&existing, request))
+        .await
+        .unwrap();
+    let cancelled = unblocked("cancel", ops.cancel(&existing, Duration::from_millis(100)))
+        .await
+        .unwrap();
+    assert_eq!(cancelled.state, OperationState::Cancelled);
+    assert!(!slow.is_finished() && !replay.is_finished());
+    gate.release.add_permits(1);
+    let slow = unblocked("the released start", slow)
+        .await
+        .unwrap()
+        .unwrap();
+    let replay = unblocked("the replay", replay).await.unwrap().unwrap();
+    assert_eq!(slow, replay);
+    assert_eq!(drain(&ops, &slow, 4096).await, b"slow\n");
+    // existing, the slow key, another key and another workspace: four launches.
+    assert_eq!(launches(dir.path()), 4);
+}
+
+/// A finalize racing a start whose credential is pending waits for that
+/// launch, then ends and forgets it; a start arriving meanwhile is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finalize_waits_for_an_in_flight_start_and_ends_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Gate::default());
+    let ops = Arc::new(ops(dir.path(), 1 << 20, 1 << 16).with_credentials(gate.clone()));
+    let slow = tokio::spawn({
+        let ops = ops.clone();
+        let spec = with_credential(spec("slow", "sleep 300", 60), "slow");
+        async move { ops.start(&workspace(), spec).await }
+    });
+    unblocked("the slow start", gate.entered.notified()).await;
+    let finalize = tokio::spawn({
+        let ops = ops.clone();
+        async move { ops.finalize(&workspace()).await }
+    });
+    // Refused once the finalize has marked the workspace; polled until then.
+    let refused = unblocked("a start during finalize", async {
+        for n in 0.. {
+            let late = spec(&format!("late{n}"), "true", 60);
+            if let Err(e) = ops.start(&workspace(), late).await {
+                return e;
+            }
+            tokio::task::yield_now().await;
+        }
+        unreachable!()
+    })
+    .await;
+    assert_eq!(refused.kind, ErrorKind::UnknownOperation, "{refused:?}");
+    assert!(
+        !finalize.is_finished(),
+        "finalize ignored the start in flight"
+    );
+    gate.release.add_permits(1);
+    let slow = unblocked("the released start", slow)
+        .await
+        .unwrap()
+        .unwrap();
+    let outcome = unblocked("finalize", finalize).await.unwrap();
+    assert_eq!(outcome.state, FinalizationState::Completed, "{outcome:?}");
+    let error = ops.status(&slow).await.unwrap_err();
+    assert_eq!(error.kind, ErrorKind::UnknownOperation);
 }
 
 /// The stand-in docker as a [`BehaviourHarness`]: the fixture's `agent` waits

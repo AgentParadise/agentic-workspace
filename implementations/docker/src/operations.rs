@@ -598,6 +598,67 @@ impl Docker {
     }
 }
 
+/// (container, operation_key).
+type Key = (String, String);
+
+fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One key's launch lock, shared by every start of that key in flight and
+/// dropped from the map with the last of them.
+struct KeySlot<'a> {
+    slots: &'a Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>,
+    key: Key,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> KeySlot<'a> {
+    fn claim(slots: &'a Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>, key: Key) -> Self {
+        let lock = guard(slots).entry(key.clone()).or_default().clone();
+        Self { slots, key, lock }
+    }
+}
+
+impl Drop for KeySlot<'_> {
+    fn drop(&mut self) {
+        // Every clone is taken under the map's lock, so two means only the
+        // map and this slot still hold it.
+        let mut slots = guard(self.slots);
+        if Arc::strong_count(&self.lock) == 2 {
+            slots.remove(&self.key);
+        }
+    }
+}
+
+/// A workspace marked as finalizing until dropped; starts in it are refused.
+struct Finalizing<'a> {
+    marks: &'a Mutex<HashMap<String, usize>>,
+    container: String,
+}
+
+impl<'a> Finalizing<'a> {
+    fn mark(marks: &'a Mutex<HashMap<String, usize>>, container: &str) -> Self {
+        *guard(marks).entry(container.to_owned()).or_default() += 1;
+        Self {
+            marks,
+            container: container.to_owned(),
+        }
+    }
+}
+
+impl Drop for Finalizing<'_> {
+    fn drop(&mut self) {
+        let mut marks = guard(self.marks);
+        if let Some(count) = marks.get_mut(&self.container) {
+            *count -= 1;
+            if *count == 0 {
+                marks.remove(&self.container);
+            }
+        }
+    }
+}
+
 /// Runs operations in Docker workspaces. A [`WorkspaceRef`]'s `resource_id`
 /// is the container; nothing assumes a host path.
 pub struct DockerOperations {
@@ -606,9 +667,14 @@ pub struct DockerOperations {
     max_page: NonZeroU64,
     sequence: AtomicU64,
     credentials: Option<Arc<dyn CredentialResolver>>,
-    /// Keyed by (container, operation_key). The async lock spans the launch,
-    /// so racing same-key starts see the first record and launch nothing.
-    records: tokio::sync::Mutex<HashMap<(String, String), Arc<Operation>>>,
+    /// Held only for map access, never across an await.
+    records: Mutex<HashMap<Key, Arc<Operation>>>,
+    /// Per-key launch locks. One spans its key's launch, credential
+    /// resolution included, so racing same-key starts see the first record
+    /// and launch nothing, while other keys and workspaces proceed.
+    launching: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>,
+    /// Workspaces being finalized, with how many finalizes are in flight.
+    finalizing: Mutex<HashMap<String, usize>>,
 }
 
 impl DockerOperations {
@@ -623,7 +689,9 @@ impl DockerOperations {
             max_page: max_page_bytes,
             sequence: AtomicU64::new(0),
             credentials: None,
-            records: tokio::sync::Mutex::new(HashMap::new()),
+            records: Mutex::new(HashMap::new()),
+            launching: Mutex::new(HashMap::new()),
+            finalizing: Mutex::new(HashMap::new()),
         }
     }
 
@@ -666,9 +734,7 @@ impl DockerOperations {
             reference.workspace.resource_id.to_string(),
             reference.operation_key.to_string(),
         );
-        self.records
-            .lock()
-            .await
+        guard(&self.records)
             .get(&key)
             .filter(|op| op.reference == *reference)
             .cloned()
@@ -943,8 +1009,9 @@ impl SupportsOperations for DockerOperations {
             workspace.resource_id.to_string(),
             spec.operation_key.to_string(),
         );
-        let mut records = self.records.lock().await;
-        if let Some(existing) = records.get(&key) {
+        let slot = KeySlot::claim(&self.launching, key.clone());
+        let _launch = slot.lock.lock().await;
+        if let Some(existing) = guard(&self.records).get(&key) {
             if existing.spec != spec {
                 return Err(error(
                     ErrorKind::Conflict,
@@ -957,9 +1024,19 @@ impl SupportsOperations for DockerOperations {
             }
             return Ok(existing.reference.clone());
         }
+        // Checked under the key's lock: a finalize marks first, then waits
+        // for every launch in flight, so it either sees this record or this
+        // start sees its mark.
+        if guard(&self.finalizing).contains_key(&key.0) {
+            return Err(error(
+                ErrorKind::UnknownOperation,
+                format!("workspace {:?} is being finalized", key.0),
+                None,
+            ));
+        }
         let operation = self.launch(&key.0, spec).await?;
         let reference = operation.reference.clone();
-        records.insert(key, operation);
+        guard(&self.records).insert(key, operation);
         Ok(reference)
     }
 
@@ -1018,11 +1095,19 @@ impl SupportsOperations for DockerOperations {
     /// Records are forgotten only once their operation has ended, so a failed
     /// finalize stays resolvable and a retry cleans up again.
     async fn finalize(&self, workspace: &WorkspaceRef) -> FinalizationOutcome {
-        let mine: Vec<((String, String), Arc<Operation>)> = match workspace.provider.as_str() {
-            "docker" => self
-                .records
-                .lock()
-                .await
+        let container = workspace.resource_id.as_str();
+        let _finalizing = Finalizing::mark(&self.finalizing, container);
+        // Wait out the launches already in flight, so their records are seen.
+        let in_flight: Vec<Arc<tokio::sync::Mutex<()>>> = guard(&self.launching)
+            .iter()
+            .filter(|((c, _), _)| c == container)
+            .map(|(_, lock)| lock.clone())
+            .collect();
+        for lock in in_flight {
+            drop(lock.lock().await);
+        }
+        let mine: Vec<(Key, Arc<Operation>)> = match workspace.provider.as_str() {
+            "docker" => guard(&self.records)
                 .iter()
                 .filter(|((c, _), _)| c == workspace.resource_id.as_str())
                 .map(|(key, op)| (key.clone(), op.clone()))
@@ -1034,7 +1119,7 @@ impl SupportsOperations for DockerOperations {
             match self.docker.cancel(&op, TIMEOUT_GRACE).await {
                 Err(e) => failures.push(e.message.to_string()),
                 Ok(()) => {
-                    let mut records = self.records.lock().await;
+                    let mut records = guard(&self.records);
                     if records.get(&key).is_some_and(|r| Arc::ptr_eq(r, &op)) {
                         records.remove(&key);
                     }
