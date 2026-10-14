@@ -159,12 +159,16 @@ class CommandLines:
         while not self._stop.wait(self._interval):
             # Fails until the container starts and after it stops; the
             # caller asserts the CLI's own line was seen.
-            top = subprocess.run(
-                ["docker", "top", self._container, "-eww", "-o", "pid,args"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            try:
+                top = subprocess.run(
+                    ["docker", "top", self._container, "-eww", "-o", "pid,args"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                continue
             if top.returncode == 0:
                 for line in top.stdout.splitlines()[1:]:
                     self.lines.add(line.strip().split(None, 1)[-1])
