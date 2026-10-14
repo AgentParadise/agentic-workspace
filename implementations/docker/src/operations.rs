@@ -15,7 +15,7 @@ use agentic_workspace_core::operations::{
     CredentialDelivery, CredentialResolver, EnforceableLimits, ErrorKind, FinalizationOutcome,
     FinalizationStage, FinalizationState, NonEmpty, ObservationDescriptor, ObservationIntegrity,
     ObservationPage, ObserveRequest, OperationError, OperationRef, OperationSpec, OperationSpool,
-    OperationState, OperationStatus, ProviderDescriptor, SecurityProfile, StatusSchema,
+    OperationState, OperationStatus, ProviderDescriptor, Redaction, SecurityProfile, StatusSchema,
     SupportsOperations, WorkspaceRef,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -274,6 +274,8 @@ struct Progress {
 struct Operation {
     reference: OperationRef,
     spec: OperationSpec,
+    /// The caller's registration; a same-key replay must register an equal set.
+    redaction: Redaction,
     container: String,
     started_at: String,
     progress: Mutex<Progress>,
@@ -830,11 +832,17 @@ impl DockerOperations {
         &self,
         container: &str,
         spec: OperationSpec,
+        redaction: Redaction,
     ) -> Result<Arc<Operation>, OperationError> {
         let secrets = self.resolve(&spec).await?;
         let names: Vec<String> = secrets.iter().map(|(name, _)| name.clone()).collect();
-        // Every resolved value is redacted from the output before it is stored.
-        let redact: Vec<Vec<u8>> = secrets.iter().map(|(_, v)| v.as_bytes().to_vec()).collect();
+        // Every registered and resolved value is redacted from the output
+        // before it is stored.
+        let redact: Vec<Vec<u8>> = redaction
+            .values()
+            .map(<[u8]>::to_vec)
+            .chain(secrets.iter().map(|(_, v)| v.as_bytes().to_vec()))
+            .collect();
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let reference = OperationRef {
             workspace: WorkspaceRef {
@@ -892,6 +900,7 @@ impl DockerOperations {
             }),
             changed: Notify::new(),
             spec,
+            redaction,
         });
         // A failed write means the client already died; `collect` settles it.
         let _ = stdin.write_all(preamble.as_bytes()).await;
@@ -1067,6 +1076,16 @@ impl SupportsOperations for DockerOperations {
         workspace: &WorkspaceRef,
         spec: OperationSpec,
     ) -> Result<OperationRef, OperationError> {
+        self.start_redacted(workspace, spec, Redaction::default())
+            .await
+    }
+
+    async fn start_redacted(
+        &self,
+        workspace: &WorkspaceRef,
+        spec: OperationSpec,
+        redaction: Redaction,
+    ) -> Result<OperationRef, OperationError> {
         if workspace.provider.as_str() != "docker" {
             return Err(error(
                 ErrorKind::UnknownOperation,
@@ -1094,6 +1113,17 @@ impl SupportsOperations for DockerOperations {
                     Some(&existing.reference),
                 ));
             }
+            // A replay must not claim a registration the spool never had.
+            if existing.redaction != redaction {
+                return Err(error(
+                    ErrorKind::Conflict,
+                    format!(
+                        "operation_key {:?} already started with different redaction values",
+                        key.1
+                    ),
+                    Some(&existing.reference),
+                ));
+            }
             return Ok(existing.reference.clone());
         }
         // Checked under the key's lock: a finalize marks first, then waits
@@ -1106,7 +1136,7 @@ impl SupportsOperations for DockerOperations {
                 None,
             ));
         }
-        let operation = self.launch(&key.0, spec).await?;
+        let operation = self.launch(&key.0, spec, redaction).await?;
         let reference = operation.reference.clone();
         guard(&self.records).insert(key, operation);
         Ok(reference)
@@ -1289,6 +1319,7 @@ mod tests {
                 client_code: None,
             }),
             changed: Notify::new(),
+            redaction: Redaction::default(),
         }
     }
 

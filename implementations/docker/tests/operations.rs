@@ -13,7 +13,7 @@ use agentic_workspace_conformance::behaviour::{
 };
 use agentic_workspace_core::operations::{
     CredentialRef, CredentialResolver, ErrorKind, FinalizationState, ObserveRequest,
-    OperationError, OperationRef, OperationSpec, OperationState, OperationStatus,
+    OperationError, OperationRef, OperationSpec, OperationState, OperationStatus, Redaction,
     SupportsOperations, WorkspaceRef,
 };
 use agentic_workspace_docker::operations::DockerOperations;
@@ -885,6 +885,75 @@ async fn credential_bindings_reach_the_workload_env_but_never_the_client_argv() 
     assert!(!log.contains("secret-for"), "{log}");
     let status = serde_json::to_string(&ops.status(&op).await.unwrap()).unwrap();
     assert!(!status.contains("secret-for"), "{status}");
+}
+
+/// Invented: a caller-held value no credential binding names.
+const CALLER_CANARY: &str = "canary-INVENTED-caller-5e1d";
+
+#[tokio::test]
+async fn a_caller_registered_value_never_reaches_storage_pages_or_channels() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let (head, tail) = CALLER_CANARY.split_at(11);
+    let script = format!(
+        "printf 'whole %s\\n' \"$1\"; printf 'split {head}'; sleep 0.2; printf '{tail}\\n'; \
+         printf '%s%s rep\\n' \"$1\" \"$1\" >&2; printf 'eof {head}'"
+    );
+    let mut spec = serde_json::to_value(spec("k1", &script, 60)).unwrap();
+    spec["argv"] = serde_json::json!(["sh", "-c", script, "sh", CALLER_CANARY]);
+    let spec: OperationSpec = serde_json::from_value(spec).unwrap();
+    let op = ops
+        .start_redacted(&workspace(), spec, Redaction::new([CALLER_CANARY]))
+        .await
+        .unwrap();
+    let output = drain(&ops, &op, 4096).await;
+    let text = String::from_utf8(output).unwrap();
+    assert!(!text.contains(CALLER_CANARY), "{text}");
+    assert_eq!(text.matches("[REDACTED]").count(), 4, "{text}");
+    assert!(text.ends_with(&format!("eof {head}")), "{text}");
+}
+
+#[tokio::test]
+async fn two_channels_never_form_a_registered_value_in_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let half = "canary-INVENTED-";
+    let script = format!("printf '{half}'; printf '{half}' >&2");
+    let op = ops
+        .start_redacted(
+            &workspace(),
+            spec("k1", &script, 60),
+            Redaction::new([half.repeat(2)]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(drain(&ops, &op, 4096).await, b"[REDACTED]");
+}
+
+#[tokio::test]
+async fn a_replay_must_register_the_same_redaction_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let other = "canary-INVENTED-other-2b";
+    let workspace = workspace();
+    let start = |values: Vec<&'static str>| {
+        ops.start_redacted(
+            &workspace,
+            spec("k1", "sleep 0.2", 60),
+            Redaction::new(values),
+        )
+    };
+    let first = start(vec![CALLER_CANARY, other]).await.unwrap();
+    // Order, duplicates and empty values do not change the set.
+    let again = start(vec![other, CALLER_CANARY, other, ""]).await.unwrap();
+    assert_eq!(first, again);
+    for changed in [vec![], vec![CALLER_CANARY], vec![CALLER_CANARY, other, "x"]] {
+        let error = start(changed).await.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Conflict, "{error:?}");
+        assert!(!format!("{error:?}").contains("canary"), "{error:?}");
+    }
+    let plain = ops.start(&workspace, spec("k1", "sleep 0.2", 60)).await;
+    assert_eq!(plain.unwrap_err().kind, ErrorKind::Conflict);
 }
 
 /// Resolves `slow` only once released, announcing that it has been entered;
