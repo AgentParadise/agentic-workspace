@@ -33,9 +33,7 @@ MAX_FILE_BYTES = 1 << 20
 
 
 def _sse(events: list[dict[str, object]]) -> bytes:
-    return "".join(
-        f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events
-    ).encode()
+    return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
 
 
 def _anthropic_reply(request: dict[str, object]) -> tuple[str, bytes]:

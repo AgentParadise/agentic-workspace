@@ -60,7 +60,9 @@ CREDENTIAL_HEADERS = {
     "chatgpt-account-id",
 }
 CREDENTIAL_ENV_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|AUTH|CREDENTIAL", re.I)
-CREDENTIAL_SHAPED = re.compile(r"sk-ant-[\w-]{8,}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_\w{20,}|github_pat_\w+")
+CREDENTIAL_SHAPED = re.compile(
+    r"sk-ant-[\w-]{8,}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_\w{20,}|github_pat_\w+"
+)
 # Synthetic stand-ins for the upstream keys the host holds. They are set in
 # this process's env for the run; finding one in the sandbox means something
 # carried host env across.
@@ -206,8 +208,9 @@ def _assert_round_trip(
 
     env = report["env"]
     assert isinstance(env, dict)
-    credential_env = {k for k in env if CREDENTIAL_ENV_NAME.search(k)}
-    assert credential_env <= set(presented.env), credential_env - set(presented.env)
+    # Every credential-named variable, presented or inherited, holds the wire.
+    stray = sorted(k for k, v in env.items() if CREDENTIAL_ENV_NAME.search(k) and v != wire)
+    assert not stray, f"credential env other than the capability: {stray}"
     files = report["files"]
     assert isinstance(files, dict)
     assert not [p for p, text in files.items() if wire in text], "capability written to disk"
