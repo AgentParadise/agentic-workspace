@@ -270,5 +270,7 @@ async def test_d_resolved_and_registered_values_never_reach_a_page_or_the_spool(
         assert all(value not in p.model_dump_json() for p in pages)
     # Per value: whole, a split at each of len - 1 offsets, and two repeats.
     assert data.count(b"[REDACTED]") == len(SECRET) + len(CALLER_CANARY) + 4, data
-    assert data.endswith(b"eof " + CALLER_CANARY[:9].encode()), data
+    # The unfinished prefix is held until EOF, so it is stored last, after
+    # whatever the other channel wrote meanwhile.
+    assert data.endswith(CALLER_CANARY[:9].encode()), data
     assert pages[-1].state == "succeeded"

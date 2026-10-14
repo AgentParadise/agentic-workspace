@@ -910,7 +910,9 @@ async fn a_caller_registered_value_never_reaches_storage_pages_or_channels() {
     let text = String::from_utf8(output).unwrap();
     assert!(!text.contains(CALLER_CANARY), "{text}");
     assert_eq!(text.matches("[REDACTED]").count(), 4, "{text}");
-    assert!(text.ends_with(&format!("eof {head}")), "{text}");
+    // The unfinished prefix is held until EOF, so it is stored last, after
+    // whatever the other channel wrote meanwhile.
+    assert!(text.ends_with(head), "{text}");
 }
 
 #[tokio::test]

@@ -648,10 +648,9 @@ fn operations_never_page_a_registered_or_resolved_value_in_a_real_container() {
         .map(|v| v.len() + 2)
         .sum::<usize>();
     assert_eq!(text.matches("[REDACTED]").count(), expected, "{text}");
-    assert!(
-        text.ends_with(&format!("eof {}", &CALLER_CANARY[..9])),
-        "{text}"
-    );
+    // The unfinished prefix is held until EOF, so it is stored last, after
+    // whatever the other channel wrote meanwhile.
+    assert!(text.ends_with(&CALLER_CANARY[..9]), "{text}");
     provider.destroy(&handle).unwrap();
 }
 
