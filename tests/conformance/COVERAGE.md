@@ -144,26 +144,41 @@ exactly the run's processes; `removing` is sticky), not a daemon.
 
 | Hazard | Fixture | Python Docker | Python Local | Rust Docker |
 |---|---|---|---|---|
-| LH-1 | `hazard-double-fork-orphan` | PASS | PASS | NOT RUN |
-| LH-2 | `hazard-interrupted-cancel` | PASS | FAIL | NOT RUN |
+| LH-1 | `hazard-double-fork-orphan` | PASS | PASS | PASS |
+| LH-2 | `hazard-interrupted-cancel` | PASS | FAIL | FAIL (unattributed) |
 | LH-3 | `hazard-cancel-before-launch-header` | FAIL | PASS (condition N/A) | NOT RUN |
 | LH-4 | `hazard-destroy-during-start` | FAIL | FAIL | NOT RUN |
 | LH-5 | `hazard-stuck-removal-timeout-settles` | PASS | PASS (condition N/A) | NOT RUN |
-| LH-6 | `hazard-drain-with-gap-reports-loss` | FAIL | FAIL | NOT RUN |
-| LH-7 | `hazard-fifo-in-workspace` | NOT RUN | FAIL | NOT RUN |
+| LH-6 | `hazard-drain-with-gap-reports-loss` | FAIL | FAIL | FAIL |
+| LH-7 | `hazard-fifo-in-workspace` | daemon only (see below) | FAIL | NOT RUN |
+
+Python LH-4 drives each provider's public `destroy` (for Docker, only the
+container boundary `_measure_usage`/`_stop`/`_remove` is a logged stand-in),
+and the harness asserts that destroy reached operation teardown before the
+credential resolver was released, so the race measured is the race claimed.
+
+Rust Docker rows come from `agentic_workspace_conformance::hazard::drive_hazard`
+over `DockerOperations` behind the stand-in `docker` of
+`implementations/docker/tests/operations.rs` (module `hazards`, Linux
+`rust-test` job), with the test process as the container's init
+(subreaper). Each case asserts its measured verdict, so a change in either
+direction fails until this table changes with it.
 
 Findings (each left to a follow-up):
 
 - Docker LH-3: `cancel` waits `_LEADER_SECONDS` (30 s) for the launch header
   before stopping the container, so it cannot settle within the 30 s bound.
-- Docker and Local LH-4: a `start` blocked in credential resolution still
-  launches after `destroy` began (measured 1 launch, fixture says 0), and a
-  later `start` fails `unknown_operation`, not `resource_lost`.
-- Docker and Local LH-6: the gap is reported correctly (`lost_bytes: 8`), but
-  no page carries the 0.2.1 `loss_detected` marker.
+- Docker and Local LH-4: a `start` blocked in credential resolution, raced by
+  the public `destroy`, still returns a ref (step 0 matched neither
+  `resource_lost` nor `cancelled`).
+- Docker and Local LH-6, and Rust Docker LH-6: the gap is reported correctly
+  (`lost_bytes: 8`), but no page carries the 0.2.1 `loss_detected` marker.
 - Local LH-2: after the caller abandons `cancel`, the retried `cancel`
   settles `failed`, neither a confirmed `cancelled` nor the unconfirmed
   `timeout` outcome.
+- Rust Docker LH-2: the retried `cancel` returns `provider_unavailable`
+  after 7 s with the TERM-ignoring workload still measured alive. Not yet
+  attributed: it may be the stand-in's `stop` rather than the provider.
 - Local LH-7: `read_file` opens a writer-less FIFO on the event loop and
   blocks; the harness's watchdog thread has to open the write end to free it.
 
@@ -172,20 +187,30 @@ Condition N/A: Local learns its leader at spawn, so LH-3's
 cancel; Local has no backend, so LH-5's `backend_stuck_removing` cannot arise
 and only `timeout_elapsed` is imposed.
 
-NOT RUN, and why:
+NOT RUN, and why (each ends its run as `NotRun`, never a pass):
 
-- Python Docker LH-7: `file_exists`, `read_file` and `destroy` go through the
-  Docker SDK, which the stand-in CLI does not serve. It needs a real-daemon
-  fixture.
-- Rust Docker: the Rust operations trait (`SupportsOperations`) exists only
-  in open PR #60. The provider-neutral half of the Rust harness,
-  `agentic_workspace_conformance::hazard` (fixture loader, `judge`, and
-  `/proc`-measured `live_processes`), is on main. Wiring it into #60's
-  `behaviour::drive` is the follow-up once #60 merges.
+- Python Docker LH-7 through the stand-in: the probes read the host workspace
+  mount, which a stand-in container lacks.
+  `test_docker_daemon_meets_lh7_fifo` runs it against a real container
+  instead; it skips without Docker and its CI result is the row's evidence.
+- Rust Docker LH-3 and LH-5: the stand-in has no late-`exec` or
+  stuck-`removing` hook (`launch_header_not_seen`, `backend_stuck_removing`).
+- Rust Docker LH-4: the harness does not yet race `finalize` against a gated
+  resolver (`destroyed_during_credential_resolution`).
+- Rust Docker LH-7: `SupportsOperations` has no `file_exists`/`read_file`;
+  the run reaches step 2 and stops there.
 
 No vacuous pass: `test_lh1_fails_a_cancel_confirmed_while_a_descendant_lives`
 replaces each Python provider's cancel confirmation with one that kills only
 the leader's group and reports confirmed. It asserts that the mutation ran and
 that LH-1 then fails on the cancel step, where `cancelled` comes back while a
-descendant is measured alive. The Rust `judge` has the same check:
-`hazard::tests::lh1_rejects_a_confirmed_cancel_while_a_descendant_lives`.
+descendant is measured alive. For Rust Docker,
+`hazards::lh1_fails_a_cancel_confirmed_while_a_descendant_lives` wraps the
+provider in a decorator whose `cancel` terminates nothing and reports
+`cancelled`, counts that it ran, and asserts LH-1 fails on step 1 `cancel`
+with the descendant measured alive.
+
+CI: the workflow edits these jobs need (APSS pin grep to 0.2.1, every Python
+invocation under `setsid -w` with an outer `timeout`, the hazard file named
+in its own step) cannot be pushed from the agent workspace; they ship as a
+patch in the PR thread for a maintainer to apply.
