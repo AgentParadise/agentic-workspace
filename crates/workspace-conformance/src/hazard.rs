@@ -5,8 +5,8 @@
 //! judges the measured outcome with [`judge`]. A [`HazardHarness`] (the
 //! hazard counterpart of [`crate::behaviour::BehaviourHarness`]) establishes
 //! each step's `given` conditions and measures `descendant_alive` (see
-//! [`live_processes`]) and launches; nothing here takes liveness from the
-//! fixture. A condition the harness cannot establish, or a call the trait has
+//! [`live_processes`]), for a step whose alternatives judge it, and launches;
+//! nothing here takes liveness from the fixture. A condition the harness cannot establish, or a call the trait has
 //! no method for, ends the run as [`HazardVerdict::NotRun`], never a pass.
 //!
 //! The Python harness (`lib/python/agentic_isolation/tests/test_behaviour_hazards.py`)
@@ -83,7 +83,9 @@ pub enum Outcome {
 pub struct Measured {
     pub outcome: Outcome,
     pub elapsed: Duration,
-    pub descendant_alive: bool,
+    /// `None` where no alternative of the step judges liveness, so it was not
+    /// measured: such a step cannot be unmeasurable.
+    pub descendant_alive: Option<bool>,
     pub launches: u32,
     pub operation_records: u32,
 }
@@ -102,11 +104,14 @@ impl fmt::Display for Mismatch {
             Self::Unsettled { bound, elapsed } => {
                 write!(f, "did not settle within {bound}s (took {elapsed:?})")
             }
-            Self::NoAlternative { measured } => write!(
-                f,
-                "{:?} with measured descendant_alive={} matched no alternative",
-                measured.outcome, measured.descendant_alive
-            ),
+            Self::NoAlternative { measured } => match measured.descendant_alive {
+                Some(alive) => write!(
+                    f,
+                    "{:?} with measured descendant_alive={alive} matched no alternative",
+                    measured.outcome
+                ),
+                None => write!(f, "{:?} matched no alternative", measured.outcome),
+            },
             Self::Launches { expected, measured } => {
                 write!(f, "measured {measured} launches, fixture says {expected}")
             }
@@ -122,11 +127,49 @@ impl fmt::Display for Mismatch {
 
 impl std::error::Error for Mismatch {}
 
+/// Outcome fields that identify a response, whatever its prose.
+const STABLE_FIELDS: [&str; 7] = [
+    "state",
+    "complete",
+    "gap",
+    "loss_detected",
+    "exists",
+    "regular_file",
+    "operation_key",
+];
+
+impl Mismatch {
+    /// The measured outcome as stable fields, never prose: what a pinned
+    /// finding names, so a miss that moves or changes shape no longer matches.
+    pub fn outcome(&self) -> String {
+        match self {
+            Self::Unsettled { .. } => "unsettled".to_owned(),
+            Self::NoAlternative { measured } => {
+                let fields = match &measured.outcome {
+                    Outcome::Error { kind, has_ref } => format!("kind={kind} ref={has_ref}"),
+                    Outcome::Document(doc) => STABLE_FIELDS
+                        .iter()
+                        .filter_map(|key| Some(format!("{key}={}", doc.get(*key)?)))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                };
+                match measured.descendant_alive {
+                    Some(alive) => format!("{fields} alive={alive}"),
+                    None => fields,
+                }
+            }
+            Self::Launches { measured, .. } => format!("launches={measured}"),
+            Self::OperationRecords { measured, .. } => format!("operation_records={measured}"),
+        }
+    }
+}
+
 const OBSERVATION_FIELDS: [&str; 4] = ["state", "complete", "gap", "loss_detected"];
 
 /// Whether `measured` is one of `step`'s correct responses, judged by outcome
-/// (state, error kind and ref, page fields), never by message prose.
-pub fn judge(step: &HazardStep, measured: &Measured) -> Result<(), Mismatch> {
+/// (state, error kind and ref, page fields), never by message prose. `Ok`
+/// carries the index of the alternative it matched.
+pub fn judge(step: &HazardStep, measured: &Measured) -> Result<usize, Mismatch> {
     if let Some(bound) = step.settles_within_seconds {
         if measured.elapsed.as_secs_f64() > bound {
             return Err(Mismatch::Unsettled {
@@ -135,11 +178,11 @@ pub fn judge(step: &HazardStep, measured: &Measured) -> Result<(), Mismatch> {
             });
         }
     }
-    if !step.alternatives().iter().any(|alt| matches(alt, measured)) {
+    let Some(matched) = matches(step.alternatives(), measured) else {
         return Err(Mismatch::NoAlternative {
             measured: Box::new(measured.clone()),
         });
-    }
+    };
     if let Some(expected) = step.launches.filter(|n| *n != measured.launches) {
         return Err(Mismatch::Launches {
             expected,
@@ -155,13 +198,20 @@ pub fn judge(step: &HazardStep, measured: &Measured) -> Result<(), Mismatch> {
             measured: measured.operation_records,
         });
     }
-    Ok(())
+    Ok(matched)
 }
 
-fn matches(alternative: &Expectation, measured: &Measured) -> bool {
+/// The index of the first alternative `measured` matches.
+fn matches(alternatives: &[Expectation], measured: &Measured) -> Option<usize> {
+    alternatives
+        .iter()
+        .position(|alt| matches_one(alt, measured))
+}
+
+fn matches_one(alternative: &Expectation, measured: &Measured) -> bool {
     if alternative
         .descendant_alive
-        .is_some_and(|alive| alive != measured.descendant_alive)
+        .is_some_and(|alive| Some(alive) != measured.descendant_alive)
     {
         return false;
     }
@@ -259,7 +309,8 @@ pub trait HazardHarness {
 /// How one hazard went for one provider.
 #[derive(Debug)]
 pub enum HazardVerdict {
-    Pass,
+    /// Every step matched; `matched[i]` is the alternative step `i` matched.
+    Pass { matched: Vec<usize> },
     /// A measured outcome the fixture forbids: a provider finding.
     Fail {
         step: usize,
@@ -300,6 +351,7 @@ pub async fn drive_hazard<H: HazardHarness>(fixture: &HazardFixture, harness: &H
     let hazard = fixture.hazard.as_str();
     let mut operation: Option<OperationRef> = None;
     let mut cursor: Option<String> = None;
+    let mut matched = Vec::with_capacity(fixture.steps.len());
     for (index, step) in fixture.steps.iter().enumerate() {
         let not_run = |reason: String| HazardVerdict::NotRun {
             step: index,
@@ -407,9 +459,16 @@ pub async fn drive_hazard<H: HazardHarness>(fixture: &HazardFixture, harness: &H
             }
         };
         let elapsed = began.elapsed();
-        let descendant_alive = match harness.descendant_alive() {
-            Ok(alive) => alive,
-            Err(unmeasurable) => return not_run(unmeasurable.to_string()),
+        // Measured only where an alternative judges it, so liveness hidden by
+        // an unrelated process cannot stop a step that never asks for it.
+        let judges_liveness = step
+            .alternatives()
+            .iter()
+            .any(|alt| alt.descendant_alive.is_some());
+        let descendant_alive = match judges_liveness.then(|| harness.descendant_alive()) {
+            None => None,
+            Some(Ok(alive)) => Some(alive),
+            Some(Err(unmeasurable)) => return not_run(unmeasurable.to_string()),
         };
         // Probed only when the step counts records: the probe may call the
         // provider (Docker's reads `status`), and LH-5 forbids a status call
@@ -436,15 +495,18 @@ pub async fn drive_hazard<H: HazardHarness>(fixture: &HazardFixture, harness: &H
             launches: settled_launches(harness, step.launches).await,
             operation_records,
         };
-        if let Err(mismatch) = judge(step, &measured) {
-            return HazardVerdict::Fail {
-                step: index,
-                call: step.call.clone(),
-                mismatch,
-            };
+        match judge(step, &measured) {
+            Ok(alternative) => matched.push(alternative),
+            Err(mismatch) => {
+                return HazardVerdict::Fail {
+                    step: index,
+                    call: step.call.clone(),
+                    mismatch,
+                };
+            }
         }
     }
-    HazardVerdict::Pass
+    HazardVerdict::Pass { matched }
 }
 
 /// The launch count once it stops moving: up to 2s for an expected launch
@@ -462,8 +524,9 @@ async fn settled_launches<H: HazardHarness>(harness: &H, expected: Option<u32>) 
 }
 
 /// `descendant_alive` cannot be measured on this host: there is no `/proc`
-/// process table to read. A driver must report this, never read it as "no
-/// live descendants", or a confirmed cancel would pass vacuously.
+/// process table to read, or a process that could be a workload hides its
+/// environment (hidepid, another uid). A driver must report this, never read
+/// it as "no live descendants", or a confirmed cancel would pass vacuously.
 #[derive(Debug)]
 pub struct Unmeasurable(pub std::io::Error);
 
@@ -471,8 +534,9 @@ impl fmt::Display for Unmeasurable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "descendant liveness is unmeasurable here: /proc is unreadable ({}); \
-             run the hazard harness on Linux",
+            "descendant liveness is unmeasurable here: {}; run the hazard harness \
+             on Linux where the workload's /proc entries are readable \
+             (AgentParadise/agentic-workspace#68)",
             self.0
         )
     }
@@ -487,22 +551,100 @@ impl std::error::Error for Unmeasurable {
 /// Live, non-zombie pids whose environment carries `variable=token`: the
 /// measured `descendant_alive`, detached descendants included. Linux only:
 /// elsewhere this is [`Unmeasurable`], not an empty list.
+///
+/// Fails closed: a process that could be a workload but whose environment
+/// cannot be read is [`Unmeasurable`], never "not ours". A process older than
+/// this one cannot be a workload it launched, and one that exits during the
+/// scan, or is a zombie, is gone; none is a candidate.
 pub fn live_processes(variable: &str, token: &str) -> Result<Vec<u32>, Unmeasurable> {
+    live_processes_in(Path::new("/proc"), variable, token)
+}
+
+/// [`live_processes`] over the process table mounted at `proc`.
+pub fn live_processes_in(
+    proc: &Path,
+    variable: &str,
+    token: &str,
+) -> Result<Vec<u32>, Unmeasurable> {
     let needle = format!("{variable}={token}");
-    let entries = std::fs::read_dir("/proc").map_err(Unmeasurable)?;
+    let entries = std::fs::read_dir(proc).map_err(|e| {
+        Unmeasurable(std::io::Error::new(
+            e.kind(),
+            format!("{} is unreadable ({e})", proc.display()),
+        ))
+    })?;
     let me = std::process::id();
-    Ok(entries
+    let began = started(&proc.join("self")).map_err(Unmeasurable)?;
+    let mut live = Vec::new();
+    for pid in entries
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
         .filter(|pid| *pid != me)
-        .filter(|pid| {
-            let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
-            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-            environ
+    {
+        let entry = proc.join(pid.to_string());
+        let read = || -> std::io::Result<Option<u32>> {
+            if started(&entry)? < began || zombie(&entry)? {
+                return Ok(None);
+            }
+            let environ = match std::fs::read(entry.join("environ")) {
+                Ok(environ) => environ,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return if exiting(&entry)? { Ok(None) } else { Err(e) };
+                }
+                Err(e) => return Err(e),
+            };
+            let ours = environ
                 .split(|b| *b == 0)
-                .any(|var| var == needle.as_bytes())
-                && !status.contains("\nState:\tZ")
+                .any(|var| var == needle.as_bytes());
+            Ok(ours.then_some(pid))
+        };
+        match read() {
+            Ok(found) => live.extend(found),
+            Err(e) if exited(&e) => {}
+            Err(e) => {
+                return Err(Unmeasurable(std::io::Error::new(
+                    e.kind(),
+                    format!("{} is unreadable ({e})", entry.display()),
+                )));
+            }
+        }
+    }
+    Ok(live)
+}
+
+/// When the process at `entry` began, in clock ticks since boot (proc(5)
+/// `stat` field 22).
+fn started(entry: &Path) -> std::io::Result<u64> {
+    let stat = std::fs::read_to_string(entry.join("stat"))?;
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(19)?.parse().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}/stat has no start time", entry.display()),
+            )
         })
-        .collect())
+}
+
+fn zombie(entry: &Path) -> std::io::Result<bool> {
+    Ok(std::fs::read_to_string(entry.join("status"))?.contains("\nState:\tZ"))
+}
+
+/// Whether a process whose environ is hidden is on its way out: an exiting
+/// process hides it from the moment it drops its memory, a little before it
+/// becomes a zombie, so it is given a moment to get there.
+fn exiting(entry: &Path) -> std::io::Result<bool> {
+    for _ in 0..5 {
+        if zombie(entry)? {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(false)
+}
+
+/// The process left the table between listing and reading: gone, not hidden.
+fn exited(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(3)
 }
 
 #[cfg(test)]
@@ -526,7 +668,7 @@ mod tests {
         Measured {
             outcome,
             elapsed: Duration::from_millis(10),
-            descendant_alive,
+            descendant_alive: Some(descendant_alive),
             launches: 1,
             operation_records: 1,
         }
@@ -549,7 +691,7 @@ mod tests {
     #[test]
     fn lh1_rejects_a_confirmed_cancel_while_a_descendant_lives() {
         let step = &lh("LH-1").steps[1];
-        assert_eq!(judge(step, &measured(cancelled(), false)), Ok(()));
+        assert_eq!(judge(step, &measured(cancelled(), false)), Ok(0));
         assert!(matches!(
             judge(step, &measured(cancelled(), true)),
             Err(Mismatch::NoAlternative { .. })
@@ -563,7 +705,7 @@ mod tests {
             kind: "timeout".into(),
             has_ref,
         };
-        assert_eq!(judge(step, &measured(timeout(true), true)), Ok(()));
+        assert_eq!(judge(step, &measured(timeout(true), true)), Ok(1));
         assert!(judge(step, &measured(timeout(false), true)).is_err());
     }
 
@@ -587,7 +729,7 @@ mod tests {
         };
         let mut clean = measured(lost, false);
         (clean.launches, clean.operation_records) = (0, 0);
-        assert_eq!(judge(step, &clean), Ok(()));
+        assert_eq!(judge(step, &clean), Ok(0));
         let mut launched = clean.clone();
         launched.launches = 1;
         assert!(matches!(
@@ -607,7 +749,7 @@ mod tests {
             }
             Outcome::Document(doc)
         };
-        assert_eq!(judge(step, &measured(page(true), false)), Ok(()));
+        assert_eq!(judge(step, &measured(page(true), false)), Ok(0));
         assert!(judge(step, &measured(page(false), false)).is_err());
     }
 
@@ -635,9 +777,45 @@ mod tests {
                 .unwrap(),
         );
         let pid = child.0.id();
+        // `spawn` returns before the exec lands: until then the child is this
+        // binary, then briefly an image with no environment. Its argv and its
+        // environment are published together, so once `sleep 30` shows the
+        // child is the tokened workload.
+        let cmdline = format!("/proc/{pid}/cmdline");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::read(&cmdline).unwrap() != b"sleep\x0030\x00" {
+            assert!(std::time::Instant::now() < deadline, "sleep never ran");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(live_processes("AW_HARNESS_RUN", &token).unwrap(), [pid]);
         drop(child);
         assert!(live_processes("AW_HARNESS_RUN", &token).unwrap().is_empty());
+    }
+
+    /// A process table whose only candidate hides its environment: an
+    /// `environ` that cannot be read as a file, whoever runs the test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreadable_environ_is_unmeasurable_not_absent() {
+        let proc = std::env::temp_dir().join(format!("aw-fake-proc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&proc);
+        let stat = |ticks: u64| format!("1 (sh) S {}{ticks} 0\n", "0 ".repeat(18));
+        std::fs::create_dir_all(proc.join("self")).unwrap();
+        std::fs::write(proc.join("self/stat"), stat(100)).unwrap();
+        let hidden = proc.join("4242");
+        std::fs::create_dir_all(hidden.join("environ")).unwrap();
+        std::fs::write(hidden.join("stat"), stat(200)).unwrap();
+        std::fs::write(hidden.join("status"), "Name:\tsh\nState:\tS\n").unwrap();
+        let measured = live_processes_in(&proc, "AW_HARNESS_RUN", "t");
+        let error = measured.expect_err("an unreadable environ was counted as not ours");
+        assert!(error.to_string().contains("4242"), "{error}");
+        // Older than the measuring process: not a candidate, so not unmeasurable.
+        std::fs::write(hidden.join("stat"), stat(50)).unwrap();
+        assert_eq!(
+            live_processes_in(&proc, "AW_HARNESS_RUN", "t").unwrap(),
+            Vec::<u32>::new()
+        );
+        std::fs::remove_dir_all(&proc).unwrap();
     }
 
     #[cfg(not(target_os = "linux"))]
