@@ -1,5 +1,7 @@
 //! Provider-neutral workspace lifecycle contracts.
 
+pub mod operations;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
