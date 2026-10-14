@@ -66,7 +66,9 @@ fn write_executable(path: &Path, body: &str) {
 /// it, or cannot reach the daemon while a `down` file does, or is stuck
 /// `removing` while a `removing` file does. While a `late-exec` file sits
 /// beside it, an operation's `exec` waits 3s before it runs anything, so its
-/// launch header comes late.
+/// launch header comes late. Every `exec` is marked as the container's from
+/// its start, so `stop` kills a held-back one too; once the container is
+/// stopped, an `exec` is refused with 137, as a stopped container's would be.
 fn fake_docker(dir: &Path) -> PathBuf {
     let script = dir.join("docker");
     let log = dir.join("docker.log");
@@ -80,7 +82,9 @@ fn fake_docker(dir: &Path) -> PathBuf {
 printf '%s\n' "$*" >> '{log}'
 case "$1" in
 exec)
+    AW_STANDIN='{dir}'; export AW_STANDIN
     [ -e '{dir}/late-exec' ] && case " $* " in *" aw-operation "*) sleep 3 ;; esac
+    [ -e '{dir}/stopped' ] && exit 137
     shift
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -92,7 +96,6 @@ exec)
     done
     shift
     [ -e '{fail}' ] || [ -e '{dir}/signal-fails' ] && [ "$4" = aw-signal ] && exit 1
-    AW_STANDIN='{dir}'; export AW_STANDIN
     if [ "$4" = aw-processes ]; then
         reaper=$(cat '{dir}/reaper' 2>/dev/null)
         "$@" | awk -v r="$reaper" '{{ if ($2 == 1) $2 = 0; else if (r != "" && $2 == r) $2 = 1; print }}'
@@ -102,11 +105,13 @@ exec)
 stop)
     [ -e '{fail}' ] && exit 1
     [ -e '{dir}/stop-lies' ] && exit 0
+    # Stopped before the KILLs: an exec they wake must already be refused.
+    [ -e '{dir}/stop-keeps-running' ] || : > '{dir}/stopped'
     for e in /proc/[0-9]*/environ; do
         tr '\0' '\n' < "$e" 2>/dev/null | grep -qx 'AW_STANDIN={dir}' || continue
         p=${{e#/proc/}}; kill -KILL "${{p%/environ}}" 2>/dev/null
     done
-    [ -e '{dir}/stop-keeps-running' ] || : > '{dir}/stopped'; exit 0 ;;
+    exit 0 ;;
 container)
     [ -e '{down}' ] && {{ echo 'Cannot connect to the Docker daemon' >&2; exit 1; }}
     [ -e '{gone}' ] && {{ echo 'Error: No such container: c1' >&2; exit 1; }}
@@ -1209,6 +1214,9 @@ mod hazards {
         pub token: String,
         gate: Arc<Gate>,
         key: std::sync::Mutex<Option<String>>,
+        /// Liveness reads as unmeasurable, as when an unrelated process's
+        /// environ cannot be read.
+        pub hide_liveness: bool,
     }
 
     /// LH-4's credential resolver: the first resolve, while armed, says it
@@ -1267,6 +1275,7 @@ mod hazards {
                 token,
                 gate,
                 key: std::sync::Mutex::new(None),
+                hide_liveness: false,
             }
         }
 
@@ -1430,6 +1439,11 @@ mod hazards {
                 .count() as u32
         }
         fn descendant_alive(&self) -> Result<bool, Unmeasurable> {
+            if self.hide_liveness {
+                return Err(Unmeasurable(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                )));
+            }
             Ok(!live_processes(TOKEN, &self.token)?.is_empty())
         }
         /// Records the provider still resolves for the fixture's key, probed
@@ -1457,34 +1471,42 @@ mod hazards {
         }
     }
 
-    /// What the Rust Docker provider does on each hazard, measured. A change
-    /// in any verdict fails here, so a fix or a regression has to update
-    /// COVERAGE.md with it.
+    /// What the Rust Docker provider does on each hazard, measured: a pass
+    /// with the alternative each step matched, or the first miss's step, call
+    /// and outcome fields. A change in any verdict fails here, so a fix or a
+    /// regression has to update COVERAGE.md with it.
     fn expect(hazard: &str, verdict: &HazardVerdict) {
         let summary = match verdict {
-            HazardVerdict::Pass => "pass".to_owned(),
-            HazardVerdict::Fail { step, call, .. } => format!("fail {step} {call}"),
+            HazardVerdict::Pass { matched } => format!("pass {matched:?}"),
+            HazardVerdict::Fail {
+                step,
+                call,
+                mismatch,
+            } => format!("fail {step} {call} {}", mismatch.outcome()),
             HazardVerdict::NotRun { step, call, .. } => format!("not run {step} {call}"),
         };
         let expected = match hazard {
-            "LH-1" => "pass",
+            // Each step confirms: the cancel and the status are `cancelled`.
+            "LH-1" => "pass [0, 0, 0]",
             // The retried cancel ends provider_unavailable after 7s with the
             // TERM-ignoring workload still alive. Not established whether the
             // stand-in's stop or the provider is at fault: COVERAGE.md.
-            "LH-2" => "fail 3 cancel",
-            // Finding: the cancel before the launch header ends
-            // provider_unavailable after ~9s, the late workload alive.
-            "LH-3" => "fail 1 cancel",
+            "LH-2" => "fail 3 cancel kind=provider_unavailable ref=true alive=true",
+            // The cancel before the launch header confirms `cancelled`. Pinned
+            // as `fail 1 cancel` (provider_unavailable, workload alive) until
+            // the stand-in refused an exec into a stopped container: that
+            // late workload was the stand-in's, not the provider's.
+            "LH-3" => "pass [0, 0, 0]",
             // Finding: start returns a ref and launches into the container
             // destroyed while it resolved, instead of resource_lost/cancelled.
-            "LH-4" => "fail 0 start",
+            "LH-4" => "fail 0 start operation_key=\"exec-42:phase-1:fence-9:agent\"",
             // Finding: with the container stuck removing, the timed-out
             // operation's observe never completes within the 120s bound.
-            "LH-5" => "fail 1 observe",
+            "LH-5" => "fail 1 observe unsettled",
             // Finding: the gap page carries no loss_detected (0.2.1).
-            "LH-6" => "fail 2 observe",
+            "LH-6" => "fail 2 observe state=\"succeeded\" complete=false gap={\"lost_bytes\":8}",
             // Finding: `collect` opens the FIFO and blocks past the 10s bound.
-            "LH-7" => "fail 2 file_exists",
+            "LH-7" => "fail 2 file_exists unsettled",
             _ => unreachable!(),
         };
         assert_eq!(summary, expected, "{hazard}: {verdict:?}");
@@ -1619,6 +1641,26 @@ mod hazards {
         std::fs::write(std::env::var(CASE_DONE).unwrap(), "").unwrap();
     }
 
+    /// The stand-in models a stopped container: an operation exec held back
+    /// past a `stop` never runs its workload, so nothing is measured alive.
+    #[tokio::test]
+    async fn a_late_exec_into_a_stopped_container_is_refused() {
+        let harness = StandIn::new("LH-3");
+        let lh3 = fixture("LH-3");
+        let spec = harness.spec("LH-3", &lh3.steps[0].args["spec"]);
+        let started = harness.provider.start(&workspace(), spec).await;
+        let stop = std::process::Command::new(harness.standin("docker"))
+            .args(["stop", "c1"])
+            .status()
+            .unwrap();
+        assert!(stop.success());
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !harness.descendant_alive().unwrap(),
+            "the held-back workload ran after stop (start: {started:?})"
+        );
+    }
+
     #[test]
     fn lh1_double_fork_orphan_before_cancel() {
         assert_passes("LH-1");
@@ -1662,6 +1704,22 @@ mod hazards {
         }
         assert!(matches!(bounded("fails", bound), CaseEnd::Failed(_)));
         assert_eq!(bounded("passes", bound), CaseEnd::Passed);
+    }
+
+    /// LH-6 judges no liveness, so liveness hidden on the host leaves its
+    /// verdict as measured; LH-1's cancel judges it, so it is not run.
+    #[tokio::test]
+    async fn hidden_liveness_stops_only_a_step_that_judges_it() {
+        let mut lh6 = StandIn::new("LH-6");
+        lh6.hide_liveness = true;
+        expect("LH-6", &drive_hazard(&fixture("LH-6"), &lh6).await);
+        let mut lh1 = StandIn::new("LH-1");
+        lh1.hide_liveness = true;
+        let verdict = drive_hazard(&fixture("LH-1"), &lh1).await;
+        assert!(
+            matches!(&verdict, HazardVerdict::NotRun { step: 1, call, .. } if call == "cancel"),
+            "{verdict:?}"
+        );
     }
 
     /// The record probe counts a started operation, and none before it, so
@@ -1805,7 +1863,7 @@ mod hazards {
             panic!("LH-1 did not fail on the confirmed cancel: {verdict:?}");
         };
         assert_eq!(call, "cancel");
-        assert!(measured.descendant_alive, "{verdict:?}");
+        assert_eq!(measured.descendant_alive, Some(true), "{verdict:?}");
         assert!(
             matches!(&measured.outcome, Outcome::Document(d) if d["state"] == "cancelled"),
             "{verdict:?}"
