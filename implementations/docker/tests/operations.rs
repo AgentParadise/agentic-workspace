@@ -261,7 +261,7 @@ async fn a_complete_page_stays_the_end_when_a_descendant_writes_late() {
         status
             .metadata
             .get()
-            .get("signal_failure")
+            .get("output_failure")
             .is_some_and(|f| f.contains("stopped reading")),
         "{status:?}"
     );

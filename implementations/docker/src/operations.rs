@@ -223,6 +223,8 @@ struct Progress {
     ended_at: Option<String>,
     escalated: bool,
     failures: Vec<String>,
+    /// Why output stopped being collected before its streams ended cleanly.
+    output_failures: Vec<String>,
     /// The exec client has exited and its output is drained; settlement may
     /// still wait on the container's presence.
     client_finished: bool,
@@ -271,6 +273,9 @@ impl Operation {
         }
         if !p.failures.is_empty() {
             metadata.insert("signal_failure".into(), p.failures.join("; "));
+        }
+        if !p.output_failures.is_empty() {
+            metadata.insert("output_failure".into(), p.output_failures.join("; "));
         }
         OperationStatus {
             schema: Some(StatusSchema::V1),
@@ -662,6 +667,7 @@ impl DockerOperations {
                 ended_at: None,
                 escalated: false,
                 failures: Vec::new(),
+                output_failures: Vec::new(),
                 client_finished: false,
                 client_code: None,
             }),
@@ -728,7 +734,7 @@ async fn collect(docker: Docker, op: Arc<Operation>, mut child: tokio::process::
         readers.abort();
         let _ = readers.await;
         op.update(|p| {
-            p.failures.push(format!(
+            p.output_failures.push(format!(
                 "output still open {}s after the client exited; stopped reading, \
                  later output is not collected",
                 FINAL_OUTPUT.as_secs()
@@ -746,7 +752,15 @@ async fn collect(docker: Docker, op: Arc<Operation>, mut child: tokio::process::
 async fn read_stdout(op: &Operation, stdout: impl AsyncRead + Unpin) {
     let mut reader = BufReader::new(stdout);
     let mut header = Vec::new();
-    let _ = reader.read_until(b'\n', &mut header).await;
+    if let Err(e) = reader.read_until(b'\n', &mut header).await {
+        op.update(|p| {
+            p.spool.append(&header);
+            p.leader_known = true;
+            p.output_failures
+                .push(format!("stdout failed before the leader line: {e}"));
+        });
+        return;
+    }
     let text = String::from_utf8_lossy(&header);
     let fields: Vec<&str> = text.split_whitespace().collect();
     op.update(|p| {
@@ -761,10 +775,26 @@ async fn read_stdout(op: &Operation, stdout: impl AsyncRead + Unpin) {
     pump(op, reader).await;
 }
 
+/// Append `stream` to the spool until EOF. A read error is not EOF: reading
+/// stops there, nothing after it is collected, and the loss is reported as
+/// `output_failure` so a complete page is never mistaken for all the output.
 async fn pump(op: &Operation, mut stream: impl AsyncRead + Unpin) {
     let mut buffer = vec![0; 64 * 1024];
-    while let Ok(n @ 1..) = stream.read(&mut buffer).await {
-        op.update(|p| p.spool.append(&buffer[..n]));
+    loop {
+        match stream.read(&mut buffer).await {
+            Ok(0) => return,
+            Ok(n) => op.update(|p| p.spool.append(&buffer[..n])),
+            Err(e) => {
+                op.update(|p| {
+                    let collected = p.spool.end();
+                    p.output_failures.push(format!(
+                        "output stream failed after {collected} bytes: {e}; \
+                         later output is not collected"
+                    ))
+                });
+                return;
+            }
+        }
     }
 }
 
@@ -946,6 +976,122 @@ impl SupportsOperations for DockerOperations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Yields its chunks in order: `Ok` bytes, or an I/O error.
+    struct Scripted(std::collections::VecDeque<std::io::Result<Vec<u8>>>);
+
+    impl AsyncRead for Scripted {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let next = self.0.pop_front().unwrap_or(Ok(Vec::new()));
+            std::task::Poll::Ready(next.map(|bytes| buf.put_slice(&bytes)))
+        }
+    }
+
+    fn scripted(chunks: Vec<std::io::Result<&[u8]>>) -> Scripted {
+        Scripted(chunks.into_iter().map(|c| c.map(<[u8]>::to_vec)).collect())
+    }
+
+    fn broken() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broke")
+    }
+
+    fn operation() -> Operation {
+        let spec: OperationSpec = serde_json::from_value(serde_json::json!({
+            "execution_id": "e1",
+            "operation_key": "k1",
+            "argv": ["true"],
+            "working_directory": ".",
+            "environment": {},
+            "credential_bindings": [],
+            "timeout_seconds": 60,
+            "metadata": {},
+        }))
+        .unwrap();
+        Operation {
+            reference: serde_json::from_value(serde_json::json!({
+                "workspace": {"provider": "docker", "resource_id": "c1"},
+                "operation_id": "op-1",
+                "operation_key": "k1",
+            }))
+            .unwrap(),
+            spec,
+            container: "c1".into(),
+            started_at: now_rfc3339(),
+            progress: Mutex::new(Progress {
+                state: OperationState::Running,
+                spool: OperationSpool::new(NonZeroU64::new(1 << 20).unwrap()),
+                leader: None,
+                leader_known: false,
+                requested: None,
+                terminating: false,
+                tracked: BTreeMap::new(),
+                exit_code: None,
+                signal: None,
+                ended_at: None,
+                escalated: false,
+                failures: Vec::new(),
+                output_failures: Vec::new(),
+                client_finished: false,
+                client_code: None,
+            }),
+            changed: Notify::new(),
+        }
+    }
+
+    fn output_failure(op: &Operation) -> Option<String> {
+        op.status().metadata.get().get("output_failure").cloned()
+    }
+
+    fn collected(op: &Operation) -> Vec<u8> {
+        let page = op
+            .lock()
+            .spool
+            .page(&op.reference, OperationState::Succeeded, None, 1 << 16)
+            .unwrap();
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            page.data_b64.as_str(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stream_error_stops_collection_and_is_reported_not_taken_for_eof() {
+        let op = operation();
+        let stream = scripted(vec![Ok(b"before\n"), Err(broken()), Ok(b"after\n")]);
+        pump(&op, stream).await;
+        assert_eq!(collected(&op), b"before\n");
+        let failure = output_failure(&op).expect("the stream error is reported");
+        assert!(failure.contains("after 7 bytes: pipe broke"), "{failure}");
+        assert!(failure.contains("not collected"), "{failure}");
+    }
+
+    #[tokio::test]
+    async fn a_clean_eof_reports_no_output_failure() {
+        let op = operation();
+        pump(&op, scripted(vec![Ok(b"all\n")])).await;
+        assert_eq!(collected(&op), b"all\n");
+        assert_eq!(output_failure(&op), None);
+    }
+
+    #[tokio::test]
+    async fn a_stdout_error_before_the_leader_line_is_reported_and_stops_reading() {
+        let op = operation();
+        let stream = scripted(vec![Ok(b"partial"), Err(broken()), Ok(b"\nafter\n")]);
+        read_stdout(&op, stream).await;
+        assert_eq!(collected(&op), b"partial");
+        assert!(op.lock().leader_known);
+        assert!(op.lock().leader.is_none());
+        let failure = output_failure(&op).expect("the stream error is reported");
+        assert!(
+            failure.contains("before the leader line: pipe broke"),
+            "{failure}"
+        );
+    }
 
     fn table(rows: &[&str]) -> Table {
         parse_table(&rows.join("\n"))
