@@ -203,15 +203,37 @@ pub fn load_hazards(dir: &Path) -> std::io::Result<Vec<HazardFixture>> {
     Ok(fixtures)
 }
 
+/// `descendant_alive` cannot be measured on this host: there is no `/proc`
+/// process table to read. A driver must report this, never read it as "no
+/// live descendants", or a confirmed cancel would pass vacuously.
+#[derive(Debug)]
+pub struct Unmeasurable(pub std::io::Error);
+
+impl fmt::Display for Unmeasurable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "descendant liveness is unmeasurable here: /proc is unreadable ({}); \
+             run the hazard harness on Linux",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Unmeasurable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// Live, non-zombie pids whose environment carries `variable=token`: the
-/// measured `descendant_alive`, detached descendants included. Linux only.
-pub fn live_processes(variable: &str, token: &str) -> Vec<u32> {
+/// measured `descendant_alive`, detached descendants included. Linux only:
+/// elsewhere this is [`Unmeasurable`], not an empty list.
+pub fn live_processes(variable: &str, token: &str) -> Result<Vec<u32>, Unmeasurable> {
     let needle = format!("{variable}={token}");
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
+    let entries = std::fs::read_dir("/proc").map_err(Unmeasurable)?;
     let me = std::process::id();
-    entries
+    Ok(entries
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
         .filter(|pid| *pid != me)
         .filter(|pid| {
@@ -222,7 +244,7 @@ pub fn live_processes(variable: &str, token: &str) -> Vec<u32> {
                 .any(|var| var == needle.as_bytes())
                 && !status.contains("\nState:\tZ")
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -331,17 +353,38 @@ mod tests {
         assert!(judge(step, &measured(page(false), false)).is_err());
     }
 
+    /// Kills and reaps the child even when an assertion panics first.
+    #[cfg(target_os = "linux")]
+    struct Reaped(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn live_processes_measures_a_tokened_child_and_not_after_it_exits() {
         let token = format!("rust-hazard-{}", std::process::id());
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .env("AW_HARNESS_RUN", &token)
-            .spawn()
-            .unwrap();
-        assert_eq!(live_processes("AW_HARNESS_RUN", &token), [child.id()]);
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(live_processes("AW_HARNESS_RUN", &token).is_empty());
+        let child = Reaped(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .env("AW_HARNESS_RUN", &token)
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        assert_eq!(live_processes("AW_HARNESS_RUN", &token).unwrap(), [pid]);
+        drop(child);
+        assert!(live_processes("AW_HARNESS_RUN", &token).unwrap().is_empty());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn live_processes_is_unmeasurable_without_proc() {
+        assert!(live_processes("AW_HARNESS_RUN", "any").is_err());
     }
 }
