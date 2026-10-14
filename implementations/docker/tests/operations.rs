@@ -23,23 +23,44 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Write an executable script whose first line answers `--probe`, and wait
+/// until it can be executed: a test thread forking meanwhile can hold the
+/// written file open for a moment, and exec then fails with ETXTBSY.
+fn write_executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(
+        path,
+        format!("#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\n{body}"),
+    )
+    .unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..500 {
+        match std::process::Command::new(path).arg("--probe").status() {
+            Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(Duration::from_millis(10)),
+            status => {
+                assert!(status.unwrap().success());
+                return;
+            }
+        }
+    }
+    panic!("{} stayed busy", path.display());
+}
+
 /// `exec` drops docker's own flags and runs the command here; `stop` is
 /// recorded. Every argv is appended to `docker.log` beside the script. While
 /// a `fail` file sits beside it, signalling and `stop` both fail; `container
 /// inspect` says the container is running, or gone while a `gone` file sits
 /// beside it, or cannot reach the daemon while a `down` file does.
 fn fake_docker(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let script = dir.join("docker");
     let log = dir.join("docker.log");
     let fail = dir.join("fail");
     let gone = dir.join("gone");
     let down = dir.join("down");
-    std::fs::write(
+    write_executable(
         &script,
-        format!(
-            r#"#!/bin/sh
-PATH='{dir}':"$PATH"; export PATH
+        &format!(
+            r#"PATH='{dir}':"$PATH"; export PATH
 printf '%s\n' "$*" >> '{log}'
 case "$1" in
 exec)
@@ -68,9 +89,7 @@ esac
             gone = gone.display(),
             down = down.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     script
 }
 
@@ -568,11 +587,7 @@ async fn drive_behaviour_fixture(name: &str) {
     let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let agent = dir.path().join("agent");
-    std::fs::write(&agent, "#!/bin/sh\nexec sleep 300\n").unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    write_executable(&agent, "exec sleep 300\n");
     let ops = ops(dir.path(), 1 << 20, 1 << 16).with_credentials(Arc::new(Vault));
     let mut issued: Option<(Value, OperationRef)> = None;
     for (i, step) in fixture["steps"].as_array().unwrap().iter().enumerate() {
