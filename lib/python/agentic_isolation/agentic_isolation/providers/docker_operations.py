@@ -177,6 +177,8 @@ _CLIENT_EXIT_SECONDS = 5.0
 # this long before its client is killed and reaped and the command counts as
 # provider_unavailable, so a hung daemon cannot hold a settlement or a cancel.
 _CONTROL_SECONDS = 30.0
+# How long a killed control client is given to be reaped.
+_REAP_SECONDS = 5.0
 
 # How long a terminal operation keeps answering status and observe before its
 # spool is reclaimed. Same-key replay outlives it; see the module docstring.
@@ -218,6 +220,9 @@ class _Operation:
     signal: str | None = None
     ended_at: str | None = None
     cancel_requested: bool = False
+    # The cancel's termination returned: every process is confirmed gone or
+    # the container stopped. Only this publishes `cancelled`.
+    cancel_confirmed: bool = False
     escalated: bool = False
     # The escalation's `docker stop` could not be run or reported failure.
     stop_failed: bool = False
@@ -587,7 +592,7 @@ class DockerOperations:
             operation.changed.set()
             return
         operation.ended_at = _now()
-        if operation.cancel_requested and operation.stop_failed:
+        if operation.cancel_requested and not operation.cancel_confirmed:
             # The cancel could not confirm the operation ended: say so.
             operation.exit_code = code
             operation.state = "failed"
@@ -685,8 +690,15 @@ class DockerOperations:
                 if operation.state in TERMINAL_STATES:
                     return self._status(operation)
                 operation.cancel_requested = True
-                await operation.leader_known.wait()
-                await self._terminate_group(operation, grace_seconds=grace_seconds)
+                try:
+                    await operation.leader_known.wait()
+                    await self._terminate_group(operation, grace_seconds=grace_seconds)
+                except asyncio.CancelledError:
+                    # Recorded before the lock is released, so the settlement
+                    # it lets in publishes the unconfirmed outcome.
+                    self._note(operation, "cancel interrupted before termination was confirmed")
+                    raise
+                operation.cancel_confirmed = True
             if operation.collector is not None:
                 await operation.collector
             # The collector may have settled before this cancel confirmed.
@@ -828,14 +840,29 @@ class DockerOperations:
             async with asyncio.timeout(_CONTROL_SECONDS):
                 out, _ = await process.communicate()
         except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-            await process.wait()
+            await self._reap(process)
             raise _error(
                 "provider_unavailable",
                 f"docker {' '.join(argv[:2])} did not answer within {_CONTROL_SECONDS:g}s",
             ) from None
+        except asyncio.CancelledError:
+            await self._reap(process)
+            raise
         return process.returncode or 0, out.decode(errors="replace")
+
+    @staticmethod
+    async def _reap(process: asyncio.subprocess.Process) -> None:
+        """Kill an abandoned control client and reap it within `_REAP_SECONDS`.
+
+        `wait` also waits for the pipes, which a child of the client may still
+        hold; closing the transport drops them, so EOF is never waited for.
+        """
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        process._transport.close()  # type: ignore[attr-defined]  # noqa: SLF001
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_REAP_SECONDS):
+                await process.wait()
 
     async def _settled_presence(self, container: str) -> _Presence:
         """Presence, waiting out a removal in progress up to `_REMOVAL_WAIT_SECONDS`."""

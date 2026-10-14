@@ -1094,6 +1094,48 @@ async def test_a_hung_docker_control_command_is_killed_at_its_deadline(
         os.kill(int(pid_file.read_text()), 0)
 
 
+async def test_a_control_client_whose_child_holds_its_pipe_is_still_bounded(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child keeping stdout open used to hold the reap past the deadline."""
+    monkeypatch.setattr(docker_operations, "_CONTROL_SECONDS", 0.1)
+    client_pid, child_pid = docker_env / "client.pid", docker_env / "child.pid"
+    forking = docker_env / "forking-docker"
+    forking.write_text(
+        f"#!/bin/sh\necho $$ > {client_pid}\nsleep 30 &\necho $! > {child_pid}\nwait\n"
+    )
+    forking.chmod(forking.stat().st_mode | stat.S_IEXEC)
+    ops = _ops(docker_env)
+    ops._docker = str(forking)
+    try:
+        began = time.monotonic()
+        with pytest.raises(OperationFailure) as caught:
+            await asyncio.wait_for(ops._presence("c1"), timeout=2)
+        assert caught.value.error.kind == "provider_unavailable"
+        assert time.monotonic() - began < 2
+        assert not _alive(int(client_pid.read_text()))  # killed and reaped
+    finally:
+        with contextlib.suppress(ProcessLookupError, FileNotFoundError):
+            os.kill(int(child_pid.read_text()), signal.SIGKILL)
+
+
+async def test_a_cancelled_control_command_leaves_no_client_behind(docker_env: Path) -> None:
+    pid_file = docker_env / "hung.pid"
+    hung = docker_env / "hung-docker"
+    hung.write_text(f"#!/bin/sh\necho $$ > {pid_file}\nexec sleep 60\n")
+    hung.chmod(hung.stat().st_mode | stat.S_IEXEC)
+    ops = _ops(docker_env)
+    ops._docker = str(hung)
+    command = asyncio.create_task(ops._presence("c1"))
+    async with asyncio.timeout(5):
+        while not pid_file.exists() or not pid_file.read_text():
+            await asyncio.sleep(0.01)
+    command.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(command, timeout=5)
+    assert not _alive(int(pid_file.read_text()))
+
+
 # Finding 3: `cancelled` is published only once the cancel has confirmed.
 async def _cancel_with_held_confirmation(
     ops: DockerOperations, monkeypatch: pytest.MonkeyPatch, *, confirmed: bool
@@ -1191,3 +1233,43 @@ async def test_forget_workspace_waits_out_an_in_flight_start(docker_env: Path) -
     assert (ops._operations, ops._by_key, ops._launching) == ({}, {}, {})
     with pytest.raises(OperationFailure):
         await ops.status(ref)
+
+
+async def test_an_interrupted_confirmation_never_publishes_cancelled(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller abandoning the cancel mid-confirmation used to read as confirmed."""
+    ops = _ops(docker_env)
+    survivor = docker_env / "survivor.pid"
+    script = "sh -c 'trap \"\" TERM; echo $$ > survivor.pid; exec sleep 30' >/dev/null 2>&1 & wait"
+    ref = await ops.start(_workspace(), _spec(script))
+    operation = ops._operations[ref.operation_id]
+    await asyncio.wait_for(operation.leader_known.wait(), timeout=5)
+    async with asyncio.timeout(5):
+        while not survivor.exists() or not survivor.read_text().strip():
+            await asyncio.sleep(0.01)
+    child = int(survivor.read_text())
+    confirming = asyncio.Event()
+
+    async def held(operation: _Operation, *, within: float) -> bool:
+        confirming.set()
+        await asyncio.Event().wait()
+        return True
+
+    monkeypatch.setattr(ops, "_group_gone", held)
+    cancel = asyncio.create_task(ops.cancel(ref, grace_seconds=1.0))
+    try:
+        await asyncio.wait_for(confirming.wait(), timeout=5)
+        assert (await ops.status(ref)).state == "running"
+        cancel.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancel
+        await asyncio.wait_for(operation.collector, timeout=10)  # type: ignore[arg-type]
+        assert _alive(child)  # TERM was ignored: nothing confirmed it gone
+        status = await ops.status(ref)
+        assert status.state == "failed"
+        assert "interrupted" in status.metadata["cancel_signal_failure"]
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(child, signal.SIGKILL)
+        await _kill_leader(operation)
