@@ -146,11 +146,11 @@ exactly the run's processes; `removing` is sticky), not a daemon.
 |---|---|---|---|---|
 | LH-1 | `hazard-double-fork-orphan` | PASS | PASS (FAIL seen in CI, below) | PASS |
 | LH-2 | `hazard-interrupted-cancel` | PASS | FAIL | FAIL (unattributed) |
-| LH-3 | `hazard-cancel-before-launch-header` | FAIL | PASS (condition N/A) | NOT RUN |
-| LH-4 | `hazard-destroy-during-start` | FAIL | FAIL | NOT RUN |
-| LH-5 | `hazard-stuck-removal-timeout-settles` | PASS | PASS (condition N/A) | NOT RUN |
+| LH-3 | `hazard-cancel-before-launch-header` | FAIL | PASS (condition N/A) | FAIL |
+| LH-4 | `hazard-destroy-during-start` | FAIL | FAIL | FAIL |
+| LH-5 | `hazard-stuck-removal-timeout-settles` | PASS | PASS (condition N/A) | FAIL |
 | LH-6 | `hazard-drain-with-gap-reports-loss` | FAIL | FAIL | FAIL |
-| LH-7 | `hazard-fifo-in-workspace` | FAIL (real daemon) | FAIL | NOT RUN |
+| LH-7 | `hazard-fifo-in-workspace` | FAIL (real daemon) | FAIL | FAIL |
 
 Python LH-4 drives each provider's public `destroy` (for Docker, only the
 container boundary `_measure_usage`/`_stop`/`_remove` is a logged stand-in),
@@ -161,7 +161,15 @@ Rust Docker rows come from `agentic_workspace_conformance::hazard::drive_hazard`
 over `DockerOperations` behind the stand-in `docker` of
 `implementations/docker/tests/operations.rs` (module `hazards`, Linux
 `rust-test` job), with the test process as the container's init
-(subreaper). Each case asserts its measured verdict, so a change in either
+(subreaper). The stand-in's `late-exec` file holds an operation's `exec`
+back 3 s (LH-3), its `removing` file keeps `container inspect` at
+`removing` (LH-5); LH-4 gates the credential resolver and, once `start` is
+inside it, marks the container gone and races the trait's `finalize`
+before releasing it; LH-7's file calls go through the Rust provider's file
+surface, `DockerProvider::collect`, on a thread of its own. Operation
+records are counted through public `status`, and
+`hazards::operation_records_counts_a_started_operation` shows the count
+moves 0 to 1 on a start. Each case asserts its measured verdict, so a change in either
 direction fails until this table changes with it.
 
 Findings (each left to a follow-up):
@@ -173,6 +181,18 @@ Findings (each left to a follow-up):
   `resource_lost` nor `cancelled`).
 - Docker and Local LH-6, and Rust Docker LH-6: the gap is reported correctly
   (`lost_bytes: 8`), but no page carries the 0.2.1 `loss_detected` marker.
+- Rust Docker LH-3: `cancel` before the launch header returns
+  `provider_unavailable` after about 9 s, and the late workload is then
+  measured alive; neither allowed outcome.
+- Rust Docker LH-4: `start` blocked in credential resolution, while the
+  container is lost and `finalize` runs, returns a ref and launches once
+  (fixture: `resource_lost` or `cancelled`, 0 launches).
+- Rust Docker LH-5: with the container stuck `removing`, the timed-out
+  operation's `observe` (repeated until complete) does not complete within
+  the 120 s bound.
+- Rust Docker LH-7: `collect` opens the writer-less FIFO and blocks; the
+  `file_exists` step does not settle within 10 s. The harness frees the
+  blocked open by opening the FIFO's write end on teardown.
 - Local LH-2: after the caller abandons `cancel`, the retried `cancel`
   settles `failed`, neither a confirmed `cancelled` nor the unconfirmed
   `timeout` outcome.
@@ -202,12 +222,6 @@ NOT RUN, and why (each ends its run as `NotRun`, never a pass):
   mount, which a stand-in container lacks.
   `test_docker_daemon_meets_lh7_fifo` runs it against a real container
   instead; it skips without Docker and its CI result is the row's evidence.
-- Rust Docker LH-3 and LH-5: the stand-in has no late-`exec` or
-  stuck-`removing` hook (`launch_header_not_seen`, `backend_stuck_removing`).
-- Rust Docker LH-4: the harness does not yet race `finalize` against a gated
-  resolver (`destroyed_during_credential_resolution`).
-- Rust Docker LH-7: `SupportsOperations` has no `file_exists`/`read_file`;
-  the run reaches step 2 and stops there.
 
 No vacuous pass: `test_lh1_fails_a_cancel_confirmed_while_a_descendant_lives`
 replaces each Python provider's cancel confirmation with one that kills only
