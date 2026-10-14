@@ -25,12 +25,68 @@ no Python test claims the row yet.
 | APS-V1-0004 transcript envelope | W-3.7-a, W-3.7-b | MUST | PENDING | PENDING | PENDING | PENDING |
 | Filesystem, process, network isolation | W-3.2-f, W-6.3-a | MUST for isolated | N/A | PASS | PENDING | PENDING |
 | Credential and resource enforcement | W-3.8-c, W-3.8-d, W-6.3-a | MUST for isolated | N/A | PARTIAL | PARTIAL | PENDING |
-| Operation start, idempotency and conflict | W-5-b3 | MUST | PENDING | PENDING | PASS | PASS |
-| Operation status from a trusted channel | W-5-b5 | MUST | PENDING | PENDING | PASS | PASS |
-| Operation observation pages, gaps and cursors | W-5-b6 | MUST | PENDING | PENDING | PASS | PASS |
-| Operation cancellation of the process tree | W-5-b4, W-4-a | MUST | PENDING | PENDING | PARTIAL | PARTIAL |
+| Operation start, idempotency and conflict | W-5-b3 | MUST | PENDING | PASS | PASS | PASS |
+| Operation status from a trusted channel | W-5-b5 | MUST | PENDING | PASS | PASS | PASS |
+| Operation observation pages, gaps and cursors | W-5-b6 | MUST | PENDING | PASS | PASS | PASS |
+| Operation cancellation of the process tree | W-5-b4, W-4-a | MUST | PENDING | PARTIAL | PARTIAL | PARTIAL |
 
 No implementation claims full conformance while a MUST row is pending.
+
+## Rust evidence
+
+Rust Docker operation rows are claimed by
+`agentic_workspace_docker::operations::DockerOperations`, the
+`SupportsOperations` implementation, through these tests in
+`implementations/docker/`. `tests/operations.rs` drives it through a stand-in
+`docker` whose `exec` runs as host processes (run by `rust-test`);
+`tests/conformance.rs` runs it against a real container (run by
+`docker-conformance`). The APSS 0.2.0 valid and invalid documents, and the
+documents behaviour fixtures expect, are parsed against the Rust models by
+`crates/workspace-conformance/tests/apss_fixtures.rs`; that is schema
+evidence, not behaviour evidence.
+
+`agentic_workspace_conformance::behaviour::drive` executes a behaviour
+fixture from its file against any `SupportsOperations` behind a
+`BehaviourHarness`, which supplies the fixture's `argv[0]` workload and a
+launch count. Each step runs with the fixture's own spec (credential binding
+and launch marker included, resolved by an injected `CredentialResolver`) and
+checks the issued ref, error `kind`, status `state` and `exit_code`, each
+page's bytes at the fixture's offset, exact `gap`, cursor progression, page
+state and `complete`, a result's derived `success` (and rejection of the
+opposite claim), and the launch count after each step. Docker runs all seven
+fixtures through `tests/operations.rs::behaviour_fixture_*` (`rust-test`,
+Linux leg). Three readings are made explicit, with their provenance:
+
+- Fixture offsets count the workload's output. The launch marker line the
+  contract requires first on the stream (plan section 4.2) is read and
+  checked before the fixture's `g1:0`.
+- A page's length is the provider's: base64 pads 10 bytes to the width of
+  12, so a provider filling its bound may return more than a fixture page.
+  The driver checks the fixture's bytes, then that any more are the
+  workload's next bytes, and refuses to reuse a fixture cursor the provider
+  skipped past.
+- A result is assembled by the orchestrator from the provider's terminal
+  status; `WorkspaceResult::success_of` is the one derivation of `success`.
+
+The Rust spool follows `late-read-drains-then-complete`: only the empty page
+at the end of a terminal operation is `complete`. The Python spool marks the
+page carrying the last bytes complete; see DISC-005.
+
+| Row | Test ids |
+|---|---|
+| Operation start, idempotency and conflict | `tests/operations.rs::start_same_key_one_launch_under_50_concurrent_tasks`, `::same_key_different_spec_is_conflict_and_launches_nothing`, `::unknown_ref_is_a_typed_unknown_operation`, `::credential_bindings_reach_the_workload_env_but_never_the_client_argv`, `::credential_bindings_without_a_resolver_are_rejected_policy`, `::behaviour_fixture_start_same_key_one_launch`, `::behaviour_fixture_same_key_different_spec_conflict`, `::behaviour_fixture_unknown_ref_typed_error` |
+| Operation status from a trusted channel | `tests/operations.rs::timeout_settles_as_timed_out_with_the_final_output`, `::cancel_kills_leader_grandchild_and_term_trapper_and_is_idempotent`, `::a_workload_whose_container_is_removed_is_lost`, `::an_unreachable_daemon_is_provider_unavailable_and_a_real_failure_stays_failed`, `::behaviour_fixture_cancel_twice_terminal_once`; `src/operations.rs::tests::signalled_exits_are_named`, `::container_inspect_answers_are_classified` |
+| Operation observation pages, gaps and cursors | `tests/operations.rs::behaviour_fixture_cursor_after_retention_gap`, `::behaviour_fixture_late_read_drains_then_complete`, `::behaviour_fixture_required_capture_unknown_success_false`, `::cursor_after_retention_reports_the_exact_gap_then_drains`, `::late_read_drains_bounded_pages_then_completes`, `::a_complete_page_stays_the_end_when_a_descendant_writes_late`; `src/operations.rs::tests::a_stream_error_stops_collection_and_is_reported_not_taken_for_eof`, `::a_clean_eof_reports_no_output_failure`, `::a_stdout_error_before_the_leader_line_is_reported_and_stops_reading`; core `operations::spool::tests::*` |
+| Operation cancellation of the process tree | `tests/operations.rs::cancel_kills_leader_grandchild_and_term_trapper_and_is_idempotent`, `::finalize_ends_running_operations_and_forgets_them`, `::failed_cleanup_stays_resolvable_and_a_retry_cleans_up`; `src/operations.rs::tests::*` (process table, escapees, reused leaders, init and own-group refusal); `tests/conformance.rs::operations_cancel_the_whole_tree_in_a_real_container` |
+
+Rust Docker cancellation is PARTIAL until
+`operations_cancel_the_whole_tree_in_a_real_container` has passed in CI with
+Docker present, and because the finalize-on-cancel half of W-4-a belongs to
+PR 6. Credential bindings with `env` delivery are resolved by an injected
+`CredentialResolver` (`DockerOperations::with_credentials`); without one they
+are `rejected_policy`, and the descriptor publishes `credential_env` only when
+one is injected. Rust Local has no
+`SupportsOperations` yet; its rows stay PENDING.
 
 ## Python evidence
 
