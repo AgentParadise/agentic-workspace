@@ -509,9 +509,7 @@ class LocalOperations:
             operation.signal = signal.Signals(-code).name
             code = 128 - code
         operation.exit_code = code
-        if operation.unconfirmed or (
-            operation.cancel_requested and not operation.cancel_confirmed
-        ):
+        if operation.unconfirmed or (operation.cancel_requested and not operation.cancel_confirmed):
             operation.state = "failed"
         elif operation.cancel_requested:
             operation.state = "cancelled"
