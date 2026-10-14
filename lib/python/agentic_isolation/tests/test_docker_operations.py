@@ -47,7 +47,8 @@ from agentic_isolation.providers.operation_spool import OperationFailure, Operat
 # `exec` drops docker's own flags and runs the command here. `container
 # inspect` answers from $FAKE_DOCKER_STATE: absent = running, `removing` or
 # `exited` (reported as `.State.Status`), `gone`, or `down` (daemon
-# unreachable). Every argv is appended to $FAKE_DOCKER_LOG.
+# unreachable). `stop` succeeds and leaves the container `exited`, except in
+# state `stuck`, which reports running. Every argv is appended to $FAKE_DOCKER_LOG.
 FAKE_DOCKER = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
 state=$(cat "$FAKE_DOCKER_STATE" 2>/dev/null)
@@ -71,7 +72,7 @@ container)
     removing|exited) echo "$state" ;;
     *) echo running ;;
     esac ;;
-stop) exit 0 ;;
+stop) [ "$state" = stuck ] || echo exited > "$FAKE_DOCKER_STATE"; exit 0 ;;
 esac
 """
 
@@ -188,7 +189,11 @@ async def test_cancel_never_signals_an_unsafe_process_group_and_escalates(
     assert "refusing unsafe process group" in status.metadata["cancel_signal_failure"]
     calls = [c.args for c in command.await_args_list]
     assert not any("aw-signal" in c or "aw-processes" in c for c in calls)
-    assert calls[-1] == ("stop", "-t", "0", "c1")
+    # The stop is confirmed by the daemon's state before `cancelled` is published.
+    assert calls[-2:] == [
+        ("stop", "-t", "0", "c1"),
+        ("container", "inspect", "-f", "{{.State.Status}}", "c1"),
+    ]
 
 
 async def test_cancel_signals_a_leader_numbered_like_our_group_in_another_namespace(
@@ -281,8 +286,9 @@ def _held_operation(leader: tuple[str, str]) -> _Operation:
 
 async def test_cancel_never_signals_the_group_of_a_reused_leader(docker_env: Path) -> None:
     ops = _ops(docker_env)
-    # pid 999999 now belongs to a process with another start time.
-    calls = _scripted(ops, ["999999 1 999999 777\n"])
+    # pid 999999 now belongs to a process with another start time, whose
+    # parent is alive: not an orphan, so no container stop is needed.
+    calls = _scripted(ops, ["999999 50 999999 777\n"])
     operation = _held_operation(("999999", "123"))
     await ops._terminate_group(operation, grace_seconds=0)
     signals = [argv for argv in calls if argv[3] == "aw-signal"]
@@ -315,7 +321,10 @@ async def test_cancel_escalates_and_reports_a_failed_signal(docker_env: Path) ->
     metadata = ops._status(operation).metadata
     assert metadata["cancel_escalation"] == "container_stopped"
     assert metadata["cancel_signal_failure"] == "kill -TERM: exit 126: sh: not found"
-    ops._docker_cmd.assert_awaited_once_with("stop", "-t", "0", "c1")
+    assert [c.args for c in ops._docker_cmd.await_args_list] == [
+        ("stop", "-t", "0", "c1"),
+        ("container", "inspect", "-f", "{{.State.Status}}", "c1"),
+    ]
 
 
 # Overrides the shell's `kill` builtin: fails as a real kill would, signals nothing.
@@ -933,6 +942,7 @@ async def test_namespace_probe_that_cannot_run_escalates_to_stop(
             raise docker_operations._error("provider_unavailable", "probe cannot spawn")
         if argv[0] == "stop":
             os.kill(leader, signal.SIGKILL)  # what a real stop does to the workload
+            (docker_env / "state").write_text("exited")
             return 0, "c1"
         return await real(*argv)
 
@@ -965,6 +975,7 @@ async def test_signalling_client_that_cannot_run_escalates_to_stop(
             raise docker_operations._error("provider_unavailable", "exec cannot spawn")
         if argv[0] == "stop":
             os.kill(leader, signal.SIGKILL)
+            (docker_env / "state").write_text("exited")
             return 0, "c1"
         return await real(*argv)
 
@@ -1273,3 +1284,96 @@ async def test_an_interrupted_confirmation_never_publishes_cancelled(
         with contextlib.suppress(ProcessLookupError):
             os.kill(child, signal.SIGKILL)
         await _kill_leader(operation)
+
+
+async def test_execute_is_bounded_while_the_container_stays_removing(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A daemon that keeps answering `removing` cannot hold execute past the settlement deadline."""
+    monkeypatch.setattr(docker_operations, "_REMOVAL_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(docker_operations, "_FINAL_OUTPUT_SECONDS", 0.1)
+    ops = _ops(docker_env)
+    provider = WorkspaceDockerProvider()
+    provider._operations = ops
+    execute = asyncio.create_task(provider.execute(_workspace(), "exec sleep 30", timeout=1))
+    operation: _Operation | None = None
+    try:
+        async with asyncio.timeout(5):
+            while not ops._operations:
+                await asyncio.sleep(0.01)
+            operation = next(iter(ops._operations.values()))
+            await operation.leader_known.wait()
+        # Removal begins after admission and never finishes; inspect keeps answering.
+        (docker_env / "state").write_text("removing")
+        result = await asyncio.wait_for(execute, timeout=15)
+        assert result.exit_code == -1
+        assert "provider_unavailable" in result.stderr
+        assert "still being removed" in result.stderr
+        # The deadline is the operation's, so later retries fail fast too.
+        with pytest.raises(OperationFailure) as caught:
+            await asyncio.wait_for(ops.status(operation.ref), timeout=5)
+        assert caught.value.error.kind == "provider_unavailable"
+    finally:
+        execute.cancel()
+        with contextlib.suppress(BaseException):
+            await execute
+        if operation is not None:
+            await _kill_leader(operation)
+
+
+async def test_cancel_stops_the_container_for_a_descendant_detached_before_cancel(
+    docker_env: Path,
+) -> None:
+    """Detached and reparented to init before the first snapshot: no chain leads to it."""
+    ops = _ops(docker_env)
+    # Leader 500 started at tick 1000; 600 started after it, in its own group,
+    # already adopted by init. The next snapshots show only 600.
+    calls = _scripted(ops, ["500 10 500 1000\n600 1 600 1500\n", "600 1 600 1500\n"])
+    operation = _held_operation(("500", "1000"))
+    await ops._terminate_group(operation, grace_seconds=0)
+    assert operation.escalated, "confirmation ignored the detached orphan"
+    assert not operation.stop_failed
+    assert ("stop", "-t", "0", "c1") in [c.args for c in ops._docker_cmd.await_args_list]  # type: ignore[attr-defined]
+    assert "600" in (operation.signal_failure or "")
+    # 600 was never seen as owned, so it was never signalled by pid.
+    assert all("600" not in argv[5:] for argv in calls if argv[3] == "aw-signal")
+
+
+async def test_cancel_does_not_stop_the_container_for_an_orphan_older_than_the_operation(
+    docker_env: Path,
+) -> None:
+    ops = _ops(docker_env)
+    # 700 was adopted by init but started before the wrapper: it cannot be ours.
+    _scripted(ops, ["500 10 500 1000\n700 1 700 900\n", "700 1 700 900\n"])
+    operation = _held_operation(("500", "1000"))
+    await ops._terminate_group(operation, grace_seconds=0)
+    assert not operation.escalated
+
+
+@pytest.mark.parametrize(
+    ("inspect", "reason"),
+    [
+        ((0, "running\n"), "still running"),
+        ((1, "Cannot connect to the Docker daemon"), "Cannot connect"),
+    ],
+)
+async def test_a_stop_that_reports_success_is_confirmed_before_cancelled(
+    docker_env: Path, inspect: tuple[int, str], reason: str
+) -> None:
+    ops = _ops(docker_env)
+
+    async def command(*argv: str) -> tuple[int, str]:
+        if argv[0] == "stop":
+            return 0, "c1"
+        if argv[0] == "container":
+            return inspect
+        return 0, ""
+
+    ops._docker_cmd = AsyncMock(side_effect=command)  # type: ignore[method-assign]
+    operation = _held_operation(("1", "123"))  # refused leader: straight to the stop
+    with pytest.raises(OperationFailure) as caught:
+        await ops._terminate_group(operation, grace_seconds=0)
+    assert caught.value.error.kind == "provider_unavailable"
+    assert reason in caught.value.error.message
+    assert operation.escalated and operation.stop_failed
+    assert ops._status(operation).metadata["cancel_escalation"] == "container_stop_failed"

@@ -23,6 +23,7 @@ from agentic_isolation.config import (
 from agentic_isolation.contract import (
     CredentialBinding,
     CredentialRef,
+    ObservationGap,
     ObservationPage,
     OperationRef,
     OperationSpec,
@@ -36,6 +37,10 @@ if TYPE_CHECKING:
     from agentic_isolation.harnesses import TranscriptSource
 
 logger = logging.getLogger(__name__)
+
+# Set in the status `drain_operation` returns when output was evicted before
+# it was read: the evicted byte count, or "unknown" when a gap's extent is.
+OBSERVATION_LOST_BYTES = "observation_lost_bytes"
 
 
 @dataclass
@@ -520,16 +525,33 @@ async def drain_operation(
 
     Built only on `observe` and `status`, so it behaves identically on every
     provider. A `complete` page guarantees no retained byte up to the terminal
-    offset is left unread.
+    offset is left unread. Bytes evicted before they were read are never
+    passed off as complete output: every page's gap is summed into the
+    returned status's `OBSERVATION_LOST_BYTES` metadata, which is absent only
+    when nothing was lost.
     """
     cursor: str | None = None
     output = bytearray()
+    lost = 0
+    unknown = False
     while True:
         page = await provider.observe(ref, cursor=cursor, max_bytes=page_bytes, wait_seconds=1.0)
+        if isinstance(page.gap, ObservationGap):
+            if page.gap.lost_bytes is None:
+                unknown = True
+            else:
+                lost += page.gap.lost_bytes
         output.extend(base64.b64decode(page.data_b64))
         cursor = page.next_cursor
         if page.complete:
-            return await provider.status(ref), bytes(output)
+            status = await provider.status(ref)
+            if unknown or lost:
+                metadata = {
+                    **status.metadata,
+                    OBSERVATION_LOST_BYTES: "unknown" if unknown else str(lost),
+                }
+                status = status.model_copy(update={"metadata": metadata})
+            return status, bytes(output)
 
 
 @runtime_checkable
