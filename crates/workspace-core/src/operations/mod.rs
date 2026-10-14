@@ -10,6 +10,7 @@ mod contract;
 mod spool;
 
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 pub use contract::*;
@@ -24,6 +25,15 @@ pub struct ObserveRequest {
     /// Clamped to the provider's published `max_page_bytes`.
     pub max_bytes: usize,
     pub wait: Duration,
+}
+
+/// Turns a [`CredentialRef`] into its secret value at launch, injected into a
+/// provider so specs, refs and pages only ever carry the reference.
+pub trait CredentialResolver: Send + Sync {
+    fn resolve<'a>(
+        &'a self,
+        credential: &'a CredentialRef,
+    ) -> Pin<Box<dyn Future<Output = Result<String, OperationError>> + Send + 'a>>;
 }
 
 /// Start, observe, cancel and finalize operations in a provider's workspaces.

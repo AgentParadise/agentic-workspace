@@ -10,10 +10,11 @@
 //! provider's, byte for byte, so both languages cancel the same way.
 
 use agentic_workspace_core::operations::{
-    EnforceableLimits, ErrorKind, FinalizationOutcome, FinalizationStage, FinalizationState,
-    NonEmpty, ObservationDescriptor, ObservationIntegrity, ObservationPage, ObserveRequest,
-    OperationError, OperationRef, OperationSpec, OperationSpool, OperationState, OperationStatus,
-    ProviderDescriptor, SecurityProfile, StatusSchema, SupportsOperations, WorkspaceRef,
+    CredentialDelivery, CredentialResolver, EnforceableLimits, ErrorKind, FinalizationOutcome,
+    FinalizationStage, FinalizationState, NonEmpty, ObservationDescriptor, ObservationIntegrity,
+    ObservationPage, ObserveRequest, OperationError, OperationRef, OperationSpec, OperationSpool,
+    OperationState, OperationStatus, ProviderDescriptor, SecurityProfile, StatusSchema,
+    SupportsOperations, WorkspaceRef,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
@@ -509,6 +510,7 @@ pub struct DockerOperations {
     retention: NonZeroU64,
     max_page: NonZeroU64,
     sequence: AtomicU64,
+    credentials: Option<Arc<dyn CredentialResolver>>,
     /// Keyed by (container, operation_key). The async lock spans the launch,
     /// so racing same-key starts see the first record and launch nothing.
     records: tokio::sync::Mutex<HashMap<(String, String), Arc<Operation>>>,
@@ -525,8 +527,43 @@ impl DockerOperations {
             retention: retention_bytes,
             max_page: max_page_bytes,
             sequence: AtomicU64::new(0),
+            credentials: None,
             records: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Resolve `env` credential bindings through `resolver` at launch.
+    pub fn with_credentials(mut self, resolver: Arc<dyn CredentialResolver>) -> Self {
+        self.credentials = Some(resolver);
+        self
+    }
+
+    /// Each binding's target and resolved value. Values reach the client's
+    /// environment only; its argv names them.
+    async fn resolve(&self, spec: &OperationSpec) -> Result<Vec<(String, String)>, OperationError> {
+        let mut secrets = Vec::new();
+        for binding in &spec.credential_bindings {
+            if binding.delivery != CredentialDelivery::Env {
+                return Err(error(
+                    ErrorKind::UnsupportedCapability,
+                    format!(
+                        "credential delivery {:?} is not supported by docker",
+                        binding.delivery
+                    ),
+                    None,
+                ));
+            }
+            let Some(resolver) = &self.credentials else {
+                return Err(error(
+                    ErrorKind::RejectedPolicy,
+                    "credential bindings need a CredentialResolver; none was injected",
+                    None,
+                ));
+            };
+            let value = resolver.resolve(&binding.credential).await?;
+            secrets.push((binding.target.to_string(), value));
+        }
+        Ok(secrets)
     }
 
     async fn lookup(&self, reference: &OperationRef) -> Result<Arc<Operation>, OperationError> {
@@ -552,7 +589,7 @@ impl DockerOperations {
             })
     }
 
-    fn client_argv(container: &str, spec: &OperationSpec) -> Vec<String> {
+    fn client_argv(container: &str, spec: &OperationSpec, secrets: &[String]) -> Vec<String> {
         let workdir = format!(
             "/workspace/{}",
             spec.working_directory.as_str().trim_end_matches('/')
@@ -560,6 +597,9 @@ impl DockerOperations {
         let mut argv: Vec<String> = ["exec", "-i", "-w", &workdir].map(String::from).into();
         for (name, value) in spec.environment.get() {
             argv.extend(["-e".to_owned(), format!("{name}={value}")]);
+        }
+        for name in secrets {
+            argv.extend(["-e".to_owned(), name.clone()]);
         }
         argv.extend([container, "sh", "-c", OUTER, "aw-operation", INNER].map(String::from));
         argv.extend(spec.argv.as_slice().iter().cloned());
@@ -571,16 +611,8 @@ impl DockerOperations {
         container: &str,
         spec: OperationSpec,
     ) -> Result<Arc<Operation>, OperationError> {
-        if let Some(binding) = spec.credential_bindings.first() {
-            return Err(error(
-                ErrorKind::UnsupportedCapability,
-                format!(
-                    "credential binding {:?}: the Rust docker provider has no credential resolver yet",
-                    binding.target
-                ),
-                None,
-            ));
-        }
+        let secrets = self.resolve(&spec).await?;
+        let names: Vec<String> = secrets.iter().map(|(name, _)| name.clone()).collect();
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let reference = OperationRef {
             workspace: WorkspaceRef {
@@ -593,7 +625,8 @@ impl DockerOperations {
             operation_key: spec.operation_key.clone(),
         };
         let mut child = Command::new(self.docker.0.as_path())
-            .args(Self::client_argv(container, &spec))
+            .args(Self::client_argv(container, &spec, &names))
+            .envs(secrets)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -756,7 +789,10 @@ impl SupportsOperations for DockerOperations {
                 network: true,
                 timeout: true,
             },
-            capabilities: names(&["operations", "cancel", "launch_marker"]),
+            capabilities: match self.credentials {
+                Some(_) => names(&["operations", "cancel", "launch_marker", "credential_env"]),
+                None => names(&["operations", "cancel", "launch_marker"]),
+            },
             observation: ObservationDescriptor {
                 retention_bytes: self.retention,
                 max_page_bytes: self.max_page,

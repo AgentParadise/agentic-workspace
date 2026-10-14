@@ -9,14 +9,17 @@
 #![cfg(target_os = "linux")]
 
 use agentic_workspace_core::operations::{
-    ErrorKind, ObserveRequest, OperationError, OperationRef, OperationSpec, OperationState,
-    OperationStatus, SupportsOperations, WorkspaceRef,
+    CredentialRef, CredentialResolver, ErrorKind, ObserveRequest, OperationError, OperationRef,
+    OperationSpec, OperationState, OperationStatus, SupportsOperations, WorkspaceRef,
 };
 use agentic_workspace_docker::operations::DockerOperations;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use serde_json::Value;
+use std::future::Future;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +39,7 @@ fn fake_docker(dir: &Path) -> PathBuf {
         &script,
         format!(
             r#"#!/bin/sh
+PATH='{dir}':"$PATH"; export PATH
 printf '%s\n' "$*" >> '{log}'
 case "$1" in
 exec)
@@ -59,6 +63,7 @@ container)
 esac
 "#,
             log = log.display(),
+            dir = dir.display(),
             fail = fail.display(),
             gone = gone.display(),
             down = down.display()
@@ -509,8 +514,170 @@ async fn an_unreachable_daemon_is_provider_unavailable_and_a_real_failure_stays_
     assert_eq!(status.state, OperationState::Failed);
 }
 
+/// Resolves every credential to `secret-for-<name>`.
+struct Vault;
+
+impl CredentialResolver for Vault {
+    fn resolve<'a>(
+        &'a self,
+        credential: &'a CredentialRef,
+    ) -> Pin<Box<dyn Future<Output = Result<String, OperationError>> + Send + 'a>> {
+        Box::pin(async move { Ok(format!("secret-for-{}", credential.name.as_str())) })
+    }
+}
+
+fn launches(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("docker.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("exec -i "))
+        .count()
+}
+
+#[tokio::test]
+async fn credential_bindings_reach_the_workload_env_but_never_the_client_argv() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16).with_credentials(Arc::new(Vault));
+    let mut spec = serde_json::to_value(spec("k1", "echo \"$GH_TOKEN\"", 60)).unwrap();
+    spec["credential_bindings"] = serde_json::json!([{
+        "ref": {"name": "github-app", "scope": "repo:acme/widgets"},
+        "delivery": "env",
+        "target": "GH_TOKEN",
+    }]);
+    let spec: OperationSpec = serde_json::from_value(spec).unwrap();
+    let op = ops.start(&workspace(), spec).await.unwrap();
+    assert_eq!(drain(&ops, &op, 4096).await, b"secret-for-github-app\n");
+    let log = std::fs::read_to_string(dir.path().join("docker.log")).unwrap();
+    assert!(log.contains(" -e GH_TOKEN "), "{log}");
+    assert!(!log.contains("secret-for"), "{log}");
+    let status = serde_json::to_string(&ops.status(&op).await.unwrap()).unwrap();
+    assert!(!status.contains("secret-for"), "{status}");
+}
+
+/// Drive a shared APSS behaviour fixture, step by step from its file, against
+/// `DockerOperations` over the stand-in docker, with the fixture's own specs
+/// and credential bindings. Each step checks what the fixture asserts about
+/// behaviour: the issued ref (same on a same-key replay), an error's `kind`,
+/// the status `state` and `exit_code`, and the launch count. Provider-chosen
+/// ids, messages, timestamps and metadata are not compared; the Python
+/// provider does not reproduce them either.
+async fn drive_behaviour_fixture(name: &str) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../lib/python/agentic_isolation/tests/fixtures/apss_exp_v1_0006/behaviour")
+        .join(name);
+    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let agent = dir.path().join("agent");
+    std::fs::write(&agent, "#!/bin/sh\nexec sleep 300\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let ops = ops(dir.path(), 1 << 20, 1 << 16).with_credentials(Arc::new(Vault));
+    let mut issued: Option<(Value, OperationRef)> = None;
+    for (i, step) in fixture["steps"].as_array().unwrap().iter().enumerate() {
+        let at = format!("{name}#{i} {}", step["call"]);
+        let expect = &step["expect"]["document"];
+        // A ref the fixture names is the one the provider issued for it.
+        let reference = || -> OperationRef {
+            match &issued {
+                Some((named, ours)) if *named == step["args"]["ref"] => ours.clone(),
+                _ => serde_json::from_value(step["args"]["ref"].clone()).unwrap(),
+            }
+        };
+        let outcome: Result<Value, OperationError> = match step["call"].as_str().unwrap() {
+            "start" => {
+                let spec: OperationSpec =
+                    serde_json::from_value(step["args"]["spec"].clone()).unwrap();
+                let workspace: WorkspaceRef = serde_json::from_value(
+                    serde_json::json!({"provider": "docker", "resource_id": "ws-7f3a"}),
+                )
+                .unwrap();
+                ops.start(&workspace, spec).await.map(|op| {
+                    if expect.get("kind").is_none() {
+                        match &issued {
+                            None => issued = Some((expect.clone(), op.clone())),
+                            Some((_, first)) => assert_eq!(&op, first, "{at}: a second ref"),
+                        }
+                    }
+                    serde_json::to_value(op).unwrap()
+                })
+            }
+            "status" => ops
+                .status(&reference())
+                .await
+                .map(|s| serde_json::to_value(s).unwrap()),
+            "cancel" => ops
+                .cancel(&reference(), Duration::from_millis(300))
+                .await
+                .map(|s| serde_json::to_value(s).unwrap()),
+            call => panic!("{at}: the driver does not dispatch {call:?}"),
+        };
+        match (expect.get("kind"), outcome) {
+            (Some(kind), Err(error)) => {
+                assert_eq!(&serde_json::to_value(error.kind).unwrap(), kind, "{at}")
+            }
+            (Some(kind), Ok(document)) => panic!("{at}: expected {kind}, got {document}"),
+            (None, Err(error)) => panic!("{at}: {error:?}"),
+            (None, Ok(document)) => {
+                for key in ["workspace", "operation_key"] {
+                    if let Some(want) = expect.get(key) {
+                        assert_eq!(document.get(key), Some(want), "{at}: {key}");
+                    }
+                }
+                for key in ["state", "exit_code"] {
+                    if let Some(want) = expect.get(key) {
+                        assert_eq!(
+                            document.get(key).unwrap_or(&Value::Null),
+                            want,
+                            "{at}: {key}"
+                        );
+                    }
+                }
+            }
+        }
+        // The stand-in logs a launch once its process runs; let it, then count.
+        let want = step["launches"].as_u64().unwrap() as usize;
+        for _ in 0..50 {
+            if launches(dir.path()) >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(launches(dir.path()), want, "{at}: launches");
+    }
+    ops.finalize(
+        &serde_json::from_value(
+            serde_json::json!({"provider": "docker", "resource_id": "ws-7f3a"}),
+        )
+        .unwrap(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn behaviour_fixture_start_same_key_one_launch() {
+    drive_behaviour_fixture("start-same-key-one-launch.json").await;
+}
+
+#[tokio::test]
+async fn behaviour_fixture_same_key_different_spec_conflict() {
+    drive_behaviour_fixture("same-key-different-spec-conflict.json").await;
+}
+
+#[tokio::test]
+async fn behaviour_fixture_cancel_twice_terminal_once() {
+    drive_behaviour_fixture("cancel-twice-terminal-once.json").await;
+}
+
+#[tokio::test]
+async fn behaviour_fixture_unknown_ref_typed_error() {
+    drive_behaviour_fixture("unknown-ref-typed-error.json").await;
+}
+
 #[test]
-fn credential_bindings_are_refused_until_a_resolver_exists() {
+fn credential_bindings_without_a_resolver_are_rejected_policy() {
     let dir = tempfile::tempdir().unwrap();
     let ops = ops(dir.path(), 1 << 20, 1 << 16);
     let mut spec = serde_json::to_value(spec("k1", "true", 60)).unwrap();
@@ -522,6 +689,6 @@ fn credential_bindings_are_refused_until_a_resolver_exists() {
     let spec: OperationSpec = serde_json::from_value(spec).unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let error = runtime.block_on(ops.start(&workspace(), spec)).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::UnsupportedCapability);
+    assert_eq!(error.kind, ErrorKind::RejectedPolicy);
     assert!(!dir.path().join("docker.log").exists());
 }
