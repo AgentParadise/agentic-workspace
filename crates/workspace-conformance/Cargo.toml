@@ -8,3 +8,5 @@ version.workspace = true
 
 [dependencies]
 agentic-workspace-core = { path = "../workspace-core" }
+serde.workspace = true
+serde_json.workspace = true

@@ -541,6 +541,9 @@ pub enum StatusDocument {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationGap {
+    // Required but nullable: `deserialize_with` stops serde defaulting a
+    // missing `Option` field to `None`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub lost_bytes: Option<std::num::NonZeroU64>,
 }
 
