@@ -411,11 +411,23 @@ pub async fn drive_hazard<H: HazardHarness>(fixture: &HazardFixture, harness: &H
             Ok(alive) => alive,
             Err(unmeasurable) => return not_run(unmeasurable.to_string()),
         };
-        let operation_records = match (step.operation_records, harness.operation_records().await) {
-            (Some(_), None) => {
-                return not_run("the provider does not expose its operation records".into());
-            }
-            (_, measured) => measured.unwrap_or(0),
+        // Probed only when the step counts records: the probe may call the
+        // provider (Docker's reads `status`), and LH-5 forbids a status call
+        // before its observe. It is bounded like the call it measures.
+        let operation_records = match step.operation_records {
+            None => 0,
+            Some(_) => match tokio::time::timeout(bound, harness.operation_records()).await {
+                Ok(Some(measured)) => measured,
+                Ok(None) => {
+                    return not_run("the provider does not expose its operation records".into());
+                }
+                Err(_) => {
+                    return not_run(format!(
+                        "the operation record probe did not answer within {}s",
+                        bound.as_secs_f64()
+                    ));
+                }
+            },
         };
         let measured = Measured {
             outcome,

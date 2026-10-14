@@ -1512,9 +1512,24 @@ mod hazards {
     async fn lh4_destroy_during_start() {
         run("LH-4").await;
     }
+    /// LH-5 through a decorator that records each provider call, so the
+    /// fixture's "no status call before observe" is measured, not assumed.
     #[tokio::test]
     async fn lh5_stuck_removal_settles() {
-        run("LH-5").await;
+        let harness = StandIn::with("LH-5", |inner| Records {
+            inner,
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let verdict = drive_hazard(&fixture("LH-5"), &harness).await;
+        let calls = harness.provider.calls.lock().unwrap().clone();
+        let observe = calls.iter().position(|c| *c == "observe");
+        assert_eq!(calls.first(), Some(&"start"), "{calls:?}");
+        assert!(observe.is_some(), "LH-5 never reached observe: {calls:?}");
+        assert!(
+            !calls[..observe.unwrap()].contains(&"status"),
+            "status called before LH-5's first observe: {calls:?}"
+        );
+        expect("LH-5", &verdict);
     }
     #[tokio::test]
     async fn lh6_drain_with_gap_reports_loss() {
@@ -1535,6 +1550,62 @@ mod hazards {
         assert_eq!(harness.operation_records().await, Some(0));
         harness.provider.start(&workspace(), spec).await.unwrap();
         assert_eq!(harness.operation_records().await, Some(1));
+    }
+
+    /// Passes every call through, naming each in order.
+    struct Records {
+        inner: DockerOperations,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Records {
+        fn note(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl SupportsOperations for Records {
+        fn describe(&self) -> agentic_workspace_core::operations::ProviderDescriptor {
+            self.inner.describe()
+        }
+        async fn start(
+            &self,
+            workspace: &WorkspaceRef,
+            spec: OperationSpec,
+        ) -> Result<OperationRef, OperationError> {
+            self.note("start");
+            self.inner.start(workspace, spec).await
+        }
+        async fn status(
+            &self,
+            operation: &OperationRef,
+        ) -> Result<OperationStatus, OperationError> {
+            self.note("status");
+            self.inner.status(operation).await
+        }
+        async fn observe(
+            &self,
+            operation: &OperationRef,
+            request: ObserveRequest,
+        ) -> Result<agentic_workspace_core::operations::ObservationPage, OperationError> {
+            self.note("observe");
+            self.inner.observe(operation, request).await
+        }
+        async fn cancel(
+            &self,
+            operation: &OperationRef,
+            grace: Duration,
+        ) -> Result<OperationStatus, OperationError> {
+            self.note("cancel");
+            self.inner.cancel(operation, grace).await
+        }
+        async fn finalize(
+            &self,
+            workspace: &WorkspaceRef,
+        ) -> agentic_workspace_core::operations::FinalizationOutcome {
+            self.note("finalize");
+            self.inner.finalize(workspace).await
+        }
     }
 
     /// The mutation: a cancel that terminates nothing and reports confirmed.

@@ -189,7 +189,9 @@ Findings (each left to a follow-up):
   (fixture: `resource_lost` or `cancelled`, 0 launches).
 - Rust Docker LH-5: with the container stuck `removing`, the timed-out
   operation's `observe` (repeated until complete) does not complete within
-  the 120 s bound.
+  the 120 s bound. Measured with no `status` call before that observe: a
+  recording decorator asserts the call order, and the record probe runs
+  only on steps that count records.
 - Rust Docker LH-7: `collect` opens the writer-less FIFO and blocks; the
   `file_exists` step does not settle within 10 s. The harness frees the
   blocked open by opening the FIFO's write end on teardown.
