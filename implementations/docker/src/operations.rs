@@ -284,7 +284,7 @@ impl Progress {
     /// Store `chunk`, copying to `channels` what the spool stored (redacted),
     /// never the raw chunk.
     fn record(&mut self, chunk: &[u8], channel: Channel) {
-        let stored = self.spool.append(chunk, channel as usize);
+        let stored = self.spool.append_channel(chunk, channel as usize);
         self.keep(&stored, channel as usize);
     }
 

@@ -4,7 +4,9 @@
 //! never reach storage: each channel is scanned before its bytes are stored,
 //! every occurrence becomes [`REDACTED`], and a channel's tail that could
 //! still begin a value is held until the next append or
-//! [`OperationSpool::finish`] decides it. Offsets, `end`, retention and gaps
+//! [`OperationSpool::finish`] decides it. The merged stream the channels
+//! interleave into is scanned again before storing, since two channels'
+//! fragments can meet there. Offsets, `end`, retention and gaps
 //! all count stored (redacted) bytes, so cursors stay consistent whatever
 //! the marker's length. The rule is the Python spool's, checked against
 //! `tests/fixtures/output_redaction/cases.json`.
@@ -92,6 +94,9 @@ pub struct OperationSpool {
     redactor: Redactor,
     /// Per channel: raw bytes not yet stored because they may begin a value.
     held: BTreeMap<usize, Vec<u8>>,
+    /// Channel-redacted bytes not yet stored because, merged with another
+    /// channel's next bytes, they may begin a value.
+    merged_held: Vec<u8>,
 }
 
 impl OperationSpool {
@@ -115,6 +120,7 @@ impl OperationSpool {
             base: 0,
             redactor: Redactor::new(values),
             held: BTreeMap::new(),
+            merged_held: Vec::new(),
         }
     }
 
@@ -123,10 +129,17 @@ impl OperationSpool {
         self.base + self.retained.len() as u64
     }
 
-    /// Append output read from `channel`, evicting the oldest bytes beyond
-    /// retention, and return the bytes this call stored. Channels are
-    /// redacted separately, since one is not interleaved with another.
-    pub fn append(&mut self, data: &[u8], channel: usize) -> Vec<u8> {
+    /// Append single-channel output, evicting the oldest bytes beyond
+    /// retention.
+    pub fn append(&mut self, data: &[u8]) {
+        self.append_channel(data, 0);
+    }
+
+    /// Append output read from `channel` and return that channel's redacted
+    /// bytes, for a caller that keeps its own per-channel copy. Each channel
+    /// is redacted on its own, then the merged stream is redacted again
+    /// before storing, so neither copy ever holds a registered value.
+    pub fn append_channel(&mut self, data: &[u8], channel: usize) -> Vec<u8> {
         if self.redactor.values.is_empty() {
             self.store(data);
             return data.to_vec();
@@ -137,22 +150,34 @@ impl OperationSpool {
         if !held.is_empty() {
             self.held.insert(channel, held);
         }
-        self.store(&released);
+        self.merge(&released, false);
         released
     }
 
     /// Decide and store every held tail once the collector has read its
-    /// last byte, returning what each channel stored. Call before the
+    /// last byte, returning what each channel released. Call before the
     /// terminal state is published, so `complete` covers the final bytes.
     pub fn finish(&mut self) -> Vec<(usize, Vec<u8>)> {
         let held = std::mem::take(&mut self.held);
-        held.into_iter()
+        let released = held
+            .into_iter()
             .map(|(channel, tail)| {
                 let (released, _) = self.redactor.scan(&tail, true);
-                self.store(&released);
+                self.merge(&released, false);
                 (channel, released)
             })
-            .collect()
+            .collect();
+        self.merge(&[], true);
+        released
+    }
+
+    /// Store channel-redacted bytes once the merged stream decides them.
+    fn merge(&mut self, data: &[u8], last: bool) {
+        let mut pending = std::mem::take(&mut self.merged_held);
+        pending.extend_from_slice(data);
+        let (released, held) = self.redactor.scan(&pending, last);
+        self.merged_held = held;
+        self.store(&released);
     }
 
     fn store(&mut self, data: &[u8]) {
@@ -230,7 +255,8 @@ impl OperationSpool {
             complete: state.is_terminal()
                 && size == 0
                 && next == self.end()
-                && self.held.is_empty(),
+                && self.held.is_empty()
+                && self.merged_held.is_empty(),
             loss_detected: None,
         }
     }
@@ -294,7 +320,7 @@ mod tests {
     fn every_page_fits_its_bound_and_pages_concatenate_to_the_output() {
         let mut spool = OperationSpool::new(NonZeroU64::new(1 << 20).unwrap());
         let output: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
-        spool.append(&output, 0);
+        spool.append(&output);
         let (mut cursor, mut seen) = (None::<String>, Vec::new());
         loop {
             let page = spool
@@ -319,7 +345,7 @@ mod tests {
     #[test]
     fn the_last_bytes_are_not_complete_and_the_empty_page_after_them_is() {
         let mut spool = OperationSpool::new(NonZeroU64::new(1 << 20).unwrap());
-        spool.append(b"hello world\n", 0);
+        spool.append(b"hello world\n");
         let last = spool
             .page(&operation(), OperationState::Succeeded, None, 4096)
             .unwrap();
@@ -350,7 +376,7 @@ mod tests {
     #[test]
     fn a_cursor_older_than_retention_reports_the_exact_gap() {
         let mut spool = OperationSpool::new(NonZeroU64::new(8).unwrap());
-        spool.append(b"0123456789abcdef", 0);
+        spool.append(b"0123456789abcdef");
         let first = spool
             .page(&operation(), OperationState::Running, None, 4096)
             .unwrap();
@@ -402,7 +428,7 @@ mod tests {
                 let at = format!("generation width {generation}, key width {key}");
                 let mut spool = OperationSpool::new(NonZeroU64::new(64).unwrap());
                 spool.generation = "f".repeat(generation);
-                spool.append(&output, 0);
+                spool.append(&output);
                 let operation: OperationRef = serde_json::from_value(serde_json::json!({
                     "workspace": {"provider": "docker", "resource_id": "c1"},
                     "operation_id": "op-1",
@@ -470,7 +496,7 @@ mod tests {
                     values.clone(),
                 );
                 for chunk in &chunks {
-                    spool.append(chunk, 0);
+                    spool.append(chunk);
                 }
                 spool.finish();
                 let at = format!("{} {chunks:?}", case["name"]);
@@ -485,6 +511,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn channels_merged_into_storage_never_form_a_value() {
+        let fixtures: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        for case in fixtures["channel_cases"].as_array().unwrap() {
+            let values: Vec<Vec<u8>> = case["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().as_bytes().to_vec())
+                .collect();
+            let whole: Vec<(usize, Vec<u8>)> = case["appends"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| {
+                    let channel = usize::try_from(a[0].as_u64().unwrap()).unwrap();
+                    (channel, a[1].as_str().unwrap().as_bytes().to_vec())
+                })
+                .collect();
+            let stored = case["stored"].as_str().unwrap().as_bytes();
+            // The appends as given, then with each one split at every offset.
+            let mut splits = vec![whole.clone()];
+            for (n, (channel, data)) in whole.iter().enumerate() {
+                for k in 0..=data.len() {
+                    let mut split = whole[..n].to_vec();
+                    split.push((*channel, data[..k].to_vec()));
+                    split.push((*channel, data[k..].to_vec()));
+                    split.extend_from_slice(&whole[n + 1..]);
+                    splits.push(split);
+                }
+            }
+            for appends in splits {
+                let mut spool = OperationSpool::with_redaction(
+                    NonZeroU64::new(1 << 20).unwrap(),
+                    values.clone(),
+                );
+                let mut copies: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+                for (channel, chunk) in &appends {
+                    let released = spool.append_channel(chunk, *channel);
+                    copies.entry(*channel).or_default().extend(released);
+                }
+                for (channel, tail) in spool.finish() {
+                    copies.entry(channel).or_default().extend(tail);
+                }
+                let at = format!("{} {appends:?}", case["name"]);
+                assert_eq!(
+                    spool.retained.iter().copied().collect::<Vec<_>>(),
+                    stored,
+                    "{at}"
+                );
+                assert_eq!(drain(&spool, 320), stored, "{at}");
+                assert_eq!(spool.end(), stored.len() as u64, "{at}");
+                for value in &values {
+                    for copy in copies.values() {
+                        assert!(!copy.windows(value.len()).any(|w| w == value), "{at}");
+                    }
+                }
+            }
+        }
+    }
+
     const CANARY: &[u8] = b"canary-INVENTED-sk-7f3a";
 
     #[test]
@@ -493,9 +580,9 @@ mod tests {
             NonZeroU64::new(1 << 20).unwrap(),
             vec![CANARY.to_vec()],
         );
-        spool.append(&[b"out:", &CANARY[..9]].concat(), 0);
-        spool.append(b"err line\n", 1);
-        spool.append(&[&CANARY[9..], b"\n"].concat(), 0);
+        spool.append(&[b"out:", &CANARY[..9]].concat());
+        spool.append_channel(b"err line\n", 1);
+        spool.append(&[&CANARY[9..], b"\n"].concat());
         spool.finish();
         assert_eq!(drain(&spool, 4096), b"out:err line\n[REDACTED]\n");
     }
@@ -506,7 +593,7 @@ mod tests {
             NonZeroU64::new(1 << 20).unwrap(),
             vec![CANARY.to_vec()],
         );
-        spool.append(&[b"ok ", &CANARY[..5]].concat(), 0);
+        spool.append(&[b"ok ", &CANARY[..5]].concat());
         assert_eq!(spool.end(), 3);
         let first = spool
             .page(&operation(), OperationState::Succeeded, None, 4096)
@@ -529,7 +616,7 @@ mod tests {
     fn retention_and_gaps_count_stored_bytes() {
         let mut spool =
             OperationSpool::with_redaction(NonZeroU64::new(12).unwrap(), vec![CANARY.to_vec()]);
-        spool.append(&[CANARY, b" tail-bytes"].concat(), 0);
+        spool.append(&[CANARY, b" tail-bytes"].concat());
         spool.finish();
         let stored = b"[REDACTED] tail-bytes";
         assert_eq!(spool.end(), stored.len() as u64);

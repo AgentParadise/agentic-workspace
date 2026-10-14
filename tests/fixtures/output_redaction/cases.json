@@ -11,5 +11,11 @@
     {"name": "value-inside-another", "values": ["INVENTED", "sk-INVENTED-tail"], "output": "sk-INVENTED-tail INVENTED", "stored": "[REDACTED] [REDACTED]"},
     {"name": "two-values-back-to-back", "values": ["canary-ONE-INVENTED", "canary-TWO-INVENTED"], "output": "canary-ONE-INVENTEDcanary-TWO-INVENTED\n", "stored": "[REDACTED][REDACTED]\n"},
     {"name": "multibyte-value", "values": ["sécret-☃-INVENTED"], "output": "v=sécret-☃-INVENTED;", "stored": "v=[REDACTED];"}
+  ],
+  "channel_cases": [
+    {"name": "two-channels-each-hold-half-at-eof", "values": ["canary-INVENTED-canary-INVENTED-"], "appends": [[0, "canary-INVENTED-"], [1, "canary-INVENTED-"]], "stored": "[REDACTED]"},
+    {"name": "split-on-one-channel-around-another", "values": ["canary-INVENTED-sk-1"], "appends": [[0, "out:canary-I"], [1, "err\n"], [0, "NVENTED-sk-1\n"]], "stored": "out:err\n[REDACTED]\n"},
+    {"name": "held-tail-released-after-another-channel", "values": ["sk-INVENTED-9"], "appends": [[0, "a sk-INV"], [1, "ENTED-9 b\n"], [0, "\n"]], "stored": "a ENTED-9 b\nsk-INV\n"},
+    {"name": "no-values-interleaves-verbatim", "values": [], "appends": [[0, "canary-INVENTED-"], [1, "canary-INVENTED-"]], "stored": "canary-INVENTED-canary-INVENTED-"}
   ]
 }

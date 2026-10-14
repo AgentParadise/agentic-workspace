@@ -37,6 +37,7 @@ _FIXTURES = json.loads(
     (Path(__file__).parents[4] / "tests/fixtures/output_redaction/cases.json").read_text()
 )
 _CASES = {case["name"]: case for case in _FIXTURES["cases"]}
+_CHANNEL_CASES = {case["name"]: case for case in _FIXTURES["channel_cases"]}
 CANARY = "canary-INVENTED-sk-7f3a"
 REF = OperationRef.model_validate(
     {
@@ -76,6 +77,35 @@ def test_every_split_of_every_fixture_stores_the_same_redacted_bytes(name: str) 
         assert bytes(spool._retained) == stored, chunks
         assert _drain(spool, page=320) == stored, chunks
         assert spool.end == len(stored)
+
+
+def _channel_splits(appends: list[list]) -> list[list[tuple[int, bytes]]]:
+    """The appends as given, then with each one split at every offset."""
+    whole = [(channel, text.encode()) for channel, text in appends]
+    splits = [whole]
+    for n, (channel, data) in enumerate(whole):
+        for k in range(len(data) + 1):
+            splits.append([*whole[:n], (channel, data[:k]), (channel, data[k:]), *whole[n + 1 :]])
+    return splits
+
+
+@pytest.mark.parametrize("name", sorted(_CHANNEL_CASES))
+def test_channels_merged_into_storage_never_form_a_value(name: str) -> None:
+    case = _CHANNEL_CASES[name]
+    stored = case["stored"].encode()
+    for appends in _channel_splits(case["appends"]):
+        spool = OperationSpool(retention_bytes=1 << 20, redact=case["values"])
+        copies: dict[int, bytes] = {}
+        for channel, chunk in appends:
+            copies[channel] = copies.get(channel, b"") + spool.append(chunk, channel=channel)
+        for channel, tail in spool.finish().items():
+            copies[channel] += tail
+        assert bytes(spool._retained) == stored, appends
+        assert _drain(spool, page=320) == stored, appends
+        assert spool.end == len(stored)
+        for value in case["values"]:
+            for copy in copies.values():
+                assert value.encode() not in copy, appends
 
 
 def test_a_value_split_across_interleaved_channels_is_redacted() -> None:

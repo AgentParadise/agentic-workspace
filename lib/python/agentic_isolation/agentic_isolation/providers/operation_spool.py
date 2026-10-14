@@ -14,7 +14,9 @@ offset into the wrong stream. Consumers treat cursors as opaque.
 Credential values registered at construction never reach storage: each
 channel is scanned before its bytes are stored, every occurrence is replaced
 by `REDACTED`, and a channel's tail that could still be the start of a value
-is held back until the next append or `finish` decides it. Offsets, `end`,
+is held back until the next append or `finish` decides it. The merged stream
+the channels interleave into is scanned again before storing, since two
+channels' fragments can meet there. Offsets, `end`,
 retention and `gap.lost_bytes` all count stored (redacted) bytes, so cursors
 stay consistent whatever the marker's length. The rule is the same as the
 Rust spool's, checked against `tests/fixtures/output_redaction/cases.json`.
@@ -132,6 +134,9 @@ class OperationSpool:
         self._redactor = OutputRedactor(redact)
         # Per channel: raw bytes not yet stored because they may begin a value.
         self._held: dict[int, bytes] = {}
+        # Channel-redacted bytes not yet stored because, merged with another
+        # channel's next bytes, they may begin a value.
+        self._merged_held = b""
 
     @property
     def end(self) -> int:
@@ -139,11 +144,11 @@ class OperationSpool:
         return self._base + len(self._retained)
 
     def append(self, data: bytes, *, channel: int = 0) -> bytes:
-        """Append collector output read from `channel`; return what was stored.
+        """Append collector output read from `channel`; return that channel's
+        redacted bytes, for a caller that keeps its own per-channel copy.
 
-        Channels are redacted separately, since a value printed on one is not
-        interleaved with another's bytes. What is returned is the redacted
-        bytes this call stored, for a caller that keeps its own copy.
+        Each channel is redacted on its own, then the merged stream is
+        redacted again before storing, so neither copy holds a value.
         """
         if not self._redactor:
             self._store(data)
@@ -151,19 +156,26 @@ class OperationSpool:
         released, held = self._redactor.scan(self._held.pop(channel, b"") + data, final=False)
         if held:
             self._held[channel] = held
-        self._store(released)
+        self._merge(released, final=False)
         return released
 
     def finish(self) -> dict[int, bytes]:
         """Decide and store every held tail: the collector has read its last
-        byte. Returns what each channel stored. Call before the terminal
+        byte. Returns what each channel released. Call before the terminal
         state is published, so `complete` covers the final bytes."""
-        stored = {}
+        released = {}
         for channel, held in sorted(self._held.items()):
-            stored[channel], _ = self._redactor.scan(held, final=True)
-            self._store(stored[channel])
+            released[channel], _ = self._redactor.scan(held, final=True)
+            self._merge(released[channel], final=False)
         self._held.clear()
-        return stored
+        if self._redactor:
+            self._merge(b"", final=True)
+        return released
+
+    def _merge(self, data: bytes, *, final: bool) -> None:
+        """Store channel-redacted bytes once the merged stream decides them."""
+        released, self._merged_held = self._redactor.scan(self._merged_held + data, final=final)
+        self._store(released)
 
     def _store(self, data: bytes) -> None:
         self._retained.extend(data)
@@ -239,7 +251,10 @@ class OperationSpool:
             data_b64=base64.b64encode(data).decode("ascii"),
             gap=MISSING if gap is None else gap,
             loss_detected=True if lossy else MISSING,
-            complete=state in TERMINAL_STATES and next_offset == self.end and not self._held,
+            complete=state in TERMINAL_STATES
+            and next_offset == self.end
+            and not self._held
+            and not self._merged_held,
         )
 
     def _encode(self, offset: int, *, lossy: bool) -> str:

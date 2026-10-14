@@ -866,7 +866,12 @@ fn launches(dir: &Path) -> usize {
 async fn credential_bindings_reach_the_workload_env_but_never_the_client_argv() {
     let dir = tempfile::tempdir().unwrap();
     let ops = ops(dir.path(), 1 << 20, 1 << 16).with_credentials(Arc::new(Vault));
-    let mut spec = serde_json::to_value(spec("k1", "echo \"$GH_TOKEN\"", 60)).unwrap();
+    // The workload compares the value itself, then prints it: the
+    // comparison proves delivery, the print proves redaction. The expected
+    // value is quoted in two parts so the argv never carries it whole.
+    let script =
+        "[ \"$GH_TOKEN\" = \"secret\"\"-for-github-app\" ] && echo bound; echo \"$GH_TOKEN\"";
+    let mut spec = serde_json::to_value(spec("k1", script, 60)).unwrap();
     spec["credential_bindings"] = serde_json::json!([{
         "ref": {"name": "github-app", "scope": "repo:acme/widgets"},
         "delivery": "env",
@@ -874,7 +879,7 @@ async fn credential_bindings_reach_the_workload_env_but_never_the_client_argv() 
     }]);
     let spec: OperationSpec = serde_json::from_value(spec).unwrap();
     let op = ops.start(&workspace(), spec).await.unwrap();
-    assert_eq!(drain(&ops, &op, 4096).await, b"secret-for-github-app\n");
+    assert_eq!(drain(&ops, &op, 4096).await, b"bound\n[REDACTED]\n");
     let log = std::fs::read_to_string(dir.path().join("docker.log")).unwrap();
     assert!(log.contains(" -e GH_TOKEN "), "{log}");
     assert!(!log.contains("secret-for"), "{log}");
