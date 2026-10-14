@@ -461,3 +461,115 @@ fn operations_cancel_the_whole_tree_in_a_real_container() {
     }
     provider.destroy(&handle).unwrap();
 }
+
+/// The Rust `SupportsOperations` against a real container: a double-forked
+/// descendant that the container's init adopted before cancel first looked
+/// has no parent chain back to the operation, so cancel must fail closed into
+/// a container stop, confirmed stopped, and nothing of the operation survives.
+#[test]
+fn operations_cancel_stops_the_container_for_a_double_forked_orphan() {
+    use agentic_workspace_core::operations::{
+        ObserveRequest, OperationSpec, OperationState, SupportsOperations, WorkspaceRef,
+    };
+    use agentic_workspace_docker::operations::DockerOperations;
+    use base64::Engine as _;
+
+    if !require_or_skip_docker() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let provider =
+        DockerProvider::new(root.path(), "python:3.12-slim", NetworkPolicy::None).unwrap();
+    let manifest = minimal_manifest("docker-operations-orphan", SecurityProfile::Isolated);
+    let handle = provider.provision(&manifest).unwrap();
+    let container = handle.provider_reference.clone().unwrap();
+    let workspace: WorkspaceRef =
+        serde_json::from_value(serde_json::json!({"provider": "docker", "resource_id": container}))
+            .unwrap();
+    let spec: OperationSpec = serde_json::from_value(serde_json::json!({
+        "execution_id": "exec-docker",
+        "operation_key": "k1",
+        "argv": ["sh", "-c",
+            "setsid sh -c 'sleep 300 & echo orphan $!' & wait; echo leader $$; sleep 300"],
+        "working_directory": manifest.workspace.working_directory,
+        "environment": {},
+        "credential_bindings": [],
+        "timeout_seconds": 120,
+        "metadata": {},
+    }))
+    .unwrap();
+    let ops = DockerOperations::new(
+        "docker",
+        std::num::NonZeroU64::new(1 << 20).unwrap(),
+        std::num::NonZeroU64::new(1 << 16).unwrap(),
+    );
+    let stat = |pid: &str| {
+        let out = Command::new("docker")
+            .args(["exec", &container, "cat", &format!("/proc/{pid}/stat")])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        out.status.success().then_some(text)
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (status, pids) = runtime.block_on(async {
+        let op = ops.start(&workspace, spec).await.unwrap();
+        let (mut pids, mut cursor) = (Vec::<String>::new(), None);
+        while pids.len() < 2 {
+            let request = ObserveRequest {
+                cursor,
+                max_bytes: 4096,
+                wait: Duration::from_secs(10),
+            };
+            let page = ops.observe(&op, request).await.unwrap();
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(page.data_b64.as_str())
+                .unwrap();
+            let text = String::from_utf8(data).unwrap();
+            pids.extend(
+                text.split_whitespace()
+                    .filter(|w| w.parse::<u32>().is_ok())
+                    .map(String::from),
+            );
+            cursor = Some(page.next_cursor.to_string());
+            assert!(!page.complete, "ended before cancel: {text}");
+        }
+        // Its parent has exited and the container's init adopted it.
+        let adopted = || {
+            stat(&pids[0]).is_some_and(|s| {
+                s.rsplit_once(") ").unwrap().1.split_whitespace().nth(1) == Some("1")
+            })
+        };
+        for _ in 0..50 {
+            if adopted() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(adopted(), "orphan {} was never adopted by init", pids[0]);
+        (ops.cancel(&op, Duration::from_secs(1)).await.unwrap(), pids)
+    });
+    assert_eq!(status.state, OperationState::Cancelled);
+    assert_eq!(
+        status.metadata.get().get("escalation").map(String::as_str),
+        Some("container_stopped"),
+        "{status:?}"
+    );
+    let state = Command::new("docker")
+        .args([
+            "container",
+            "inspect",
+            "-f",
+            "{{.State.Status}}",
+            &container,
+        ])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&state.stdout);
+    assert!(state.trim() != "running", "container still {state}");
+    // A stopped container runs nothing, so no identity can have survived.
+    for pid in &pids {
+        assert!(stat(pid).is_none(), "pid {pid} survived cancel");
+    }
+    provider.destroy(&handle).unwrap();
+}

@@ -48,11 +48,21 @@ fn write_executable(path: &Path, body: &str) {
     panic!("{} stayed busy", path.display());
 }
 
-/// `exec` drops docker's own flags and runs the command here; `stop` is
-/// recorded. Every argv is appended to `docker.log` beside the script. While
-/// a `fail` file sits beside it, signalling and `stop` both fail; `container
-/// inspect` says the container is running, or gone while a `gone` file sits
-/// beside it, or cannot reach the daemon while a `down` file does.
+/// `exec` drops docker's own flags and runs the command here, marking every
+/// process it starts as the container's with `AW_STANDIN=<dir>` in its
+/// environment. Every argv is appended to `docker.log` beside the script.
+///
+/// The process table is the container's: the host's init is not its init,
+/// so a host pid 1 parent reads as 0, and while a `reaper` file names a
+/// subreaper pid, that pid's adoptees read as children of pid 1.
+///
+/// While a `fail` file sits beside it, signalling and `stop` both fail; a
+/// `signal-fails` file fails signalling only. `stop` KILLs every marked
+/// process and leaves the container `exited`, unless a `stop-lies` file
+/// makes it report success and do nothing, or a `stop-keeps-running` file
+/// leaves the container reported running after the KILLs. `container inspect` says the
+/// container is running or exited, or gone while a `gone` file sits beside
+/// it, or cannot reach the daemon while a `down` file does.
 fn fake_docker(dir: &Path) -> PathBuf {
     let script = dir.join("docker");
     let log = dir.join("docker.log");
@@ -76,12 +86,26 @@ exec)
         esac
     done
     shift
-    [ -e '{fail}' ] && [ "$4" = aw-signal ] && exit 1
+    [ -e '{fail}' ] || [ -e '{dir}/signal-fails' ] && [ "$4" = aw-signal ] && exit 1
+    AW_STANDIN='{dir}'; export AW_STANDIN
+    if [ "$4" = aw-processes ]; then
+        reaper=$(cat '{dir}/reaper' 2>/dev/null)
+        "$@" | awk -v r="$reaper" '{{ if ($2 == 1) $2 = 0; else if (r != "" && $2 == r) $2 = 1; print }}'
+        exit 0
+    fi
     exec "$@" ;;
-stop) [ -e '{fail}' ] && exit 1; exit 0 ;;
+stop)
+    [ -e '{fail}' ] && exit 1
+    [ -e '{dir}/stop-lies' ] && exit 0
+    for e in /proc/[0-9]*/environ; do
+        tr '\0' '\n' < "$e" 2>/dev/null | grep -qx 'AW_STANDIN={dir}' || continue
+        p=${{e#/proc/}}; kill -KILL "${{p%/environ}}" 2>/dev/null
+    done
+    [ -e '{dir}/stop-keeps-running' ] || : > '{dir}/stopped'; exit 0 ;;
 container)
     [ -e '{down}' ] && {{ echo 'Cannot connect to the Docker daemon' >&2; exit 1; }}
     [ -e '{gone}' ] && {{ echo 'Error: No such container: c1' >&2; exit 1; }}
+    [ -e '{dir}/stopped' ] && {{ echo exited; exit 0; }}
     echo running ;;
 esac
 "#,
@@ -357,6 +381,199 @@ async fn cancel_kills_leader_grandchild_and_term_trapper_and_is_idempotent() {
     let second = ops.cancel(&op, Duration::from_millis(300)).await.unwrap();
     assert_eq!(second, first);
     assert_eq!(ops.status(&op).await.unwrap(), first);
+}
+
+unsafe extern "C" {
+    fn prctl(option: i32, ...) -> i32;
+}
+
+/// Make this test process the subreaper of everything it starts, so an
+/// orphan is adopted here, where the stand-in can present it as adopted by
+/// the container's init (see `fake_docker`).
+fn become_subreaper(dir: &Path) {
+    const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    // SAFETY: prctl with integer arguments only.
+    assert_eq!(
+        unsafe { prctl(PR_SET_CHILD_SUBREAPER, 1u64, 0u64, 0u64, 0u64) },
+        0
+    );
+    std::fs::write(dir.join("reaper"), std::process::id().to_string()).unwrap();
+}
+
+/// Read whitespace-separated pids from the output until `count` have come.
+async fn printed_pids(ops: &DockerOperations, op: &OperationRef, count: usize) -> Vec<String> {
+    let (mut pids, mut cursor) = (Vec::new(), None);
+    while pids.len() < count {
+        let page = ops
+            .observe(
+                op,
+                ObserveRequest {
+                    cursor,
+                    max_bytes: 4096,
+                    wait: Duration::from_secs(5),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!page.complete, "ended before cancel");
+        let text = String::from_utf8(STANDARD.decode(page.data_b64.as_str()).unwrap()).unwrap();
+        pids.extend(
+            text.split_whitespace()
+                .filter(|w| w.parse::<u32>().is_ok())
+                .map(String::from),
+        );
+        cursor = Some(page.next_cursor.to_string());
+    }
+    pids
+}
+
+fn parent_of(pid: &str) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// A double fork: the workload's child leaves the group and exits at once,
+/// so its own child is adopted by init before cancel first looks, with no
+/// parent chain back to the operation. Signalling the group cannot confirm
+/// it gone; cancel must fail closed into a confirmed container stop.
+#[tokio::test]
+async fn cancel_stops_the_container_for_a_double_forked_orphan_of_init() {
+    let dir = tempfile::tempdir().unwrap();
+    become_subreaper(dir.path());
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let script = "setsid sh -c 'sleep 300 & echo orphan $!' & wait; echo leader $$; sleep 300";
+    let op = ops
+        .start(&workspace(), spec("k1", script, 60))
+        .await
+        .unwrap();
+    let pids = printed_pids(&ops, &op, 2).await;
+    let orphan = &pids[0];
+    // Its parent has exited and init (here, this subreaper) adopted it.
+    for _ in 0..100 {
+        if parent_of(orphan) == Some(std::process::id()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(parent_of(orphan), Some(std::process::id()), "not adopted");
+    assert!(pids.iter().all(|p| alive(p)), "{pids:?}");
+    let status = ops.cancel(&op, Duration::from_millis(300)).await.unwrap();
+    assert_eq!(status.state, OperationState::Cancelled);
+    let metadata = status.metadata.get();
+    assert_eq!(
+        metadata.get("escalation").map(String::as_str),
+        Some("container_stopped"),
+        "{status:?}"
+    );
+    assert!(
+        metadata["signal_failure"].contains(&format!("\"{orphan}\"")),
+        "{status:?}"
+    );
+    for pid in &pids {
+        assert!(!alive(pid), "pid {pid} survived cancel");
+    }
+    assert!(dir.path().join("stopped").exists());
+}
+
+/// Start a sleeper whose signalling fails, so cancel escalates to `stop`.
+async fn unsignallable(dir: &Path, ops: &DockerOperations) -> (OperationRef, String) {
+    let (op, pid) = sleeper(ops).await;
+    std::fs::write(dir.join("signal-fails"), "").unwrap();
+    (op, pid)
+}
+
+#[tokio::test]
+async fn an_escalated_cancel_is_confirmed_by_the_stopped_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let (op, pid) = unsignallable(dir.path(), &ops).await;
+    let status = ops.cancel(&op, Duration::from_millis(100)).await.unwrap();
+    assert_eq!(status.state, OperationState::Cancelled, "{status:?}");
+    assert!(status.metadata.get().contains_key("escalation"));
+    assert!(!alive(&pid), "the leader survived the stop");
+}
+
+/// `docker stop` exits 0 but the container keeps running: the cancel is
+/// unconfirmed, never `cancelled`, and a retry once stop works confirms it.
+#[tokio::test]
+async fn a_stop_that_falsely_reports_success_never_certifies_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let (op, pid) = unsignallable(dir.path(), &ops).await;
+    std::fs::write(dir.path().join("stop-lies"), "").unwrap();
+    let error = ops
+        .cancel(&op, Duration::from_millis(100))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::ProviderUnavailable, "{error:?}");
+    assert!(
+        error.message.as_str().contains("still running"),
+        "{error:?}"
+    );
+    assert!(alive(&pid));
+    assert_eq!(
+        ops.status(&op).await.unwrap().state,
+        OperationState::Running
+    );
+    std::fs::remove_file(dir.path().join("stop-lies")).unwrap();
+    let status = ops.cancel(&op, Duration::from_millis(100)).await.unwrap();
+    assert_eq!(status.state, OperationState::Cancelled, "{status:?}");
+    assert!(!alive(&pid));
+}
+
+/// The stop KILLs the workload, so its client exits and the collector
+/// settles while the cancel is still confirming, but the container is then
+/// reported running: settlement must not publish `cancelled`.
+#[tokio::test]
+async fn a_collector_settling_during_an_unconfirmed_cancel_never_publishes_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let (op, pid) = unsignallable(dir.path(), &ops).await;
+    std::fs::write(dir.path().join("stop-keeps-running"), "").unwrap();
+    let error = ops
+        .cancel(&op, Duration::from_millis(100))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::ProviderUnavailable, "{error:?}");
+    assert!(!alive(&pid), "the stop itself ran");
+    let status = status_until(&ops, &op, |s| {
+        s.as_ref().is_ok_and(|s| s.state.is_terminal())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.state, OperationState::Failed, "{status:?}");
+}
+
+/// The stop ran but the daemon cannot then report the container: the
+/// termination is unconfirmed, so the outcome is never `cancelled` while it
+/// stays so, and a retried cancel confirms it.
+#[tokio::test]
+async fn an_unreadable_state_after_stop_never_certifies_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let (op, pid) = unsignallable(dir.path(), &ops).await;
+    std::fs::write(dir.path().join("down"), "").unwrap();
+    let error = ops
+        .cancel(&op, Duration::from_millis(100))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::ProviderUnavailable, "{error:?}");
+    assert!(!alive(&pid), "the stop itself ran");
+    for _ in 0..30 {
+        match ops.status(&op).await {
+            Ok(status) => assert_ne!(status.state, OperationState::Cancelled),
+            Err(e) => assert_eq!(e.kind, ErrorKind::ProviderUnavailable),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    std::fs::remove_file(dir.path().join("down")).unwrap();
+    let status = ops.cancel(&op, Duration::from_millis(100)).await.unwrap();
+    assert_eq!(status.state, OperationState::Cancelled, "{status:?}");
 }
 
 #[tokio::test]

@@ -5,8 +5,10 @@
 //! line, a channel the workload cannot write before it. Cancel signals that
 //! group TERM then KILL, each only while the leader still has its recorded
 //! start time, also signals by pid every descendant that left the group, and
-//! confirms all of them gone. Anything it cannot confirm, or a pid it must
-//! not signal, escalates to `docker stop`. The shell scripts are the Python
+//! confirms all of them gone, and no untracked orphan of init started since
+//! the wrapper survives. Anything it cannot confirm, or a pid it must not
+//! signal, escalates to `docker stop`, itself confirmed by the container's
+//! state before the cancel is. The shell scripts are the Python
 //! provider's, byte for byte, so both languages cancel the same way.
 
 use agentic_workspace_core::operations::{
@@ -131,6 +133,28 @@ fn all_gone(table: &Table, leader: &str, start: &str, tracked: &BTreeMap<String,
     !group && !escaped
 }
 
+/// Orphans of the container's init that started no earlier than the
+/// operation's wrapper and are not tracked: a descendant that left the group
+/// and lost its parent before cancel first looked has no parent chain back to
+/// the operation, so nothing proves it is not ours. One started before the
+/// wrapper cannot be.
+fn unattributed(table: &Table, start: &str, tracked: &BTreeMap<String, String>) -> Vec<String> {
+    let Ok(start) = start.parse::<u64>() else {
+        return table.keys().cloned().collect();
+    };
+    let mut orphans: Vec<String> = table
+        .iter()
+        .filter(|(pid, row)| {
+            row.0 == "1"
+                && row.2.parse::<u64>().is_ok_and(|s| s >= start)
+                && tracked.get(*pid) != Some(&row.2)
+        })
+        .map(|(pid, _)| pid.clone())
+        .collect();
+    orphans.sort_by_key(|pid| pid.parse::<u64>().unwrap_or(u64::MAX));
+    orphans
+}
+
 /// Why `pid`'s group must not be signalled, or `None` when it may be. Init
 /// and malformed pids are refused everywhere; our own group only when the
 /// container shares our pid namespace, and an unreadable namespace counts as
@@ -217,6 +241,9 @@ struct Progress {
     requested: Option<OperationState>,
     /// A termination is in flight; cleared when one fails, so it is retried.
     terminating: bool,
+    /// The cancel's termination confirmed every process gone or the container
+    /// stopped. Only this lets settlement publish `cancelled`.
+    cancel_confirmed: bool,
     tracked: BTreeMap<String, String>,
     exit_code: Option<i64>,
     signal: Option<String>,
@@ -358,6 +385,16 @@ impl Docker {
             p.leader_known = true;
             p.ended_at = Some(now_rfc3339());
             p.state = match (p.requested, presence) {
+                (Some(OperationState::Cancelled), _) if !p.cancel_confirmed => {
+                    if p.terminating {
+                        // The cancel is still confirming; it settles once it has.
+                        p.ended_at = None;
+                        return;
+                    }
+                    // The cancel could not confirm the operation ended: say so.
+                    p.exit_code = p.client_code.map(i64::from);
+                    OperationState::Failed
+                }
                 (Some(requested), _) => requested,
                 (None, Presence::Gone) => OperationState::Lost,
                 (None, _) => {
@@ -398,6 +435,16 @@ impl Docker {
             if let Err(e) = self.terminate(op, grace).await {
                 op.update(|p| p.terminating = false);
                 return Err(e);
+            }
+            let finished = {
+                let mut p = op.lock();
+                p.cancel_confirmed = true;
+                p.client_finished
+            };
+            op.changed.notify_waiters();
+            // The collector may have finished while this cancel was confirming.
+            if finished {
+                self.settle(op, true).await;
             }
         }
         // `collect` settles once the client exits; a stopped container ends it.
@@ -452,19 +499,45 @@ impl Docker {
             }
         }
         op.update(|p| p.escalated = true);
-        match self.run(&["stop", "-t", "0", &op.container]).await {
-            Ok((0, _)) => Ok(()),
-            Ok((code, out)) => Err(format!(
-                "docker stop {}: exit {code}: {}",
-                op.container,
-                out.trim()
-            )),
-            Err(why) => Err(why),
-        }
-        .map_err(|why| {
+        self.stop_confirmed(&op.container).await.map_err(|why| {
             op.update(|p| p.failures.push(why.clone()));
             error(ErrorKind::ProviderUnavailable, why, Some(&op.reference))
         })
+    }
+
+    /// `docker stop` the container and observe it stopped or gone. A stop
+    /// that reports success is confirmed by the daemon's own state: running,
+    /// an unreadable state, or a removal still in progress after
+    /// `REMOVAL_WAIT` leaves the termination unconfirmed.
+    async fn stop_confirmed(&self, container: &str) -> Result<(), String> {
+        match self.run(&["stop", "-t", "0", container]).await? {
+            (0, _) => {}
+            (code, out) => {
+                return Err(format!(
+                    "docker stop {container}: exit {code}: {}",
+                    out.trim()
+                ));
+            }
+        }
+        let deadline = tokio::time::Instant::now() + REMOVAL_WAIT;
+        loop {
+            match self.presence(container).await? {
+                Presence::Stopped | Presence::Gone => return Ok(()),
+                Presence::Running => {
+                    return Err(format!(
+                        "docker stop {container} reported success but the container is still running"
+                    ));
+                }
+                Presence::Removing if tokio::time::Instant::now() >= deadline => {
+                    return Err(format!(
+                        "docker stop {container} reported success but the container is still \
+                         being removed {}s later; its termination is unconfirmed",
+                        REMOVAL_WAIT.as_secs()
+                    ));
+                }
+                Presence::Removing => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
     }
 
     /// TERM, then KILL; whether every process of the operation is confirmed gone.
@@ -494,8 +567,25 @@ impl Docker {
             let deadline = tokio::time::Instant::now() + wait;
             loop {
                 if let Ok(table) = self.table(&op.container).await {
-                    if all_gone(&table, pid, start, &op.lock().tracked) {
-                        return Ok(true);
+                    let tracked = op.lock().tracked.clone();
+                    if all_gone(&table, pid, start, &tracked) {
+                        // Ownership of an orphan adopted by init cannot be
+                        // proven, so any such survivor fails closed into a
+                        // container stop, which also ends unrelated detached
+                        // processes of the workspace: the price of a
+                        // confirmed cancel.
+                        let orphans = unattributed(&table, start, &tracked);
+                        if orphans.is_empty() {
+                            return Ok(true);
+                        }
+                        op.update(|p| {
+                            p.failures.push(format!(
+                                "processes {orphans:?} were orphaned to init after the \
+                                 operation began and may be its detached descendants; \
+                                 stopping the container"
+                            ))
+                        });
+                        return Ok(false);
                     }
                 }
                 if tokio::time::Instant::now() >= deadline {
@@ -661,6 +751,7 @@ impl DockerOperations {
                 leader_known: false,
                 requested: None,
                 terminating: false,
+                cancel_confirmed: false,
                 tracked: BTreeMap::new(),
                 exit_code: None,
                 signal: None,
@@ -1028,6 +1119,7 @@ mod tests {
                 leader_known: false,
                 requested: None,
                 terminating: false,
+                cancel_confirmed: false,
                 tracked: BTreeMap::new(),
                 exit_code: None,
                 signal: None,
@@ -1132,6 +1224,31 @@ mod tests {
         let reused = table(&["12 1 12 999"]);
         assert!(members(&reused, "10", "500", &tracked).is_empty());
         assert!(all_gone(&reused, "10", "500", &tracked));
+        // ...but it was adopted by init after the wrapper started, so it may
+        // be another descendant and confirmation fails closed.
+        assert_eq!(unattributed(&reused, "500", &tracked), ["12"]);
+    }
+
+    #[test]
+    fn an_untracked_orphan_of_init_since_the_wrapper_is_unattributed() {
+        // Detached and orphaned before cancel first looked: no member, the
+        // group is gone, yet it may be ours.
+        let rows = table(&["12 1 12 502"]);
+        let none = BTreeMap::new();
+        assert!(members(&rows, "10", "500", &none).is_empty());
+        assert!(all_gone(&rows, "10", "500", &none));
+        assert_eq!(unattributed(&rows, "500", &none), ["12"]);
+        // An equal start tick is included; an earlier start, a tracked
+        // identity, and a process with a living parent are not.
+        let rows = table(&[
+            "13 1 13 500",
+            "14 1 14 499",
+            "15 1 15 600",
+            "16 40 16 700",
+            "40 0 40 1",
+        ]);
+        let tracked = BTreeMap::from([("15".to_owned(), "600".to_owned())]);
+        assert_eq!(unattributed(&rows, "500", &tracked), ["13"]);
     }
 
     #[test]
