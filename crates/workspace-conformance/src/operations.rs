@@ -111,8 +111,10 @@ pub fn invalid_documents() -> Vec<(String, PathBuf, Value)> {
         .collect()
 }
 
-/// Every schema-tagged document a behaviour fixture step expects, as
-/// `(fixture name and step, schema, document)`.
+/// Every schema-tagged document a behaviour fixture step expects, each
+/// `expect_one_of` alternative included, as `(fixture name and step,
+/// schema, document)`. Fixture-local schemas (`fixtures/...`, the LH-7 file
+/// probe) describe harness readings, not contract documents, and are left out.
 pub fn behaviour_documents() -> Vec<(String, String, Value)> {
     json_files(&fixture_root().join("behaviour"))
         .into_iter()
@@ -120,16 +122,25 @@ pub fn behaviour_documents() -> Vec<(String, String, Value)> {
             let name = path.file_stem().unwrap().to_string_lossy().into_owned();
             let fixture = read(&path);
             let steps = fixture["steps"].as_array().cloned().unwrap_or_default();
-            steps.into_iter().enumerate().map(move |(i, step)| {
-                let schema = step["expect"]["schema"]
-                    .as_str()
-                    .expect("schema")
-                    .to_owned();
-                (
-                    format!("{name}#{i}"),
-                    schema,
-                    step["expect"]["document"].clone(),
-                )
+            steps.into_iter().enumerate().flat_map(move |(i, step)| {
+                let alternatives = match step.get("expect_one_of") {
+                    Some(many) => many.as_array().expect("expect_one_of array").clone(),
+                    None => vec![step["expect"].clone()],
+                };
+                let name = name.clone();
+                alternatives
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(move |(j, expect)| {
+                        let schema = expect["schema"].as_str().expect("schema").to_owned();
+                        (!schema.starts_with("fixtures/")).then(|| {
+                            (
+                                format!("{name}#{i}.{j}"),
+                                schema,
+                                expect["document"].clone(),
+                            )
+                        })
+                    })
             })
         })
         .collect()

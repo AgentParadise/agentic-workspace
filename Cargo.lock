@@ -52,7 +52,7 @@ dependencies = [
 [[package]]
 name = "apss-core"
 version = "1.6.0"
-source = "git+https://github.com/AgentParadise/agent-paradise-standards-system?rev=3bdbc3382371af5c9bedbc2f6de07037ae081c7e#3bdbc3382371af5c9bedbc2f6de07037ae081c7e"
+source = "git+https://github.com/AgentParadise/agent-paradise-standards-system?rev=ee926c6e44c0e37ad524e0ee265ffc4fabb714fc#ee926c6e44c0e37ad524e0ee265ffc4fabb714fc"
 dependencies = [
  "handlebars",
  "semver",
@@ -66,8 +66,8 @@ dependencies = [
 
 [[package]]
 name = "apss-v1-0006-workspace"
-version = "0.2.0"
-source = "git+https://github.com/AgentParadise/agent-paradise-standards-system?rev=3bdbc3382371af5c9bedbc2f6de07037ae081c7e#3bdbc3382371af5c9bedbc2f6de07037ae081c7e"
+version = "0.2.1"
+source = "git+https://github.com/AgentParadise/agent-paradise-standards-system?rev=ee926c6e44c0e37ad524e0ee265ffc4fabb714fc#ee926c6e44c0e37ad524e0ee265ffc4fabb714fc"
 dependencies = [
  "apss-core",
  "serde",

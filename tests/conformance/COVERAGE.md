@@ -128,3 +128,138 @@ the daemon), so PARTIAL rows stay PARTIAL until the Docker-backed run in
 `tests/integration/test_docker_operations_live.py` has passed in CI with
 Docker present. Cancellation is PARTIAL for the same reason, and because the
 finalize-on-cancel half of W-4-a belongs to PR 6.
+
+## Lifecycle hazards (EXP-V1-0006 0.2.1, APSS ee926c6)
+
+One row per `behaviour/hazard-*.json` fixture per provider, from
+`lib/python/agentic_isolation/tests/test_behaviour_hazards.py`, run as
+`setsid -w uv run --extra dev pytest -q -rsx tests/test_behaviour_hazards.py`.
+Each step's `given` is established for real, `descendant_alive` and
+`launches` are measured (`/proc` and launch logs), and every
+`settles_within_seconds` bound is enforced. FAIL rows are provider findings,
+held as `xfail(strict=True)` so they keep running and a fix flips them to an
+unexpected pass; this change does not alter provider behaviour. Python Docker
+runs through a stand-in `docker` that models a container (its `stop` kills
+exactly the run's processes; `removing` is sticky), not a daemon.
+
+| Hazard | Fixture | Python Docker | Python Local | Rust Docker |
+|---|---|---|---|---|
+| LH-1 | `hazard-double-fork-orphan` | PASS | PASS, or XFAIL APSS#146 (fixture gap, below) | PASS |
+| LH-2 | `hazard-interrupted-cancel` | PASS | FAIL | FAIL (unattributed) |
+| LH-3 | `hazard-cancel-before-launch-header` | FAIL | PASS (condition N/A) | FAIL |
+| LH-4 | `hazard-destroy-during-start` | FAIL | FAIL | FAIL |
+| LH-5 | `hazard-stuck-removal-timeout-settles` | PASS | PASS (condition N/A) | FAIL |
+| LH-6 | `hazard-drain-with-gap-reports-loss` | FAIL | FAIL | FAIL |
+| LH-7 | `hazard-fifo-in-workspace` | FAIL (real daemon) | FAIL | FAIL |
+
+Python LH-4 drives each provider's public `destroy` (for Docker, only the
+container boundary `_measure_usage`/`_stop`/`_remove` is a logged stand-in),
+and the harness asserts that destroy reached operation teardown before the
+credential resolver was released, so the race measured is the race claimed.
+
+Rust Docker rows come from `agentic_workspace_conformance::hazard::drive_hazard`
+over `DockerOperations` behind the stand-in `docker` of
+`implementations/docker/tests/operations.rs` (module `hazards`, Linux
+`rust-test` job), with the test process as the container's init
+(subreaper). The stand-in's `late-exec` file holds an operation's `exec`
+back 3 s (LH-3), its `removing` file keeps `container inspect` at
+`removing` (LH-5); LH-4 gates the credential resolver and, once `start` is
+inside it, marks the container gone and races the trait's `finalize`
+before releasing it; LH-7's file calls go through the Rust provider's file
+surface, `DockerProvider::collect`, on a thread of its own. Operation
+records are counted through public `status`, and
+`hazards::operation_records_counts_a_started_operation` shows the count
+moves 0 to 1 on a start. Each case asserts its measured verdict, so a change in either
+direction fails until this table changes with it.
+
+Findings (each left to a follow-up):
+
+- Docker LH-3: `cancel` waits `_LEADER_SECONDS` (30 s) for the launch header
+  before stopping the container, so it cannot settle within the 30 s bound.
+- Docker and Local LH-4: a `start` blocked in credential resolution, raced by
+  the public `destroy`, still returns a ref (step 0 matched neither
+  `resource_lost` nor `cancelled`).
+- Docker and Local LH-6, and Rust Docker LH-6: the gap is reported correctly
+  (`lost_bytes: 8`), but no page carries the 0.2.1 `loss_detected` marker.
+- Rust Docker LH-3: `cancel` before the launch header returns
+  `provider_unavailable` after about 9 s, and the late workload is then
+  measured alive; neither allowed outcome.
+- Rust Docker LH-4: `start` blocked in credential resolution, while the
+  container is lost and `finalize` runs, returns a ref and launches once
+  (fixture: `resource_lost` or `cancelled`, 0 launches).
+- Rust Docker LH-5: with the container stuck `removing`, the timed-out
+  operation's `observe` (repeated until complete) does not complete within
+  the 120 s bound. Measured with no `status` call before that observe: a
+  recording decorator asserts the call order, and the record probe runs
+  only on steps that count records.
+- Rust Docker LH-7: `collect` opens the writer-less FIFO and blocks; the
+  `file_exists` step does not settle within 10 s. The harness frees the
+  blocked open by opening the FIFO's write end on teardown.
+- Local LH-2: after the caller abandons `cancel`, the retried `cancel`
+  settles `failed`, neither a confirmed `cancelled` nor the unconfirmed
+  `timeout` outcome.
+- Rust Docker LH-2: the retried `cancel` returns `provider_unavailable`
+  after 7 s with the TERM-ignoring workload still measured alive. Not yet
+  attributed: it may be the stand-in's `stop` rather than the provider.
+- Python Docker LH-7 (real daemon, CI run 38593606789): `file_exists` on the
+  FIFO returns `exists: false, regular_file: false`; the fixture needs
+  `exists: true, regular_file: false` or `rejected_policy`. Held as
+  `xfail(strict=True)` on `test_docker_daemon_meets_lh7_fifo`.
+- Local LH-1 is a fixture limitation, not a provider finding. When a foreign
+  subreaper adopts the detached descendant (host-dependent: CI runs
+  38593606789 and 38603430148; passes locally), `cancel` fails closed:
+  `state: failed`, `cancel_signal_failure` "orphaned to a reaper ... cannot
+  be confirmed unrelated, so they were not signalled", `descendant_alive`
+  measured false. That is correct provider behaviour; the 0.2.1 fixture's
+  accepted set lacks the explicit unconfirmed outcome, which
+  AgentParadise/agent-paradise-standards-system#146 adds for APSS 0.2.2.
+  Until then `FIXTURE_GAPS` classifies exactly that outcome (hazard LH-1,
+  step 1, `failed`, that note, no live descendant) as
+  `UnconfirmedOrphanCancel`; every other mismatch fails, which
+  `test_any_other_local_lh1_mismatch_still_fails` pins.
+  `test_local_lh1_unconfirmed_orphan_is_the_apss146_gap` makes the condition
+  deterministic (an unrelated orphan is adopted by a reaper just before
+  cancel) and is `xfail(strict=True, raises=UnconfirmedOrphanCancel)`: any
+  other miss fails it, and a pass is an XPASS(strict) failure, which is how
+  APSS 0.2.2 will announce itself. The matrix case
+  `test_provider_meets_lifecycle_hazard[local-LH-1]` stays unmarked, because
+  the adoption does not reproduce on every host; there the same classifier
+  turns only that outcome into a runtime xfail. Remove all of it at 0.2.2.
+- Local LH-7: `read_file` opens a writer-less FIFO on the event loop and
+  blocks; the harness's watchdog thread has to open the write end to free it.
+
+Condition N/A: Local learns its leader at spawn, so LH-3's
+`launch_header_not_seen` cannot arise and the step runs as an immediate
+cancel; Local has no backend, so LH-5's `backend_stuck_removing` cannot arise
+and only `timeout_elapsed` is imposed.
+
+NOT RUN, and why (each ends its run as `NotRun`, never a pass):
+
+- Python Docker LH-7 through the stand-in: the probes read the host workspace
+  mount, which a stand-in container lacks.
+  `test_docker_daemon_meets_lh7_fifo` runs it against a real container
+  instead; it skips without Docker and its CI result is the row's evidence.
+
+No vacuous pass: `test_lh1_fails_a_cancel_confirmed_while_a_descendant_lives`
+replaces each Python provider's cancel confirmation with one that kills only
+the leader's group and reports confirmed. It asserts that the mutation ran and
+that LH-1 then fails on the cancel step, where `cancelled` comes back while a
+descendant is measured alive. For Rust Docker,
+`hazards::lh1_fails_a_cancel_confirmed_while_a_descendant_lives` wraps the
+provider in a decorator whose `cancel` terminates nothing and reports
+`cancelled`, counts that it ran, and asserts LH-1 fails on step 1 `cancel`
+with the descendant measured alive.
+
+Per-case bound, Rust: each `hazards::lh*` test runs its case (setup,
+every step, measurement, cleanup) in a child process that leads its own
+session under `setsid -w`, and a plain thread kills that session at 180 s
+(`CASE_BOUND`, above LH-5's 120 s observe). Tokio timeouts inside a case
+cannot interrupt a blocked thread or synchronous code; this can.
+`hazards::a_synchronously_blocked_case_fails_within_its_bound_and_the_next_runs`
+proves it with a case that blocks synchronously in `StandIn` setup. Python's
+per-test bound is `_outer_deadline` (faulthandler, 300 s).
+
+CI: the workflow edits these jobs need (APSS pin grep to 0.2.1, every Python
+invocation under `setsid -w` with an outer `timeout`, the hazard file named
+in its own step) cannot be pushed from the agent workspace; they ship as a
+patch in the PR thread for a maintainer to apply.

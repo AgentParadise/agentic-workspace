@@ -1,0 +1,171 @@
+{
+  "description": "The output stream overran retention before the drain after a terminal state. The first page reports the gap; the later completing page has no gap of its own but still carries loss_detected, so completion never hides the earlier loss.",
+  "hazard": "LH-6",
+  "provider": "valid/workspace-provider/small-retention.json",
+  "output": {
+    "generation": 1,
+    "produced_bytes": 24
+  },
+  "steps": [
+    {
+      "call": "start",
+      "args": {
+        "spec": {
+          "schema": "apss.workspace-operation/v1",
+          "execution_id": "exec-42",
+          "operation_key": "exec-42:phase-1:fence-9:agent",
+          "argv": [
+            "agent",
+            "--print",
+            "--output-format",
+            "stream-json"
+          ],
+          "working_directory": "repo",
+          "environment": {
+            "LANG": "C.UTF-8"
+          },
+          "credential_bindings": [
+            {
+              "ref": {
+                "name": "github-app",
+                "scope": "repo:acme/widgets"
+              },
+              "delivery": "env",
+              "target": "GH_TOKEN"
+            }
+          ],
+          "launch_marker": {
+            "argv0": "agent-launch",
+            "line": "APSS-LAUNCH 6f1e9c"
+          },
+          "timeout_seconds": 3600,
+          "metadata": {
+            "phase_id": "phase-1"
+          }
+        }
+      },
+      "expect": {
+        "schema": "workspace-operation.schema.json#/$defs/operationRef",
+        "document": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "status",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        }
+      },
+      "expect": {
+        "schema": "workspace-status.schema.json",
+        "document": {
+          "schema": "apss.workspace-status/v1",
+          "ref": {
+            "workspace": {
+              "provider": "docker",
+              "resource_id": "ws-7f3a"
+            },
+            "operation_id": "op-0001",
+            "operation_key": "exec-42:phase-1:fence-9:agent"
+          },
+          "state": "succeeded",
+          "execution_id": "exec-42",
+          "metadata": {},
+          "exit_code": 0
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "observe",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        },
+        "cursor": "g1:0"
+      },
+      "given": [
+        "observation_gap"
+      ],
+      "settles_within_seconds": 10,
+      "expect": {
+        "schema": "workspace-observation.schema.json",
+        "document": {
+          "schema": "apss.workspace-observation/v1",
+          "ref": {
+            "workspace": {
+              "provider": "docker",
+              "resource_id": "ws-7f3a"
+            },
+            "operation_id": "op-0001",
+            "operation_key": "exec-42:phase-1:fence-9:agent"
+          },
+          "state": "succeeded",
+          "cursor": "g1:0",
+          "next_cursor": "g1:16",
+          "data_b64": "cmV0YWluZWQ=",
+          "complete": false,
+          "gap": {
+            "lost_bytes": 8
+          },
+          "loss_detected": true
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "observe",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        },
+        "cursor": "g1:16"
+      },
+      "settles_within_seconds": 10,
+      "expect": {
+        "schema": "workspace-observation.schema.json",
+        "document": {
+          "schema": "apss.workspace-observation/v1",
+          "ref": {
+            "workspace": {
+              "provider": "docker",
+              "resource_id": "ws-7f3a"
+            },
+            "operation_id": "op-0001",
+            "operation_key": "exec-42:phase-1:fence-9:agent"
+          },
+          "state": "succeeded",
+          "cursor": "g1:16",
+          "next_cursor": "g1:24",
+          "data_b64": "IG91dHB1dAo=",
+          "complete": true,
+          "loss_detected": true
+        }
+      },
+      "launches": 1
+    }
+  ]
+}

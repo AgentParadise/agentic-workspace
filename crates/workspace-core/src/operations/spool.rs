@@ -121,6 +121,7 @@ impl OperationSpool {
             data_b64: Base64::try_from(STANDARD.encode(&data)).expect("STANDARD is padded base64"),
             gap,
             complete: state.is_terminal() && size == 0 && next == self.end(),
+            loss_detected: None,
         }
     }
 

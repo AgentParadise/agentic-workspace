@@ -63,7 +63,10 @@ fn write_executable(path: &Path, body: &str) {
 /// makes it report success and do nothing, or a `stop-keeps-running` file
 /// leaves the container reported running after the KILLs. `container inspect` says the
 /// container is running or exited, or gone while a `gone` file sits beside
-/// it, or cannot reach the daemon while a `down` file does.
+/// it, or cannot reach the daemon while a `down` file does, or is stuck
+/// `removing` while a `removing` file does. While a `late-exec` file sits
+/// beside it, an operation's `exec` waits 3s before it runs anything, so its
+/// launch header comes late.
 fn fake_docker(dir: &Path) -> PathBuf {
     let script = dir.join("docker");
     let log = dir.join("docker.log");
@@ -77,6 +80,7 @@ fn fake_docker(dir: &Path) -> PathBuf {
 printf '%s\n' "$*" >> '{log}'
 case "$1" in
 exec)
+    [ -e '{dir}/late-exec' ] && case " $* " in *" aw-operation "*) sleep 3 ;; esac
     shift
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -106,6 +110,7 @@ stop)
 container)
     [ -e '{down}' ] && {{ echo 'Cannot connect to the Docker daemon' >&2; exit 1; }}
     [ -e '{gone}' ] && {{ echo 'Error: No such container: c1' >&2; exit 1; }}
+    [ -e '{dir}/removing' ] && {{ echo removing; exit 0; }}
     [ -e '{dir}/stopped' ] && {{ echo exited; exit 0; }}
     echo running ;;
 esac
@@ -1157,4 +1162,653 @@ fn credential_bindings_without_a_resolver_are_rejected_policy() {
     let error = runtime.block_on(ops.start(&workspace(), spec)).unwrap_err();
     assert_eq!(error.kind, ErrorKind::RejectedPolicy);
     assert!(!dir.path().join("docker.log").exists());
+}
+
+// --- APSS 0.2.1 lifecycle hazards (LH-1..LH-7) -------------------------------
+
+mod hazards {
+    use super::*;
+    use agentic_workspace_conformance::hazard::{
+        HazardFixture, HazardHarness, HazardVerdict, Outcome, Unmeasurable, drive_hazard,
+        live_processes, load_hazards, vendored_behaviour_dir,
+    };
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TOKEN: &str = "AW_HARNESS_RUN";
+
+    /// What each hazard's workload does once the provider launches it.
+    fn workload(hazard: &str) -> &'static str {
+        match hazard {
+            // Double fork: the middle shell exits, so the setsid'd sleeper is
+            // reparented and leaves the leader's group before cancel.
+            "LH-1" => "(setsid sleep 300 </dev/null >/dev/null 2>&1 &); exec sleep 300",
+            "LH-2" => "trap '' TERM; while :; do sleep 0.1; done",
+            "LH-6" => "printf 'lost-it retained output\\n'",
+            // The stand-in ignores `-w`; its marker names the "container".
+            // `ws` is the file surface's workspace root; see `StandIn::file`.
+            "LH-7" => {
+                "mkdir -p \"$AW_STANDIN/ws/outputs\" && mkfifo \"$AW_STANDIN/ws/outputs/pipe\""
+            }
+            _ => "exec sleep 300",
+        }
+    }
+
+    fn fixture(hazard: &str) -> HazardFixture {
+        load_hazards(&vendored_behaviour_dir())
+            .unwrap()
+            .into_iter()
+            .find(|f| f.hazard == hazard)
+            .unwrap()
+    }
+
+    /// `DockerOperations` behind the stand-in docker, its workloads tokened.
+    pub(super) struct StandIn<P> {
+        pub provider: P,
+        pub dir: tempfile::TempDir,
+        pub token: String,
+        gate: Arc<Gate>,
+        key: std::sync::Mutex<Option<String>>,
+    }
+
+    /// LH-4's credential resolver: the first resolve, while armed, says it
+    /// has begun and waits to be released; every resolve then answers as
+    /// `Vault` does.
+    #[derive(Default)]
+    struct Gate {
+        armed: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    struct GatedVault(Arc<Gate>);
+
+    impl CredentialResolver for GatedVault {
+        fn resolve<'a>(
+            &'a self,
+            credential: &'a CredentialRef,
+        ) -> Pin<Box<dyn Future<Output = Result<String, OperationError>> + Send + 'a>> {
+            Box::pin(async move {
+                if self.0.armed.swap(false, Ordering::SeqCst) {
+                    self.0.entered.notify_one();
+                    self.0.release.notified().await;
+                }
+                Vault.resolve(credential).await
+            })
+        }
+    }
+
+    impl StandIn<DockerOperations> {
+        pub fn new(hazard: &str) -> Self {
+            StandIn::with(hazard, |ops| ops)
+        }
+    }
+
+    impl<P> StandIn<P> {
+        pub fn with(hazard: &str, wrap: impl FnOnce(DockerOperations) -> P) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("repo")).unwrap();
+            // This process stands for the container's init, so a detached
+            // descendant reparents to "pid 1" as it would in a container.
+            become_subreaper(dir.path());
+            if hazard == "LH-3" {
+                std::fs::write(dir.path().join("late-exec"), "").unwrap();
+            }
+            let gate = Arc::new(Gate::default());
+            gate.armed.store(hazard == "LH-4", Ordering::SeqCst);
+            // LH-6's provider descriptor: the 16-byte retention the gap needs.
+            let retention = if hazard == "LH-6" { 16 } else { 1 << 20 };
+            let provider = ops(dir.path(), retention, 1 << 16)
+                .with_credentials(Arc::new(GatedVault(gate.clone())));
+            let token = format!("rust-lh-{}-{}", std::process::id(), unique());
+            Self {
+                provider: wrap(provider),
+                dir,
+                token,
+                gate,
+                key: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn standin(&self, file: &str) -> PathBuf {
+            self.dir.path().join(file)
+        }
+    }
+
+    fn unique() -> usize {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    impl<P> Drop for StandIn<P> {
+        fn drop(&mut self) {
+            // Only this run's tokened processes: the workload and what it forked.
+            for pid in live_processes(TOKEN, &self.token).unwrap_or_default() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+            // A file-surface read still blocked opening LH-7's FIFO is let go:
+            // a writer that opens and closes gives it end of file.
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NONBLOCK: i32 = 0o4000;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(O_NONBLOCK)
+                .open(self.standin("ws/outputs/pipe"));
+            self.gate.release.notify_one();
+        }
+    }
+
+    /// How a `WorkspaceError` from the file surface reads as an APSS kind:
+    /// a refused path is policy, anything else the provider's own failure.
+    fn file_error(error: &agentic_workspace_core::WorkspaceError) -> Outcome {
+        use agentic_workspace_core::WorkspaceError as E;
+        let kind = match error {
+            E::UnsafePath(_) | E::InvalidHandle(_) => "rejected_policy",
+            _ => "internal",
+        };
+        Outcome::Error {
+            kind: kind.into(),
+            has_ref: false,
+        }
+    }
+
+    impl<P: SupportsOperations> HazardHarness for StandIn<P> {
+        type Provider = P;
+        fn provider(&self) -> &P {
+            &self.provider
+        }
+        fn workspace(&self) -> WorkspaceRef {
+            workspace()
+        }
+        fn spec(&self, hazard: &str, fixture_spec: &Value) -> OperationSpec {
+            let mut spec = fixture_spec.clone();
+            spec["argv"] = serde_json::json!(["sh", "-c", workload(hazard)]);
+            spec["environment"][TOKEN] = Value::String(self.token.clone());
+            if hazard == "LH-5" {
+                spec["timeout_seconds"] = 1.into();
+            }
+            if hazard == "LH-6" {
+                // The fixture's offsets count the workload's output only.
+                spec.as_object_mut().unwrap().remove("launch_marker");
+            }
+            *self.key.lock().unwrap() = spec["operation_key"].as_str().map(str::to_owned);
+            serde_json::from_value(spec).unwrap()
+        }
+        fn establish(&self, hazard: &str, given: &str) -> Result<(), String> {
+            match given {
+                // The workload forks it; liveness is measured, not assumed.
+                "detached_descendant" | "timeout_elapsed" => Ok(()),
+                "observation_gap" if hazard == "LH-6" => Ok(()),
+                // `late-exec` holds the exec back, so no workload runs yet.
+                "launch_header_not_seen" => match live_processes(TOKEN, &self.token) {
+                    Ok(live) if live.is_empty() => Ok(()),
+                    Ok(live) => Err(format!("the workload already runs: {live:?}")),
+                    Err(unmeasurable) => Err(unmeasurable.to_string()),
+                },
+                // Made true by `alongside`, while the start resolves.
+                "destroyed_during_credential_resolution" if hazard == "LH-4" => Ok(()),
+                "workspace_destroyed" if self.standin("gone").exists() => Ok(()),
+                "backend_stuck_removing" => {
+                    std::fs::write(self.standin("removing"), "").map_err(|e| e.to_string())
+                }
+                "fifo_in_workspace" => {
+                    use std::os::unix::fs::FileTypeExt;
+                    match std::fs::symlink_metadata(self.standin("ws/outputs/pipe")) {
+                        Ok(meta) if meta.file_type().is_fifo() => Ok(()),
+                        other => Err(format!("outputs/pipe is not a FIFO: {other:?}")),
+                    }
+                }
+                other => Err(format!("the stand-in docker cannot produce {other}")),
+            }
+        }
+        async fn alongside(&self, _hazard: &str, given: &str) -> Result<(), String> {
+            if given != "destroyed_during_credential_resolution" {
+                return Ok(());
+            }
+            let entered =
+                tokio::time::timeout(Duration::from_secs(5), self.gate.entered.notified()).await;
+            if entered.is_err() {
+                self.gate.release.notify_one();
+                return Err("start never reached credential resolution".into());
+            }
+            // The backend loses the container and the workspace is torn
+            // down through the trait's boundary while start still resolves.
+            std::fs::write(self.standin("gone"), "").map_err(|e| e.to_string())?;
+            let destroyed = workspace();
+            let finalize = self.provider.finalize(&destroyed);
+            tokio::pin!(finalize);
+            let early = tokio::time::timeout(Duration::from_millis(200), &mut finalize).await;
+            self.gate.release.notify_one();
+            if early.is_err() {
+                finalize.await;
+            }
+            Ok(())
+        }
+        /// The Rust Docker provider's file surface is `WorkspaceProvider::
+        /// collect`, read here on a thread of its own so a read that never
+        /// returns is bounded by the step, not this test.
+        async fn file(&self, call: &str, path: &str) -> Result<Outcome, String> {
+            use agentic_workspace_core::{WorkspaceHandle, WorkspaceProvider};
+            use agentic_workspace_docker::NetworkPolicy;
+            let files = agentic_workspace_docker::DockerProvider::new(
+                self.dir.path(),
+                "stand-in",
+                NetworkPolicy::None,
+            )
+            .map_err(|e| e.to_string())?;
+            let root = std::fs::canonicalize(self.standin("ws")).map_err(|e| e.to_string())?;
+            let handle = WorkspaceHandle {
+                id: "ws".into(),
+                working_directory: root.clone(),
+                root,
+                provider_reference: Some("agentic-workspace-ws".into()),
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let relative = PathBuf::from(path);
+            std::thread::spawn(move || {
+                let _ = tx.send(files.collect(&handle, &[relative]));
+            });
+            let collected = rx.await.map_err(|_| "the collect thread died".to_owned())?;
+            Ok(match (call, collected) {
+                ("file_exists", Ok(_)) => Outcome::Document(serde_json::json!({
+                    "path": path, "exists": true, "regular_file": true,
+                })),
+                ("read_file", Ok(artifacts)) => Outcome::Document(serde_json::json!({
+                    "path": path, "bytes": artifacts.first().map_or(0, |a| a.bytes.len()),
+                })),
+                (_, Err(error)) => file_error(&error),
+                (other, Ok(_)) => return Err(format!("no file call {other}")),
+            })
+        }
+        fn launches(&self) -> u32 {
+            std::fs::read_to_string(self.standin("docker.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("exec -i ") && l.contains(&self.token))
+                .count() as u32
+        }
+        fn descendant_alive(&self) -> Result<bool, Unmeasurable> {
+            Ok(!live_processes(TOKEN, &self.token)?.is_empty())
+        }
+        /// Records the provider still resolves for the fixture's key, probed
+        /// through public `status`: its operation ids are `c1-op<n>`, issued
+        /// in sequence, so the first eight cover every start a hazard makes.
+        async fn operation_records(&self) -> Option<u32> {
+            let key = self.key.lock().unwrap().clone()?;
+            let mut held = 0;
+            for n in 1..=8 {
+                let reference: OperationRef = serde_json::from_value(serde_json::json!({
+                    "workspace": {"provider": "docker", "resource_id": "c1"},
+                    "operation_id": format!("c1-op{n}"),
+                    "operation_key": key,
+                }))
+                .unwrap();
+                match self.provider.status(&reference).await {
+                    Err(e) if e.kind == ErrorKind::UnknownOperation => {}
+                    _ => held += 1,
+                }
+            }
+            Some(held)
+        }
+        fn awaits_exit(&self, hazard: &str) -> bool {
+            matches!(hazard, "LH-6" | "LH-7")
+        }
+    }
+
+    /// What the Rust Docker provider does on each hazard, measured. A change
+    /// in any verdict fails here, so a fix or a regression has to update
+    /// COVERAGE.md with it.
+    fn expect(hazard: &str, verdict: &HazardVerdict) {
+        let summary = match verdict {
+            HazardVerdict::Pass => "pass".to_owned(),
+            HazardVerdict::Fail { step, call, .. } => format!("fail {step} {call}"),
+            HazardVerdict::NotRun { step, call, .. } => format!("not run {step} {call}"),
+        };
+        let expected = match hazard {
+            "LH-1" => "pass",
+            // The retried cancel ends provider_unavailable after 7s with the
+            // TERM-ignoring workload still alive. Not established whether the
+            // stand-in's stop or the provider is at fault: COVERAGE.md.
+            "LH-2" => "fail 3 cancel",
+            // Finding: the cancel before the launch header ends
+            // provider_unavailable after ~9s, the late workload alive.
+            "LH-3" => "fail 1 cancel",
+            // Finding: start returns a ref and launches into the container
+            // destroyed while it resolved, instead of resource_lost/cancelled.
+            "LH-4" => "fail 0 start",
+            // Finding: with the container stuck removing, the timed-out
+            // operation's observe never completes within the 120s bound.
+            "LH-5" => "fail 1 observe",
+            // Finding: the gap page carries no loss_detected (0.2.1).
+            "LH-6" => "fail 2 observe",
+            // Finding: `collect` opens the FIFO and blocks past the 10s bound.
+            "LH-7" => "fail 2 file_exists",
+            _ => unreachable!(),
+        };
+        assert_eq!(summary, expected, "{hazard}: {verdict:?}");
+    }
+
+    async fn run(hazard: &str) {
+        let harness = StandIn::new(hazard);
+        let verdict = drive_hazard(&fixture(hazard), &harness).await;
+        expect(hazard, &verdict);
+    }
+
+    /// LH-5 through a decorator that records each provider call, so the
+    /// fixture's "no status call before observe" is measured, not assumed.
+    async fn lh5() {
+        let harness = StandIn::with("LH-5", |inner| Records {
+            inner,
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let verdict = drive_hazard(&fixture("LH-5"), &harness).await;
+        let calls = harness.provider.calls.lock().unwrap().clone();
+        let observe = calls.iter().position(|c| *c == "observe");
+        assert_eq!(calls.first(), Some(&"start"), "{calls:?}");
+        assert!(observe.is_some(), "LH-5 never reached observe: {calls:?}");
+        assert!(
+            !calls[..observe.unwrap()].contains(&"status"),
+            "status called before LH-5's first observe: {calls:?}"
+        );
+        expect("LH-5", &verdict);
+    }
+
+    // --- The per-case bound ---------------------------------------------------
+    //
+    // A Tokio timeout cannot interrupt a blocked thread, nor the synchronous
+    // setup (`StandIn::new`), liveness measurement and cleanup (`Drop`) around
+    // the futures it bounds. So each case runs in a process of its own, a
+    // session of its own under `setsid -w`, and a plain thread here kills
+    // that whole session once `CASE_BOUND` passes. One stuck case then fails
+    // alone, within its bound, and the next still runs.
+
+    /// Above the slowest case: LH-5's 120s observe bound plus setup.
+    const CASE_BOUND: Duration = Duration::from_secs(180);
+    /// Names the case `hazard_case` runs; unset, it runs nothing.
+    const CASE: &str = "AW_HAZARD_CASE";
+    /// Where the case writes once it has run to the end, so a filter that
+    /// selects no test is never read as a pass.
+    const CASE_DONE: &str = "AW_HAZARD_CASE_DONE";
+
+    #[derive(Debug, PartialEq)]
+    enum CaseEnd {
+        Passed,
+        /// The case process exited without completing: a failed assertion
+        /// or a panic. Its output is in the test's.
+        Failed(std::process::ExitStatus),
+        /// Still running at the bound; its session was killed.
+        OutOfBound(Duration),
+    }
+
+    /// Run `case` in its own bounded session and say how it ended.
+    fn bounded(case: &str, bound: Duration) -> CaseEnd {
+        let done = tempfile::tempdir().unwrap();
+        let marker = done.path().join("done");
+        let began = std::time::Instant::now();
+        let mut child = std::process::Command::new("setsid")
+            .arg("-w")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "hazards::hazard_case", "--ignored"])
+            .args(["--nocapture", "--test-threads=1", "-q"])
+            .env(CASE, case)
+            .env(CASE_DONE, &marker)
+            .spawn()
+            .expect("setsid(1) is required to bound a hazard case");
+        // A spawned child never leads a process group, so setsid(1) does not
+        // fork: the child is the session leader and its pid the session's
+        // group id.
+        let session = format!("-{}", child.id());
+        let end = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break if status.success() && marker.exists() {
+                    CaseEnd::Passed
+                } else {
+                    CaseEnd::Failed(status)
+                };
+            }
+            if began.elapsed() >= bound {
+                kill_session(&session);
+                child.wait().unwrap();
+                break CaseEnd::OutOfBound(began.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // Whatever the case leaked into its session goes with it.
+        kill_session(&session);
+        end
+    }
+
+    fn kill_session(group: &str) {
+        // ESRCH once the session is empty is the expected end.
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", group])
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    fn assert_passes(case: &str) {
+        let end = bounded(case, CASE_BOUND);
+        assert_eq!(end, CaseEnd::Passed, "{case} in its bounded session");
+    }
+
+    /// The entry point `bounded` runs in the case process. Ignored, so a
+    /// plain `cargo test` never runs a case outside its bound.
+    #[test]
+    #[ignore = "one hazard case, run by `bounded` in its own session"]
+    fn hazard_case() {
+        let Ok(case) = std::env::var(CASE) else {
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        match case.as_str() {
+            "LH-5" => runtime.block_on(lh5()),
+            // The guard's own proof cases, below.
+            "blocks-synchronously" => {
+                let _harness = StandIn::new("LH-1");
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+            "fails" => panic!("the failing proof case"),
+            "passes" => {}
+            hazard => runtime.block_on(run(hazard)),
+        }
+        std::fs::write(std::env::var(CASE_DONE).unwrap(), "").unwrap();
+    }
+
+    #[test]
+    fn lh1_double_fork_orphan_before_cancel() {
+        assert_passes("LH-1");
+    }
+    #[test]
+    fn lh2_interrupted_cancel() {
+        assert_passes("LH-2");
+    }
+    #[test]
+    fn lh3_cancel_before_launch_header() {
+        assert_passes("LH-3");
+    }
+    #[test]
+    fn lh4_destroy_during_start() {
+        assert_passes("LH-4");
+    }
+    #[test]
+    fn lh5_stuck_removal_settles() {
+        assert_passes("LH-5");
+    }
+    #[test]
+    fn lh6_drain_with_gap_reports_loss() {
+        assert_passes("LH-6");
+    }
+    #[test]
+    fn lh7_fifo_in_workspace() {
+        assert_passes("LH-7");
+    }
+
+    /// The bound holds where Tokio's cannot: a case blocked synchronously in
+    /// setup is killed, session and all, within it; a failing case fails; and
+    /// the next case still runs and passes.
+    #[test]
+    fn a_synchronously_blocked_case_fails_within_its_bound_and_the_next_runs() {
+        let bound = Duration::from_secs(5);
+        match bounded("blocks-synchronously", bound) {
+            CaseEnd::OutOfBound(elapsed) => {
+                assert!(elapsed < bound + Duration::from_secs(2), "{elapsed:?}")
+            }
+            other => panic!("a blocked case ended {other:?}"),
+        }
+        assert!(matches!(bounded("fails", bound), CaseEnd::Failed(_)));
+        assert_eq!(bounded("passes", bound), CaseEnd::Passed);
+    }
+
+    /// The record probe counts a started operation, and none before it, so
+    /// LH-4's `operation_records: 0` is measured, not the probe's blindness.
+    #[tokio::test]
+    async fn operation_records_counts_a_started_operation() {
+        let harness = StandIn::new("LH-1");
+        let lh1 = fixture("LH-1");
+        let spec = harness.spec("LH-1", &lh1.steps[0].args["spec"]);
+        assert_eq!(harness.operation_records().await, Some(0));
+        harness.provider.start(&workspace(), spec).await.unwrap();
+        assert_eq!(harness.operation_records().await, Some(1));
+    }
+
+    /// Passes every call through, naming each in order.
+    struct Records {
+        inner: DockerOperations,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Records {
+        fn note(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl SupportsOperations for Records {
+        fn describe(&self) -> agentic_workspace_core::operations::ProviderDescriptor {
+            self.inner.describe()
+        }
+        async fn start(
+            &self,
+            workspace: &WorkspaceRef,
+            spec: OperationSpec,
+        ) -> Result<OperationRef, OperationError> {
+            self.note("start");
+            self.inner.start(workspace, spec).await
+        }
+        async fn status(
+            &self,
+            operation: &OperationRef,
+        ) -> Result<OperationStatus, OperationError> {
+            self.note("status");
+            self.inner.status(operation).await
+        }
+        async fn observe(
+            &self,
+            operation: &OperationRef,
+            request: ObserveRequest,
+        ) -> Result<agentic_workspace_core::operations::ObservationPage, OperationError> {
+            self.note("observe");
+            self.inner.observe(operation, request).await
+        }
+        async fn cancel(
+            &self,
+            operation: &OperationRef,
+            grace: Duration,
+        ) -> Result<OperationStatus, OperationError> {
+            self.note("cancel");
+            self.inner.cancel(operation, grace).await
+        }
+        async fn finalize(
+            &self,
+            workspace: &WorkspaceRef,
+        ) -> agentic_workspace_core::operations::FinalizationOutcome {
+            self.note("finalize");
+            self.inner.finalize(workspace).await
+        }
+    }
+
+    /// The mutation: a cancel that terminates nothing and reports confirmed.
+    struct ConfirmsBlindly {
+        inner: DockerOperations,
+        applied: AtomicUsize,
+    }
+
+    impl SupportsOperations for ConfirmsBlindly {
+        fn describe(&self) -> agentic_workspace_core::operations::ProviderDescriptor {
+            self.inner.describe()
+        }
+        async fn start(
+            &self,
+            workspace: &WorkspaceRef,
+            spec: OperationSpec,
+        ) -> Result<OperationRef, OperationError> {
+            self.inner.start(workspace, spec).await
+        }
+        async fn status(
+            &self,
+            operation: &OperationRef,
+        ) -> Result<OperationStatus, OperationError> {
+            self.inner.status(operation).await
+        }
+        async fn observe(
+            &self,
+            operation: &OperationRef,
+            request: ObserveRequest,
+        ) -> Result<agentic_workspace_core::operations::ObservationPage, OperationError> {
+            self.inner.observe(operation, request).await
+        }
+        async fn cancel(
+            &self,
+            operation: &OperationRef,
+            _grace: Duration,
+        ) -> Result<OperationStatus, OperationError> {
+            self.applied.fetch_add(1, Ordering::SeqCst);
+            let mut status = serde_json::to_value(self.inner.status(operation).await?).unwrap();
+            status["state"] = "cancelled".into();
+            status["ended_at"] = "2026-01-01T00:00:00Z".into();
+            Ok(serde_json::from_value(status).unwrap())
+        }
+        async fn finalize(
+            &self,
+            workspace: &WorkspaceRef,
+        ) -> agentic_workspace_core::operations::FinalizationOutcome {
+            self.inner.finalize(workspace).await
+        }
+    }
+
+    /// No vacuous pass: a cancel confirmed while the measured descendant
+    /// lives must fail LH-1 on the cancel step.
+    #[tokio::test]
+    async fn lh1_fails_a_cancel_confirmed_while_a_descendant_lives() {
+        use agentic_workspace_conformance::hazard::{Mismatch, Outcome};
+        let harness = StandIn::with("LH-1", |inner| ConfirmsBlindly {
+            inner,
+            applied: AtomicUsize::new(0),
+        });
+        let verdict = drive_hazard(&fixture("LH-1"), &harness).await;
+        assert_eq!(
+            harness.provider.applied.load(Ordering::SeqCst),
+            1,
+            "the mutation never ran"
+        );
+        let HazardVerdict::Fail {
+            step: 1,
+            call,
+            mismatch: Mismatch::NoAlternative { measured },
+        } = &verdict
+        else {
+            panic!("LH-1 did not fail on the confirmed cancel: {verdict:?}");
+        };
+        assert_eq!(call, "cancel");
+        assert!(measured.descendant_alive, "{verdict:?}");
+        assert!(
+            matches!(&measured.outcome, Outcome::Document(d) if d["state"] == "cancelled"),
+            "{verdict:?}"
+        );
+    }
 }

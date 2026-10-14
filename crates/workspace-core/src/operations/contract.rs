@@ -563,10 +563,16 @@ checked_struct! {
         #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
         pub gap: Option<ObservationGap>,
         pub complete: bool,
+        /// 0.2.1: output was lost somewhere in this drain. Only ever `true`.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+        pub loss_detected: Option<bool>,
     }
     fn check(this) -> Result<(), String> {
         if this.complete && !this.state.is_terminal() {
             return Err(format!("a complete page cannot have state {:?}", this.state));
+        }
+        if this.loss_detected == Some(false) {
+            return Err("loss_detected is present only as true".to_owned());
         }
     }
 }
