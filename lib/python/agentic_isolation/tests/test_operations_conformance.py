@@ -867,3 +867,17 @@ async def test_local_marker_finds_a_program_on_a_workspace_relative_path(tmp_pat
             await provider.start(workspace, missing)
         assert caught.value.error.kind == "provider_unavailable"
     await provider.destroy(workspace)
+
+
+async def test_local_start_off_linux_is_unsupported_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ops = LocalOperations(credentials=None, retention_bytes=1 << 20, max_page_bytes=1 << 16)
+    workspace = Workspace(
+        id="ws1", provider="local", path=tmp_path, config=WorkspaceConfig(), _handle=None
+    )
+    monkeypatch.setattr(local_operations.sys, "platform", "darwin")
+    with pytest.raises(OperationFailure) as caught:
+        await ops.start(workspace, _spec("true"), base_env={})
+    assert caught.value.error.kind == "unsupported_capability"
+    assert "darwin" in caught.value.error.message
