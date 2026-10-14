@@ -1,6 +1,7 @@
 //! Shared black-box assertions for workspace provider implementations.
 
 pub mod behaviour;
+pub mod hazard;
 pub mod operations;
 
 use agentic_workspace_core::{

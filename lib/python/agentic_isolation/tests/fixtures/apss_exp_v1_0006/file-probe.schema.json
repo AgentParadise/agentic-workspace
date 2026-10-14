@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "APSS Workspace Fixture File Probe",
+  "description": "Fixture-level result of the file_exists harness call. Not a contract artifact: providers expose file probing in their own shape, and the harness maps it to this one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "path",
+    "exists",
+    "regular_file"
+  ],
+  "properties": {
+    "path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "exists": {
+      "type": "boolean"
+    },
+    "regular_file": {
+      "type": "boolean"
+    }
+  }
+}

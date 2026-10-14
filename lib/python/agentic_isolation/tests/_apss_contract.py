@@ -86,11 +86,15 @@ def invalid_document(path: Path) -> Json:
 def behaviour_documents() -> Iterator[tuple[str, Json]]:
     """Every schema-tagged document a behaviour fixture expects, as `(id, document)`.
 
-    Untagged expectations (`operationRef`, a `$defs` fragment) have no
-    top-level schema to dispatch on and are not contract documents.
+    Untagged expectations (`operationRef`, a `$defs` fragment, a 0.2.1 file
+    probe) have no top-level schema to dispatch on and are not contract
+    documents. Each alternative of a 0.2.1 `expect_one_of` is yielded.
     """
     for path in sorted((FIXTURES / "behaviour").glob("*.json")):
         for index, step in enumerate(json.loads(path.read_text())["steps"]):
-            document = step.get("expect", {}).get("document")
-            if isinstance(document, dict) and "schema" in document:
-                yield f"{path.stem}/step{index}", document
+            alternatives = step.get("expect_one_of", [step.get("expect", {})])
+            for choice, expect in enumerate(alternatives):
+                document = expect.get("document")
+                suffix = f"/alt{choice}" if "expect_one_of" in step else ""
+                if isinstance(document, dict) and "schema" in document:
+                    yield f"{path.stem}/step{index}{suffix}", document
