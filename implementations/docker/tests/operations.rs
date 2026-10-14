@@ -270,16 +270,23 @@ async fn cursor_after_retention_reports_the_exact_gap_then_drains() {
 #[tokio::test]
 async fn late_read_drains_bounded_pages_then_completes() {
     let dir = tempfile::tempdir().unwrap();
-    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let ops = ops(dir.path(), 1 << 20, 1 << 16).with_separate_channels();
     let op = ops
         .start(&workspace(), spec("k1", "seq 1 3000; echo done >&2", 60))
         .await
         .unwrap();
-    let data = drain(&ops, &op, 300).await;
-    let mut expected: Vec<String> = (1..=3000).map(|n| n.to_string()).collect();
-    expected.push("done".into());
-    let expected = expected.join("\n") + "\n";
-    assert_eq!(String::from_utf8(data).unwrap(), expected);
+    let data = String::from_utf8(drain(&ops, &op, 300).await).unwrap();
+    let stdout: String = (1..=3000).map(|n| format!("{n}\n")).collect();
+    // Each channel is whole and in order. The two pipes are read
+    // independently, so the combined stream may carry stderr's chunk at any
+    // point between stdout's: only its presence is asserted there.
+    let (out, err) = ops.channels(&op).unwrap();
+    assert_eq!(
+        (out.as_slice(), err.as_slice()),
+        (stdout.as_bytes(), &b"done\n"[..])
+    );
+    assert_eq!(data.len(), stdout.len() + 5);
+    assert_eq!(data.replacen("done\n", "", 1), stdout);
 }
 
 /// A descendant holds the output open past the leader's exit and writes

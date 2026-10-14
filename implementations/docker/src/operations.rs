@@ -229,10 +229,23 @@ fn error(
     OperationError::new(kind, message, operation.cloned())
 }
 
+/// Which of the exec client's pipes a chunk came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Channel {
+    Stdout = 0,
+    Stderr = 1,
+}
+
 /// What is known of one operation; guarded by its record's mutex.
 struct Progress {
     state: OperationState,
+    /// Both channels, each chunk in the order its reader received it. The
+    /// two pipes are read independently, so nothing orders one channel's
+    /// bytes against the other's.
     spool: OperationSpool,
+    /// Per-channel copies (stdout, stderr), each in its own order, kept only
+    /// when the provider was built `with_separate_channels`.
+    channels: Option<[Vec<u8>; 2]>,
     /// The trusted `(pid, start)` of the session leader, once printed.
     leader: Option<(String, String)>,
     /// Set once stdout's first line has been read or cannot come.
@@ -265,6 +278,15 @@ struct Operation {
     started_at: String,
     progress: Mutex<Progress>,
     changed: Notify,
+}
+
+impl Progress {
+    fn record(&mut self, chunk: &[u8], channel: Channel) {
+        self.spool.append(chunk);
+        if let Some(channels) = &mut self.channels {
+            channels[channel as usize].extend_from_slice(chunk);
+        }
+    }
 }
 
 impl Operation {
@@ -667,6 +689,7 @@ pub struct DockerOperations {
     max_page: NonZeroU64,
     sequence: AtomicU64,
     credentials: Option<Arc<dyn CredentialResolver>>,
+    separate_channels: bool,
     /// Held only for map access, never across an await.
     records: Mutex<HashMap<Key, Arc<Operation>>>,
     /// Per-key launch locks. One spans its key's launch, credential
@@ -689,6 +712,7 @@ impl DockerOperations {
             max_page: max_page_bytes,
             sequence: AtomicU64::new(0),
             credentials: None,
+            separate_channels: false,
             records: Mutex::new(HashMap::new()),
             launching: Mutex::new(HashMap::new()),
             finalizing: Mutex::new(HashMap::new()),
@@ -699,6 +723,28 @@ impl DockerOperations {
     pub fn with_credentials(mut self, resolver: Arc<dyn CredentialResolver>) -> Self {
         self.credentials = Some(resolver);
         self
+    }
+
+    /// Also keep each operation's stdout and stderr apart, for
+    /// [`DockerOperations::channels`]. Unbounded, unlike the observation
+    /// spool: for callers that consume whole outputs.
+    pub fn with_separate_channels(mut self) -> Self {
+        self.separate_channels = true;
+        self
+    }
+
+    /// The (stdout, stderr) bytes collected so far, each in its own order.
+    pub fn channels(&self, reference: &OperationRef) -> Result<(Vec<u8>, Vec<u8>), OperationError> {
+        let op = self.lookup(reference)?;
+        let p = op.lock();
+        let [stdout, stderr] = p.channels.clone().ok_or_else(|| {
+            error(
+                ErrorKind::UnknownOperation,
+                format!("{} kept no separate channels", reference.operation_id),
+                Some(reference),
+            )
+        })?;
+        Ok((stdout, stderr))
     }
 
     /// Each binding's target and resolved value. Values reach the client's
@@ -729,7 +775,7 @@ impl DockerOperations {
         Ok(secrets)
     }
 
-    async fn lookup(&self, reference: &OperationRef) -> Result<Arc<Operation>, OperationError> {
+    fn lookup(&self, reference: &OperationRef) -> Result<Arc<Operation>, OperationError> {
         let key = (
             reference.workspace.resource_id.to_string(),
             reference.operation_key.to_string(),
@@ -813,6 +859,7 @@ impl DockerOperations {
             progress: Mutex::new(Progress {
                 state: OperationState::Running,
                 spool: OperationSpool::new(self.retention),
+                channels: self.separate_channels.then(Default::default),
                 leader: None,
                 leader_known: false,
                 requested: None,
@@ -845,7 +892,7 @@ async fn collect(docker: Docker, op: Arc<Operation>, mut child: tokio::process::
     let stderr = child.stderr.take().expect("piped");
     let readers = tokio::spawn({
         let op = op.clone();
-        async move { tokio::join!(read_stdout(&op, stdout), pump(&op, stderr)) }
+        async move { read_output(&op, stdout, stderr).await }
     });
     let timeout = Duration::from_secs(op.spec.timeout_seconds.get());
     let code = match tokio::time::timeout(timeout, child.wait()).await {
@@ -906,12 +953,21 @@ async fn collect(docker: Docker, op: Arc<Operation>, mut child: tokio::process::
     docker.settle(&op, true).await;
 }
 
+/// Read both pipes to their ends, each independently and in its own order.
+async fn read_output(
+    op: &Operation,
+    stdout: impl AsyncRead + Unpin,
+    stderr: impl AsyncRead + Unpin,
+) {
+    tokio::join!(read_stdout(op, stdout), pump(op, stderr, Channel::Stderr));
+}
+
 async fn read_stdout(op: &Operation, stdout: impl AsyncRead + Unpin) {
     let mut reader = BufReader::new(stdout);
     let mut header = Vec::new();
     if let Err(e) = reader.read_until(b'\n', &mut header).await {
         op.update(|p| {
-            p.spool.append(&header);
+            p.record(&header, Channel::Stdout);
             p.leader_known = true;
             p.output_failures
                 .push(format!("stdout failed before the leader line: {e}"));
@@ -925,22 +981,22 @@ async fn read_stdout(op: &Operation, stdout: impl AsyncRead + Unpin) {
             p.leader = Some((fields[0].to_owned(), fields[1].to_owned()));
         } else {
             // Not the wrapper's line (it failed before exec); keep it.
-            p.spool.append(&header);
+            p.record(&header, Channel::Stdout);
         }
         p.leader_known = true;
     });
-    pump(op, reader).await;
+    pump(op, reader, Channel::Stdout).await;
 }
 
 /// Append `stream` to the spool until EOF. A read error is not EOF: reading
 /// stops there, nothing after it is collected, and the loss is reported as
 /// `output_failure` so a complete page is never mistaken for all the output.
-async fn pump(op: &Operation, mut stream: impl AsyncRead + Unpin) {
+async fn pump(op: &Operation, mut stream: impl AsyncRead + Unpin, channel: Channel) {
     let mut buffer = vec![0; 64 * 1024];
     loop {
         match stream.read(&mut buffer).await {
             Ok(0) => return,
-            Ok(n) => op.update(|p| p.spool.append(&buffer[..n])),
+            Ok(n) => op.update(|p| p.record(&buffer[..n], channel)),
             Err(e) => {
                 op.update(|p| {
                     let collected = p.spool.end();
@@ -1041,7 +1097,7 @@ impl SupportsOperations for DockerOperations {
     }
 
     async fn status(&self, operation: &OperationRef) -> Result<OperationStatus, OperationError> {
-        let op = self.lookup(operation).await?;
+        let op = self.lookup(operation)?;
         let unsettled = {
             let p = op.lock();
             p.client_finished && !p.state.is_terminal()
@@ -1061,7 +1117,7 @@ impl SupportsOperations for DockerOperations {
         operation: &OperationRef,
         request: ObserveRequest,
     ) -> Result<ObservationPage, OperationError> {
-        let op = self.lookup(operation).await?;
+        let op = self.lookup(operation)?;
         let cursor = request.cursor.as_deref();
         let limit = usize::try_from(self.max_page.get()).unwrap_or(usize::MAX);
         let max_bytes = if request.max_bytes == 0 {
@@ -1087,7 +1143,7 @@ impl SupportsOperations for DockerOperations {
         operation: &OperationRef,
         grace: Duration,
     ) -> Result<OperationStatus, OperationError> {
-        let op = self.lookup(operation).await?;
+        let op = self.lookup(operation)?;
         self.docker.cancel(&op, grace).await?;
         Ok(op.status())
     }
@@ -1200,6 +1256,7 @@ mod tests {
             progress: Mutex::new(Progress {
                 state: OperationState::Running,
                 spool: OperationSpool::new(NonZeroU64::new(1 << 20).unwrap()),
+                channels: Some(Default::default()),
                 leader: None,
                 leader_known: false,
                 requested: None,
@@ -1240,7 +1297,7 @@ mod tests {
     async fn a_stream_error_stops_collection_and_is_reported_not_taken_for_eof() {
         let op = operation();
         let stream = scripted(vec![Ok(b"before\n"), Err(broken()), Ok(b"after\n")]);
-        pump(&op, stream).await;
+        pump(&op, stream, Channel::Stdout).await;
         assert_eq!(collected(&op), b"before\n");
         let failure = output_failure(&op).expect("the stream error is reported");
         assert!(failure.contains("after 7 bytes: pipe broke"), "{failure}");
@@ -1250,7 +1307,7 @@ mod tests {
     #[tokio::test]
     async fn a_clean_eof_reports_no_output_failure() {
         let op = operation();
-        pump(&op, scripted(vec![Ok(b"all\n")])).await;
+        pump(&op, scripted(vec![Ok(b"all\n")]), Channel::Stdout).await;
         assert_eq!(collected(&op), b"all\n");
         assert_eq!(output_failure(&op), None);
     }
@@ -1268,6 +1325,107 @@ mod tests {
             failure.contains("before the leader line: pipe broke"),
             "{failure}"
         );
+    }
+
+    /// Which pipe the test lets the reader see first.
+    #[derive(Clone, Copy)]
+    enum First {
+        Stdout,
+        Stderr,
+    }
+
+    /// Drive `read_output` over real async pipes, forcing `first`'s bytes to
+    /// be read in full before the other pipe carries anything.
+    async fn read_scheduled(first: First, stdout: &[u8], stderr: &[u8]) -> Operation {
+        let op = Arc::new(operation());
+        let (mut out_w, out_r) = tokio::io::duplex(1 << 16);
+        let (mut err_w, err_r) = tokio::io::duplex(1 << 16);
+        let readers = tokio::spawn({
+            let op = op.clone();
+            async move { read_output(&op, out_r, err_r).await }
+        });
+        let mut writes: [(&mut tokio::io::DuplexStream, &[u8], Channel); 2] = [
+            (&mut out_w, stdout, Channel::Stdout),
+            (&mut err_w, stderr, Channel::Stderr),
+        ];
+        if let First::Stderr = first {
+            writes.swap(0, 1);
+        }
+        for (pipe, bytes, channel) in writes {
+            pipe.write_all(bytes).await.unwrap();
+            pipe.shutdown().await.unwrap();
+            // Wait until this pipe is read whole before the other carries
+            // anything; a trusted header is consumed, not recorded.
+            let header = bytes.iter().position(|b| *b == b'\n').map_or(0, |i| i + 1);
+            let read = |p: &Progress| {
+                let kept = p.channels.as_ref().unwrap()[channel as usize].len();
+                let consumed = match channel {
+                    Channel::Stdout if p.leader.is_some() => header,
+                    _ => 0,
+                };
+                kept + consumed == bytes.len()
+            };
+            assert!(op.wait_for(Duration::from_secs(5), read).await);
+        }
+        readers.await.unwrap();
+        Arc::try_unwrap(op).ok().unwrap()
+    }
+
+    fn channels(op: &Operation) -> (Vec<u8>, Vec<u8>) {
+        let [stdout, stderr] = op.lock().channels.clone().unwrap();
+        (stdout, stderr)
+    }
+
+    #[tokio::test]
+    async fn each_channel_keeps_its_own_order_under_either_reader_schedule() {
+        let header = b"4242 123456\n";
+        let stdout: Vec<u8> = [&header[..], b"out1\nout2\n"].concat();
+        for first in [First::Stdout, First::Stderr] {
+            let op = read_scheduled(first, &stdout, b"err1\nerr2\n").await;
+            assert_eq!(
+                op.lock().leader,
+                Some(("4242".to_owned(), "123456".to_owned()))
+            );
+            assert_eq!(
+                channels(&op),
+                (b"out1\nout2\n".to_vec(), b"err1\nerr2\n".to_vec())
+            );
+            // The combined stream is the order the readers received: which
+            // pipe came first is the schedule's, never assumed.
+            let expected: &[u8] = match first {
+                First::Stdout => b"out1\nout2\nerr1\nerr2\n",
+                First::Stderr => b"err1\nerr2\nout1\nout2\n",
+            };
+            assert_eq!(collected(&op), expected);
+            assert_eq!(output_failure(&op), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn stderr_before_the_header_is_never_taken_for_it() {
+        let op = read_scheduled(First::Stderr, b"7 8\n", b"1 2\n").await;
+        assert_eq!(op.lock().leader, Some(("7".to_owned(), "8".to_owned())));
+        assert_eq!(channels(&op), (Vec::new(), b"1 2\n".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn one_channel_alone_is_collected_whole() {
+        let op = read_scheduled(First::Stdout, b"7 8\nonly out\n", b"").await;
+        assert_eq!(channels(&op), (b"only out\n".to_vec(), Vec::new()));
+        let op = read_scheduled(First::Stderr, b"7 8\n", b"only err\n").await;
+        assert_eq!(channels(&op), (Vec::new(), b"only err\n".to_vec()));
+        assert_eq!(collected(&op), b"only err\n");
+    }
+
+    #[tokio::test]
+    async fn a_second_chunk_failure_on_one_channel_keeps_the_other_whole() {
+        let op = operation();
+        let stdout = scripted(vec![Ok(b"7 8\nfirst\n"), Err(broken()), Ok(b"lost\n")]);
+        let stderr = scripted(vec![Ok(b"e1\n"), Ok(b"e2\n")]);
+        read_output(&op, stdout, stderr).await;
+        assert_eq!(channels(&op), (b"first\n".to_vec(), b"e1\ne2\n".to_vec()));
+        let failure = output_failure(&op).expect("the stream error is reported");
+        assert!(failure.contains("pipe broke"), "{failure}");
     }
 
     fn table(rows: &[&str]) -> Table {
