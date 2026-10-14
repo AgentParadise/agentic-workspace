@@ -145,12 +145,12 @@ exactly the run's processes; `removing` is sticky), not a daemon.
 | Hazard | Fixture | Python Docker | Python Local | Rust Docker |
 |---|---|---|---|---|
 | LH-1 | `hazard-double-fork-orphan` | PASS | PASS, or XFAIL APSS#146 (fixture gap, below) | PASS |
-| LH-2 | `hazard-interrupted-cancel` | PASS | FAIL | FAIL (unattributed) |
-| LH-3 | `hazard-cancel-before-launch-header` | FAIL | PASS (condition N/A) | FAIL |
-| LH-4 | `hazard-destroy-during-start` | FAIL | FAIL | FAIL |
-| LH-5 | `hazard-stuck-removal-timeout-settles` | PASS | PASS (condition N/A) | FAIL |
-| LH-6 | `hazard-drain-with-gap-reports-loss` | FAIL | FAIL | FAIL |
-| LH-7 | `hazard-fifo-in-workspace` | FAIL (real daemon) | FAIL | FAIL |
+| LH-2 | `hazard-interrupted-cancel` | PASS | PASS | FAIL (unattributed) |
+| LH-3 | `hazard-cancel-before-launch-header` | FAIL | NOT RUN | FAIL |
+| LH-4 | `hazard-destroy-during-start` | FAIL | PASS | FAIL |
+| LH-5 | `hazard-stuck-removal-timeout-settles` | PASS | NOT RUN | FAIL |
+| LH-6 | `hazard-drain-with-gap-reports-loss` | PASS | PASS | FAIL |
+| LH-7 | `hazard-fifo-in-workspace` | FAIL (real daemon) | PASS | FAIL |
 
 Python LH-4 drives each provider's public `destroy` (for Docker, only the
 container boundary `_measure_usage`/`_stop`/`_remove` is a logged stand-in),
@@ -176,11 +176,13 @@ Findings (each left to a follow-up):
 
 - Docker LH-3: `cancel` waits `_LEADER_SECONDS` (30 s) for the launch header
   before stopping the container, so it cannot settle within the 30 s bound.
-- Docker and Local LH-4: a `start` blocked in credential resolution, raced by
+- Docker LH-4: a `start` blocked in credential resolution, raced by
   the public `destroy`, still returns a ref (step 0 matched neither
   `resource_lost` nor `cancelled`).
-- Docker and Local LH-6, and Rust Docker LH-6: the gap is reported correctly
-  (`lost_bytes: 8`), but no page carries the 0.2.1 `loss_detected` marker.
+- Rust Docker LH-6: the gap is reported correctly (`lost_bytes: 8`), but no
+  page carries the 0.2.1 `loss_detected` marker. (Python Docker and Local
+  share `OperationSpool`, which carries a crossed gap in its cursors, so
+  every page from the gap on carries `loss_detected`.)
 - Rust Docker LH-3: `cancel` before the launch header returns
   `provider_unavailable` after about 9 s, and the late workload is then
   measured alive; neither allowed outcome.
@@ -195,9 +197,6 @@ Findings (each left to a follow-up):
 - Rust Docker LH-7: `collect` opens the writer-less FIFO and blocks; the
   `file_exists` step does not settle within 10 s. The harness frees the
   blocked open by opening the FIFO's write end on teardown.
-- Local LH-2: after the caller abandons `cancel`, the retried `cancel`
-  settles `failed`, neither a confirmed `cancelled` nor the unconfirmed
-  `timeout` outcome.
 - Rust Docker LH-2: the retried `cancel` returns `provider_unavailable`
   after 7 s with the TERM-ignoring workload still measured alive. Not yet
   attributed: it may be the stand-in's `stop` rather than the provider.
@@ -225,15 +224,12 @@ Findings (each left to a follow-up):
   `test_provider_meets_lifecycle_hazard[local-LH-1]` stays unmarked, because
   the adoption does not reproduce on every host; there the same classifier
   turns only that outcome into a runtime xfail. Remove all of it at 0.2.2.
-- Local LH-7: `read_file` opens a writer-less FIFO on the event loop and
-  blocks; the harness's watchdog thread has to open the write end to free it.
-
-Condition N/A: Local learns its leader at spawn, so LH-3's
-`launch_header_not_seen` cannot arise and the step runs as an immediate
-cancel; Local has no backend, so LH-5's `backend_stuck_removing` cannot arise
-and only `timeout_elapsed` is imposed.
-
 NOT RUN, and why (each ends its run as `NotRun`, never a pass):
+
+- Python Local LH-3 and LH-5 (#68): their `given` cannot be set up. Local
+  learns its leader at spawn, so LH-3's `launch_header_not_seen` cannot
+  arise; Local has no backend, so LH-5's `backend_stuck_removing` cannot
+  arise. Run without it, each passed vacuously.
 
 - Python Docker LH-7 through the stand-in: the probes read the host workspace
   mount, which a stand-in container lacks.

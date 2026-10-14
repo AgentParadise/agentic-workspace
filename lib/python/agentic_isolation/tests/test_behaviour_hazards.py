@@ -439,7 +439,8 @@ class Outcome:
 
 
 def _failure(error: OperationFailure) -> Outcome:
-    return Outcome(kind=error.error.kind, has_ref=getattr(error.error, "ref", None) is not None)
+    # An absent ref is the MISSING sentinel, not None.
+    return Outcome(kind=error.error.kind, has_ref=isinstance(error.error.ref, OperationRef))
 
 
 def _matches(alternative: dict[str, Any], outcome: Outcome, alive: bool) -> bool:
@@ -675,13 +676,6 @@ FINDINGS: dict[tuple[str, str], str] = {
     "so it cannot settle within the 30s bound",
     ("docker", "LH-4"): "a start blocked in credential resolution launches after destroy began; "
     "the later start is unknown_operation, not resource_lost",
-    ("docker", "LH-6"): "the completing page of a lossy drain carries no loss_detected (0.2.1)",
-    ("local", "LH-2"): "after an abandoned cancel, the retried cancel settles failed, "
-    "neither confirmed cancelled nor the unconfirmed timeout outcome",
-    ("local", "LH-4"): "a start blocked in credential resolution launches after destroy began; "
-    "the later start is unknown_operation, not resource_lost",
-    ("local", "LH-6"): "the completing page of a lossy drain carries no loss_detected (0.2.1)",
-    ("local", "LH-7"): "read_file opens a FIFO on the event loop and blocks until a writer appears",
 }
 # Fixture limitations: (provider, hazard) -> the one mismatch the 0.2.1 fixture
 # wrongly rejects. Only that mismatch is expected; any other verdict fails.
@@ -726,6 +720,11 @@ async def _run_classified(subject: Subject, hazard: str) -> None:
 NOT_RUN: dict[tuple[str, str], str] = {
     ("docker", "LH-7"): "the probes read the host workspace mount, which a stand-in container "
     "does not have; run against a real daemon by test_docker_daemon_meets_lh7_fifo",
+    # AgentParadise/agentic-workspace#68: these passed with `given` never set up.
+    ("local", "LH-3"): "launch_header_not_seen cannot be set up: Local learns its leader at "
+    "spawn and has no launch-header phase",
+    ("local", "LH-5"): "backend_stuck_removing cannot be set up: Local has no backend to be "
+    "stuck removing",
 }
 
 
