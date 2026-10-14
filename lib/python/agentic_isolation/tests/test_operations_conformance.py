@@ -164,7 +164,10 @@ async def test_a_start_returns_promptly_while_running(make: Factory) -> None:
         ref = await ops.start(workspace, _spec("sleep 30"))
         assert time.monotonic() - began < 2
         assert (await ops.status(ref)).state == "running"
-        assert (await ops.cancel(ref, grace_seconds=0.5)).state == "cancelled"
+        status = await ops.cancel(ref, grace_seconds=0.5)
+        # A host process adopted by a reaper meanwhile fails Local closed
+        # (the APSS#146 gap); the metadata names it when that happens.
+        assert status.state == "cancelled", status.metadata
 
 
 async def test_b_concurrent_same_key_starts_launch_once(make: Factory) -> None:
