@@ -1196,9 +1196,16 @@ async def test_a_finding_that_misses_elsewhere_fails(miss: FixtureMismatch) -> N
     async def fails() -> None:
         raise miss
 
-    with pytest.raises(FixtureMismatch) as caught:
+    # An xfail escaping here would report this test as expected-failed, not
+    # failed, so taking the miss for the finding is turned into a failure.
+    try:
         await _expect_finding(fails(), FINDINGS["docker", "LH-3"])
-    assert caught.value is miss
+    except pytest.xfail.Exception:
+        pytest.fail(f"a miss at step {miss.step} {miss.call} was taken for the pinned finding")
+    except FixtureMismatch as caught:
+        assert caught is miss
+    else:
+        pytest.fail("the miss produced no verdict")
 
 
 async def test_a_finding_xfails_only_on_its_pinned_miss() -> None:

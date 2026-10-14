@@ -105,11 +105,13 @@ exec)
 stop)
     [ -e '{fail}' ] && exit 1
     [ -e '{dir}/stop-lies' ] && exit 0
+    # Stopped before the KILLs: an exec they wake must already be refused.
+    [ -e '{dir}/stop-keeps-running' ] || : > '{dir}/stopped'
     for e in /proc/[0-9]*/environ; do
         tr '\0' '\n' < "$e" 2>/dev/null | grep -qx 'AW_STANDIN={dir}' || continue
         p=${{e#/proc/}}; kill -KILL "${{p%/environ}}" 2>/dev/null
     done
-    [ -e '{dir}/stop-keeps-running' ] || : > '{dir}/stopped'; exit 0 ;;
+    exit 0 ;;
 container)
     [ -e '{down}' ] && {{ echo 'Cannot connect to the Docker daemon' >&2; exit 1; }}
     [ -e '{gone}' ] && {{ echo 'Error: No such container: c1' >&2; exit 1; }}
