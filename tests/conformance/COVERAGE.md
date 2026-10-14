@@ -25,12 +25,39 @@ no Python test claims the row yet.
 | APS-V1-0004 transcript envelope | W-3.7-a, W-3.7-b | MUST | PENDING | PENDING | PENDING | PENDING |
 | Filesystem, process, network isolation | W-3.2-f, W-6.3-a | MUST for isolated | N/A | PASS | PENDING | PENDING |
 | Credential and resource enforcement | W-3.8-c, W-3.8-d, W-6.3-a | MUST for isolated | N/A | PARTIAL | PARTIAL | PENDING |
-| Operation start, idempotency and conflict | W-5-b3 | MUST | PENDING | PENDING | PASS | PASS |
-| Operation status from a trusted channel | W-5-b5 | MUST | PENDING | PENDING | PASS | PASS |
-| Operation observation pages, gaps and cursors | W-5-b6 | MUST | PENDING | PENDING | PASS | PASS |
-| Operation cancellation of the process tree | W-5-b4, W-4-a | MUST | PENDING | PENDING | PARTIAL | PARTIAL |
+| Operation start, idempotency and conflict | W-5-b3 | MUST | PENDING | PASS | PASS | PASS |
+| Operation status from a trusted channel | W-5-b5 | MUST | PENDING | PASS | PASS | PASS |
+| Operation observation pages, gaps and cursors | W-5-b6 | MUST | PENDING | PASS | PASS | PASS |
+| Operation cancellation of the process tree | W-5-b4, W-4-a | MUST | PENDING | PARTIAL | PARTIAL | PARTIAL |
 
 No implementation claims full conformance while a MUST row is pending.
+
+## Rust evidence
+
+Rust Docker operation rows are claimed by
+`agentic_workspace_docker::operations::DockerOperations`, the
+`SupportsOperations` implementation, through these tests in
+`implementations/docker/`. `tests/operations.rs` drives it through a stand-in
+`docker` whose `exec` runs as host processes (run by `rust-test`);
+`tests/conformance.rs` runs it against a real container (run by
+`docker-conformance`). The APSS 0.2.0 valid, invalid and behaviour documents
+are checked against the Rust models by
+`crates/workspace-conformance/tests/apss_fixtures.rs`.
+
+| Row | Test ids |
+|---|---|
+| Operation start, idempotency and conflict | `tests/operations.rs::start_same_key_one_launch_under_50_concurrent_tasks`, `::same_key_different_spec_is_conflict_and_launches_nothing`, `::unknown_ref_is_a_typed_unknown_operation`, `::credential_bindings_are_refused_until_a_resolver_exists` |
+| Operation status from a trusted channel | `tests/operations.rs::timeout_settles_as_timed_out_with_the_final_output`, `::cancel_kills_leader_grandchild_and_term_trapper_and_is_idempotent`; `src/operations.rs::tests::signalled_exits_are_named` |
+| Operation observation pages, gaps and cursors | `tests/operations.rs::cursor_after_retention_reports_the_exact_gap_then_drains`, `::late_read_drains_bounded_pages_then_completes`; core `operations::spool::tests::*` |
+| Operation cancellation of the process tree | `tests/operations.rs::cancel_kills_leader_grandchild_and_term_trapper_and_is_idempotent`, `::finalize_ends_running_operations_and_forgets_them`; `src/operations.rs::tests::*` (process table, escapees, reused leaders, init and own-group refusal); `tests/conformance.rs::operations_cancel_the_whole_tree_in_a_real_container` |
+
+Rust Docker cancellation is PARTIAL until
+`operations_cancel_the_whole_tree_in_a_real_container` has passed in CI with
+Docker present, and because the finalize-on-cancel half of W-4-a belongs to
+PR 6. Credential bindings are refused with `unsupported_capability` (no
+credential resolver is wired into the Rust provider yet), so the Rust Docker
+descriptor does not publish `credential_env`. Rust Local has no
+`SupportsOperations` yet; its rows stay PENDING.
 
 ## Python evidence
 
