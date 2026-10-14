@@ -227,3 +227,32 @@ async def test_local_final_output_never_carries_the_canary(tmp_path: Path) -> No
         _assert_clean(bytes(spool._retained))
     finally:
         await provider.destroy(workspace)
+
+
+class _OldProvider:
+    """A provider whose `start` predates the `redact` option."""
+
+    def __init__(self, inner: WorkspaceLocalProvider) -> None:
+        self._inner = inner
+
+    async def start(self, workspace, spec):  # type: ignore[no-untyped-def]
+        return await self._inner.start(workspace, spec)
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._inner, name)
+
+
+async def test_an_unchanged_caller_still_runs_on_a_provider_without_redact(
+    tmp_path: Path,
+) -> None:
+    provider = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
+    workspace = await provider.create(WorkspaceConfig())
+    try:
+        status, data = await asyncio.wait_for(
+            run_to_completion(_OldProvider(provider), workspace, _spec("printf 'plain\\n'")),  # type: ignore[arg-type]
+            30,
+        )
+        assert status.state == "succeeded"
+        assert data == b"plain\n"
+    finally:
+        await provider.destroy(workspace)

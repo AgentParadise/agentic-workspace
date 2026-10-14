@@ -521,9 +521,17 @@ async def run_to_completion(
     The bytes are the operation's observation stream: everything the workload
     wrote to stdout and stderr, in arrival order, with no channel identity,
     and with every `redact` value replaced (see `SupportsOperations.start`).
-    Callers that must parse stdout alone use `WorkspaceProvider.execute`.
+    A redacting spool may release a held tail after later bytes from the
+    other channel. Callers that must parse stdout alone use
+    `WorkspaceProvider.execute`. With no `redact` values the provider is
+    called exactly as before the option existed, so a provider whose `start`
+    predates it keeps working.
     """
-    return await drain_operation(provider, await provider.start(workspace, spec, redact=redact))
+    if redact:
+        ref = await provider.start(workspace, spec, redact=redact)
+    else:
+        ref = await provider.start(workspace, spec)
+    return await drain_operation(provider, ref)
 
 
 async def drain_operation(
