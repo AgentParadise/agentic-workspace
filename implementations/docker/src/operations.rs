@@ -37,6 +37,9 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 /// How long output may keep arriving after the exec client exits: a
 /// descendant holding the pipe (or a TERM handler's last words).
 const FINAL_OUTPUT: Duration = Duration::from_secs(2);
+/// How long the exec client may outlive a timed-out operation's termination
+/// before it is detached, so a failed stop still settles.
+const CLIENT_EXIT: Duration = Duration::from_secs(10);
 /// The grace a timed-out operation gets between TERM and KILL.
 const TIMEOUT_GRACE: Duration = Duration::from_secs(1);
 
@@ -565,7 +568,21 @@ async fn collect(docker: Docker, op: Arc<Operation>, mut child: tokio::process::
                     op.update(|p| p.failures.push(e.message.to_string()));
                 }
             }
-            child.wait().await.ok().and_then(|s| s.code())
+            match tokio::time::timeout(CLIENT_EXIT, child.wait()).await {
+                Ok(status) => status.ok().and_then(|s| s.code()),
+                Err(_) => {
+                    // The workload outlived the stop. Detach from it, and say so.
+                    let _ = child.kill().await;
+                    op.update(|p| {
+                        p.failures.push(format!(
+                            "exec client still attached {}s after the timeout's termination; \
+                             detached, the workload may still be running",
+                            CLIENT_EXIT.as_secs()
+                        ))
+                    });
+                    None
+                }
+            }
         }
     };
     if tokio::time::timeout(FINAL_OUTPUT, readers).await.is_err() {
