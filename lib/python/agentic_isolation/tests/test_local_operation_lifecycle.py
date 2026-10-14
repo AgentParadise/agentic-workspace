@@ -82,16 +82,17 @@ async def test_destroy_drains_a_start_held_in_credential_resolution(tmp_path: Pa
         # Teardown has begun: a start of a new key is refused, not admitted.
         with pytest.raises(OperationFailure) as refused:
             await asyncio.wait_for(provider.start(workspace, _spec("true", key="k2")), 5)
-        assert refused.value.error.kind == "unknown_operation"
+        assert refused.value.error.kind == "resource_lost"
         resolver.release.set()
-        ref = await asyncio.wait_for(held, 5)
+        # The held start re-checks admission once its credential resolves and
+        # launches nothing (APSS 0.2.1 LH-4).
+        with pytest.raises(OperationFailure) as lost:
+            await asyncio.wait_for(held, 5)
+        assert lost.value.error.kind == "resource_lost"
         await asyncio.wait_for(destroy, 10)
         assert not workspace.path.exists()
         assert not provider._operations._operations
         assert not provider._operations._by_key
-        # The launched workload was cancelled before the directory went.
-        with pytest.raises(OperationFailure):
-            await provider.status(ref)
         # Closure survives destruction.
         with pytest.raises(OperationFailure):
             await asyncio.wait_for(provider.start(workspace, _spec("true", key="k3")), 5)
@@ -105,7 +106,7 @@ async def test_destroy_drains_a_start_held_in_credential_resolution(tmp_path: Pa
                     await task
 
 
-async def test_destroy_cancels_the_drained_start_workload(tmp_path: Path) -> None:
+async def test_a_start_drained_by_destroy_launches_nothing(tmp_path: Path) -> None:
     resolver = _HeldResolver()
     provider = WorkspaceLocalProvider(base_dir=tmp_path, credentials=resolver, allow_insecure=True)
     workspace = await provider.create(WorkspaceConfig())
@@ -119,14 +120,8 @@ async def test_destroy_cancels_the_drained_start_workload(tmp_path: Path) -> Non
     destroy = asyncio.create_task(provider.destroy(workspace))
     await asyncio.sleep(0.1)
     resolver.release.set()
-    ref = await asyncio.wait_for(held, 5)
-    operation = provider._operations._operations.get(ref.operation_id)
-    process = operation.process if operation is not None else None
-    try:
-        await asyncio.wait_for(destroy, 10)
-        assert process is not None
-        assert process.returncode is not None, "the drained start's workload survived destroy"
-    finally:
-        if process is not None and process.returncode is None:
-            process.kill()
-            await asyncio.wait_for(process.wait(), 5)
+    with pytest.raises(OperationFailure) as lost:
+        await asyncio.wait_for(held, 5)
+    assert lost.value.error.kind == "resource_lost"
+    await asyncio.wait_for(destroy, 10)
+    assert not provider._operations._operations

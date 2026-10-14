@@ -6,7 +6,8 @@ regrow what was observed. Only the provider's collector appends, and the only
 loss is the spool's own retention eviction, which it counts exactly. That is
 why a provider backed by this spool declares `integrity: exact`.
 
-A cursor is `<generation>:<offset>`. The generation is fresh per spool, so a
+A cursor is `<generation>:<offset>`, suffixed `:lossy` once the drain that
+holds it has crossed a retention gap. The generation is fresh per spool, so a
 cursor from another operation is recognised as foreign rather than read as an
 offset into the wrong stream. Consumers treat cursors as opaque.
 """
@@ -40,6 +41,8 @@ class OperationFailure(Exception):
 class _Position:
     generation: str
     offset: int
+    # A drain that reached this cursor lost bytes to retention on the way.
+    lossy: bool = False
 
 
 class OperationSpool:
@@ -81,18 +84,22 @@ class OperationSpool:
         not issue. A cursor older than retention resumes at the oldest retained
         byte and reports the evicted count as `gap.lost_bytes`. The page is
         `complete` only when `state` is terminal and nothing remains to read.
+        Once a drain has crossed a gap, its page and every later page carry
+        `loss_detected`: the loss travels in the cursors it was handed.
         """
-        start = self._resolve(ref, cursor)
+        position = self._resolve(ref, cursor)
+        start = position.offset
         gap: ObservationGap | None = None
         if start < self._base:
             gap = ObservationGap(lost_bytes=self._base - start)
             start = self._base
+        lossy = position.lossy or gap is not None
         available = self.end - start
         # Start from the largest payload whose base64 could fit, then shrink
         # until the whole serialised envelope does.
         size = min(available, (max_page_bytes * 3) // 4)
         while True:
-            page = self._build(ref, state, cursor, start, size, gap)
+            page = self._build(ref, state, cursor, start, size, gap, lossy)
             if len(page.model_dump_json().encode()) <= max_page_bytes:
                 return page
             if size == 0:
@@ -116,6 +123,7 @@ class OperationSpool:
         start: int,
         size: int,
         gap: ObservationGap | None,
+        lossy: bool,
     ) -> ObservationPage:
         lo = start - self._base
         data = bytes(self._retained[lo : lo + size])
@@ -124,19 +132,20 @@ class OperationSpool:
             schema="apss.workspace-observation/v1",
             ref=ref,
             state=state,
-            cursor=cursor or self._encode(0),
-            next_cursor=self._encode(next_offset),
+            cursor=cursor or self._encode(0, lossy=False),
+            next_cursor=self._encode(next_offset, lossy=lossy),
             data_b64=base64.b64encode(data).decode("ascii"),
             gap=MISSING if gap is None else gap,
+            loss_detected=True if lossy else MISSING,
             complete=state in TERMINAL_STATES and next_offset == self.end,
         )
 
-    def _encode(self, offset: int) -> str:
-        return f"{self._generation}:{offset}"
+    def _encode(self, offset: int, *, lossy: bool) -> str:
+        return f"{self._generation}:{offset}" + (_LOSSY if lossy else "")
 
-    def _resolve(self, ref: OperationRef, cursor: str | None) -> int:
+    def _resolve(self, ref: OperationRef, cursor: str | None) -> _Position:
         if cursor is None:
-            return 0
+            return _Position(generation=self._generation, offset=0)
         position = _parse(cursor)
         if position is None or position.generation != self._generation:
             raise OperationFailure(
@@ -154,11 +163,15 @@ class OperationSpool:
                     ref=ref,
                 )
             )
-        return position.offset
+        return position
+
+
+_LOSSY = ":lossy"
 
 
 def _parse(cursor: str) -> _Position | None:
-    generation, sep, offset = cursor.rpartition(":")
+    lossy = cursor.endswith(_LOSSY)
+    generation, sep, offset = cursor.removesuffix(_LOSSY).rpartition(":")
     if not sep or not generation or not offset.isdigit():
         return None
-    return _Position(generation=generation, offset=int(offset))
+    return _Position(generation=generation, offset=int(offset), lossy=lossy)

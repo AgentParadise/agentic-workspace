@@ -1,0 +1,193 @@
+{
+  "description": "The workload leaves a FIFO with no writer at outputs/pipe. Probing it settles with a non-regular result or a typed refusal, reading it settles with a typed error and no data, and finalize settles completed (non-regular file skipped) or retained with a typed error.",
+  "hazard": "LH-7",
+  "steps": [
+    {
+      "call": "start",
+      "args": {
+        "spec": {
+          "schema": "apss.workspace-operation/v1",
+          "execution_id": "exec-42",
+          "operation_key": "exec-42:phase-1:fence-9:agent",
+          "argv": [
+            "agent",
+            "--print",
+            "--output-format",
+            "stream-json"
+          ],
+          "working_directory": "repo",
+          "environment": {
+            "LANG": "C.UTF-8"
+          },
+          "credential_bindings": [
+            {
+              "ref": {
+                "name": "github-app",
+                "scope": "repo:acme/widgets"
+              },
+              "delivery": "env",
+              "target": "GH_TOKEN"
+            }
+          ],
+          "launch_marker": {
+            "argv0": "agent-launch",
+            "line": "APSS-LAUNCH 6f1e9c"
+          },
+          "timeout_seconds": 3600,
+          "metadata": {
+            "phase_id": "phase-1"
+          }
+        }
+      },
+      "expect": {
+        "schema": "workspace-operation.schema.json#/$defs/operationRef",
+        "document": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "status",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        }
+      },
+      "expect": {
+        "schema": "workspace-status.schema.json",
+        "document": {
+          "schema": "apss.workspace-status/v1",
+          "ref": {
+            "workspace": {
+              "provider": "docker",
+              "resource_id": "ws-7f3a"
+            },
+            "operation_id": "op-0001",
+            "operation_key": "exec-42:phase-1:fence-9:agent"
+          },
+          "state": "succeeded",
+          "execution_id": "exec-42",
+          "metadata": {},
+          "exit_code": 0
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "file_exists",
+      "args": {
+        "workspace": {
+          "provider": "docker",
+          "resource_id": "ws-7f3a"
+        },
+        "path": "outputs/pipe"
+      },
+      "given": [
+        "fifo_in_workspace"
+      ],
+      "settles_within_seconds": 10,
+      "expect_one_of": [
+        {
+          "schema": "fixtures/file-probe.schema.json",
+          "document": {
+            "path": "outputs/pipe",
+            "exists": true,
+            "regular_file": false
+          }
+        },
+        {
+          "schema": "workspace-status.schema.json",
+          "document": {
+            "schema": "apss.workspace-status/v1",
+            "kind": "rejected_policy",
+            "message": "outputs/pipe is not a regular file"
+          }
+        }
+      ],
+      "launches": 1
+    },
+    {
+      "call": "read_file",
+      "args": {
+        "workspace": {
+          "provider": "docker",
+          "resource_id": "ws-7f3a"
+        },
+        "path": "outputs/pipe"
+      },
+      "given": [
+        "fifo_in_workspace"
+      ],
+      "settles_within_seconds": 10,
+      "expect_one_of": [
+        {
+          "schema": "workspace-status.schema.json",
+          "document": {
+            "schema": "apss.workspace-status/v1",
+            "kind": "rejected_policy",
+            "message": "outputs/pipe is not a regular file"
+          }
+        },
+        {
+          "schema": "workspace-status.schema.json",
+          "document": {
+            "schema": "apss.workspace-status/v1",
+            "kind": "internal",
+            "message": "refusing to open non-regular file outputs/pipe"
+          }
+        }
+      ],
+      "launches": 1
+    },
+    {
+      "call": "finalize",
+      "args": {
+        "workspace": {
+          "provider": "docker",
+          "resource_id": "ws-7f3a"
+        }
+      },
+      "given": [
+        "fifo_in_workspace"
+      ],
+      "settles_within_seconds": 30,
+      "expect_one_of": [
+        {
+          "schema": "workspace-finalization.schema.json",
+          "document": {
+            "schema": "apss.workspace-finalization/v1",
+            "state": "completed"
+          }
+        },
+        {
+          "schema": "workspace-finalization.schema.json",
+          "document": {
+            "schema": "apss.workspace-finalization/v1",
+            "state": "retained",
+            "stage": "before_delete",
+            "error": {
+              "kind": "internal",
+              "message": "outputs/pipe is not a regular file"
+            },
+            "retained": {
+              "provider": "docker",
+              "resource_id": "ws-7f3a"
+            }
+          }
+        }
+      ],
+      "launches": 1
+    }
+  ]
+}

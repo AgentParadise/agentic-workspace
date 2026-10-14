@@ -46,10 +46,10 @@ VALID = _ids(valid_fixtures())
 INVALID = _ids(invalid_fixtures())
 
 
-def test_fixture_inventory_matches_apss_0_2_0() -> None:
+def test_fixture_inventory_matches_apss_0_2_1() -> None:
     # Guards against an empty or partial vendor silently passing the
     # parametrised tests below.
-    assert len(VALID) == 26
+    assert len(VALID) == 27
     assert len(INVALID) == 33
     assert {path.parent.name for path in VALID} == {
         path.name.removesuffix(".schema.json")
@@ -85,14 +85,16 @@ def test_model_serializes_back_to_the_fixture(path: Path) -> None:
 BEHAVIOUR = list(behaviour_documents())
 
 
-def test_behaviour_inventory_matches_apss_0_2_0() -> None:
-    # 14 schema-tagged expectations across the 7 behaviour fixtures; an empty
-    # walk would otherwise pass the parametrised test below vacuously.
-    assert len(BEHAVIOUR) == 14
+def test_behaviour_inventory_matches_apss_0_2_1() -> None:
+    # 46 schema-tagged expectations (each expect_one_of alternative counted)
+    # across the 14 behaviour fixtures; an empty walk would otherwise pass the
+    # parametrised test below vacuously.
+    assert len(BEHAVIOUR) == 46
     assert {document["schema"] for _, document in BEHAVIOUR if isinstance(document, dict)} == {
         "apss.workspace-status/v1",
         "apss.workspace-observation/v1",
         "apss.workspace-result/v1",
+        "apss.workspace-finalization/v1",
     }
 
 
