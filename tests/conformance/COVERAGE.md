@@ -213,12 +213,18 @@ Findings (each left to a follow-up):
   measured false. That is correct provider behaviour; the 0.2.1 fixture's
   accepted set lacks the explicit unconfirmed outcome, which
   AgentParadise/agent-paradise-standards-system#146 adds for APSS 0.2.2.
-  Until then `FIXTURE_GAPS` excuses exactly that outcome (hazard LH-1, step 1,
-  `failed`, that note, no live descendant) as `UnconfirmedOrphanCancel` and
-  `pytest.xfail`; every other mismatch fails, which
-  `test_any_other_local_lh1_mismatch_still_fails` pins. It is a runtime
-  xfail rather than `xfail(strict=True)` because the adoption does not
-  reproduce on every host, so a pass must stay a pass. Remove it at 0.2.2.
+  Until then `FIXTURE_GAPS` classifies exactly that outcome (hazard LH-1,
+  step 1, `failed`, that note, no live descendant) as
+  `UnconfirmedOrphanCancel`; every other mismatch fails, which
+  `test_any_other_local_lh1_mismatch_still_fails` pins.
+  `test_local_lh1_unconfirmed_orphan_is_the_apss146_gap` makes the condition
+  deterministic (an unrelated orphan is adopted by a reaper just before
+  cancel) and is `xfail(strict=True, raises=UnconfirmedOrphanCancel)`: any
+  other miss fails it, and a pass is an XPASS(strict) failure, which is how
+  APSS 0.2.2 will announce itself. The matrix case
+  `test_provider_meets_lifecycle_hazard[local-LH-1]` stays unmarked, because
+  the adoption does not reproduce on every host; there the same classifier
+  turns only that outcome into a runtime xfail. Remove all of it at 0.2.2.
 - Local LH-7: `read_file` opens a writer-less FIFO on the event loop and
   blocks; the harness's watchdog thread has to open the write end to free it.
 

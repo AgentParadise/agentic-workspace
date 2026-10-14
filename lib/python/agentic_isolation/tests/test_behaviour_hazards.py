@@ -40,11 +40,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import faulthandler
 import json
 import os
 import signal
 import stat
+import subprocess
 import threading
 import time
 import uuid
@@ -742,7 +744,8 @@ async def test_provider_meets_lifecycle_hazard(
     if (subject.name, hazard) in FIXTURE_GAPS:
         # Not a mark: the adoption that triggers it is host-dependent, so a
         # pass is a pass. Only UnconfirmedOrphanCancel is excused; any other
-        # mismatch propagates and fails.
+        # mismatch propagates and fails. The strict expected failure is
+        # test_local_lh1_unconfirmed_orphan_is_the_apss146_gap.
         try:
             await _run_classified(subject, hazard)
         except UnconfirmedOrphanCancel as gap:
@@ -834,6 +837,49 @@ async def test_any_other_local_lh1_mismatch_still_fails(
     with pytest.raises(FixtureMismatch) as caught:
         await _run_classified(local, "LH-1")
     assert caught.value is miss and not isinstance(caught.value, UnconfirmedOrphanCancel)
+
+
+def _unrelated_orphan() -> int:
+    """A live process adopted by a reaper, unrelated to any operation: its
+    parent `sh` exits at once, and it carries neither a token nor a pipe."""
+    parent = subprocess.run(
+        ["sh", "-c", "sleep 120 >/dev/null 2>&1 & echo $!"],
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return int(parent.stdout)
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+@pytest.mark.xfail(
+    raises=UnconfirmedOrphanCancel,
+    strict=True,
+    reason="APSS#146 (AgentParadise/agent-paradise-standards-system#146): "
+    + FIXTURE_GAPS["local", "LH-1"],
+)
+async def test_local_lh1_unconfirmed_orphan_is_the_apss146_gap(subject: Subject) -> None:
+    """The host condition CI hit, made deterministic: an unrelated orphan adopted
+    after the operation began is alive when LH-1 cancels. Local fails closed,
+    which 0.2.1 rejects. Strict: a pass, or any other miss, fails this test;
+    at APSS 0.2.2 it XPASSes, and the mark and FIXTURE_GAPS go."""
+    original = LocalOperations._signal_and_confirm
+    orphans: list[int] = []
+
+    async def with_orphan(self: LocalOperations, operation: Any, *, grace_seconds: float) -> None:
+        orphans.append(_unrelated_orphan())
+        await original(self, operation, grace_seconds=grace_seconds)
+
+    subject.monkeypatch.setattr(LocalOperations, "_signal_and_confirm", with_orphan)
+    try:
+        await _run_classified(subject, "LH-1")
+    finally:
+        for pid in orphans:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+    assert orphans, "LH-1 never cancelled, so no orphan was introduced"
 
 
 async def _kill_leader_and_claim_confirmed_local(
