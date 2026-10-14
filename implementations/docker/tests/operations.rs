@@ -3,6 +3,10 @@
 //! the command here. That exercises the real wrapper, `setsid`, `/proc` and
 //! signal scripts; what it cannot prove (namespaces, `docker stop`) is in the
 //! docker-backed `conformance` test.
+//!
+//! The stand-in needs `setsid` and `/proc`, so the suite is Linux only; the
+//! Linux `rust-test` job runs it.
+#![cfg(target_os = "linux")]
 
 use agentic_workspace_core::operations::{
     ErrorKind, ObserveRequest, OperationRef, OperationSpec, OperationState, SupportsOperations,
