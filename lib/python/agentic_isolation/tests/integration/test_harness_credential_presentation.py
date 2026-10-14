@@ -8,26 +8,31 @@ the presenter's `wire_credential`, take `sha256(wire)` (what the broker
 stores), then `present(wire, base_url)`. Only the presentation crosses into
 a `--network none` container running the pinned image. There
 `harness_credential_probe.py` serves a fake upstream on loopback, runs the
-real CLI, and reports every request, the child env and every file in the
-child's writable locations (read in full, symlinks followed). This side then
-asserts:
+real CLI, and reports every request and the child env. The host side
+(`harness_credential_scan.py`) samples every process command line while it
+runs and, once it exits, reads the container's whole filesystem and every
+writable mount through the daemon, as root, so files the agent user cannot
+read are scanned too. This side then asserts:
 
 - exactly one request reached the upstream, at the class's model path,
 - it carries exactly one credential header, the class's standard one, once,
   and that value hashes to `sha256(wire_credential(entropy))`,
-- the file inventory is complete: nothing was left unread,
+- the CLI's command line was sampled and the scan left nothing unread,
+- neither the wire nor a host canary is in any file of the sandbox
+  filesystem, image files included,
 - no other credential header, env var or credential-shaped string is in the
-  requests, the sandbox env or the sandbox files, and the host's synthetic
-  upstream-key canaries appear nowhere.
+  requests, the sandbox env, the command lines or the files the run wrote,
+  and the host's synthetic upstream-key canaries appear in none of them.
 
 Requirements:
     - Docker
-    - a claude-cli image built from this tree:
+    - the claude-cli image; the release pin is
+      ghcr.io/agentparadise/agentic-workspace-claude@sha256:b3f39a3577a46dee75347ce0db7803014ab4569083c7aa353be63643df810231
+      (set AGENTIC_CLAUDE_CLI_IMAGE), or one built from this tree with
       `uv run scripts/build-provider.py claude-cli`
-      (override the tag with AGENTIC_CLAUDE_CLI_IMAGE)
 
 Run with:
-    uv run pytest tests/integration/test_harness_credential_presentation.py -v
+    uv run pytest -m integration tests/integration/test_harness_credential_presentation.py -v
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from pydantic import SecretStr
 from agentic_isolation.harnesses.claude.credentials import ClaudeApiKeyPresenter
 from agentic_isolation.harnesses.codex.credentials import CodexApiKeyPresenter
 from agentic_isolation.harnesses.credentials import PresentedCredentials
+from tests.integration.harness_credential_scan import CommandLines, scan_container
 
 IMAGE = os.environ.get("AGENTIC_CLAUDE_CLI_IMAGE", "agentic-workspace-claude-cli:latest")
 PROBE = Path(__file__).with_name("harness_credential_probe.py")
@@ -148,12 +154,14 @@ CLASSES = {
 }
 
 
-def _docker(mount: Path, *argv: str) -> subprocess.CompletedProcess[str]:
+def _docker(mount: Path, *argv: str, name: str | None = None) -> subprocess.CompletedProcess[str]:
+    # Named runs are kept after exit for the host scan; the caller removes them.
+    keep = ["--name", name] if name else ["--rm"]
     return subprocess.run(
         [
             "docker",
             "run",
-            "--rm",
+            *keep,
             "--network",
             "none",
             "--entrypoint",
@@ -219,16 +227,22 @@ def _assert_round_trip(
     # Every credential-named variable, presented or inherited, holds the wire.
     stray = sorted(k for k, v in env.items() if CREDENTIAL_ENV_NAME.search(k) and v != wire)
     assert not stray, f"credential env other than the capability: {stray}"
+    cmdlines = report["cmdlines"]
+    assert isinstance(cmdlines, list)
+    assert [c for c in cmdlines if "PROBE" in c], f"CLI command line not sampled: {cmdlines}"
     unscanned = report["unscanned"]
     assert isinstance(unscanned, dict)
-    assert not unscanned, f"sandbox file inventory incomplete: {sorted(unscanned)}"
+    assert not unscanned, f"sandbox file scan incomplete: {sorted(unscanned)}"
+    hits = report["hits"]
+    assert isinstance(hits, dict)
+    assert not hits, f"wire or host canary on sandbox disk: {hits}"
     files = report["files"]
     assert isinstance(files, dict)
-    assert not [p for p, text in files.items() if wire in text], "capability written to disk"
 
     haystacks = {
         "env": "\n".join(f"{k}={v}" for k, v in env.items()),
         "requests": json.dumps(requests),
+        "command lines": "\n".join(cmdlines),
         **{f"file {p}": text for p, text in files.items()},
     }
     for where, text in haystacks.items():
@@ -260,8 +274,19 @@ def test_pinned_cli_sends_only_the_wire_capability(
     ):
         (tmp_path / target).write_text(text)
         (tmp_path / target).chmod(0o644)
-    run = _docker(tmp_path, "python3", "/probe/probe.py", "/probe/spec.json")
-    assert run.returncode == 0, run.stderr
-    _assert_round_trip(
-        harness, presented, stored_hash, wire.get_secret_value(), json.loads(run.stdout)
-    )
+    container = f"s1-credential-probe-{secrets.token_hex(6)}"
+    needles = {"wire": wire.get_secret_value(), **HOST_CANARIES}
+    try:
+        with CommandLines(container) as cmdlines:
+            run = _docker(
+                tmp_path, "python3", "/probe/probe.py", "/probe/spec.json", name=container
+            )
+        assert run.returncode == 0, run.stderr
+        report = {
+            **json.loads(run.stdout),
+            "cmdlines": sorted(cmdlines.lines),
+            **scan_container(container, needles),
+        }
+    finally:
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True, check=False)
+    _assert_round_trip(harness, presented, stored_hash, wire.get_secret_value(), report)

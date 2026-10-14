@@ -9,13 +9,12 @@ upstream at once:
 2. serves a fake Anthropic Messages / OpenAI Responses upstream on loopback,
 3. runs the pinned CLI with the image env plus the presented env,
 4. prints one JSON report: every request the upstream saw (method, path,
-   headers, body), the CLI's exit, the full child env, every file left in
-   the writable locations the child was given (its work dir, which holds
-   $HOME, its cwd and its $TMPDIR, plus the system temp dir), and every
-   location it could not read in full.
+   headers, body), the CLI's exit and the full child env.
 
-It asserts nothing. The host owns the assertions, so the canaries it scans
-for never enter the sandbox.
+It neither scans files nor asserts. The host reads the stopped container's
+filesystem and samples its command lines through the Docker daemon
+(`harness_credential_scan.py`), so files the agent user cannot read are
+still scanned, and the canaries it matches never enter the sandbox.
 
 Usage: python3 harness_credential_probe.py SPEC_JSON
 """
@@ -24,13 +23,17 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+# The upstream holds each reply this long so the host's command-line
+# sampler sees the CLI process while it is waiting.
+HOLD_SECONDS = 2.0
 
 
 def _sse(events: list[dict[str, object]]) -> bytes:
@@ -128,6 +131,7 @@ def _serve(port: int, seen: list[dict[str, object]]) -> ThreadingHTTPServer:
 
         def do_POST(self) -> None:
             body = self._record()
+            time.sleep(HOLD_SECONDS)
             path = self.path.split("?", 1)[0]
             if path.endswith("/v1/messages"):
                 self._reply(200, *_anthropic_reply(json.loads(body or b"{}")))
@@ -139,50 +143,6 @@ def _serve(port: int, seen: list[dict[str, object]]) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer(("127.0.0.1", port), Upstream)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
-
-
-def _inventory(roots: list[Path]) -> dict[str, object]:
-    """Read every regular file under `roots` in full, following symlinks.
-
-    Nothing is truncated or skipped silently: a path that cannot be resolved
-    (dangling or looping link) or read lands in `unscanned`, and the host
-    fails its cleanliness check on any entry there. Sockets and FIFOs hold no
-    bytes at rest; they are listed in `special`.
-    """
-    files: dict[str, str] = {}
-    unscanned: dict[str, str] = {}
-    special: list[str] = []
-    dirs_seen: set[Path] = set()
-
-    def visit(path: Path) -> None:
-        try:
-            real = path.resolve(strict=True)
-            mode = real.stat().st_mode
-        except (OSError, RuntimeError) as exc:
-            unscanned[str(path)] = f"unresolvable: {exc}"
-            return
-        if stat.S_ISDIR(mode):
-            if real in dirs_seen:
-                return
-            dirs_seen.add(real)
-            try:
-                children = sorted(path.iterdir())
-            except OSError as exc:
-                unscanned[str(path)] = f"unlistable: {exc}"
-                return
-            for child in children:
-                visit(child)
-        elif stat.S_ISREG(mode):
-            try:
-                files[str(path)] = real.read_bytes().decode("utf-8", "replace")
-            except OSError as exc:
-                unscanned[str(path)] = f"unreadable: {exc}"
-        else:
-            special.append(str(path))
-
-    for root in roots:
-        visit(root)
-    return {"files": files, "unscanned": unscanned, "special": special}
 
 
 def main(spec_path: str) -> None:
@@ -226,7 +186,6 @@ def main(spec_path: str) -> None:
             "stderr": run.stderr[-4000:],
             "requests": seen,
             "env": env,
-            **_inventory([work, Path("/tmp"), Path(tempfile.gettempdir())]),
         },
         sys.stdout,
     )

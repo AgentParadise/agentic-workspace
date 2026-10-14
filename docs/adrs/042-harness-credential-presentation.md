@@ -100,18 +100,25 @@ pinned CLI in the `claude-cli` image with `--network none` through
 - exactly one request reached the upstream, `POST` at the class's model path,
 - the request carries exactly one credential header, the class's standard
   one, once, and its value hashes to `sha256(wire_credential(entropy))`,
-- every file in the child's writable locations (its work dir, which holds
-  `$HOME`, its cwd and its `$TMPDIR`, plus the system temp dir) was read in
-  full with symlinks followed; anything unreadable or unresolvable fails it,
+- the scan is host-side with full read access (`harness_credential_scan.py`):
+  the host samples every process command line through `docker top` while
+  the CLI runs, then reads the stopped container's whole filesystem through
+  `docker export` and each writable mount through `docker cp`, so a file the
+  agent user cannot read (the release image's root-owned 0600 build
+  leftovers) is read in full rather than reported unscanned; the CLI's own
+  command line must be among the samples and nothing may be left unscanned,
 - every credential-named env var in the CLI's environment holds exactly the
-  wire, no inventoried file contains the wire, and no request, env value or
-  file holds a credential-shaped string or one of the host's synthetic
-  upstream-key canaries.
+  wire, neither the wire nor a host canary is in any file of the sandbox
+  filesystem, image files included, and no request, env value, command line
+  or file the run wrote holds a credential-shaped string or a canary.
 
 `tests/test_harness_credential_round_trip_checks.py` runs those assertions
-without Docker against planted contamination: a repeated auth header, a
-canary in a second file, past the first MiB, outside `$HOME`, or behind a
-symlink, and an unreadable or looping path.
+without Docker against planted contamination: a repeated auth header, and
+sandbox filesystems built as the daemon's tar streams with a canary in a
+root-owned 0600 file, a second file, past the first MiB, a writable path
+outside `$HOME` and `$TMPDIR`, or a writable mount, the wire in an image
+file, a credential-shaped string written outside `$HOME`, a missing CLI
+command line, a canary on a command line, and an unscanned location.
 
 Run it with:
 
