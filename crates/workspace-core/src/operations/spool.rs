@@ -73,25 +73,31 @@ impl OperationSpool {
         });
         start = start.max(self.base);
         let available = usize::try_from(self.end() - start).unwrap_or(usize::MAX);
-        let mut size = available.min(max_page_bytes / 4 * 3);
-        loop {
+        let fits = |size| {
             let page = self.build(operation, state, cursor, start, size, gap);
-            let fits = serde_json::to_vec(&page).map(|bytes| bytes.len() <= max_page_bytes);
-            if fits.unwrap_or(false) {
-                return Ok(page);
-            }
-            if size == 0 {
-                return Err(OperationError::new(
-                    ErrorKind::RejectedPolicy,
-                    format!(
-                        "max_page_bytes={max_page_bytes} cannot hold an empty page envelope; \
-                         request a larger page"
-                    ),
-                    Some(operation.clone()),
-                ));
-            }
-            size = size.saturating_sub((size / 8).max(3));
+            serde_json::to_vec(&page).is_ok_and(|bytes| bytes.len() <= max_page_bytes)
+        };
+        if !fits(0) {
+            return Err(OperationError::new(
+                ErrorKind::RejectedPolicy,
+                format!(
+                    "max_page_bytes={max_page_bytes} cannot hold an empty page envelope; \
+                     request a larger page"
+                ),
+                Some(operation.clone()),
+            ));
         }
+        // The serialised page never shrinks as it carries more bytes, so the
+        // largest size that fits is found by bisection. Taking the largest,
+        // not the first a descent happens to land on, keeps the page size
+        // monotonic in the bound whatever the identifiers' widths: a larger
+        // bound never returns fewer bytes, and no reachable page is skipped.
+        let (mut lo, mut hi) = (0, available.min(max_page_bytes / 4 * 3));
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fits(mid) { lo = mid } else { hi = mid - 1 }
+        }
+        Ok(self.build(operation, state, cursor, start, lo, gap))
     }
 
     fn build(
@@ -243,6 +249,67 @@ mod tests {
         let (generation, next) = first.next_cursor.as_str().rsplit_once(':').unwrap();
         assert_eq!(next, "16");
         assert_eq!(format!("{generation}:0"), origin);
+    }
+
+    /// The page after `cursor` under every bound up to 512, asserting a
+    /// larger bound never returns fewer bytes, and the page the conformance
+    /// driver takes: the smallest bound whose page carries `len` bytes or more.
+    fn smallest_page_holding(
+        spool: &OperationSpool,
+        operation: &OperationRef,
+        cursor: &str,
+        len: usize,
+    ) -> ObservationPage {
+        let pages: Vec<ObservationPage> = (1..=512)
+            .filter_map(|bound| {
+                spool
+                    .page(operation, OperationState::Running, Some(cursor), bound)
+                    .ok()
+            })
+            .collect();
+        for pair in pages.windows(2) {
+            let (smaller, larger) = (decoded(&pair[0]).len(), decoded(&pair[1]).len());
+            assert!(
+                larger >= smaller,
+                "{larger} bytes after {smaller} at a larger bound"
+            );
+        }
+        pages
+            .into_iter()
+            .find(|page| decoded(page).len() >= len)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_larger_bound_never_returns_fewer_bytes_at_any_identifier_width() {
+        // Generations and operation keys vary in width with unrelated state
+        // (process id, how many spools came before), so page sizing must not
+        // depend on where those widths happen to fall.
+        let output: Vec<u8> = (0..128u32).map(|i| b'a' + (i % 26) as u8).collect();
+        for generation in 1..=16 {
+            for key in 1..=6 {
+                let at = format!("generation width {generation}, key width {key}");
+                let mut spool = OperationSpool::new(NonZeroU64::new(64).unwrap());
+                spool.generation = "f".repeat(generation);
+                spool.append(&output);
+                let operation: OperationRef = serde_json::from_value(serde_json::json!({
+                    "workspace": {"provider": "docker", "resource_id": "c1"},
+                    "operation_id": "op-1",
+                    "operation_key": "k".repeat(key),
+                }))
+                .unwrap();
+                // Both pages of the retention-gap fixture: six bytes and the
+                // exact gap from the origin, then the bytes straight after.
+                let origin = spool.encode(0).to_string();
+                let first = smallest_page_holding(&spool, &operation, &origin, 6);
+                assert_eq!(decoded(&first), output[64..70], "{at}");
+                assert_eq!(first.gap.unwrap().lost_bytes, NonZeroU64::new(64), "{at}");
+                let next = first.next_cursor.as_str();
+                let second = smallest_page_holding(&spool, &operation, next, 6);
+                assert_eq!(decoded(&second), output[70..76], "{at}");
+                assert!(second.gap.is_none(), "{at}");
+            }
+        }
     }
 
     #[test]

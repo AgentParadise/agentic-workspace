@@ -1119,6 +1119,20 @@ async fn behaviour_fixture_cursor_after_retention_gap() {
 }
 
 #[tokio::test]
+async fn behaviour_fixture_cursor_after_retention_gap_after_unrelated_operations() {
+    // Unrelated operations widen every later generation, and with it the
+    // page envelope; the fixture's pages must stay reachable at each width.
+    for total in [0x1_0000, 0x10_0000] {
+        for _ in 0..total {
+            drop(agentic_workspace_core::operations::OperationSpool::new(
+                NonZeroU64::MIN,
+            ));
+        }
+        drive_behaviour_fixture("cursor-after-retention-gap.json").await;
+    }
+}
+
+#[tokio::test]
 async fn behaviour_fixture_late_read_drains_then_complete() {
     drive_behaviour_fixture("late-read-drains-then-complete.json").await;
 }
