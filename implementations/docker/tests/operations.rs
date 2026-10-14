@@ -1483,11 +1483,11 @@ mod hazards {
             // TERM-ignoring workload still alive. Not established whether the
             // stand-in's stop or the provider is at fault: COVERAGE.md.
             "LH-2" => "fail 3 cancel kind=provider_unavailable ref=true alive=true",
-            // Finding: the cancel before the launch header ends
-            // provider_unavailable after ~9s, the late workload alive. Measured
-            // again with a stand-in that kills a held-back exec on `stop` and
-            // refuses an exec into a stopped container: unchanged.
-            "LH-3" => "fail 1 cancel kind=provider_unavailable ref=true alive=true",
+            // The cancel before the launch header confirms `cancelled`. Pinned
+            // as `fail 1 cancel` (provider_unavailable, workload alive) until
+            // the stand-in refused an exec into a stopped container: that
+            // late workload was the stand-in's, not the provider's.
+            "LH-3" => "pass [0, 0, 0]",
             // Finding: start returns a ref and launches into the container
             // destroyed while it resolved, instead of resource_lost/cancelled.
             "LH-4" => "fail 0 start operation_key=\"exec-42:phase-1:fence-9:agent\" alive=false",

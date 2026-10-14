@@ -160,7 +160,7 @@ non-root user with no Docker daemon. First miss per cell:
 |---|---|---|---|---|
 | LH-1 | `hazard-double-fork-orphan` | PASS, step 1 matched `cancelled` (alternative 0) | PASS, or XFAIL APSS#146 (fixture gap, below) | PASS `[0, 0, 0]` |
 | LH-2 | `hazard-interrupted-cancel` | PASS, step 3 matched `cancelled` (0) | PASS, step 3 matched `cancelled` (0) | FAIL step 3 `cancel`: `kind=provider_unavailable ref=true alive=true` (unattributed) |
-| LH-3 | `hazard-cancel-before-launch-header` | FAIL step 1 `cancel`: not settled within 30 s | NOT RUN: `given launch_header_not_seen` cannot be set up | FAIL step 1 `cancel`: `kind=provider_unavailable ref=true alive=true` |
+| LH-3 | `hazard-cancel-before-launch-header` | FAIL step 1 `cancel`: not settled within 30 s | NOT RUN: `given launch_header_not_seen` cannot be set up | PASS `[0, 0, 0]` (was FAIL step 1 `cancel`, a stand-in artefact; below) |
 | LH-4 | `hazard-destroy-during-start` | FAIL step 0 `start`: returned an operation ref | PASS | FAIL step 0 `start`: returned a ref (`operation_key` the fixture's), `alive=false` |
 | LH-5 | `hazard-stuck-removal-timeout-settles` | PASS, step 1 matched `provider_unavailable` (1) | NOT RUN: `given backend_stuck_removing` cannot be set up | FAIL step 1 `observe`: not settled within 120 s |
 | LH-6 | `hazard-drain-with-gap-reports-loss` | PASS | PASS | FAIL step 2 `observe`: `state=succeeded complete=false gap={lost_bytes:8}`, no `loss_detected` |
@@ -197,14 +197,16 @@ Findings (each left to a follow-up):
   page carries the 0.2.1 `loss_detected` marker. (Python Docker and Local
   share `OperationSpool`, which carries a crossed gap in its cursors, so
   every page from the gap on carries `loss_detected`.)
-- Rust Docker LH-3: `cancel` before the launch header returns
-  `provider_unavailable` after about 9 s, and the late workload is then
-  measured alive; neither allowed outcome. Re-measured with a stand-in whose
-  `exec` is marked as the container's before the late-exec sleep (so `stop`
-  kills it) and which refuses an `exec` into a stopped container with 137:
-  unchanged, so the late workload is not a stand-in artefact.
-  `hazards::a_late_exec_into_a_stopped_container_is_refused` shows the
-  stand-in itself kills a held-back exec on `stop`.
+- Rust Docker LH-3 is no longer a finding. It was recorded as
+  `provider_unavailable` after about 9 s with the late workload measured
+  alive. That workload was the stand-in's: its held-back `exec` slept before
+  it was marked as the container's, so `stop` missed it, and nothing refused
+  an `exec` into a stopped container. The stand-in now marks every `exec`
+  first, marks the container stopped before its KILLs, and refuses an `exec`
+  into a stopped container with 137 (as the Python stand-in does). Measured
+  again, the cancel confirms `cancelled` and the cell passes, matching
+  alternative 0 at every step. `hazards::a_late_exec_into_a_stopped_container_is_refused`
+  pins the stand-in behaviour.
 - Rust Docker LH-4: `start` blocked in credential resolution, while the
   container is lost and `finalize` runs, returns a ref and launches once
   (fixture: `resource_lost` or `cancelled`, 0 launches).
