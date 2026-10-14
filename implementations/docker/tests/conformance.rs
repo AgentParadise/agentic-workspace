@@ -43,8 +43,7 @@ struct Provisioned<'a> {
 
 impl Drop for Provisioned<'_> {
     fn drop(&mut self) {
-        // MUTATION (probe only, never merge): guard no longer destroys.
-        let _ = (&self.provider, &self.handle);
+        let _ = self.provider.destroy(&self.handle);
     }
 }
 
