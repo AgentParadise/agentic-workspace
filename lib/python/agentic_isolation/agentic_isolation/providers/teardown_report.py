@@ -41,10 +41,11 @@ class TeardownUsage:
     oom_killed: bool | None = None
     disk_bytes_at_teardown: int | None = None
     delete_failures: tuple[str, ...] | None = None
-    #: `None` when the host deleted the directory alone or never tried.
-    delete_fallback: DeleteFallback | None = None
     net_rx_bytes: int | None = None
     net_tx_bytes: int | None = None
+    #: `None` when the host deleted the directory alone or never tried. Last,
+    #: so existing positional construction keeps its meaning.
+    delete_fallback: DeleteFallback | None = None
 
 
 @dataclass(frozen=True)

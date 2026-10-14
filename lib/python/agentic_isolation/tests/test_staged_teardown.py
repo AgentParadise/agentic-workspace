@@ -803,6 +803,13 @@ class TestUsageReachesTheReport:
     def test_nothing_read_is_unknown_not_zero(self) -> None:
         assert _usage_from_cgroup("", oom_killed=None) == TeardownUsage()
 
+    def test_positional_construction_keeps_the_network_fields(self) -> None:
+        # `delete_fallback` was added after the network fields so existing
+        # positional callers keep their meaning.
+        usage = TeardownUsage(None, None, None, None, None, None, None, None, 123, 456)
+        assert (usage.net_rx_bytes, usage.net_tx_bytes) == (123, 456)
+        assert usage.delete_fallback is None
+
     def test_no_kills_counted_is_false(self) -> None:
         usage = _usage_from_cgroup("memory.events.oom_kill 0\n", oom_killed=None)
         assert (usage.oom_kills, usage.oom_killed) == (0, False)
