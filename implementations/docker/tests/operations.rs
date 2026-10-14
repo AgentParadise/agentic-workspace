@@ -8,6 +8,9 @@
 //! Linux `rust-test` job runs it.
 #![cfg(target_os = "linux")]
 
+use agentic_workspace_conformance::behaviour::{
+    BehaviourHarness, Workload, behaviour_fixture, drive,
+};
 use agentic_workspace_core::operations::{
     CredentialRef, CredentialResolver, ErrorKind, ObserveRequest, OperationError, OperationRef,
     OperationSpec, OperationState, OperationStatus, SupportsOperations, WorkspaceRef,
@@ -15,7 +18,6 @@ use agentic_workspace_core::operations::{
 use agentic_workspace_docker::operations::DockerOperations;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use serde_json::Value;
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -225,7 +227,19 @@ async fn cursor_after_retention_reports_the_exact_gap_then_drains() {
     assert_eq!(page.gap.unwrap().lost_bytes, NonZeroU64::new(204 - 64));
     let data = STANDARD.decode(page.data_b64.as_str()).unwrap();
     assert_eq!(data.len(), 64);
-    assert!(data.ends_with(b"tail") && page.complete);
+    assert!(data.ends_with(b"tail") && !page.complete);
+    let end = ops
+        .observe(
+            &op,
+            ObserveRequest {
+                cursor: Some(page.next_cursor.to_string()),
+                max_bytes: 4096,
+                wait: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(end.data_b64.as_str().is_empty() && end.complete);
 }
 
 #[tokio::test]
@@ -277,8 +291,20 @@ async fn a_complete_page_stays_the_end_when_a_descendant_writes_late() {
         )
         .await
         .unwrap();
-    assert!(page.complete);
+    assert!(!page.complete);
     assert_eq!(STANDARD.decode(page.data_b64.as_str()).unwrap(), b"early\n");
+    let end = ops
+        .observe(
+            &op,
+            ObserveRequest {
+                cursor: Some(page.next_cursor.to_string()),
+                max_bytes: 4096,
+                wait: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(end.data_b64.as_str().is_empty() && end.complete);
 }
 
 #[tokio::test]
@@ -573,102 +599,60 @@ async fn credential_bindings_reach_the_workload_env_but_never_the_client_argv() 
     assert!(!status.contains("secret-for"), "{status}");
 }
 
-/// Drive a shared APSS behaviour fixture, step by step from its file, against
-/// `DockerOperations` over the stand-in docker, with the fixture's own specs
-/// and credential bindings. Each step checks what the fixture asserts about
-/// behaviour: the issued ref (same on a same-key replay), an error's `kind`,
-/// the status `state` and `exit_code`, and the launch count. Provider-chosen
-/// ids, messages, timestamps and metadata are not compared; the Python
-/// provider does not reproduce them either.
-async fn drive_behaviour_fixture(name: &str) {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../lib/python/agentic_isolation/tests/fixtures/apss_exp_v1_0006/behaviour")
-        .join(name);
-    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let agent = dir.path().join("agent");
-    write_executable(&agent, "exec sleep 300\n");
-    let ops = ops(dir.path(), 1 << 20, 1 << 16).with_credentials(Arc::new(Vault));
-    let mut issued: Option<(Value, OperationRef)> = None;
-    for (i, step) in fixture["steps"].as_array().unwrap().iter().enumerate() {
-        let at = format!("{name}#{i} {}", step["call"]);
-        let expect = &step["expect"]["document"];
-        // A ref the fixture names is the one the provider issued for it.
-        let reference = || -> OperationRef {
-            match &issued {
-                Some((named, ours)) if *named == step["args"]["ref"] => ours.clone(),
-                _ => serde_json::from_value(step["args"]["ref"].clone()).unwrap(),
-            }
-        };
-        let outcome: Result<Value, OperationError> = match step["call"].as_str().unwrap() {
-            "start" => {
-                let spec: OperationSpec =
-                    serde_json::from_value(step["args"]["spec"].clone()).unwrap();
-                let workspace: WorkspaceRef = serde_json::from_value(
-                    serde_json::json!({"provider": "docker", "resource_id": "ws-7f3a"}),
-                )
-                .unwrap();
-                ops.start(&workspace, spec).await.map(|op| {
-                    if expect.get("kind").is_none() {
-                        match &issued {
-                            None => issued = Some((expect.clone(), op.clone())),
-                            Some((_, first)) => assert_eq!(&op, first, "{at}: a second ref"),
-                        }
-                    }
-                    serde_json::to_value(op).unwrap()
-                })
-            }
-            "status" => ops
-                .status(&reference())
-                .await
-                .map(|s| serde_json::to_value(s).unwrap()),
-            "cancel" => ops
-                .cancel(&reference(), Duration::from_millis(300))
-                .await
-                .map(|s| serde_json::to_value(s).unwrap()),
-            call => panic!("{at}: the driver does not dispatch {call:?}"),
-        };
-        match (expect.get("kind"), outcome) {
-            (Some(kind), Err(error)) => {
-                assert_eq!(&serde_json::to_value(error.kind).unwrap(), kind, "{at}")
-            }
-            (Some(kind), Ok(document)) => panic!("{at}: expected {kind}, got {document}"),
-            (None, Err(error)) => panic!("{at}: {error:?}"),
-            (None, Ok(document)) => {
-                for key in ["workspace", "operation_key"] {
-                    if let Some(want) = expect.get(key) {
-                        assert_eq!(document.get(key), Some(want), "{at}: {key}");
-                    }
-                }
-                for key in ["state", "exit_code"] {
-                    if let Some(want) = expect.get(key) {
-                        assert_eq!(
-                            document.get(key).unwrap_or(&Value::Null),
-                            want,
-                            "{at}: {key}"
-                        );
-                    }
-                }
-            }
-        }
-        // The stand-in logs a launch once its process runs; let it, then count.
-        let want = step["launches"].as_u64().unwrap() as usize;
-        for _ in 0..50 {
-            if launches(dir.path()) >= want {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(launches(dir.path()), want, "{at}: launches");
+/// The stand-in docker as a [`BehaviourHarness`]: the fixture's `agent` waits
+/// for a `release` file, writes the programmed output, then exits 0 or keeps
+/// running. Retention and page bound are the published Docker descriptor's.
+struct StandIn {
+    dir: tempfile::TempDir,
+    ops: DockerOperations,
+}
+
+impl StandIn {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = ops(dir.path(), 8 << 20, 1 << 16).with_credentials(Arc::new(Vault));
+        Self { dir, ops }
     }
-    ops.finalize(
-        &serde_json::from_value(
-            serde_json::json!({"provider": "docker", "resource_id": "ws-7f3a"}),
-        )
-        .unwrap(),
-    )
-    .await;
+}
+
+impl BehaviourHarness for StandIn {
+    type Provider = DockerOperations;
+
+    fn provider(&self) -> &DockerOperations {
+        &self.ops
+    }
+
+    fn program(&self, workload: &Workload) {
+        let payload = self.dir.path().join("payload");
+        std::fs::write(&payload, &workload.output).unwrap();
+        let release = self.dir.path().join("release");
+        let end = if workload.exits {
+            "exit 0"
+        } else {
+            "exec sleep 300"
+        };
+        write_executable(
+            &self.dir.path().join("agent"),
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.05; done\ncat '{}'\n{end}\n",
+                release.display(),
+                payload.display()
+            ),
+        );
+    }
+
+    fn release(&self) {
+        std::fs::write(self.dir.path().join("release"), b"").unwrap();
+    }
+
+    fn launches(&self) -> usize {
+        launches(self.dir.path())
+    }
+}
+
+async fn drive_behaviour_fixture(name: &str) {
+    let fixture = behaviour_fixture(name);
+    drive(name, &fixture, &StandIn::new()).await;
 }
 
 #[tokio::test]
@@ -689,6 +673,21 @@ async fn behaviour_fixture_cancel_twice_terminal_once() {
 #[tokio::test]
 async fn behaviour_fixture_unknown_ref_typed_error() {
     drive_behaviour_fixture("unknown-ref-typed-error.json").await;
+}
+
+#[tokio::test]
+async fn behaviour_fixture_cursor_after_retention_gap() {
+    drive_behaviour_fixture("cursor-after-retention-gap.json").await;
+}
+
+#[tokio::test]
+async fn behaviour_fixture_late_read_drains_then_complete() {
+    drive_behaviour_fixture("late-read-drains-then-complete.json").await;
+}
+
+#[tokio::test]
+async fn behaviour_fixture_required_capture_unknown_success_false() {
+    drive_behaviour_fixture("required-capture-unknown-success-false.json").await;
 }
 
 #[test]

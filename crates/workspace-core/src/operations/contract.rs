@@ -673,8 +673,7 @@ checked_struct! {
             return Err("a result's process must be terminal".into());
         }
         let succeeded = this.process.state == OperationState::Succeeded;
-        let captured = !this.capture.required || this.capture.state == CaptureState::Captured;
-        if this.success != (succeeded && captured) {
+        if this.success != WorkspaceResult::success_of(this.process.state, &this.capture) {
             return Err(format!(
                 "success={} contradicts process {:?} and capture {:?}",
                 this.success, this.process.state, this.capture
@@ -683,6 +682,15 @@ checked_struct! {
         if succeeded && this.primary_failure.is_some() {
             return Err("a succeeded process cannot carry a primary_failure".into());
         }
+    }
+}
+
+impl WorkspaceResult {
+    /// The only `success` a result may carry: the process succeeded, and a
+    /// required capture was captured.
+    pub fn success_of(process: OperationState, capture: &CaptureOutcome) -> bool {
+        process == OperationState::Succeeded
+            && (!capture.required || capture.state == CaptureState::Captured)
     }
 }
 

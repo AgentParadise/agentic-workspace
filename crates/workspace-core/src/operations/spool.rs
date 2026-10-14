@@ -56,7 +56,10 @@ impl OperationSpool {
     }
 
     /// The page after `cursor`, serialised to at most `max_page_bytes`. It is
-    /// `complete` only when `state` is terminal and nothing remains to read.
+    /// `complete` only when `state` is terminal and it is the empty page at
+    /// the end: a page carrying the last bytes is not, so a reader drains the
+    /// rest and only then sees `complete` (APSS behaviour fixture
+    /// `late-read-drains-then-complete`).
     pub fn page(
         &self,
         operation: &OperationRef,
@@ -111,7 +114,7 @@ impl OperationSpool {
             next_cursor: self.encode(next),
             data_b64: Base64::try_from(STANDARD.encode(&data)).expect("STANDARD is padded base64"),
             gap,
-            complete: state.is_terminal() && next == self.end(),
+            complete: state.is_terminal() && size == 0 && next == self.end(),
         }
     }
 
@@ -194,6 +197,37 @@ mod tests {
             }
         }
         assert_eq!(seen, output);
+    }
+
+    #[test]
+    fn the_last_bytes_are_not_complete_and_the_empty_page_after_them_is() {
+        let mut spool = OperationSpool::new(NonZeroU64::new(1 << 20).unwrap());
+        spool.append(b"hello world\n");
+        let last = spool
+            .page(&operation(), OperationState::Succeeded, None, 4096)
+            .unwrap();
+        assert_eq!(decoded(&last), b"hello world\n");
+        assert!(!last.complete);
+        let end = spool
+            .page(
+                &operation(),
+                OperationState::Succeeded,
+                Some(last.next_cursor.as_str()),
+                4096,
+            )
+            .unwrap();
+        assert_eq!(decoded(&end), b"");
+        assert_eq!(end.next_cursor, last.next_cursor);
+        assert!(end.complete);
+        let running = spool
+            .page(
+                &operation(),
+                OperationState::Running,
+                Some(last.next_cursor.as_str()),
+                4096,
+            )
+            .unwrap();
+        assert!(!running.complete);
     }
 
     #[test]
