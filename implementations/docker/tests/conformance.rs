@@ -534,6 +534,127 @@ fn operations_cancel_the_whole_tree_in_a_real_container() {
     provider.destroy(&handle).unwrap();
 }
 
+/// Resolves every credential to one invented value.
+struct InventedVault;
+
+/// Invented values: one a credential binding resolves, one only the caller holds.
+const RESOLVED_CANARY: &str = "canary-INVENTED-resolved-41c9";
+const CALLER_CANARY: &str = "canary-INVENTED-caller-5e1d";
+
+impl agentic_workspace_core::operations::CredentialResolver for InventedVault {
+    fn resolve<'a>(
+        &'a self,
+        _credential: &'a agentic_workspace_core::operations::CredentialRef,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<String, agentic_workspace_core::operations::OperationError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(RESOLVED_CANARY.to_owned()) })
+    }
+}
+
+/// The Rust `SupportsOperations` against a real container: a workload prints
+/// a resolved credential and a caller-registered value whole, split across
+/// two writes at every offset, repeated on stderr, and as an unfinished
+/// prefix at EOF, and neither value is ever in a page.
+#[test]
+fn operations_never_page_a_registered_or_resolved_value_in_a_real_container() {
+    use agentic_workspace_core::operations::{
+        ObserveRequest, OperationSpec, OperationState, Redaction, SupportsOperations, WorkspaceRef,
+    };
+    use agentic_workspace_docker::operations::DockerOperations;
+    use base64::Engine as _;
+
+    if !require_or_skip_docker() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let provider =
+        DockerProvider::new(root.path(), "python:3.12-slim", NetworkPolicy::None).unwrap();
+    let manifest = minimal_manifest("docker-redaction", SecurityProfile::Isolated);
+    let handle = provision(&provider, &manifest);
+    let container = handle.provider_reference.clone().unwrap();
+    let workspace: WorkspaceRef =
+        serde_json::from_value(serde_json::json!({"provider": "docker", "resource_id": container}))
+            .unwrap();
+    // `$T` is the resolved value, `$1` the caller's. Split writes are
+    // separated by a sleep so they reach the collector as separate reads.
+    let script = "C=\"$1\"; for V in \"$T\" \"$C\"; do \
+        printf 'whole %s\\n' \"$V\"; \
+        k=1; while [ $k -lt ${#V} ]; do \
+          printf %s \"$V\" | head -c $k; sleep 0.02; \
+          printf %s \"$V\" | tail -c +$((k + 1)); echo; k=$((k + 1)); \
+        done; \
+        printf '%s%s rep\\n' \"$V\" \"$V\" >&2; \
+      done; printf 'eof %s' \"$(printf %s \"$C\" | head -c 9)\"";
+    let spec: OperationSpec = serde_json::from_value(serde_json::json!({
+        "execution_id": "exec-docker",
+        "operation_key": "redaction",
+        "argv": ["sh", "-c", script, "sh", CALLER_CANARY],
+        "working_directory": manifest.workspace.working_directory,
+        "environment": {},
+        "credential_bindings": [{
+            "ref": {"name": "invented", "scope": "test"},
+            "delivery": "env",
+            "target": "T",
+        }],
+        "timeout_seconds": 120,
+        "metadata": {},
+    }))
+    .unwrap();
+    let ops = DockerOperations::new(
+        "docker",
+        std::num::NonZeroU64::new(1 << 20).unwrap(),
+        std::num::NonZeroU64::new(1 << 16).unwrap(),
+    )
+    .with_credentials(std::sync::Arc::new(InventedVault));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, output) = runtime.block_on(async {
+        let op = ops
+            .start_redacted(&workspace, spec, Redaction::new([CALLER_CANARY]))
+            .await
+            .unwrap();
+        let (mut output, mut cursor) = (Vec::new(), None);
+        loop {
+            let request = ObserveRequest {
+                cursor,
+                max_bytes: 4096,
+                wait: Duration::from_secs(10),
+            };
+            let page = ops.observe(&op, request).await.unwrap();
+            output.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(page.data_b64.as_str())
+                    .unwrap(),
+            );
+            cursor = Some(page.next_cursor.to_string());
+            if page.complete {
+                return (page.state, output);
+            }
+        }
+    });
+    let text = String::from_utf8(output).unwrap();
+    assert_eq!(state, OperationState::Succeeded, "{text}");
+    for value in [RESOLVED_CANARY, CALLER_CANARY] {
+        assert!(!text.contains(value), "{text}");
+    }
+    // Per value: whole, a split at each of len - 1 offsets, and two repeats.
+    let expected = [RESOLVED_CANARY, CALLER_CANARY]
+        .iter()
+        .map(|v| v.len() + 2)
+        .sum::<usize>();
+    assert_eq!(text.matches("[REDACTED]").count(), expected, "{text}");
+    assert!(
+        text.ends_with(&format!("eof {}", &CALLER_CANARY[..9])),
+        "{text}"
+    );
+    provider.destroy(&handle).unwrap();
+}
+
 /// The Rust `SupportsOperations` against a real container: a double-forked
 /// descendant that the container's init adopted before cancel first looked
 /// has no parent chain back to the operation, so cancel must fail closed into
