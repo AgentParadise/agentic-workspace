@@ -25,7 +25,7 @@ import stat
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -701,9 +701,11 @@ class WorkspaceDockerProvider(BaseProvider):
         """SupportsOperations: published before any launch."""
         return self._operations.describe()
 
-    async def start(self, workspace: Workspace, spec: OperationSpec) -> OperationRef:
+    async def start(
+        self, workspace: Workspace, spec: OperationSpec, *, redact: Collection[str] = ()
+    ) -> OperationRef:
         """SupportsOperations: accept `spec`; idempotent per operation_key."""
-        return await self._operations.start(workspace, spec)
+        return await self._operations.start(workspace, spec, redact=redact)
 
     async def status(self, ref: OperationRef) -> OperationStatus:
         """SupportsOperations: status from the daemon-reported exit code."""

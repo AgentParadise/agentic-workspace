@@ -39,6 +39,7 @@ import contextlib
 import os
 import posixpath
 import signal
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -339,8 +340,13 @@ class DockerOperations:
         *,
         delivered_env: dict[str, str] | None = None,
         separate_channels: bool = False,
+        redact: Collection[str] = (),
     ) -> OperationRef:
         """Accept `spec` once per `(workspace, operation_key)`.
+
+        `redact` registers credential values the workload may print; they,
+        and every value this provider resolves or delivers, are replaced in
+        the spool, its pages and `channels` before anything is stored.
 
         `delivered_env` and `separate_channels` are for the legacy `execute`
         path only: values the caller already holds, delivered exactly like
@@ -361,7 +367,7 @@ class DockerOperations:
         try:
             async with launch.lock:
                 return await self._start_locked(
-                    workspace, spec, key, container, delivered_env, separate_channels
+                    workspace, spec, key, container, delivered_env, separate_channels, redact
                 )
         finally:
             launch.users -= 1
@@ -376,6 +382,7 @@ class DockerOperations:
         container: str,
         delivered_env: dict[str, str] | None,
         separate_channels: bool,
+        redact: Collection[str],
     ) -> OperationRef:
         existing = self._by_key.get(key)
         if existing is not None:
@@ -422,7 +429,9 @@ class DockerOperations:
             ref=ref,
             spec=spec,
             container=container,
-            spool=OperationSpool(retention_bytes=self._retention),
+            spool=OperationSpool(
+                retention_bytes=self._retention, redact=(*redact, *secrets.values())
+            ),
             started_at=_now(),
             key=key,
             channels=(bytearray(), bytearray()) if separate_channels else None,
@@ -556,6 +565,8 @@ class DockerOperations:
                 with contextlib.suppress(asyncio.CancelledError):
                     await readers
             operation.leader_known.set()
+        for channel, stored in operation.spool.finish().items():
+            self._keep(operation, stored, channel=channel)
         operation.client_finished = True
         operation.settle_by = asyncio.get_running_loop().time() + _REMOVAL_WAIT_SECONDS
         await self._settle(operation, process.returncode, wait=True)
@@ -581,10 +592,16 @@ class DockerOperations:
 
     @staticmethod
     def _record(operation: _Operation, chunk: bytes, *, channel: Literal[0, 1]) -> None:
-        operation.spool.append(chunk)
-        if operation.channels is not None:
-            operation.channels[channel].extend(chunk)
+        DockerOperations._keep(
+            operation, operation.spool.append(chunk, channel=channel), channel=channel
+        )
         operation.changed.set()
+
+    @staticmethod
+    def _keep(operation: _Operation, stored: bytes, *, channel: int) -> None:
+        """Copy what the spool stored, never the raw chunk, to `channels`."""
+        if operation.channels is not None:
+            operation.channels[channel].extend(stored)
 
     @staticmethod
     def _note(operation: _Operation, failure: str) -> None:
