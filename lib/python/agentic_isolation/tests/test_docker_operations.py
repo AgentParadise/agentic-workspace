@@ -1377,3 +1377,70 @@ async def test_a_stop_that_reports_success_is_confirmed_before_cancelled(
     assert reason in caught.value.error.message
     assert operation.escalated and operation.stop_failed
     assert ops._status(operation).metadata["cancel_escalation"] == "container_stop_failed"
+
+
+@pytest.mark.parametrize(
+    ("presences", "reason"),
+    [
+        (["removing"], "still being removed"),
+        (["removing", "running"], "still running"),
+    ],
+)
+async def test_a_stop_answered_removing_never_publishes_cancelled(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch, presences: list[str], reason: str
+) -> None:
+    """`removing` after a stop is no evidence it ended; only stopped or gone confirms."""
+    monkeypatch.setattr(docker_operations, "_REMOVAL_WAIT_SECONDS", 0.2)
+    ops = _ops(docker_env)
+    answers = iter(presences)
+    last = presences[-1]
+
+    async def command(*argv: str) -> tuple[int, str]:
+        if argv[0] == "stop":
+            return 0, "c1"
+        if argv[0] == "container":
+            return 0, f"{next(answers, last)}\n"
+        return 0, ""
+
+    ops._docker_cmd = AsyncMock(side_effect=command)  # type: ignore[method-assign]
+    operation = _held_operation(("1", "123"))  # refused leader: straight to the stop
+    operation.leader_known.set()
+    ops._operations[operation.ref.operation_id] = operation
+    with pytest.raises(OperationFailure) as caught:
+        await asyncio.wait_for(ops.cancel(operation.ref, grace_seconds=0), timeout=5)
+    assert caught.value.error.kind == "provider_unavailable"
+    assert reason in caught.value.error.message
+    assert not operation.cancel_confirmed
+    assert operation.escalated and operation.stop_failed
+    # Whatever the daemon answers next, the collector's settlement is not `cancelled`.
+    answers = iter(["running"])
+    await ops._settle(operation, 137, wait=False)
+    status = ops._status(operation)
+    assert status.state == "failed", status
+    assert status.metadata["cancel_escalation"] == "container_stop_failed"
+
+
+async def test_a_stop_answered_removing_then_stopped_is_confirmed(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(docker_operations, "_REMOVAL_WAIT_SECONDS", 5.0)
+    ops = _ops(docker_env)
+    answers = iter(["removing", "removing", "exited"])
+
+    async def command(*argv: str) -> tuple[int, str]:
+        if argv[0] == "stop":
+            return 0, "c1"
+        if argv[0] == "container":
+            return 0, f"{next(answers, 'exited')}\n"
+        return 0, ""
+
+    ops._docker_cmd = AsyncMock(side_effect=command)  # type: ignore[method-assign]
+    operation = _held_operation(("1", "123"))
+    operation.leader_known.set()
+    ops._operations[operation.ref.operation_id] = operation
+    await asyncio.wait_for(ops.cancel(operation.ref, grace_seconds=0), timeout=5)
+    assert operation.cancel_confirmed and not operation.stop_failed
+    await ops._settle(operation, 137, wait=False)
+    status = ops._status(operation)
+    assert status.state == "cancelled", status
+    assert status.metadata["cancel_escalation"] == "container_stopped"

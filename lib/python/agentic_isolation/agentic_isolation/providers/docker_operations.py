@@ -753,8 +753,9 @@ class DockerOperations:
         a leader whose pid was reused, and signals by pid every descendant
         that escaped the group, so a confirmed cancel means all of them died.
         A docker client that cannot run while signalling also escalates. A
-        stop that cannot run or fails is recorded and raised as
-        provider_unavailable: the operation may still be running.
+        stop that cannot run, fails, or is not then observed `stopped` or
+        `gone` is recorded and raised as provider_unavailable: the operation
+        may still be running.
         """
         if operation.leader is not None and (refusal := await self._unsafe_leader(operation)):
             # Never signal init or our own group; stopping the container still
@@ -780,9 +781,14 @@ class DockerOperations:
                 f"docker stop {operation.container}: exit {code}: {out.strip()}",
                 operation.ref,
             )
-        # A stop that reported success is confirmed by the daemon's own state.
+        # A stop that reported success is confirmed by the daemon's own state:
+        # only `stopped` or `gone` is evidence; `removing` is waited out, bounded.
+        deadline = asyncio.get_running_loop().time() + _REMOVAL_WAIT_SECONDS
         try:
-            presence = await self._presence(operation.container)
+            while (presence := await self._presence(operation.container)) == "removing":
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.1)
         except OperationFailure:
             operation.stop_failed = True
             raise
@@ -792,6 +798,15 @@ class DockerOperations:
                 "provider_unavailable",
                 f"docker stop {operation.container} reported success but the container "
                 "is still running",
+                operation.ref,
+            )
+        if presence == "removing":
+            operation.stop_failed = True
+            raise _error(
+                "provider_unavailable",
+                f"docker stop {operation.container} reported success but the container "
+                f"is still being removed {_REMOVAL_WAIT_SECONDS:g}s later; its termination "
+                "is unconfirmed",
                 operation.ref,
             )
 
