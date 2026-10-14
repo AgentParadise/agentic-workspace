@@ -276,7 +276,7 @@ async fn late_read_drains_bounded_pages_then_completes() {
         .await
         .unwrap();
     let data = String::from_utf8(drain(&ops, &op, 300).await).unwrap();
-    let stdout: String = (1..=3000).map(|n| format!("{n}\n")).collect();
+    let stdout: String = (1..=3000).map(|n| n.to_string() + "\n").collect();
     // Each channel is whole and in order. The two pipes are read
     // independently, so the combined stream may carry stderr's chunk at any
     // point between stdout's: only its presence is asserted there.
@@ -287,6 +287,59 @@ async fn late_read_drains_bounded_pages_then_completes() {
     );
     assert_eq!(data.len(), stdout.len() + 5);
     assert_eq!(data.replacen("done\n", "", 1), stdout);
+}
+
+/// Every page until `complete`, each checked against the provider's own cap
+/// whatever the caller asked for; the pages read.
+async fn drain_capped(
+    ops: &DockerOperations,
+    op: &OperationRef,
+    max_bytes: usize,
+    cap: usize,
+) -> (Vec<u8>, usize) {
+    let (mut cursor, mut data) = (None, Vec::new());
+    for pages in 1..10_000 {
+        let request = ObserveRequest {
+            cursor: cursor.clone(),
+            max_bytes,
+            wait: Duration::from_secs(5),
+        };
+        let page = ops.observe(op, request).await.unwrap();
+        let size = serde_json::to_vec(&page).unwrap().len();
+        assert!(
+            size <= cap,
+            "page {pages} is {size} bytes, over the cap {cap}"
+        );
+        data.extend(STANDARD.decode(page.data_b64.as_str()).unwrap());
+        if page.complete {
+            return (data, pages);
+        }
+        cursor = Some(page.next_cursor.to_string());
+    }
+    panic!("never complete");
+}
+
+/// The provider's `max_page_bytes` bounds every page, for a caller asking
+/// for no limit (0) and for one asking for more than the cap.
+#[tokio::test]
+async fn the_provider_page_cap_bounds_every_page_below_the_callers_limit() {
+    const CAP: usize = 400;
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, CAP as u64);
+    let op = ops
+        .start(&workspace(), spec("k1", "seq 1 500", 60))
+        .await
+        .unwrap();
+    let expected: String = (1..=500).map(|n| n.to_string() + "\n").collect();
+    for max_bytes in [0, 4096] {
+        let (data, pages) = drain_capped(&ops, &op, max_bytes, CAP).await;
+        assert_eq!(
+            String::from_utf8(data).unwrap(),
+            expected,
+            "max_bytes {max_bytes}"
+        );
+        assert!(pages > 2, "{pages} pages for {} bytes", expected.len());
+    }
 }
 
 /// A descendant holds the output open past the leader's exit and writes
