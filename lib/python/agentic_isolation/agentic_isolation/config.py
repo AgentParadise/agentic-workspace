@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from importlib import resources
@@ -108,6 +109,16 @@ def _check_env_target(target: str, ref_name: str) -> None:
             f"credential {ref_name!r} targets reserved variable {target!r}, which "
             "controls the provider's host client; deliver it under another name"
         )
+
+
+def check_env_targets(names: Iterable[str]) -> None:
+    """Refuse any env delivery target that is not a safe bare variable name.
+
+    For values a caller delivers directly, outside a `CredentialBinding`; the
+    name stands in for the binding's ref in the error.
+    """
+    for name in names:
+        _check_env_target(name, name)
 
 
 def check_credential_bindings(bindings: list[CredentialBinding]) -> list[CredentialBinding]:
