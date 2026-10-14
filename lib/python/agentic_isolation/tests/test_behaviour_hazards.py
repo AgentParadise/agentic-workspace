@@ -323,7 +323,7 @@ async def _settled(subject: Subject, *, within: float = 10.0) -> None:
 class Outcome:
     """What a call did: a document it returned, or the typed error it raised."""
 
-    document: OperationStatus | ObservationPage | dict[str, Any] | None = None
+    document: OperationRef | OperationStatus | ObservationPage | dict[str, Any] | None = None
     kind: str | None = None
     has_ref: bool = False
     pages: list[ObservationPage] = field(default_factory=list)
@@ -358,11 +358,9 @@ def _matches(alternative: dict[str, Any], outcome: Outcome, alive: bool) -> bool
             page.get(key) == want.get(key) for key in ("state", "complete", "gap", "loss_detected")
         )
     if isinstance(got, dict):
-        return all(
-            got.get(key) == value for key, value in want.items() if key != "schema" or key in got
-        )
+        return all(got.get(key) == value for key, value in want.items() if key != "schema")
     # An operationRef expectation: start returned a ref.
-    return isinstance(got, OperationRef) or got is None and "operation_id" in want
+    return isinstance(got, OperationRef)
 
 
 async def _call(
@@ -396,7 +394,7 @@ async def _call(
                 await _settled(subject)
             if hazard in ("LH-6", "LH-7"):
                 await _drained(subject, ref)
-            return Outcome(document=ref)  # type: ignore[arg-type]  # an OperationRef
+            return Outcome(document=ref)
         assert subject.ref is not None, f"{hazard}: {call} before a successful start"
         ref = subject.ref
         if call == "status":
@@ -491,7 +489,8 @@ async def _probe(subject: Subject, call: str, path: str, bound: float) -> Outcom
         if call == "file_exists":
             exists = await subject.provider.file_exists(subject.workspace, path)
             regular = stat.S_ISREG(os.stat(fifo).st_mode) if exists else False
-            # A bare bool cannot say "not regular"; the probe is what it claims.
+            # Python's file_exists is a bool, so only `exists` is the provider's
+            # claim; `regular_file` is read from the filesystem.
             outcome = Outcome(document={"path": path, "exists": exists, "regular_file": regular})
         else:
             data = await subject.provider.read_file(subject.workspace, path)
