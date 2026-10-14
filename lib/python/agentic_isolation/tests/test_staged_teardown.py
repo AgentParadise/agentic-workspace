@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,13 @@ class _Proc:
                 return b""
 
         return _R()
+
+
+@pytest.fixture(autouse=True)
+def _temp_base(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # With no `workspace_base_dir`, the provider only deletes the
+    # `agentic-ws-` directories `create()` makes under the temp dir.
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
 
 
 def _provider() -> Any:
@@ -136,7 +144,7 @@ class TestHooksRunAtTheSafePoints:
     ) -> None:
         seq: list[str] = []
         _record(monkeypatch, seq)
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
         (d / "spool.jsonl").write_text("transcript")
         seen: dict[str, bool] = {}
@@ -153,7 +161,7 @@ class TestHooksRunAtTheSafePoints:
     def test_full_order(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         seq: list[str] = []
         _record(monkeypatch, seq)
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
 
         async def _run() -> None:
@@ -187,7 +195,7 @@ class TestFailedArchiveRetainsTheData:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         _record(monkeypatch, [])
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
         (d / "spool.jsonl").write_text("transcript")
 
@@ -208,7 +216,7 @@ class TestFailedArchiveRetainsTheData:
     ) -> None:
         seq: list[str] = []
         _record(monkeypatch, seq)
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
 
         async def _fails() -> None:
@@ -251,7 +259,7 @@ class TestOperationRecordsFollowTheOutcome:
             forgotten.append(workspace_id)
 
         monkeypatch.setattr(provider._operations, "forget_workspace", _forget)
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
 
         async def _fails() -> None:
@@ -281,7 +289,7 @@ class TestOperationRecordsFollowTheOutcome:
         provider._operations = ops = DockerOperations(
             credentials=None, retention_bytes=1024, max_page_bytes=1024, docker=str(docker)
         )
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
         ws = _Workspace(workspace_dir=str(d))
         other = _Workspace(handle="container-other")
@@ -365,7 +373,7 @@ class TestRegistryIsNotLeaked:
         # registry instead, under the ref the report carries.
         _record(monkeypatch, [])
         provider = _provider()
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
         ws = _Workspace(workspace_dir=str(d))
         provider._workspaces[ws.id] = ws
@@ -391,7 +399,7 @@ class TestRetainedThenRetried:
         seq: list[str] = []
         _record(monkeypatch, seq)
         provider = _provider()
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
         (d / "spool.jsonl").write_text("transcript")
         ws = _Workspace(workspace_dir=str(d))
@@ -429,7 +437,7 @@ class TestRetainedThenRetried:
         seq: list[str] = []
         _record(monkeypatch, seq)
         provider = _provider()
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
         ws = _Workspace(workspace_dir=str(d))
         provider._workspaces[ws.id] = ws
@@ -453,7 +461,7 @@ class TestRetainedThenRetried:
     ) -> None:
         _record(monkeypatch, [])
         provider = _provider()
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
         (d / "spool.jsonl").write_text("transcript")
         ws = _Workspace(workspace_dir=str(d))
@@ -470,8 +478,8 @@ class TestRetainedThenRetried:
         assert first.finalization.stage == "before_delete"
         assert first.usage.delete_failures is not None
         assert "PermissionError" in first.usage.delete_failures[0]
-        # `ws` is not `ws-<id>` under a base directory, so the root container
-        # fallback refused to mount it.
+        # No workspace image is recorded, so the root container fallback
+        # refused to run.
         assert first.usage.delete_fallback == "refused"
         assert d.exists()
         ref = WorkspaceRef(provider="docker", resource_id=ws._handle)
@@ -495,7 +503,7 @@ class TestRetainedThenRetried:
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
         provider = _provider()
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
         (d / "spool.jsonl").write_text("transcript")
         ws = _Workspace(workspace_dir=str(d))
@@ -526,7 +534,7 @@ class TestDestroyIsUnchanged:
     ) -> None:
         seq: list[str] = []
         _record(monkeypatch, seq)
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
         provider = _provider()
         ws = _Workspace(workspace_dir=str(d))
@@ -600,7 +608,7 @@ class TestAsyncFailureModes:
 
         async def _main() -> None:
             provider = _provider()
-            d = tmp_path / "ws"
+            d = tmp_path / "agentic-ws-1"
             d.mkdir()
             (d / "spool.jsonl").write_text("transcript")
             ws = _Workspace(workspace_dir=str(d))
@@ -653,7 +661,7 @@ class TestAsyncFailureModes:
 
         async def _main() -> None:
             provider = _provider()
-            d = tmp_path / "ws"
+            d = tmp_path / "agentic-ws-1"
             d.mkdir()
             (d / "spool.jsonl").write_text("transcript")
             ws = _Workspace(workspace_dir=str(d))
@@ -781,7 +789,7 @@ class TestUsageReachesTheReport:
     ) -> None:
         self._docker(monkeypatch, b"false\n")
         provider = _provider()
-        d = tmp_path / "ws"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
 
         async def _fails() -> None:
@@ -926,43 +934,60 @@ class TestContainerOwnedFilesAreDeletedThroughAContainer:
         assert "docker run exited 125" in failures[1]
         assert d.exists()
 
-    def test_a_symlinked_workspace_dir_is_refused_without_running_docker(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    @pytest.mark.parametrize("via", ["outside", "ancestor-symlink", "symlink"])
+    def test_a_dir_that_is_not_ours_is_never_deleted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, via: str
     ) -> None:
-        provider, ws, d, calls = self._setup(monkeypatch, tmp_path)
-        link = tmp_path / "link" / "ws-1"
-        link.parent.mkdir()
-        link.symlink_to(d)
-        provider._workspace_base_dir = link.parent
-        ws.metadata["workspace_dir"] = str(link)
-        monkeypatch.setattr(
-            shutil,
-            "rmtree",
-            lambda path: (_ for _ in ()).throw(PermissionError(13, "Permission denied", path)),
-        )
+        # Host rmtree is real here, so a missing containment check would
+        # delete the sentinel rather than merely run the fallback.
+        provider = _provider()
+        provider._workspace_base_dir = (tmp_path / "base").resolve()
+        provider._workspace_base_dir.mkdir()
+        outside = tmp_path / "outside" / "ws-1"
+        outside.mkdir(parents=True)
+        sentinel = outside / "must-survive"
+        sentinel.write_text("not the provider's")
+        candidate = {
+            "outside": outside,
+            "ancestor-symlink": provider._workspace_base_dir / "redirect" / "ws-1",
+            "symlink": provider._workspace_base_dir / "ws-1",
+        }[via]
+        if via == "ancestor-symlink":
+            candidate.parent.symlink_to(outside.parent, target_is_directory=True)
+        elif via == "symlink":
+            candidate.symlink_to(outside, target_is_directory=True)
+        calls: list[str] = []
+        _record(monkeypatch, calls)
+        ws = _Workspace(workspace_dir=str(candidate))
+        ws.metadata["image_id"] = "sha256:feed"
+        provider._workspaces[ws.id] = ws
         report = asyncio.run(provider.teardown(ws))
 
+        assert sentinel.exists(), report
         assert report.finalization.state == "retained"
-        assert report.usage.delete_fallback == "refused"
-        assert not [c for c in calls if c[1] == "run"]
+        assert report.usage.delete_failures is not None
+        assert "refused" in report.usage.delete_failures[0]
+        assert report.usage.delete_fallback is None
+        assert "docker run" not in calls
 
-    def test_a_dir_outside_the_base_dir_is_refused_without_running_docker(
+    def test_an_already_absent_dir_is_completed(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        provider, ws, _d, calls = self._setup(monkeypatch, tmp_path)
-        provider._workspace_base_dir = (tmp_path / "elsewhere").resolve()
+        _record(monkeypatch, [])
+        provider = _provider()
+        provider._workspace_base_dir = (tmp_path / "base").resolve()
+        ws = _Workspace(workspace_dir=str(provider._workspace_base_dir / "ws-1"))
+        provider._workspaces[ws.id] = ws
         report = asyncio.run(provider.teardown(ws))
 
-        assert report.finalization.state == "retained"
-        assert report.usage.delete_fallback == "refused"
-        assert not [c for c in calls if c[1] == "run"]
+        assert report.finalization.state == "completed"
 
     def test_a_directory_rmtree_deletes_does_not_use_the_fallback(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         _record(monkeypatch, [])
         provider = _provider()
-        d = tmp_path / "ws-1"
+        d = tmp_path / "agentic-ws-1"
         d.mkdir()
         ws = _Workspace(workspace_dir=str(d))
         provider._workspaces[ws.id] = ws

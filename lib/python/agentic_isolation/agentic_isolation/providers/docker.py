@@ -1122,7 +1122,9 @@ class WorkspaceDockerProvider(BaseProvider):
 
         Returns what could not be deleted, empty when the directory is gone,
         and how the container fallback went when it was needed. An already
-        absent directory is success, so a retry is idempotent.
+        absent directory is success, so a retry is idempotent. A directory
+        that is not one this provider created under its base directory is
+        refused and left untouched.
 
         The container writes as its own uid, so files it leaves in
         subdirectories it created can be undeletable by this process (CI
@@ -1131,8 +1133,12 @@ class WorkspaceDockerProvider(BaseProvider):
         directory, which this process created, is removed here.
         """
         workspace_dir = workspace.metadata.get("workspace_dir")
-        if not workspace_dir:
+        if not workspace_dir or not os.path.lexists(workspace_dir):
             return (), None
+        # Checked before ANY delete, host or container: a path outside the
+        # base directory is never this provider's to remove.
+        if self._owned_workspace_dir(workspace, workspace_dir) is None:
+            return (f"{workspace_dir}: refused: {self._NOT_OWNED}",), None
         error = _rmtree(workspace_dir)
         fallback: DeleteFallback | None = None
         why = ""
@@ -1152,14 +1158,18 @@ class WorkspaceDockerProvider(BaseProvider):
     #: Where the workspace directory is mounted inside the fallback container.
     _DELETE_TARGET = "/workspace-delete"
 
-    def _delete_mount_source(self, workspace: Workspace, workspace_dir: str) -> str | None:
-        """The Docker host path of `workspace_dir`, or None when it is not ours.
+    #: Why a workspace directory is refused for deletion.
+    _NOT_OWNED = "not a directory this provider created under its base directory"
+
+    def _owned_workspace_dir(self, workspace: Workspace, workspace_dir: str) -> Path | None:
+        """`workspace_dir` resolved, or None when this provider did not create it.
 
         Only a real directory directly under the provider's base directory
         qualifies: `ws-<id>` under `workspace_base_dir`, or the
         `agentic-ws-` mkdtemp directory when no base is configured. A symlink,
-        or a path resolving anywhere else, is refused, so the root container
-        never mounts a directory the provider did not create.
+        or a path resolving anywhere else (a symlinked ancestor included), is
+        refused, so neither the host nor the root container ever deletes a
+        directory the provider did not create.
         """
         path = Path(workspace_dir)
         if path.is_symlink() or not path.is_dir():
@@ -1172,12 +1182,18 @@ class WorkspaceDockerProvider(BaseProvider):
             if not path.name.startswith("agentic-ws-"):
                 return None
             base = Path(tempfile.gettempdir()).resolve()
-        if path.resolve() != base / path.name:
+        resolved = path.resolve()
+        return resolved if resolved == base / path.name else None
+
+    def _delete_mount_source(self, workspace: Workspace, workspace_dir: str) -> str | None:
+        """The Docker host path of `workspace_dir`, or None when it is not ours."""
+        owned = self._owned_workspace_dir(workspace, workspace_dir)
+        if owned is None:
             return None
         if self._workspace_host_dir is not None and self._workspace_base_dir is not None:
-            source = str(self._workspace_host_dir / path.name)
+            source = str(self._workspace_host_dir / owned.name)
         else:
-            source = str(path.resolve())
+            source = str(owned)
         # `--mount` is comma separated; a comma would smuggle in an option.
         return None if "," in source else source
 
@@ -1232,7 +1248,7 @@ class WorkspaceDockerProvider(BaseProvider):
         """
         source = self._delete_mount_source(workspace, workspace_dir)
         if source is None:
-            return "refused", "not a directory this provider created under its base directory"
+            return "refused", self._NOT_OWNED
         if not workspace.metadata.get("image_id"):
             return "refused", "no workspace image recorded to run the delete in"
         cmd = self._delete_contents_command(workspace, source)
