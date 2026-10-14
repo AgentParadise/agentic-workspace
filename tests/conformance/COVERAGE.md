@@ -53,7 +53,10 @@ and `exit_code`, and launch counts. It drives
 `start-same-key-one-launch`, `same-key-different-spec-conflict`,
 `cancel-twice-terminal-once` and `unknown-ref-typed-error`. It does not yet
 drive `cursor-after-retention-gap` (needs 16 MiB of seeded output),
-`late-read-drains-then-complete` (needs seeded output) or
+`late-read-drains-then-complete` (its first terminal page carries the
+remaining bytes with `complete: false`, but both the Rust and the Python
+operation spools mark a terminal page that reaches the end complete; its
+offsets also leave out the launch marker line the provider writes first) or
 `required-capture-unknown-success-false` (a `result` call the Rust trait does
 not have); those behaviours are covered only by the hand-written tests named
 below, so the observation row is PARTIAL.
