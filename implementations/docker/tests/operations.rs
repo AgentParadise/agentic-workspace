@@ -1158,3 +1158,275 @@ fn credential_bindings_without_a_resolver_are_rejected_policy() {
     assert_eq!(error.kind, ErrorKind::RejectedPolicy);
     assert!(!dir.path().join("docker.log").exists());
 }
+
+// --- APSS 0.2.1 lifecycle hazards (LH-1..LH-7) -------------------------------
+
+mod hazards {
+    use super::*;
+    use agentic_workspace_conformance::hazard::{
+        HazardFixture, HazardHarness, HazardVerdict, Unmeasurable, drive_hazard, live_processes,
+        load_hazards, vendored_behaviour_dir,
+    };
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TOKEN: &str = "AW_HARNESS_RUN";
+
+    /// What each hazard's workload does once the provider launches it.
+    fn workload(hazard: &str) -> &'static str {
+        match hazard {
+            // Double fork: the middle shell exits, so the setsid'd sleeper is
+            // reparented and leaves the leader's group before cancel.
+            "LH-1" => "(setsid sleep 300 </dev/null >/dev/null 2>&1 &); exec sleep 300",
+            "LH-2" => "trap '' TERM; while :; do sleep 0.1; done",
+            "LH-6" => "printf 'lost-it retained output\\n'",
+            // The stand-in ignores `-w`; its marker names the "container".
+            "LH-7" => "mkdir -p \"$AW_STANDIN/outputs\" && mkfifo \"$AW_STANDIN/outputs/pipe\"",
+            _ => "exec sleep 300",
+        }
+    }
+
+    fn fixture(hazard: &str) -> HazardFixture {
+        load_hazards(&vendored_behaviour_dir())
+            .unwrap()
+            .into_iter()
+            .find(|f| f.hazard == hazard)
+            .unwrap()
+    }
+
+    /// `DockerOperations` behind the stand-in docker, its workloads tokened.
+    pub(super) struct StandIn<P> {
+        pub provider: P,
+        pub dir: tempfile::TempDir,
+        pub token: String,
+    }
+
+    impl StandIn<DockerOperations> {
+        pub fn new(hazard: &str) -> Self {
+            StandIn::with(hazard, |ops| ops)
+        }
+    }
+
+    impl<P> StandIn<P> {
+        pub fn with(hazard: &str, wrap: impl FnOnce(DockerOperations) -> P) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("repo")).unwrap();
+            // This process stands for the container's init, so a detached
+            // descendant reparents to "pid 1" as it would in a container.
+            become_subreaper(dir.path());
+            // LH-6's provider descriptor: the 16-byte retention the gap needs.
+            let retention = if hazard == "LH-6" { 16 } else { 1 << 20 };
+            let provider = ops(dir.path(), retention, 1 << 16).with_credentials(Arc::new(Vault));
+            let token = format!("rust-lh-{}-{}", std::process::id(), unique());
+            Self {
+                provider: wrap(provider),
+                dir,
+                token,
+            }
+        }
+    }
+
+    fn unique() -> usize {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    impl<P> Drop for StandIn<P> {
+        fn drop(&mut self) {
+            // Only this run's tokened processes: the workload and what it forked.
+            for pid in live_processes(TOKEN, &self.token).unwrap_or_default() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+
+    impl<P: SupportsOperations> HazardHarness for StandIn<P> {
+        type Provider = P;
+        fn provider(&self) -> &P {
+            &self.provider
+        }
+        fn workspace(&self) -> WorkspaceRef {
+            workspace()
+        }
+        fn spec(&self, hazard: &str, fixture_spec: &Value) -> OperationSpec {
+            let mut spec = fixture_spec.clone();
+            spec["argv"] = serde_json::json!(["sh", "-c", workload(hazard)]);
+            spec["environment"][TOKEN] = Value::String(self.token.clone());
+            if hazard == "LH-5" {
+                spec["timeout_seconds"] = 1.into();
+            }
+            if hazard == "LH-6" {
+                // The fixture's offsets count the workload's output only.
+                spec.as_object_mut().unwrap().remove("launch_marker");
+            }
+            serde_json::from_value(spec).unwrap()
+        }
+        fn establish(&self, hazard: &str, given: &str) -> Result<(), String> {
+            match given {
+                // The workload forks it; liveness is measured, not assumed.
+                "detached_descendant" | "timeout_elapsed" | "fifo_in_workspace" => Ok(()),
+                "observation_gap" if hazard == "LH-6" => Ok(()),
+                other => Err(format!("the stand-in docker cannot produce {other}")),
+            }
+        }
+        fn launches(&self) -> u32 {
+            std::fs::read_to_string(self.dir.path().join("docker.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("exec -i ") && l.contains(&self.token))
+                .count() as u32
+        }
+        fn descendant_alive(&self) -> Result<bool, Unmeasurable> {
+            Ok(!live_processes(TOKEN, &self.token)?.is_empty())
+        }
+        fn operation_records(&self) -> Option<u32> {
+            None
+        }
+        fn awaits_exit(&self, hazard: &str) -> bool {
+            matches!(hazard, "LH-6" | "LH-7")
+        }
+    }
+
+    /// What the Rust Docker provider does on each hazard, measured. A change
+    /// in any verdict fails here, so a fix or a regression has to update
+    /// COVERAGE.md with it.
+    fn expect(hazard: &str, verdict: &HazardVerdict) {
+        let summary = match verdict {
+            HazardVerdict::Pass => "pass".to_owned(),
+            HazardVerdict::Fail { step, call, .. } => format!("fail {step} {call}"),
+            HazardVerdict::NotRun { step, call, .. } => format!("not run {step} {call}"),
+        };
+        let expected = match hazard {
+            "LH-1" => "pass",
+            // The retried cancel ends provider_unavailable after 7s with the
+            // TERM-ignoring workload still alive. Not established whether the
+            // stand-in's stop or the provider is at fault: COVERAGE.md.
+            "LH-2" => "fail 3 cancel",
+            "LH-3" => "not run 1 cancel",
+            "LH-4" => "not run 0 start",
+            "LH-5" => "not run 1 observe",
+            // Finding: the gap page carries no loss_detected (0.2.1).
+            "LH-6" => "fail 2 observe",
+            "LH-7" => "not run 2 file_exists",
+            _ => unreachable!(),
+        };
+        assert_eq!(summary, expected, "{hazard}: {verdict:?}");
+    }
+
+    async fn run(hazard: &str) {
+        let harness = StandIn::new(hazard);
+        let verdict = drive_hazard(&fixture(hazard), &harness).await;
+        expect(hazard, &verdict);
+    }
+
+    #[tokio::test]
+    async fn lh1_double_fork_orphan_before_cancel() {
+        run("LH-1").await;
+    }
+    #[tokio::test]
+    async fn lh2_interrupted_cancel() {
+        run("LH-2").await;
+    }
+    #[tokio::test]
+    async fn lh3_cancel_before_launch_header() {
+        run("LH-3").await;
+    }
+    #[tokio::test]
+    async fn lh4_destroy_during_start() {
+        run("LH-4").await;
+    }
+    #[tokio::test]
+    async fn lh5_stuck_removal_settles() {
+        run("LH-5").await;
+    }
+    #[tokio::test]
+    async fn lh6_drain_with_gap_reports_loss() {
+        run("LH-6").await;
+    }
+    #[tokio::test]
+    async fn lh7_fifo_in_workspace() {
+        run("LH-7").await;
+    }
+
+    /// The mutation: a cancel that terminates nothing and reports confirmed.
+    struct ConfirmsBlindly {
+        inner: DockerOperations,
+        applied: AtomicUsize,
+    }
+
+    impl SupportsOperations for ConfirmsBlindly {
+        fn describe(&self) -> agentic_workspace_core::operations::ProviderDescriptor {
+            self.inner.describe()
+        }
+        async fn start(
+            &self,
+            workspace: &WorkspaceRef,
+            spec: OperationSpec,
+        ) -> Result<OperationRef, OperationError> {
+            self.inner.start(workspace, spec).await
+        }
+        async fn status(
+            &self,
+            operation: &OperationRef,
+        ) -> Result<OperationStatus, OperationError> {
+            self.inner.status(operation).await
+        }
+        async fn observe(
+            &self,
+            operation: &OperationRef,
+            request: ObserveRequest,
+        ) -> Result<agentic_workspace_core::operations::ObservationPage, OperationError> {
+            self.inner.observe(operation, request).await
+        }
+        async fn cancel(
+            &self,
+            operation: &OperationRef,
+            _grace: Duration,
+        ) -> Result<OperationStatus, OperationError> {
+            self.applied.fetch_add(1, Ordering::SeqCst);
+            let mut status = serde_json::to_value(self.inner.status(operation).await?).unwrap();
+            status["state"] = "cancelled".into();
+            status["ended_at"] = "2026-01-01T00:00:00Z".into();
+            Ok(serde_json::from_value(status).unwrap())
+        }
+        async fn finalize(
+            &self,
+            workspace: &WorkspaceRef,
+        ) -> agentic_workspace_core::operations::FinalizationOutcome {
+            self.inner.finalize(workspace).await
+        }
+    }
+
+    /// No vacuous pass: a cancel confirmed while the measured descendant
+    /// lives must fail LH-1 on the cancel step.
+    #[tokio::test]
+    async fn lh1_fails_a_cancel_confirmed_while_a_descendant_lives() {
+        use agentic_workspace_conformance::hazard::{Mismatch, Outcome};
+        let harness = StandIn::with("LH-1", |inner| ConfirmsBlindly {
+            inner,
+            applied: AtomicUsize::new(0),
+        });
+        let verdict = drive_hazard(&fixture("LH-1"), &harness).await;
+        assert_eq!(
+            harness.provider.applied.load(Ordering::SeqCst),
+            1,
+            "the mutation never ran"
+        );
+        let HazardVerdict::Fail {
+            step: 1,
+            call,
+            mismatch: Mismatch::NoAlternative { measured },
+        } = &verdict
+        else {
+            panic!("LH-1 did not fail on the confirmed cancel: {verdict:?}");
+        };
+        assert_eq!(call, "cancel");
+        assert!(measured.descendant_alive, "{verdict:?}");
+        assert!(
+            matches!(&measured.outcome, Outcome::Document(d) if d["state"] == "cancelled"),
+            "{verdict:?}"
+        );
+    }
+}

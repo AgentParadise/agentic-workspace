@@ -1,17 +1,20 @@
 //! APSS EXP-V1-0006 0.2.1 lifecycle-hazard fixtures (LH-1..LH-7) for Rust providers.
 //!
-//! The provider-neutral half of the hazard harness: it loads the vendored
-//! `behaviour/hazard-*.json` fixtures and judges one step's measured outcome
-//! against them. A driver performs the call, establishes the step's `given`
-//! conditions, and measures `descendant_alive` itself (see [`live_processes`]);
-//! nothing here takes liveness from the fixture.
+//! Loads the vendored `behaviour/hazard-*.json` fixtures, drives each step
+//! through any [`SupportsOperations`] provider with [`drive_hazard`], and
+//! judges the measured outcome with [`judge`]. A [`HazardHarness`] (the
+//! hazard counterpart of [`crate::behaviour::BehaviourHarness`]) establishes
+//! each step's `given` conditions and measures `descendant_alive` (see
+//! [`live_processes`]) and launches; nothing here takes liveness from the
+//! fixture. A condition the harness cannot establish, or a call the trait has
+//! no method for, ends the run as [`HazardVerdict::NotRun`], never a pass.
 //!
-//! The Rust operations trait (`SupportsOperations`) lands with PR #60, so no
-//! Rust provider is driven through these fixtures yet. That driver belongs in
-//! #60's `behaviour::drive`, calling [`judge`] per step. The Python harness
-//! (`lib/python/agentic_isolation/tests/test_behaviour_hazards.py`) drives
-//! both Python providers today and uses the same matching rule.
+//! The Python harness (`lib/python/agentic_isolation/tests/test_behaviour_hazards.py`)
+//! drives both Python providers with the same matching rule.
 
+use agentic_workspace_core::operations::{
+    ObserveRequest, OperationError, OperationRef, OperationSpec, SupportsOperations, WorkspaceRef,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;
@@ -35,6 +38,8 @@ pub struct HazardFixture {
 pub struct HazardStep {
     pub call: String,
     #[serde(default)]
+    pub args: Value,
+    #[serde(default)]
     pub given: Vec<String>,
     pub settles_within_seconds: Option<f64>,
     expect: Option<Expectation>,
@@ -47,6 +52,7 @@ pub struct HazardStep {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Expectation {
+    pub schema: Option<String>,
     pub document: Value,
     pub descendant_alive: Option<bool>,
 }
@@ -159,6 +165,16 @@ fn matches(alternative: &Expectation, measured: &Measured) -> bool {
         return false;
     }
     let want = &alternative.document;
+    if alternative
+        .schema
+        .as_deref()
+        .is_some_and(|s| s.ends_with("#/$defs/operationRef"))
+    {
+        // Workspace and operation ids are provider-chosen; the key is the caller's.
+        return matches!(&measured.outcome, Outcome::Document(got)
+            if got.get("operation_id").is_some()
+                && got.get("operation_key") == want.get("operation_key"));
+    }
     match (&measured.outcome, want.get("kind")) {
         (Outcome::Error { kind, has_ref }, Some(want_kind)) => {
             want_kind.as_str() == Some(kind) && *has_ref == want.get("ref").is_some()
@@ -201,6 +217,211 @@ pub fn load_hazards(dir: &Path) -> std::io::Result<Vec<HazardFixture>> {
     }
     fixtures.sort_by(|a: &HazardFixture, b| a.hazard.cmp(&b.hazard));
     Ok(fixtures)
+}
+
+/// The provider under test and the test environment around one hazard.
+pub trait HazardHarness {
+    type Provider: SupportsOperations;
+    fn provider(&self) -> &Self::Provider;
+    fn workspace(&self) -> WorkspaceRef;
+    /// The spec to start: the fixture's, with its `argv` replaced by a
+    /// workload that produces `hazard`'s conditions, carrying the harness's
+    /// liveness token.
+    fn spec(&self, hazard: &str, fixture_spec: &Value) -> OperationSpec;
+    /// Make `given` true before the step runs, or say why it cannot be.
+    /// `caller_cancelled_during_confirmation` is the runner's, not this.
+    fn establish(&self, hazard: &str, given: &str) -> Result<(), String>;
+    /// Workloads the provider launched for this run.
+    fn launches(&self) -> u32;
+    /// Live processes carrying this run's token, detached ones included.
+    fn descendant_alive(&self) -> Result<bool, Unmeasurable>;
+    /// Operation records the provider holds for the workspace, when it
+    /// exposes that; `None` makes a step that counts them not run.
+    fn operation_records(&self) -> Option<u32>;
+    /// Whether `hazard`'s workload is short and the fixture's next steps
+    /// assume it has exited: `start` then waits for a terminal status.
+    fn awaits_exit(&self, hazard: &str) -> bool;
+}
+
+/// How one hazard went for one provider.
+#[derive(Debug)]
+pub enum HazardVerdict {
+    Pass,
+    /// A measured outcome the fixture forbids: a provider finding.
+    Fail {
+        step: usize,
+        call: String,
+        mismatch: Mismatch,
+    },
+    /// The step could not be executed as the fixture says. Not a pass.
+    NotRun {
+        step: usize,
+        call: String,
+        reason: String,
+    },
+}
+
+const CALLER_ABANDONS: &str = "caller_cancelled_during_confirmation";
+
+fn error_outcome(error: &OperationError) -> Outcome {
+    Outcome::Error {
+        kind: serde_json::to_value(error.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+        has_ref: error.operation.is_some(),
+    }
+}
+
+fn document<T: serde::Serialize>(result: Result<T, OperationError>) -> Outcome {
+    match result {
+        Ok(value) => Outcome::Document(serde_json::to_value(value).expect("serialisable")),
+        Err(error) => error_outcome(&error),
+    }
+}
+
+/// Run every step of `fixture` against `harness`'s provider, stopping at the
+/// first step that fails or cannot run.
+pub async fn drive_hazard<H: HazardHarness>(fixture: &HazardFixture, harness: &H) -> HazardVerdict {
+    let provider = harness.provider();
+    let hazard = fixture.hazard.as_str();
+    let mut operation: Option<OperationRef> = None;
+    let mut cursor: Option<String> = None;
+    for (index, step) in fixture.steps.iter().enumerate() {
+        let not_run = |reason: String| HazardVerdict::NotRun {
+            step: index,
+            call: step.call.clone(),
+            reason,
+        };
+        for given in step.given.iter().filter(|g| *g != CALLER_ABANDONS) {
+            if let Err(reason) = harness.establish(hazard, given) {
+                return not_run(format!("given {given}: {reason}"));
+            }
+        }
+        let bound = Duration::from_secs_f64(step.settles_within_seconds.unwrap_or(30.0));
+        let began = std::time::Instant::now();
+        let call = async {
+            match step.call.as_str() {
+                "start" => {
+                    let spec = harness.spec(hazard, &step.args["spec"]);
+                    let result = provider.start(&harness.workspace(), spec).await;
+                    if let Ok(started) = &result {
+                        operation = Some(started.clone());
+                        while harness.awaits_exit(hazard)
+                            && !provider
+                                .status(started)
+                                .await
+                                .is_ok_and(|s| s.state.is_terminal())
+                        {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                    Ok(document(result))
+                }
+                "finalize" => Ok(Outcome::Document(
+                    serde_json::to_value(provider.finalize(&harness.workspace()).await)
+                        .expect("serialisable"),
+                )),
+                call => {
+                    let Some(op) = operation.as_ref() else {
+                        return Err(format!("{call} before a successful start"));
+                    };
+                    match call {
+                        "status" => Ok(document(provider.status(op).await)),
+                        "cancel" if step.given.iter().any(|g| g == CALLER_ABANDONS) => {
+                            // The caller drops the cancel mid-confirmation.
+                            let abandoned = tokio::time::timeout(
+                                Duration::from_millis(300),
+                                provider.cancel(op, Duration::from_secs(3)),
+                            )
+                            .await;
+                            Ok(match abandoned {
+                                Ok(result) => document(result),
+                                Err(_) => Outcome::Error {
+                                    kind: "cancelled".into(),
+                                    has_ref: true,
+                                },
+                            })
+                        }
+                        "cancel" => Ok(document(provider.cancel(op, Duration::from_secs(1)).await)),
+                        "observe" => loop {
+                            let request = ObserveRequest {
+                                cursor: cursor.clone(),
+                                max_bytes: 1 << 16,
+                                wait: Duration::from_secs(1),
+                            };
+                            match provider.observe(op, request).await {
+                                Ok(page) => {
+                                    cursor = Some(page.next_cursor.to_string());
+                                    if page.complete || !step.repeat_until_complete {
+                                        break Ok(document(Ok(page)));
+                                    }
+                                }
+                                Err(error) => break Ok(error_outcome(&error)),
+                            }
+                        },
+                        other => Err(format!(
+                            "SupportsOperations has no {other}; no Rust provider surface serves it"
+                        )),
+                    }
+                }
+            }
+        };
+        let outcome = match tokio::time::timeout(bound, call).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(reason)) => return not_run(reason),
+            Err(_) => {
+                return HazardVerdict::Fail {
+                    step: index,
+                    call: step.call.clone(),
+                    mismatch: Mismatch::Unsettled {
+                        bound: bound.as_secs_f64(),
+                        elapsed: began.elapsed(),
+                    },
+                };
+            }
+        };
+        let elapsed = began.elapsed();
+        let descendant_alive = match harness.descendant_alive() {
+            Ok(alive) => alive,
+            Err(unmeasurable) => return not_run(unmeasurable.to_string()),
+        };
+        let operation_records = match (step.operation_records, harness.operation_records()) {
+            (Some(_), None) => {
+                return not_run("the provider does not expose its operation records".into());
+            }
+            (_, measured) => measured.unwrap_or(0),
+        };
+        let measured = Measured {
+            outcome,
+            elapsed,
+            descendant_alive,
+            launches: settled_launches(harness, step.launches).await,
+            operation_records,
+        };
+        if let Err(mismatch) = judge(step, &measured) {
+            return HazardVerdict::Fail {
+                step: index,
+                call: step.call.clone(),
+                mismatch,
+            };
+        }
+    }
+    HazardVerdict::Pass
+}
+
+/// The launch count once it stops moving: up to 2s for an expected launch
+/// to be logged, then a quiet period so a late extra launch is counted too.
+async fn settled_launches<H: HazardHarness>(harness: &H, expected: Option<u32>) -> u32 {
+    let Some(expected) = expected else {
+        return harness.launches();
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while harness.launches() != expected && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    harness.launches()
 }
 
 /// `descendant_alive` cannot be measured on this host: there is no `/proc`
