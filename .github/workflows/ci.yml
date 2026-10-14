@@ -31,15 +31,17 @@ jobs:
       # lib/python/agentic_isolation/agentic_isolation/apparmor/README.md).
       - name: Load Codex sandbox AppArmor profile
         run: sudo apparmor_parser -r lib/python/agentic_isolation/agentic_isolation/apparmor/agentic-codex-sandbox
-      - run: cargo test --workspace
+      # Process tests (the LH hazards among them) run in their own session,
+      # so they signal only groups inside it, under an outer wall-clock bound.
+      - run: setsid -w timeout -k 30 1200 cargo test --workspace
       - name: Verify APSS pin
         run: |
           grep -F 'id: EXP-V1-0006' APSS.yaml
-          grep -F 'version: "=0.2.0"' APSS.yaml
+          grep -F 'version: "=0.2.1"' APSS.yaml
           grep -F 'id = "EXP-V1-0006"' apss.lock
-          grep -F 'version = "0.2.0"' apss.lock
-          grep -F 'rev=3bdbc3382371af5c9bedbc2f6de07037ae081c7e#3bdbc3382371af5c9bedbc2f6de07037ae081c7e' Cargo.lock
-          cargo tree -p agentic-workspace-core | grep -F 'apss-v1-0006-workspace v0.2.0'
+          grep -F 'version = "0.2.1"' apss.lock
+          grep -F 'rev=ee926c6e44c0e37ad524e0ee265ffc4fabb714fc#ee926c6e44c0e37ad524e0ee265ffc4fabb714fc' Cargo.lock
+          cargo tree -p agentic-workspace-core | grep -F 'apss-v1-0006-workspace v0.2.1'
 
   rust-test:
     strategy:
@@ -56,7 +58,10 @@ jobs:
       - name: Load Codex sandbox AppArmor profile
         if: runner.os == 'Linux'
         run: sudo apparmor_parser -r lib/python/agentic_isolation/agentic_isolation/apparmor/agentic-codex-sandbox
-      - run: cargo test --workspace
+      - if: runner.os == 'Linux'
+        run: setsid -w timeout -k 30 1200 cargo test --workspace
+      - if: runner.os != 'Linux'
+        run: cargo test --workspace
 
   itmux-test:
     runs-on: ubuntu-latest
@@ -85,7 +90,15 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
       - run: uv sync --locked --all-extras
-      - run: uv run pytest -q
+      # Every invocation runs in its own session (`setsid -w`), so process
+      # tests signal only groups inside it, under an outer wall-clock bound.
+      # The hazard harness is named in its own step and excluded here, so it
+      # is never selected by a run that is not isolated and bounded for it.
+      - run: setsid -w timeout -k 30 900 uv run pytest -q --ignore=tests/test_behaviour_hazards.py
+      - name: APSS lifecycle-hazard behaviour harness
+        if: matrix.package == 'agentic_isolation'
+        timeout-minutes: 10
+        run: setsid -w timeout -k 30 480 uv run pytest -q -rsx tests/test_behaviour_hazards.py
 
   consumer-contracts:
     runs-on: ubuntu-latest
