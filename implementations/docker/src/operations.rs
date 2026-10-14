@@ -64,7 +64,8 @@ fn leader_reused(table: &Table, leader: &str, start: &str) -> bool {
 /// Every live process of the operation: its group, then their descendants.
 /// A descendant that left the group (`setsid`, `setpgid`) is still found
 /// through its parent chain, and once tracked stays tracked by pid and start
-/// time after its parent dies. Never pid 1.
+/// time after its parent dies. Never pid 1, nor (unlike the Python
+/// provider) init's other children through it.
 fn members(
     table: &Table,
     leader: &str,
@@ -74,6 +75,7 @@ fn members(
     let reused = leader_reused(table, leader, start);
     let mut found: BTreeMap<String, String> = table
         .iter()
+        .filter(|(pid, _)| pid.parse::<u64>().is_ok_and(|n| n > 1))
         .filter(|(pid, row)| (row.1 == leader && !reused) || tracked.get(*pid) == Some(&row.2))
         .map(|(pid, row)| (pid.clone(), row.2.clone()))
         .collect();
@@ -88,7 +90,6 @@ fn members(
         }
         found.extend(children);
     }
-    found.retain(|pid, _| pid.parse::<u64>().is_ok_and(|n| n > 1));
     found
 }
 
@@ -770,5 +771,89 @@ impl SupportsOperations for DockerOperations {
                 retained: None,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(rows: &[&str]) -> Table {
+        parse_table(&rows.join("\n"))
+    }
+
+    #[test]
+    fn the_process_table_skips_malformed_rows() {
+        let parsed = table(&["10 1 10 500", "garbage", "11 10 10", "12 x 10 501"]);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed["10"], ("1".into(), "10".into(), "500".into()));
+    }
+
+    #[test]
+    fn members_follow_escapees_and_never_include_init() {
+        // 10 leads; 11 is in its group; 12 left the group via setsid but is
+        // 11's child; 13 is 12's child; 1 claims group 10 and is never a member.
+        let rows = table(&[
+            "10 1 10 500",
+            "11 10 10 501",
+            "12 11 12 502",
+            "13 12 12 503",
+            "1 0 10 1",
+            "20 1 20 600",
+        ]);
+        let found = members(&rows, "10", "500", &BTreeMap::new());
+        let pids: Vec<&str> = found.keys().map(String::as_str).collect();
+        assert_eq!(pids, ["10", "11", "12", "13"]);
+        assert!(!all_gone(&rows, "10", "500", &found));
+    }
+
+    #[test]
+    fn a_tracked_escapee_whose_parent_died_is_still_a_member() {
+        let tracked = BTreeMap::from([("12".to_owned(), "502".to_owned())]);
+        let rows = table(&["12 1 12 502"]);
+        assert!(members(&rows, "10", "500", &tracked).contains_key("12"));
+        assert!(!all_gone(&rows, "10", "500", &tracked));
+        // Same pid, new start time: a reused pid is not ours.
+        let reused = table(&["12 1 12 999"]);
+        assert!(members(&reused, "10", "500", &tracked).is_empty());
+        assert!(all_gone(&reused, "10", "500", &tracked));
+    }
+
+    #[test]
+    fn the_group_of_a_reused_leader_is_never_ours() {
+        let rows = table(&["10 1 10 777", "11 10 10 501"]);
+        assert!(leader_reused(&rows, "10", "500"));
+        assert!(members(&rows, "10", "500", &BTreeMap::new()).is_empty());
+        assert!(all_gone(&rows, "10", "500", &BTreeMap::new()));
+    }
+
+    #[test]
+    fn init_malformed_and_our_own_group_are_refused() {
+        for pid in ["0", "1", "-5", "", "x"] {
+            assert!(
+                unsafe_leader(pid, Some(42), Some("a"), Some("b")).is_some(),
+                "{pid:?}"
+            );
+        }
+        assert!(unsafe_leader("7", Some(42), None, None).is_none());
+        // Our own group number: safe only in a provably different namespace.
+        assert!(unsafe_leader("42", Some(42), Some("pid:[1]"), Some("pid:[2]")).is_none());
+        assert!(unsafe_leader("42", Some(42), Some("pid:[1]"), Some("pid:[1]")).is_some());
+        assert!(unsafe_leader("42", Some(42), Some("pid:[1]"), None).is_some());
+        assert!(unsafe_leader("42", None, None, Some("pid:[2]")).is_some());
+    }
+
+    #[test]
+    fn signalled_exits_are_named() {
+        assert_eq!(signal_name(143).as_deref(), Some("SIGTERM"));
+        assert_eq!(signal_name(137).as_deref(), Some("SIGKILL"));
+        assert_eq!(signal_name(1), None);
+    }
+
+    #[test]
+    fn timestamps_are_rfc3339_utc() {
+        let now = now_rfc3339();
+        assert_eq!(now.len(), 20, "{now}");
+        assert!(now.ends_with('Z') && now.as_bytes()[10] == b'T', "{now}");
     }
 }

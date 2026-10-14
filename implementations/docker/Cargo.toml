@@ -14,3 +14,4 @@ tokio.workspace = true
 [dev-dependencies]
 agentic-workspace-conformance = { path = "../../crates/workspace-conformance" }
 tempfile.workspace = true
+base64.workspace = true

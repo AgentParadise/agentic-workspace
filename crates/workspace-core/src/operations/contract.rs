@@ -479,7 +479,8 @@ pub struct OperationError {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
-    pub operation: Option<OperationRef>,
+    // Boxed so every `Result<_, OperationError>` stays small.
+    pub operation: Option<Box<OperationRef>>,
 }
 
 impl OperationError {
@@ -495,7 +496,7 @@ impl OperationError {
             schema: Some(StatusSchema::V1),
             kind,
             message,
-            operation,
+            operation: operation.map(Box::new),
         }
     }
 }

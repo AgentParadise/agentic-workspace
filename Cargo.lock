@@ -31,6 +31,7 @@ version = "0.3.0"
 dependencies = [
  "agentic-workspace-conformance",
  "agentic-workspace-core",
+ "base64",
  "serde_json",
  "tempfile",
  "tokio",
