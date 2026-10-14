@@ -286,7 +286,7 @@ class Subject:
         be a workload but whose environment cannot be read makes liveness
         unmeasurable, raised as NotRun, never counted as not ours. A process
         older than this harness cannot be a workload it launched, and one that
-        exits during the scan is gone; neither is a candidate.
+        exits during the scan, or is a zombie, is gone; none is a candidate.
         """
         needle = f"{TOKEN_VARIABLE}={self.token}".encode()
         harness_began = _started(Path("/proc/self"))
@@ -295,11 +295,16 @@ class Subject:
             if not entry.name.isdigit() or int(entry.name) == os.getpid():
                 continue
             try:
-                if _started(entry) < harness_began:
+                if _started(entry) < harness_began or _zombie(entry):
                     continue
-                if needle not in _environ(entry).split(b"\0"):
-                    continue
-                if "\nState:\tZ" in (entry / "status").read_text():
+                try:
+                    environ = _environ(entry)
+                except PermissionError:
+                    # A process that died after the check hides its environ too.
+                    if _zombie(entry):
+                        continue
+                    raise
+                if needle not in environ.split(b"\0"):
                     continue
             except (FileNotFoundError, ProcessLookupError):
                 continue
@@ -350,6 +355,10 @@ class Subject:
 def _started(entry: Path) -> int:
     """When the process began, in clock ticks since boot (proc(5) stat field 22)."""
     return int((entry / "stat").read_text().rsplit(")", 1)[1].split()[19])
+
+
+def _zombie(entry: Path) -> bool:
+    return "\nState:\tZ" in (entry / "status").read_text()
 
 
 def _environ(entry: Path) -> bytes:
@@ -857,7 +866,8 @@ DOCKER_DAEMON_LH7 = Finding(
 CONFIRMED: dict[tuple[str, str], dict[int, int]] = {
     ("docker", "LH-1"): {1: 0},
     ("docker", "LH-2"): {3: 0},
-    ("docker", "LH-5"): {1: 0},
+    # The stuck removal settles provider_unavailable, never timed_out.
+    ("docker", "LH-5"): {1: 1},
     ("local", "LH-2"): {3: 0},
 }
 
@@ -1112,6 +1122,83 @@ async def test_lh1_fails_a_cancel_confirmed_while_a_descendant_lives(subject: Su
     message = str(caught.value)
     assert "LH-1 step 1 cancel" in message, message
     assert '"state":"cancelled"' in message and "descendant_alive=True" in message, message
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+async def test_an_unreadable_environ_is_not_run_not_dead(subject: Subject) -> None:
+    """Liveness fails closed (#68): a workload whose environ cannot be read is
+    unmeasurable, so the cell is NOT RUN rather than judged alive=false."""
+    readable = _environ
+
+    def hidden(entry: Path) -> bytes:
+        environ = readable(entry)
+        if f"{TOKEN_VARIABLE}={subject.token}".encode() in environ.split(b"\0"):
+            raise PermissionError(13, "Permission denied", str(entry / "environ"))
+        return environ
+
+    subject.monkeypatch.setattr(f"{__name__}._environ", hidden)
+    with pytest.raises(NotRun, match="unreadable"):
+        await run_hazard(subject, "LH-2")
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+async def test_a_probe_raising_an_untyped_error_is_a_fixture_mismatch(subject: Subject) -> None:
+    async def untyped(workspace: Workspace, path: str) -> bool:
+        raise ValueError("not a typed refusal")
+
+    subject.monkeypatch.setattr(subject.provider, "file_exists", untyped)
+    with pytest.raises(FixtureMismatch, match="untyped error ValueError") as caught:
+        await run_hazard(subject, "LH-7")
+    assert (caught.value.step, caught.value.call) == (2, "file_exists")
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+async def test_a_not_a_regular_file_refusal_is_rejected_policy(subject: Subject) -> None:
+    async def refuses(workspace: Workspace, path: str) -> bytes:
+        raise NotARegularFileError(path)
+
+    subject.monkeypatch.setattr(subject.provider, "read_file", refuses)
+    matched = await run_hazard(subject, "LH-7")
+    read = HAZARDS["LH-7"]["steps"][3]["expect_one_of"][matched[3]]["document"]
+    assert read["kind"] == "rejected_policy"
+
+
+def _miss(step: int, call: str, **fields: Any) -> FixtureMismatch:
+    settled = fields.pop("settled", True)
+    outcome = Outcome(document=fields) if fields else None
+    return FixtureMismatch("miss", step=step, call=call, outcome=outcome, settled=settled)
+
+
+@pytest.mark.parametrize(
+    "miss",
+    [
+        pytest.param(_miss(2, "status", settled=False), id="other-step"),
+        pytest.param(_miss(1, "status", settled=False), id="other-call"),
+        pytest.param(_miss(1, "cancel", state="failed"), id="other-outcome"),
+    ],
+)
+async def test_a_finding_that_misses_elsewhere_fails(miss: FixtureMismatch) -> None:
+    """A pin is (step, call, outcome): any other miss propagates as itself."""
+
+    async def fails() -> None:
+        raise miss
+
+    with pytest.raises(FixtureMismatch) as caught:
+        await _expect_finding(fails(), FINDINGS["docker", "LH-3"])
+    assert caught.value is miss
+
+
+async def test_a_finding_xfails_only_on_its_pinned_miss() -> None:
+    async def fails() -> None:
+        raise _miss(1, "cancel", settled=False)
+
+    async def passes() -> None:
+        return None
+
+    with pytest.raises(pytest.xfail.Exception):
+        await _expect_finding(fails(), FINDINGS["docker", "LH-3"])
+    with pytest.raises(pytest.fail.Exception, match="XPASS"):
+        await _expect_finding(passes(), FINDINGS["docker", "LH-3"])
 
 
 @pytest.mark.integration
