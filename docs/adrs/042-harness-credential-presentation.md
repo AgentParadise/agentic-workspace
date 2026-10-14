@@ -98,12 +98,20 @@ pinned CLI in the `claude-cli` image with `--network none` through
 
 - the image's CLI version is the pinned one,
 - exactly one request reached the upstream, `POST` at the class's model path,
-- the only credential header sent is the class's standard one, and its value
-  hashes to `sha256(wire_credential(entropy))`,
+- the request carries exactly one credential header, the class's standard
+  one, once, and its value hashes to `sha256(wire_credential(entropy))`,
+- every file in the child's writable locations (its work dir, which holds
+  `$HOME`, its cwd and its `$TMPDIR`, plus the system temp dir) was read in
+  full with symlinks followed; anything unreadable or unresolvable fails it,
 - every credential-named env var in the CLI's environment holds exactly the
-  wire, no file under `$HOME` contains the wire, and no request, env value or
+  wire, no inventoried file contains the wire, and no request, env value or
   file holds a credential-shaped string or one of the host's synthetic
   upstream-key canaries.
+
+`tests/test_harness_credential_round_trip_checks.py` runs those assertions
+without Docker against planted contamination: a repeated auth header, a
+canary in a second file, past the first MiB, outside `$HOME`, or behind a
+symlink, and an unreadable or looping path.
 
 Run it with:
 
