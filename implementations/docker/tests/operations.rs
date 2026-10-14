@@ -9,8 +9,8 @@
 #![cfg(target_os = "linux")]
 
 use agentic_workspace_core::operations::{
-    ErrorKind, ObserveRequest, OperationRef, OperationSpec, OperationState, SupportsOperations,
-    WorkspaceRef,
+    ErrorKind, ObserveRequest, OperationError, OperationRef, OperationSpec, OperationState,
+    OperationStatus, SupportsOperations, WorkspaceRef,
 };
 use agentic_workspace_docker::operations::DockerOperations;
 use base64::Engine as _;
@@ -22,12 +22,16 @@ use std::time::Duration;
 
 /// `exec` drops docker's own flags and runs the command here; `stop` is
 /// recorded. Every argv is appended to `docker.log` beside the script. While
-/// a `fail` file sits beside it, signalling and `stop` both fail.
+/// a `fail` file sits beside it, signalling and `stop` both fail; `container
+/// inspect` says the container is running, or gone while a `gone` file sits
+/// beside it, or cannot reach the daemon while a `down` file does.
 fn fake_docker(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let script = dir.join("docker");
     let log = dir.join("docker.log");
     let fail = dir.join("fail");
+    let gone = dir.join("gone");
+    let down = dir.join("down");
     std::fs::write(
         &script,
         format!(
@@ -48,10 +52,16 @@ exec)
     [ -e '{fail}' ] && [ "$4" = aw-signal ] && exit 1
     exec "$@" ;;
 stop) [ -e '{fail}' ] && exit 1; exit 0 ;;
+container)
+    [ -e '{down}' ] && {{ echo 'Cannot connect to the Docker daemon' >&2; exit 1; }}
+    [ -e '{gone}' ] && {{ echo 'Error: No such container: c1' >&2; exit 1; }}
+    echo running ;;
 esac
 "#,
             log = log.display(),
-            fail = fail.display()
+            fail = fail.display(),
+            gone = gone.display(),
+            down = down.display()
         ),
     )
     .unwrap();
@@ -417,6 +427,86 @@ async fn failed_cleanup_stays_resolvable_and_a_retry_cleans_up() {
         ops.status(&op).await.unwrap_err().kind,
         ErrorKind::UnknownOperation
     );
+}
+
+/// Start `echo $$; sleep 300` and return its leader's pid once printed.
+async fn sleeper(ops: &DockerOperations) -> (OperationRef, String) {
+    let op = ops
+        .start(&workspace(), spec("k1", "echo $$; sleep 300", 60))
+        .await
+        .unwrap();
+    let page = ops
+        .observe(
+            &op,
+            ObserveRequest {
+                cursor: None,
+                max_bytes: 4096,
+                wait: Duration::from_secs(5),
+            },
+        )
+        .await
+        .unwrap();
+    let pid = String::from_utf8(STANDARD.decode(page.data_b64.as_str()).unwrap()).unwrap();
+    (op, pid.trim().to_owned())
+}
+
+/// Poll `status` until `done` holds of its result.
+async fn status_until(
+    ops: &DockerOperations,
+    op: &OperationRef,
+    done: impl Fn(&Result<OperationStatus, OperationError>) -> bool,
+) -> Result<OperationStatus, OperationError> {
+    for _ in 0..100 {
+        let status = ops.status(op).await;
+        if done(&status) {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("status never settled: {:?}", ops.status(op).await);
+}
+
+#[tokio::test]
+async fn a_workload_whose_container_is_removed_is_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let (op, pid) = sleeper(&ops).await;
+    // Removing the container kills its processes and then it is gone.
+    std::fs::write(dir.path().join("gone"), "").unwrap();
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = status_until(&ops, &op, |s| {
+        s.as_ref().is_ok_and(|s| s.state.is_terminal())
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.state, OperationState::Lost);
+}
+
+#[tokio::test]
+async fn an_unreachable_daemon_is_provider_unavailable_and_a_real_failure_stays_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let (op, pid) = sleeper(&ops).await;
+    std::fs::write(dir.path().join("down"), "").unwrap();
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let error = status_until(&ops, &op, |s| s.is_err()).await.unwrap_err();
+    assert_eq!(error.kind, ErrorKind::ProviderUnavailable, "{error:?}");
+    // The daemon is back and the container is still there: the workload failed.
+    std::fs::remove_file(dir.path().join("down")).unwrap();
+    let status = ops.status(&op).await.unwrap();
+    assert_eq!(status.state, OperationState::Failed);
 }
 
 #[test]

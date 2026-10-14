@@ -42,6 +42,31 @@ const FINAL_OUTPUT: Duration = Duration::from_secs(2);
 const CLIENT_EXIT: Duration = Duration::from_secs(10);
 /// The grace a timed-out operation gets between TERM and KILL.
 const TIMEOUT_GRACE: Duration = Duration::from_secs(1);
+/// How long settlement waits out a container removal in progress.
+const REMOVAL_WAIT: Duration = Duration::from_secs(30);
+
+/// What `docker container inspect` says of an operation's container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presence {
+    Running,
+    Removing,
+    Stopped,
+    Gone,
+}
+
+/// Classify `docker container inspect -f {{.State.Status}}`; an answer that
+/// is neither a state nor "no such container" means docker cannot tell.
+fn presence(code: i32, out: &str) -> Result<Presence, String> {
+    match (code, out.trim()) {
+        (0, "running" | "paused" | "restarting") => Ok(Presence::Running),
+        (0, "removing") => Ok(Presence::Removing),
+        (0, _) => Ok(Presence::Stopped),
+        (_, out) if out.to_lowercase().contains("no such") => Ok(Presence::Gone),
+        (code, out) => Err(format!(
+            "docker could not report the container: exit {code}: {out}"
+        )),
+    }
+}
 
 /// pid -> (ppid, pgrp, start), as `PROCESSES` reports it.
 type Table = HashMap<String, (String, String, String)>;
@@ -197,6 +222,10 @@ struct Progress {
     ended_at: Option<String>,
     escalated: bool,
     failures: Vec<String>,
+    /// The exec client has exited and its output is drained; settlement may
+    /// still wait on the container's presence.
+    client_finished: bool,
+    client_code: Option<i32>,
 }
 
 struct Operation {
@@ -289,6 +318,54 @@ impl Docker {
             (0, out) => Ok(out),
             (code, out) => Err(format!("{name}: exit {code}: {}", out.trim())),
         }
+    }
+
+    async fn presence(&self, container: &str) -> Result<Presence, String> {
+        let (code, out) = self
+            .run(&["container", "inspect", "-f", "{{.State.Status}}", container])
+            .await?;
+        presence(code, &out).map_err(|why| format!("{container}: {why}"))
+    }
+
+    /// Settle a finished client's operation. A workload whose container is
+    /// gone is `lost`, not `failed`; while docker cannot tell, or the
+    /// container is still being removed, it stays unsettled and `status`
+    /// probes again. `wait` waits out a removal in progress.
+    async fn settle(&self, op: &Operation, wait: bool) {
+        let deadline = tokio::time::Instant::now() + REMOVAL_WAIT;
+        let presence = loop {
+            match self.presence(&op.container).await {
+                Ok(Presence::Removing) if wait && tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(100)).await
+                }
+                other => break other,
+            }
+        };
+        let Ok(presence) = presence else { return };
+        if presence == Presence::Removing {
+            return;
+        }
+        op.update(|p| {
+            if p.state.is_terminal() {
+                return;
+            }
+            p.leader_known = true;
+            p.ended_at = Some(now_rfc3339());
+            p.state = match (p.requested, presence) {
+                (Some(requested), _) => requested,
+                (None, Presence::Gone) => OperationState::Lost,
+                (None, _) => {
+                    let code = p.client_code;
+                    p.exit_code = code.map(i64::from);
+                    p.signal = code.and_then(signal_name);
+                    if code == Some(0) {
+                        OperationState::Succeeded
+                    } else {
+                        OperationState::Failed
+                    }
+                }
+            };
+        });
     }
 
     async fn table(&self, container: &str) -> Result<Table, String> {
@@ -552,6 +629,8 @@ impl DockerOperations {
                 ended_at: None,
                 escalated: false,
                 failures: Vec::new(),
+                client_finished: false,
+                client_code: None,
             }),
             changed: Notify::new(),
             spec,
@@ -625,20 +704,10 @@ async fn collect(docker: Docker, op: Arc<Operation>, mut child: tokio::process::
     }
     op.update(|p| {
         p.leader_known = true;
-        p.ended_at = Some(now_rfc3339());
-        p.state = match p.requested {
-            Some(requested) => requested,
-            None => {
-                p.exit_code = code.map(i64::from);
-                p.signal = code.and_then(signal_name);
-                if code == Some(0) {
-                    OperationState::Succeeded
-                } else {
-                    OperationState::Failed
-                }
-            }
-        };
+        p.client_finished = true;
+        p.client_code = code;
     });
+    docker.settle(&op, true).await;
 }
 
 async fn read_stdout(op: &Operation, stdout: impl AsyncRead + Unpin) {
@@ -738,7 +807,19 @@ impl SupportsOperations for DockerOperations {
     }
 
     async fn status(&self, operation: &OperationRef) -> Result<OperationStatus, OperationError> {
-        Ok(self.lookup(operation).await?.status())
+        let op = self.lookup(operation).await?;
+        let unsettled = {
+            let p = op.lock();
+            p.client_finished && !p.state.is_terminal()
+        };
+        if unsettled {
+            self.docker
+                .presence(&op.container)
+                .await
+                .map_err(|why| error(ErrorKind::ProviderUnavailable, why, Some(&op.reference)))?;
+            self.docker.settle(&op, false).await;
+        }
+        Ok(op.status())
     }
 
     async fn observe(
@@ -893,6 +974,25 @@ mod tests {
         assert!(unsafe_leader("42", Some(42), Some("pid:[1]"), Some("pid:[1]")).is_some());
         assert!(unsafe_leader("42", Some(42), Some("pid:[1]"), None).is_some());
         assert!(unsafe_leader("42", None, None, Some("pid:[2]")).is_some());
+    }
+
+    #[test]
+    fn container_inspect_answers_are_classified() {
+        assert_eq!(presence(0, "running\n"), Ok(Presence::Running));
+        assert_eq!(presence(0, "paused\n"), Ok(Presence::Running));
+        assert_eq!(presence(0, "removing\n"), Ok(Presence::Removing));
+        assert_eq!(presence(0, "exited\n"), Ok(Presence::Stopped));
+        assert_eq!(
+            presence(1, "Error response from daemon: No such container: c1\n"),
+            Ok(Presence::Gone)
+        );
+        assert!(
+            presence(
+                1,
+                "Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
