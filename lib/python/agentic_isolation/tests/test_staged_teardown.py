@@ -74,6 +74,8 @@ def _provider() -> Any:
     p._retained = {}
     p._lock = asyncio.Lock()
     p._teardown_locks = {}
+    p._workspace_base_dir = None
+    p._workspace_host_dir = None
     p._operations = DockerOperations(credentials=None, retention_bytes=1024, max_page_bytes=1024)
     return p
 
@@ -468,6 +470,9 @@ class TestRetainedThenRetried:
         assert first.finalization.stage == "before_delete"
         assert first.usage.delete_failures is not None
         assert "PermissionError" in first.usage.delete_failures[0]
+        # `ws` is not `ws-<id>` under a base directory, so the root container
+        # fallback refused to mount it.
+        assert first.usage.delete_fallback == "refused"
         assert d.exists()
         ref = WorkspaceRef(provider="docker", resource_id=ws._handle)
         assert first.finalization.retained == ref
@@ -801,3 +806,160 @@ class TestUsageReachesTheReport:
     def test_no_kills_counted_is_false(self) -> None:
         usage = _usage_from_cgroup("memory.events.oom_kill 0\n", oom_killed=None)
         assert (usage.oom_kills, usage.oom_killed) == (0, False)
+
+
+class TestContainerOwnedFilesAreDeletedThroughAContainer:
+    """`rmtree` hits EACCES on files the container wrote under another uid.
+
+    The provider then empties the directory from a short-lived root
+    container and removes the emptied directory itself. Seen on GitHub
+    runners, whose uid differs from the container user's.
+    """
+
+    def _setup(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, run_exit: int = 0
+    ) -> tuple[Any, _Workspace, Path, list[tuple[str, ...]]]:
+        provider = _provider()
+        provider._workspace_base_dir = tmp_path.resolve()
+        d = tmp_path / "ws-1"
+        (d / "sub").mkdir(parents=True)
+        (d / "sub" / "owned-by-root").write_text("x")
+        ws = _Workspace(workspace_dir=str(d))
+        ws.metadata["image_id"] = "sha256:feed"
+        provider._workspaces[ws.id] = ws
+        calls: list[tuple[str, ...]] = []
+
+        async def _spawn(*argv: str, **_k: object) -> Any:
+            calls.append(argv)
+            if argv[1] == "run":
+                if run_exit == 0:
+                    shutil.rmtree(d / "sub")  # what `find -delete` would do
+                return _ExitProc(run_exit)
+            return _Proc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+        real_rmtree = shutil.rmtree
+        denied = [True]
+
+        def _rmtree(path: str) -> None:
+            if denied and Path(path) == d:
+                denied.clear()
+                raise PermissionError(13, "Permission denied", path)
+            real_rmtree(path)
+
+        monkeypatch.setattr(shutil, "rmtree", _rmtree)
+        return provider, ws, d, calls
+
+    def test_permission_error_runs_the_fallback_with_the_exact_safe_argv(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        provider, ws, d, calls = self._setup(monkeypatch, tmp_path)
+        report = asyncio.run(provider.teardown(ws))
+
+        runs = [c for c in calls if c[1] == "run"]
+        assert runs == [
+            (
+                "docker",
+                "run",
+                "--rm",
+                "--name",
+                "container-abc-delete",
+                "--network",
+                "none",
+                "--pull",
+                "never",
+                "--user",
+                "0:0",
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "DAC_OVERRIDE",
+                "--security-opt",
+                "no-new-privileges",
+                "--read-only",
+                "--pids-limit",
+                "64",
+                "--entrypoint",
+                "find",
+                "--mount",
+                f"type=bind,source={d.resolve()},target=/workspace-delete",
+                "sha256:feed",
+                "/workspace-delete",
+                "-mindepth",
+                "1",
+                "-delete",
+            )
+        ]
+        assert report.finalization.state == "completed", report
+        assert report.usage.delete_fallback == "deleted"
+        assert report.usage.delete_failures is None
+        assert not d.exists()
+
+    def test_docker_in_docker_mounts_the_host_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        provider, ws, _d, calls = self._setup(monkeypatch, tmp_path)
+        provider._workspace_host_dir = Path("/host/workspaces")
+        asyncio.run(provider.teardown(ws))
+
+        (run,) = [c for c in calls if c[1] == "run"]
+        assert "type=bind,source=/host/workspaces/ws-1,target=/workspace-delete" in run
+
+    def test_a_failed_fallback_is_retained_and_says_why(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        provider, ws, d, _calls = self._setup(monkeypatch, tmp_path, run_exit=125)
+        report = asyncio.run(provider.teardown(ws))
+
+        assert report.finalization.state == "retained", report
+        assert report.usage.delete_fallback == "failed"
+        failures = report.usage.delete_failures
+        assert failures is not None
+        assert "PermissionError" in failures[0]
+        assert "docker run exited 125" in failures[1]
+        assert d.exists()
+
+    def test_a_symlinked_workspace_dir_is_refused_without_running_docker(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        provider, ws, d, calls = self._setup(monkeypatch, tmp_path)
+        link = tmp_path / "link" / "ws-1"
+        link.parent.mkdir()
+        link.symlink_to(d)
+        provider._workspace_base_dir = link.parent
+        ws.metadata["workspace_dir"] = str(link)
+        monkeypatch.setattr(
+            shutil,
+            "rmtree",
+            lambda path: (_ for _ in ()).throw(PermissionError(13, "Permission denied", path)),
+        )
+        report = asyncio.run(provider.teardown(ws))
+
+        assert report.finalization.state == "retained"
+        assert report.usage.delete_fallback == "refused"
+        assert not [c for c in calls if c[1] == "run"]
+
+    def test_a_dir_outside_the_base_dir_is_refused_without_running_docker(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        provider, ws, _d, calls = self._setup(monkeypatch, tmp_path)
+        provider._workspace_base_dir = (tmp_path / "elsewhere").resolve()
+        report = asyncio.run(provider.teardown(ws))
+
+        assert report.finalization.state == "retained"
+        assert report.usage.delete_fallback == "refused"
+        assert not [c for c in calls if c[1] == "run"]
+
+    def test_a_directory_rmtree_deletes_does_not_use_the_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _record(monkeypatch, [])
+        provider = _provider()
+        d = tmp_path / "ws-1"
+        d.mkdir()
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+        report = asyncio.run(provider.teardown(ws))
+
+        assert report.finalization.state == "completed"
+        assert report.usage.delete_fallback is None

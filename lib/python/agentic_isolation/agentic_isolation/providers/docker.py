@@ -59,7 +59,11 @@ from agentic_isolation.providers.base import (
 )
 from agentic_isolation.providers.docker_operations import DockerOperations
 from agentic_isolation.providers.operation_spool import OperationFailure
-from agentic_isolation.providers.teardown_report import TeardownReport, TeardownUsage
+from agentic_isolation.providers.teardown_report import (
+    DeleteFallback,
+    TeardownReport,
+    TeardownUsage,
+)
 
 # Security tmpfs targets that an explicit mount may never replace or sit beneath:
 # /home/agent holds harness configuration and credentials, /tmp and /var/agentic
@@ -1036,7 +1040,8 @@ class WorkspaceDockerProvider(BaseProvider):
                     usage=usage,
                 )
 
-        delete_failures = self._delete_workspace_dir(workspace)
+        delete_failures, delete_fallback = await self._delete_workspace_dir(workspace)
+        usage = replace(usage, delete_fallback=delete_fallback)
         if delete_failures:
             # `completed` would claim a directory that is still on disk, so the
             # workspace stays retained under the same ref for a retry.
@@ -1110,23 +1115,149 @@ class WorkspaceDockerProvider(BaseProvider):
             return None
         return out.decode(errors="replace")
 
-    def _delete_workspace_dir(self, workspace: Workspace) -> tuple[str, ...]:
+    async def _delete_workspace_dir(
+        self, workspace: Workspace
+    ) -> tuple[tuple[str, ...], DeleteFallback | None]:
         """Delete the host workspace directory. Irreversible.
 
-        Returns what could not be deleted, empty when the directory is gone. An
-        already absent directory is success, so a retry is idempotent.
+        Returns what could not be deleted, empty when the directory is gone,
+        and how the container fallback went when it was needed. An already
+        absent directory is success, so a retry is idempotent.
+
+        The container writes as its own uid, so files it leaves in
+        subdirectories it created can be undeletable by this process (CI
+        runners are the common case). On `PermissionError` the contents are
+        deleted from a short-lived root container instead, and the emptied
+        directory, which this process created, is removed here.
         """
         workspace_dir = workspace.metadata.get("workspace_dir")
         if not workspace_dir:
-            return ()
-        error: OSError | None = None
-        try:
-            shutil.rmtree(workspace_dir)
-        except OSError as exc:
-            error = exc
+            return (), None
+        error = _rmtree(workspace_dir)
+        fallback: DeleteFallback | None = None
+        why = ""
+        if isinstance(error, PermissionError):
+            fallback, why = await self._delete_contents_in_container(workspace, workspace_dir)
+            if fallback == "deleted":
+                error = _rmtree(workspace_dir)
         if not os.path.lexists(workspace_dir):
-            return ()
-        return (f"{workspace_dir}: {error!r}" if error else f"{workspace_dir}: still present",)
+            return (), fallback
+        detail = f"{workspace_dir}: {error!r}" if error else f"{workspace_dir}: still present"
+        if why:
+            return (detail, f"container delete {fallback}: {why}"), fallback
+        return (detail,), fallback
+
+    #: Bounds the whole `docker run` of the fallback delete.
+    _DELETE_TIMEOUT_SECONDS = 60.0
+    #: Where the workspace directory is mounted inside the fallback container.
+    _DELETE_TARGET = "/workspace-delete"
+
+    def _delete_mount_source(self, workspace: Workspace, workspace_dir: str) -> str | None:
+        """The Docker host path of `workspace_dir`, or None when it is not ours.
+
+        Only a real directory directly under the provider's base directory
+        qualifies: `ws-<id>` under `workspace_base_dir`, or the
+        `agentic-ws-` mkdtemp directory when no base is configured. A symlink,
+        or a path resolving anywhere else, is refused, so the root container
+        never mounts a directory the provider did not create.
+        """
+        path = Path(workspace_dir)
+        if path.is_symlink() or not path.is_dir():
+            return None
+        if self._workspace_base_dir is not None:
+            if path.name != workspace.id:
+                return None
+            base = self._workspace_base_dir
+        else:
+            if not path.name.startswith("agentic-ws-"):
+                return None
+            base = Path(tempfile.gettempdir()).resolve()
+        if path.resolve() != base / path.name:
+            return None
+        if self._workspace_host_dir is not None and self._workspace_base_dir is not None:
+            source = str(self._workspace_host_dir / path.name)
+        else:
+            source = str(path.resolve())
+        # `--mount` is comma separated; a comma would smuggle in an option.
+        return None if "," in source else source
+
+    def _delete_contents_command(self, workspace: Workspace, source: str) -> list[str]:
+        """`docker run` deleting everything under `source`, as root, offline.
+
+        `find -delete` never follows symlinks and unlinks them as entries, so
+        nothing outside the mount is touched. DAC_OVERRIDE is the one
+        capability root needs to unlink entries in another uid's directories,
+        including mode 000 ones; everything else stays dropped.
+        """
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            f"{workspace._handle}-delete",
+            "--network",
+            "none",
+            "--pull",
+            "never",
+            "--user",
+            "0:0",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "DAC_OVERRIDE",
+            "--security-opt",
+            "no-new-privileges",
+            "--read-only",
+            "--pids-limit",
+            "64",
+            "--entrypoint",
+            "find",
+            "--mount",
+            f"type=bind,source={source},target={self._DELETE_TARGET}",
+            workspace.metadata["image_id"],
+            self._DELETE_TARGET,
+            "-mindepth",
+            "1",
+            "-delete",
+        ]
+
+    async def _delete_contents_in_container(
+        self, workspace: Workspace, workspace_dir: str
+    ) -> tuple[DeleteFallback, str]:
+        """Empty `workspace_dir` from a root container. Never raises.
+
+        Uses the workspace's own image, which is already local: no pull, and
+        no second image to trust. Returns the outcome and why it was not
+        `deleted` (empty when it was).
+        """
+        source = self._delete_mount_source(workspace, workspace_dir)
+        if source is None:
+            return "refused", "not a directory this provider created under its base directory"
+        if not workspace.metadata.get("image_id"):
+            return "refused", "no workspace image recorded to run the delete in"
+        cmd = self._delete_contents_command(workspace, source)
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self._DELETE_TIMEOUT_SECONDS
+            )
+        except asyncio.CancelledError:
+            if proc is not None:
+                await self._terminate(proc)
+                await asyncio.shield(self._remove(f"{workspace._handle}-delete"))
+            raise
+        except Exception as exc:  # noqa: BLE001 - reported as retained, never raised
+            if proc is not None:
+                await self._terminate(proc)
+                await self._remove(f"{workspace._handle}-delete")
+            return "failed", repr(exc)
+        if proc.returncode != 0:
+            detail = stderr.decode(errors="replace").strip()[-500:]
+            return "failed", f"docker run exited {proc.returncode}: {detail}"
+        return "deleted", ""
 
     async def _stop(self, container_name: str) -> None:
         """`docker stop`, then snapshot the logs it caused to be written."""
@@ -1185,6 +1316,15 @@ class WorkspaceDockerProvider(BaseProvider):
         await self._stop(container_name)
         if not await self._remove(container_name):
             logger.warning("docker rm -f %s failed; the container may still exist", container_name)
+
+
+def _rmtree(path: str) -> OSError | None:
+    """`shutil.rmtree`, returning its error instead of raising it."""
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        return exc
+    return None
 
 
 class NotARegularFileError(ValueError):

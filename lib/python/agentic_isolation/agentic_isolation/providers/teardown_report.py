@@ -14,8 +14,15 @@ table. Every field is `None` when the provider did not measure it; `None` is
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from agentic_isolation.contract import FinalizationOutcome
+
+#: How a provider's fallback delete of the workspace directory went, when the
+#: host process could not delete it alone (Docker: files the container wrote
+#: under another uid). `refused` means the fallback was not run because the
+#: directory is not one the provider created under its base directory.
+DeleteFallback = Literal["deleted", "failed", "refused"]
 
 
 @dataclass(frozen=True)
@@ -34,6 +41,8 @@ class TeardownUsage:
     oom_killed: bool | None = None
     disk_bytes_at_teardown: int | None = None
     delete_failures: tuple[str, ...] | None = None
+    #: `None` when the host deleted the directory alone or never tried.
+    delete_fallback: DeleteFallback | None = None
     net_rx_bytes: int | None = None
     net_tx_bytes: int | None = None
 
