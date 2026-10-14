@@ -762,6 +762,16 @@ mod tests {
                 .unwrap(),
         );
         let pid = child.0.id();
+        // `spawn` returns before the exec lands: until then the child is this
+        // binary, then briefly an image with no environment. Its argv and its
+        // environment are published together, so once `sleep 30` shows the
+        // child is the tokened workload.
+        let cmdline = format!("/proc/{pid}/cmdline");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::read(&cmdline).unwrap() != b"sleep\x0030\x00" {
+            assert!(std::time::Instant::now() < deadline, "sleep never ran");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(live_processes("AW_HARNESS_RUN", &token).unwrap(), [pid]);
         drop(child);
         assert!(live_processes("AW_HARNESS_RUN", &token).unwrap().is_empty());
