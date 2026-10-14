@@ -244,6 +244,15 @@ provider in a decorator whose `cancel` terminates nothing and reports
 `cancelled`, counts that it ran, and asserts LH-1 fails on step 1 `cancel`
 with the descendant measured alive.
 
+Per-case bound, Rust: each `hazards::lh*` test runs its case (setup,
+every step, measurement, cleanup) in a child process that leads its own
+session under `setsid -w`, and a plain thread kills that session at 180 s
+(`CASE_BOUND`, above LH-5's 120 s observe). Tokio timeouts inside a case
+cannot interrupt a blocked thread or synchronous code; this can.
+`hazards::a_synchronously_blocked_case_fails_within_its_bound_and_the_next_runs`
+proves it with a case that blocks synchronously in `StandIn` setup. Python's
+per-test bound is `_outer_deadline` (faulthandler, 300 s).
+
 CI: the workflow edits these jobs need (APSS pin grep to 0.2.1, every Python
 invocation under `setsid -w` with an outer `timeout`, the hazard file named
 in its own step) cannot be pushed from the agent workspace; they ship as a

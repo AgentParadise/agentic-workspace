@@ -1496,26 +1496,9 @@ mod hazards {
         expect(hazard, &verdict);
     }
 
-    #[tokio::test]
-    async fn lh1_double_fork_orphan_before_cancel() {
-        run("LH-1").await;
-    }
-    #[tokio::test]
-    async fn lh2_interrupted_cancel() {
-        run("LH-2").await;
-    }
-    #[tokio::test]
-    async fn lh3_cancel_before_launch_header() {
-        run("LH-3").await;
-    }
-    #[tokio::test]
-    async fn lh4_destroy_during_start() {
-        run("LH-4").await;
-    }
     /// LH-5 through a decorator that records each provider call, so the
     /// fixture's "no status call before observe" is measured, not assumed.
-    #[tokio::test]
-    async fn lh5_stuck_removal_settles() {
+    async fn lh5() {
         let harness = StandIn::with("LH-5", |inner| Records {
             inner,
             calls: std::sync::Mutex::new(Vec::new()),
@@ -1531,13 +1514,154 @@ mod hazards {
         );
         expect("LH-5", &verdict);
     }
-    #[tokio::test]
-    async fn lh6_drain_with_gap_reports_loss() {
-        run("LH-6").await;
+
+    // --- The per-case bound ---------------------------------------------------
+    //
+    // A Tokio timeout cannot interrupt a blocked thread, nor the synchronous
+    // setup (`StandIn::new`), liveness measurement and cleanup (`Drop`) around
+    // the futures it bounds. So each case runs in a process of its own, a
+    // session of its own under `setsid -w`, and a plain thread here kills
+    // that whole session once `CASE_BOUND` passes. One stuck case then fails
+    // alone, within its bound, and the next still runs.
+
+    /// Above the slowest case: LH-5's 120s observe bound plus setup.
+    const CASE_BOUND: Duration = Duration::from_secs(180);
+    /// Names the case `hazard_case` runs; unset, it runs nothing.
+    const CASE: &str = "AW_HAZARD_CASE";
+    /// Where the case writes once it has run to the end, so a filter that
+    /// selects no test is never read as a pass.
+    const CASE_DONE: &str = "AW_HAZARD_CASE_DONE";
+
+    #[derive(Debug, PartialEq)]
+    enum CaseEnd {
+        Passed,
+        /// The case process exited without completing: a failed assertion
+        /// or a panic. Its output is in the test's.
+        Failed(std::process::ExitStatus),
+        /// Still running at the bound; its session was killed.
+        OutOfBound(Duration),
     }
-    #[tokio::test]
-    async fn lh7_fifo_in_workspace() {
-        run("LH-7").await;
+
+    /// Run `case` in its own bounded session and say how it ended.
+    fn bounded(case: &str, bound: Duration) -> CaseEnd {
+        let done = tempfile::tempdir().unwrap();
+        let marker = done.path().join("done");
+        let began = std::time::Instant::now();
+        let mut child = std::process::Command::new("setsid")
+            .arg("-w")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "hazards::hazard_case", "--ignored"])
+            .args(["--nocapture", "--test-threads=1", "-q"])
+            .env(CASE, case)
+            .env(CASE_DONE, &marker)
+            .spawn()
+            .expect("setsid(1) is required to bound a hazard case");
+        // A spawned child never leads a process group, so setsid(1) does not
+        // fork: the child is the session leader and its pid the session's
+        // group id.
+        let session = format!("-{}", child.id());
+        let end = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break if status.success() && marker.exists() {
+                    CaseEnd::Passed
+                } else {
+                    CaseEnd::Failed(status)
+                };
+            }
+            if began.elapsed() >= bound {
+                kill_session(&session);
+                child.wait().unwrap();
+                break CaseEnd::OutOfBound(began.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // Whatever the case leaked into its session goes with it.
+        kill_session(&session);
+        end
+    }
+
+    fn kill_session(group: &str) {
+        // ESRCH once the session is empty is the expected end.
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", group])
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    fn assert_passes(case: &str) {
+        let end = bounded(case, CASE_BOUND);
+        assert_eq!(end, CaseEnd::Passed, "{case} in its bounded session");
+    }
+
+    /// The entry point `bounded` runs in the case process. Ignored, so a
+    /// plain `cargo test` never runs a case outside its bound.
+    #[test]
+    #[ignore = "one hazard case, run by `bounded` in its own session"]
+    fn hazard_case() {
+        let Ok(case) = std::env::var(CASE) else {
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        match case.as_str() {
+            "LH-5" => runtime.block_on(lh5()),
+            // The guard's own proof cases, below.
+            "blocks-synchronously" => {
+                let _harness = StandIn::new("LH-1");
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+            "fails" => panic!("the failing proof case"),
+            "passes" => {}
+            hazard => runtime.block_on(run(hazard)),
+        }
+        std::fs::write(std::env::var(CASE_DONE).unwrap(), "").unwrap();
+    }
+
+    #[test]
+    fn lh1_double_fork_orphan_before_cancel() {
+        assert_passes("LH-1");
+    }
+    #[test]
+    fn lh2_interrupted_cancel() {
+        assert_passes("LH-2");
+    }
+    #[test]
+    fn lh3_cancel_before_launch_header() {
+        assert_passes("LH-3");
+    }
+    #[test]
+    fn lh4_destroy_during_start() {
+        assert_passes("LH-4");
+    }
+    #[test]
+    fn lh5_stuck_removal_settles() {
+        assert_passes("LH-5");
+    }
+    #[test]
+    fn lh6_drain_with_gap_reports_loss() {
+        assert_passes("LH-6");
+    }
+    #[test]
+    fn lh7_fifo_in_workspace() {
+        assert_passes("LH-7");
+    }
+
+    /// The bound holds where Tokio's cannot: a case blocked synchronously in
+    /// setup is killed, session and all, within it; a failing case fails; and
+    /// the next case still runs and passes.
+    #[test]
+    fn a_synchronously_blocked_case_fails_within_its_bound_and_the_next_runs() {
+        let bound = Duration::from_secs(5);
+        match bounded("blocks-synchronously", bound) {
+            CaseEnd::OutOfBound(elapsed) => {
+                assert!(elapsed < bound + Duration::from_secs(2), "{elapsed:?}")
+            }
+            other => panic!("a blocked case ended {other:?}"),
+        }
+        assert!(matches!(bounded("fails", bound), CaseEnd::Failed(_)));
+        assert_eq!(bounded("passes", bound), CaseEnd::Passed);
     }
 
     /// The record probe counts a started operation, and none before it, so
