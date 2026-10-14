@@ -1155,6 +1155,8 @@ class WorkspaceDockerProvider(BaseProvider):
 
     #: Bounds the whole `docker run` of the fallback delete.
     _DELETE_TIMEOUT_SECONDS = 60.0
+    #: Bounds removing the fallback's container after its run failed.
+    _DELETE_CLEANUP_TIMEOUT_SECONDS = 15.0
     #: Where the workspace directory is mounted inside the fallback container.
     _DELETE_TARGET = "/workspace-delete"
 
@@ -1252,6 +1254,7 @@ class WorkspaceDockerProvider(BaseProvider):
         if not workspace.metadata.get("image_id"):
             return "refused", "no workspace image recorded to run the delete in"
         cmd = self._delete_contents_command(workspace, source)
+        name = f"{workspace._handle}-delete"
         proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1261,19 +1264,58 @@ class WorkspaceDockerProvider(BaseProvider):
                 proc.communicate(), timeout=self._DELETE_TIMEOUT_SECONDS
             )
         except asyncio.CancelledError:
+            # The cancellation is what propagates; a cleanup error must not
+            # replace it.
             if proc is not None:
-                await self._terminate(proc)
-                await asyncio.shield(self._remove(f"{workspace._handle}-delete"))
+                with contextlib.suppress(Exception):
+                    await self._terminate(proc)
+                    await asyncio.shield(self._remove_delete_container(name))
             raise
         except Exception as exc:  # noqa: BLE001 - reported as retained, never raised
+            why = repr(exc)
             if proc is not None:
-                await self._terminate(proc)
-                await self._remove(f"{workspace._handle}-delete")
-            return "failed", repr(exc)
+                # Killing the client leaves the container running; `rm -f`
+                # stops it before it deletes anything more.
+                with contextlib.suppress(Exception):
+                    await self._terminate(proc)
+                left = await self._remove_delete_container(name)
+                if left:
+                    why = f"{why}; {left}"
+            return "failed", why
         if proc.returncode != 0:
             detail = stderr.decode(errors="replace").strip()[-500:]
             return "failed", f"docker run exited {proc.returncode}: {detail}"
         return "deleted", ""
+
+    async def _remove_delete_container(self, name: str) -> str:
+        """`docker rm -f` the fallback's container, bounded. Raises only on cancellation.
+
+        Returns why the container may still exist, empty when it is gone.
+        Unlike `_remove`, a stalled client is killed after
+        `_DELETE_CLEANUP_TIMEOUT_SECONDS`, so the fallback stays bounded.
+        """
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker",
+                "rm",
+                "-f",
+                name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            code = await asyncio.wait_for(proc.wait(), timeout=self._DELETE_CLEANUP_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    await self._terminate(proc)
+            raise
+        except Exception as exc:  # noqa: BLE001 - reported with the failed fallback
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    await self._terminate(proc)
+            return f"docker rm -f {name} failed: {exc!r}"
+        return "" if code == 0 else f"docker rm -f {name} exited {code}"
 
     async def _stop(self, container_name: str) -> None:
         """`docker stop`, then snapshot the logs it caused to be written."""

@@ -995,3 +995,99 @@ class TestContainerOwnedFilesAreDeletedThroughAContainer:
 
         assert report.finalization.state == "completed"
         assert report.usage.delete_fallback is None
+
+
+class _StalledProc:
+    """A `docker` client that never finishes until killed."""
+
+    returncode: int | None = None
+
+    def __init__(self) -> None:
+        self._killed = asyncio.Event()
+
+    @property
+    def killed(self) -> bool:
+        return self._killed.is_set()
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        await self._killed.wait()
+        return b"", b""
+
+    async def wait(self) -> int:
+        await self._killed.wait()
+        return -9
+
+    def kill(self) -> None:
+        self._killed.set()
+
+
+class TestTheFallbackCleanupIsBoundedAndNeverRaises:
+    """The fallback's `docker run` failed; removing its container can fail too.
+
+    Each case drives the transition from a failed run into that cleanup.
+    """
+
+    def _setup(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, removal: str
+    ) -> tuple[Any, _Workspace, Path, list[_StalledProc]]:
+        provider, ws, d, _calls = TestContainerOwnedFilesAreDeletedThroughAContainer()._setup(
+            monkeypatch, tmp_path
+        )
+        provider._DELETE_TIMEOUT_SECONDS = 0.05
+        provider._DELETE_CLEANUP_TIMEOUT_SECONDS = 0.05
+        stalled: list[_StalledProc] = []
+
+        async def _spawn(*argv: str, **_k: object) -> Any:
+            if argv[1] == "run" or argv[1:3] == ("rm", "-f") and argv[3].endswith("-delete"):
+                if argv[1] == "rm" and removal == "spawn-error":
+                    raise OSError("docker unavailable during cleanup")
+                stalled.append(_StalledProc())
+                return stalled[-1]
+            return _Proc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+        return provider, ws, d, stalled
+
+    def test_a_removal_that_cannot_start_is_retained(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        provider, ws, d, _stalled = self._setup(monkeypatch, tmp_path, "spawn-error")
+        report = asyncio.run(asyncio.wait_for(provider.teardown(ws), timeout=5))
+
+        assert report.finalization.state == "retained", report
+        assert report.usage.delete_fallback == "failed"
+        failures = report.usage.delete_failures
+        assert failures is not None
+        assert "TimeoutError" in failures[1]
+        assert "docker unavailable during cleanup" in failures[1]
+        assert d.exists()
+
+    def test_a_stalled_removal_is_killed_and_retained(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        provider, ws, d, stalled = self._setup(monkeypatch, tmp_path, "stall")
+        report = asyncio.run(asyncio.wait_for(provider.teardown(ws), timeout=5))
+
+        assert report.finalization.state == "retained", report
+        assert report.usage.delete_fallback == "failed"
+        assert len(stalled) == 2
+        assert all(p.killed for p in stalled)
+        assert d.exists()
+
+    def test_cancellation_survives_a_failing_cleanup(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        provider, ws, d, stalled = self._setup(monkeypatch, tmp_path, "spawn-error")
+        provider._DELETE_TIMEOUT_SECONDS = 60.0
+
+        async def _cancel_mid_run() -> None:
+            task = asyncio.ensure_future(provider.teardown(ws))
+            while not stalled:
+                await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.wait_for(task, timeout=5)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(_cancel_mid_run())
+        assert stalled[0].killed
+        assert d.exists()
