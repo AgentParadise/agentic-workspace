@@ -25,6 +25,8 @@ Rust spool's, checked against `tests/fixtures/output_redaction/cases.json`.
 from __future__ import annotations
 
 import base64
+import hmac
+import secrets
 import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -57,6 +59,25 @@ class _Position:
 
 
 REDACTED = b"[REDACTED]"
+
+
+# Keys `redaction_policy`, so a fingerprint means nothing outside this process.
+_POLICY_KEY = secrets.token_bytes(32)
+
+
+def redaction_policy(values: Collection[str | bytes]) -> bytes:
+    """An opaque fingerprint of a registration, never the values themselves.
+
+    Equal for equal sets of non-empty values in any order, which is how
+    `OutputRedactor` treats them. A replayed start compares it with the
+    original's: a key cannot be replayed under a different registration.
+    """
+    encoded = sorted({v.encode() if isinstance(v, str) else bytes(v) for v in values} - {b""})
+    mac = hmac.new(_POLICY_KEY, digestmod="sha256")
+    for value in encoded:
+        mac.update(len(value).to_bytes(8, "big"))
+        mac.update(value)
+    return mac.digest()
 
 
 class OutputRedactor:

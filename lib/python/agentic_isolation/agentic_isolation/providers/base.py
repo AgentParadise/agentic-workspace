@@ -473,7 +473,9 @@ class SupportsOperations(Protocol):
         provider replaces each with `[REDACTED]` before its output is stored,
         so no page, spool or final output carries them; the values it resolves
         from `spec.credential_bindings` are registered for it. None registered
-        means output is stored exactly as printed.
+        means output is stored exactly as printed. A replay of the same key
+        must register the same set of values (order and empty values do not
+        matter); a different set raises `conflict`, naming no value.
 
         The same `(workspace, operation_key)` with an equal spec returns the
         original ref and launches nothing, however many callers race. The

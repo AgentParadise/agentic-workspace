@@ -22,7 +22,7 @@ from agentic_isolation.contract import (
 )
 from agentic_isolation.providers.base import run_to_completion
 from agentic_isolation.providers.local import WorkspaceLocalProvider
-from agentic_isolation.providers.operation_spool import REDACTED, OperationSpool
+from agentic_isolation.providers.operation_spool import REDACTED, OperationFailure, OperationSpool
 from tests.test_docker_operations import (
     SECRET,
     _data,
@@ -254,5 +254,41 @@ async def test_an_unchanged_caller_still_runs_on_a_provider_without_redact(
         )
         assert status.state == "succeeded"
         assert data == b"plain\n"
+    finally:
+        await provider.destroy(workspace)
+
+
+_OTHER = "canary-INVENTED-other-2b"
+
+
+async def _assert_replay_is_bound_to_redaction(start, key: str) -> None:  # type: ignore[no-untyped-def]
+    first, again = await asyncio.gather(start(key, [CANARY, _OTHER]), start(key, [_OTHER, CANARY]))
+    assert first == again
+    for changed in ([], [CANARY], [CANARY, _OTHER, "canary-INVENTED-third"]):
+        with pytest.raises(OperationFailure) as raised:
+            await start(key, changed)
+        assert raised.value.error.kind == "conflict"
+        assert "canary" not in str(raised.value) and "canary" not in repr(raised.value.error)
+    assert await start(key, [CANARY, _OTHER, ""]) == first
+
+
+async def test_docker_replay_is_bound_to_its_redaction_values(
+    docker_env: Path,  # noqa: F811
+) -> None:
+    ops = _ops(docker_env)
+    spec = _spec("sleep 0.2")
+    await _assert_replay_is_bound_to_redaction(
+        lambda key, redact: ops.start(_workspace(), spec, redact=redact), "k"
+    )
+
+
+async def test_local_replay_is_bound_to_its_redaction_values(tmp_path: Path) -> None:
+    provider = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
+    workspace = await provider.create(WorkspaceConfig())
+    try:
+        spec = _spec("sleep 0.2")
+        await _assert_replay_is_bound_to_redaction(
+            lambda key, redact: provider.start(workspace, spec, redact=redact), "k"
+        )
     finally:
         await provider.destroy(workspace)

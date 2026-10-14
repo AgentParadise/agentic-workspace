@@ -80,7 +80,11 @@ from agentic_isolation.contract import (
     WorkspaceRef,
 )
 from agentic_isolation.providers.base import CredentialResolver, Workspace
-from agentic_isolation.providers.operation_spool import OperationFailure, OperationSpool
+from agentic_isolation.providers.operation_spool import (
+    OperationFailure,
+    OperationSpool,
+    redaction_policy,
+)
 
 # Values published in tests/fixtures/apss_exp_v1_0006/valid/workspace-provider/local.json.
 RETENTION_BYTES = 1 << 20
@@ -278,6 +282,8 @@ class _Operation:
     token: str
     # Clock ticks since boot before launch; every descendant started later.
     born: int
+    # `redaction_policy` of the caller's registration; a replay must match it.
+    policy: bytes = field(default_factory=lambda: redaction_policy(()), repr=False)
     # Inode of the output pipe; whoever still holds it keeps the operation open.
     pipe: int | None = None
     changed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -371,6 +377,14 @@ class LocalOperations:
                         "conflict",
                         f"operation_key {spec.operation_key!r} already started "
                         "with a different spec",
+                        existing.ref,
+                    )
+                # A replay must not claim a registration the spool never had.
+                if existing.policy != redaction_policy(redact):
+                    raise _error(
+                        "conflict",
+                        f"operation_key {spec.operation_key!r} already started "
+                        "with different redaction values",
                         existing.ref,
                     )
                 return existing.ref
@@ -470,6 +484,7 @@ class LocalOperations:
             process=process,
             token=token,
             born=born,
+            policy=redaction_policy(redact),
             pipe=inode,
         )
         operation.collector = asyncio.create_task(self._collect(operation, output, transport))

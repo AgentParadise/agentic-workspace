@@ -64,7 +64,11 @@ from agentic_isolation.contract import (
     WorkspaceRef,
 )
 from agentic_isolation.providers.base import CredentialResolver, Workspace
-from agentic_isolation.providers.operation_spool import OperationFailure, OperationSpool
+from agentic_isolation.providers.operation_spool import (
+    OperationFailure,
+    OperationSpool,
+    redaction_policy,
+)
 
 # Runs as the exec's main process. Reads the launch marker's argv0 and line
 # from stdin into shell variables (never an argv or an exported variable),
@@ -230,6 +234,8 @@ class _Replay:
 
     spec: OperationSpec
     ref: OperationRef
+    # `redaction_policy` of the caller's registration; a replay must match it.
+    policy: bytes = field(default_factory=lambda: redaction_policy(()), repr=False)
 
 
 @dataclass
@@ -392,6 +398,14 @@ class DockerOperations:
                     f"operation_key {spec.operation_key!r} already started with a different spec",
                     existing.ref,
                 )
+            # A replay must not claim a registration the spool never had.
+            if existing.policy != redaction_policy(redact):
+                raise _error(
+                    "conflict",
+                    f"operation_key {spec.operation_key!r} already started "
+                    "with different redaction values",
+                    existing.ref,
+                )
             return existing.ref
         # Credential values ride in the docker client's own environment, so
         # a name that steers that client (DOCKER_HOST, PATH, LD_PRELOAD...)
@@ -453,7 +467,7 @@ class DockerOperations:
             process.stdin.close()
         operation.collector = asyncio.create_task(self._collect(operation, process))
         self._operations[ref.operation_id] = operation
-        self._by_key[key] = _Replay(spec=spec, ref=ref)
+        self._by_key[key] = _Replay(spec=spec, ref=ref, policy=redaction_policy(redact))
         return ref
 
     def client_argv(
