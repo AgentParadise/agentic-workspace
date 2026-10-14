@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import faulthandler
 import json
 import os
 import signal
@@ -252,6 +253,27 @@ class Subject:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+#: Outer per-test bound, above every fixture's summed settlement bounds. It
+#: holds when the event loop is blocked or cancellation is swallowed, where
+#: `asyncio.timeout` cannot fire.
+TEST_DEADLINE_SECONDS = 300
+
+
+@pytest.fixture(autouse=True)
+def _outer_deadline() -> Any:
+    """Dump every thread's stack and exit the run if a test outlives its deadline.
+
+    faulthandler's timer is a C thread, independent of the event loop. It
+    signals nothing: the process exits, and under `setsid -w` the session it
+    leads is the test's own.
+    """
+    faulthandler.dump_traceback_later(TEST_DEADLINE_SECONDS, exit=True)
+    try:
+        yield
+    finally:
+        faulthandler.cancel_dump_traceback_later()
 
 
 @pytest.fixture(params=PROVIDERS)
