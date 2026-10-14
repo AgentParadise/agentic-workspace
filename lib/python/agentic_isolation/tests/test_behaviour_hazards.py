@@ -137,7 +137,35 @@ WORKLOADS = {
 
 
 class FixtureMismatch(AssertionError):
-    """A provider's measured response matched none of a step's alternatives."""
+    """A provider's measured response matched none of a step's alternatives.
+
+    A miss on a step's outcome also carries what was measured, so a verdict can
+    be classified on fields rather than on the message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        hazard: str | None = None,
+        step: int | None = None,
+        outcome: Outcome | None = None,
+        alive: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.hazard = hazard
+        self.step = step
+        self.outcome = outcome
+        self.alive = alive
+
+
+class UnconfirmedOrphanCancel(FixtureMismatch):
+    """LH-1's cancel failed closed on an orphan it cannot confirm unrelated.
+
+    Correct provider behaviour that the 0.2.1 fixture does not yet accept:
+    AgentParadise/agent-paradise-standards-system#146 adds the explicit
+    unconfirmed outcome. Drop this, and its xfail, at APSS 0.2.2.
+    """
 
 
 @dataclass
@@ -618,7 +646,11 @@ async def run_hazard(subject: Subject, hazard: str) -> None:
             raise FixtureMismatch(
                 f"{where}: got {outcome.describe()} with descendant_alive={alive} "
                 f"(measured pids {subject.alive()}); none of "
-                + "; ".join(_summary(a) for a in alternatives)
+                + "; ".join(_summary(a) for a in alternatives),
+                hazard=hazard,
+                step=index,
+                outcome=outcome,
+                alive=alive,
             )
         if (
             "launches" in step
@@ -649,6 +681,45 @@ FINDINGS: dict[tuple[str, str], str] = {
     ("local", "LH-6"): "the completing page of a lossy drain carries no loss_detected (0.2.1)",
     ("local", "LH-7"): "read_file opens a FIFO on the event loop and blocks until a writer appears",
 }
+# Fixture limitations: (provider, hazard) -> the one mismatch the 0.2.1 fixture
+# wrongly rejects. Only that mismatch is expected; any other verdict fails.
+FIXTURE_GAPS: dict[tuple[str, str], str] = {
+    ("local", "LH-1"): "cancel fails closed (state failed, cancel_signal_failure names an orphan "
+    "it cannot confirm unrelated, no descendant measured alive), an outcome the 0.2.1 fixture "
+    "lacks; AgentParadise/agent-paradise-standards-system#146 adds it in APSS 0.2.2",
+}
+_UNCONFIRMED_ORPHAN = "cannot be confirmed unrelated"
+
+
+def _unconfirmed_orphan_cancel(error: FixtureMismatch) -> bool:
+    """Whether `error` is exactly the APSS#146 outcome on LH-1's cancel step."""
+    status = error.outcome.document if error.outcome is not None else None
+    return (
+        error.hazard == "LH-1"
+        and error.step == 1
+        and isinstance(status, OperationStatus)
+        and status.state == "failed"
+        and _UNCONFIRMED_ORPHAN in status.metadata.get("cancel_signal_failure", "")
+        and error.alive is False
+    )
+
+
+async def _run_classified(subject: Subject, hazard: str) -> None:
+    """`run_hazard`, with the one mismatch in FIXTURE_GAPS reraised as its own type."""
+    try:
+        await run_hazard(subject, hazard)
+    except FixtureMismatch as error:
+        if (subject.name, hazard) in FIXTURE_GAPS and _unconfirmed_orphan_cancel(error):
+            raise UnconfirmedOrphanCancel(
+                str(error),
+                hazard=error.hazard,
+                step=error.step,
+                outcome=error.outcome,
+                alive=error.alive,
+            ) from error
+        raise
+
+
 # Cases the harness cannot drive yet; each is reported as not run, never as a pass.
 NOT_RUN: dict[tuple[str, str], str] = {
     ("docker", "LH-7"): "the probes read the host workspace mount, which a stand-in container "
@@ -668,6 +739,15 @@ async def test_provider_meets_lifecycle_hazard(
                 raises=FixtureMismatch, strict=True, reason=FINDINGS[subject.name, hazard]
             )
         )
+    if (subject.name, hazard) in FIXTURE_GAPS:
+        # Not a mark: the adoption that triggers it is host-dependent, so a
+        # pass is a pass. Only UnconfirmedOrphanCancel is excused; any other
+        # mismatch propagates and fails.
+        try:
+            await _run_classified(subject, hazard)
+        except UnconfirmedOrphanCancel as gap:
+            pytest.xfail(f"APSS#146: {FIXTURE_GAPS[subject.name, hazard]}: {gap}")
+        return
     await run_hazard(subject, hazard)
 
 
@@ -676,6 +756,84 @@ def test_every_hazard_fixture_is_driven() -> None:
     assert sorted(HAZARDS) == [f"LH-{n}" for n in range(1, 8)]
     calls = {step["call"] for doc in HAZARDS.values() for step in doc["steps"]}
     assert calls == {"start", "status", "cancel", "observe", "file_exists", "read_file", "finalize"}
+
+
+# The cancel status Local emitted in CI run 38603430148 (job 115988139845).
+_CI_UNCONFIRMED_ORPHAN = {
+    "ref": {
+        "workspace": {"provider": "local", "resource_id": "w1"},
+        "operation_id": "op1",
+        "operation_key": "k1",
+    },
+    "state": "failed",
+    "exit_code": 143,
+    "signal": "SIGTERM",
+    "execution_id": "e1",
+    "metadata": {
+        "cancel_signal_failure": "processes [31103] were orphaned to a reaper after the "
+        "operation began and may be its descendants; without containment they cannot be "
+        "confirmed unrelated, so they were not signalled"
+    },
+}
+
+
+def _cancel_miss(*, alive: bool = False, step: int = 1, hazard: str = "LH-1", **status: Any):
+    document = OperationStatus.model_validate({**_CI_UNCONFIRMED_ORPHAN, **status})
+    return FixtureMismatch(
+        "miss", hazard=hazard, step=step, outcome=Outcome(document=document), alive=alive
+    )
+
+
+async def test_the_apss146_gap_is_exactly_the_emitted_unconfirmed_orphan_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    miss = _cancel_miss()
+
+    async def fails(subject: Any, hazard: str) -> None:
+        raise miss
+
+    monkeypatch.setattr(f"{__name__}.run_hazard", fails)
+    local = Subject.__new__(Subject)
+    local.name = "local"
+    with pytest.raises(UnconfirmedOrphanCancel) as caught:
+        await _run_classified(local, "LH-1")
+    assert caught.value.__cause__ is miss
+    # Only Local's LH-1 is excused: Docker's identical miss stays a FixtureMismatch.
+    local.name = "docker"
+    with pytest.raises(FixtureMismatch) as docker:
+        await _run_classified(local, "LH-1")
+    assert not isinstance(docker.value, UnconfirmedOrphanCancel)
+
+
+@pytest.mark.parametrize(
+    "miss",
+    [
+        pytest.param(_cancel_miss(alive=True), id="descendant-alive"),
+        pytest.param(_cancel_miss(state="cancelled", metadata={}), id="confirmed-cancel"),
+        pytest.param(_cancel_miss(metadata={}), id="failed-without-orphan-note"),
+        pytest.param(
+            _cancel_miss(metadata={"cancel_signal_failure": "owned processes [7] survived"}),
+            id="other-signal-failure",
+        ),
+        pytest.param(_cancel_miss(step=0), id="other-step"),
+        pytest.param(_cancel_miss(hazard="LH-2"), id="other-hazard"),
+        pytest.param(FixtureMismatch("LH-1 step 1 cancel: did not settle"), id="unsettled"),
+    ],
+)
+async def test_any_other_local_lh1_mismatch_still_fails(
+    miss: FixtureMismatch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The LH-1 expected failure is narrow: a different miss propagates as itself."""
+
+    async def fails(subject: Any, hazard: str) -> None:
+        raise miss
+
+    monkeypatch.setattr(f"{__name__}.run_hazard", fails)
+    local = Subject.__new__(Subject)
+    local.name = "local"
+    with pytest.raises(FixtureMismatch) as caught:
+        await _run_classified(local, "LH-1")
+    assert caught.value is miss and not isinstance(caught.value, UnconfirmedOrphanCancel)
 
 
 async def _kill_leader_and_claim_confirmed_local(

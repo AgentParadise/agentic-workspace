@@ -144,7 +144,7 @@ exactly the run's processes; `removing` is sticky), not a daemon.
 
 | Hazard | Fixture | Python Docker | Python Local | Rust Docker |
 |---|---|---|---|---|
-| LH-1 | `hazard-double-fork-orphan` | PASS | PASS (FAIL seen in CI, below) | PASS |
+| LH-1 | `hazard-double-fork-orphan` | PASS | PASS, or XFAIL APSS#146 (fixture gap, below) | PASS |
 | LH-2 | `hazard-interrupted-cancel` | PASS | FAIL | FAIL (unattributed) |
 | LH-3 | `hazard-cancel-before-launch-header` | FAIL | PASS (condition N/A) | FAIL |
 | LH-4 | `hazard-destroy-during-start` | FAIL | FAIL | FAIL |
@@ -205,11 +205,20 @@ Findings (each left to a follow-up):
   FIFO returns `exists: false, regular_file: false`; the fixture needs
   `exists: true, regular_file: false` or `rejected_policy`. Held as
   `xfail(strict=True)` on `test_docker_daemon_meets_lh7_fifo`.
-- Local LH-1, intermittent and host-dependent (CI run 38593606789; passed at
-  the previous head's CI and locally 5/5): when a foreign subreaper adopts the
-  detached descendant, `cancel` settles `failed` (`cancel_signal_failure`:
-  "orphaned to a reaper ... not signalled"), which matches neither allowed
-  outcome. Not pinned, because it does not reproduce deterministically.
+- Local LH-1 is a fixture limitation, not a provider finding. When a foreign
+  subreaper adopts the detached descendant (host-dependent: CI runs
+  38593606789 and 38603430148; passes locally), `cancel` fails closed:
+  `state: failed`, `cancel_signal_failure` "orphaned to a reaper ... cannot
+  be confirmed unrelated, so they were not signalled", `descendant_alive`
+  measured false. That is correct provider behaviour; the 0.2.1 fixture's
+  accepted set lacks the explicit unconfirmed outcome, which
+  AgentParadise/agent-paradise-standards-system#146 adds for APSS 0.2.2.
+  Until then `FIXTURE_GAPS` excuses exactly that outcome (hazard LH-1, step 1,
+  `failed`, that note, no live descendant) as `UnconfirmedOrphanCancel` and
+  `pytest.xfail`; every other mismatch fails, which
+  `test_any_other_local_lh1_mismatch_still_fails` pins. It is a runtime
+  xfail rather than `xfail(strict=True)` because the adoption does not
+  reproduce on every host, so a pass must stay a pass. Remove it at 0.2.2.
 - Local LH-7: `read_file` opens a writer-less FIFO on the event loop and
   blocks; the harness's watchdog thread has to open the write end to free it.
 
