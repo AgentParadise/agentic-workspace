@@ -9,7 +9,8 @@ fixture, decides what happened:
   whose `exec` is late or whose container is stuck `removing`, a credential
   resolver gated on `destroy`, a retention smaller than the output, a FIFO.
 - `descendant_alive` is measured from `/proc`: any live process carrying this
-  run's token in its environment, detached descendants included.
+  run's token in its environment, detached descendants included. It is
+  measured only for a step whose alternatives judge it.
 - `launches` is measured from a log every workload appends to as it starts.
 - `settles_within_seconds` is enforced by `asyncio.timeout` and, for calls
   that could block the event loop, by a watchdog thread outside it.
@@ -577,7 +578,9 @@ def _failure(error: OperationFailure) -> Outcome:
     return Outcome(kind=error.error.kind, has_ref=isinstance(error.error.ref, OperationRef))
 
 
-def _matches(alternatives: list[dict[str, Any]], outcome: Outcome, alive: bool) -> int | None:
+def _matches(
+    alternatives: list[dict[str, Any]], outcome: Outcome, alive: bool | None
+) -> int | None:
     """The index of the first alternative `outcome` matches, or None."""
     return next(
         (i for i, alternative in enumerate(alternatives) if _match(alternative, outcome, alive)),
@@ -585,7 +588,7 @@ def _matches(alternatives: list[dict[str, Any]], outcome: Outcome, alive: bool) 
     )
 
 
-def _match(alternative: dict[str, Any], outcome: Outcome, alive: bool) -> bool:
+def _match(alternative: dict[str, Any], outcome: Outcome, alive: bool | None) -> bool:
     want = alternative["document"]
     if "descendant_alive" in alternative and alternative["descendant_alive"] != alive:
         return False
@@ -787,8 +790,8 @@ async def run_hazard(subject: Subject, hazard: str) -> list[int]:
     """Drive every step of `hazard` against `subject`.
 
     Returns the index of the alternative each step matched. Raises
-    FixtureMismatch on the first miss, or NotRun when a step's `given` or its
-    liveness cannot be established.
+    FixtureMismatch on the first miss, or NotRun when a step's `given`, or the
+    liveness its alternatives judge, cannot be established.
     """
     fixture = HAZARDS[hazard]
     if "provider" in fixture:
@@ -822,14 +825,19 @@ async def run_hazard(subject: Subject, hazard: str) -> list[int]:
                 settled=e.settled,
             ) from e
         elapsed = time.monotonic() - began
-        alive = bool(subject.alive())
         alternatives = step.get("expect_one_of") or [step["expect"]]
+        # Measured only where an alternative judges it: a step that names no
+        # descendant_alive needs no liveness, so it cannot be unmeasurable.
+        pids = subject.alive() if any("descendant_alive" in a for a in alternatives) else None
+        alive = None if pids is None else bool(pids)
         where = f"{subject.name} {hazard} step {index} {call} ({elapsed:.1f}s)"
         miss = {"hazard": hazard, "step": index, "call": call, "outcome": outcome, "alive": alive}
         if (alternative := _matches(alternatives, outcome, alive)) is None:
+            measured = (
+                "" if pids is None else f" with descendant_alive={alive} (measured pids {pids})"
+            )
             raise FixtureMismatch(
-                f"{where}: got {outcome.describe()} with descendant_alive={alive} "
-                f"(measured pids {subject.alive()}); none of "
+                f"{where}: got {outcome.describe()}{measured}; none of "
                 + "; ".join(_summary(a) for a in alternatives),
                 **miss,
             )
@@ -1243,8 +1251,8 @@ async def test_a_finding_xfails_only_on_its_pinned_miss() -> None:
 
 
 async def _daemon_lh7(subject: Subject) -> None:
-    """The real-daemon LH-7 cell: its strict finding, or NOT RUN when liveness is
-    unmeasurable (#68), as in the matrix; never a failure, xfail or pass."""
+    """The real-daemon LH-7 cell: its strict finding, or NOT RUN when a step
+    cannot be executed, as in the matrix; never a failure, xfail or pass."""
     try:
         await _expect_finding(run_hazard(subject, "LH-7"), DOCKER_DAEMON_LH7)
     except NotRun as reason:
@@ -1271,22 +1279,62 @@ def _unreadable_bystander(subject: Subject) -> Iterator[None]:
         bystander.wait()
 
 
+@_reports_not_run
+async def _local_lh2(subject: Subject) -> None:
+    await run_hazard(subject, "LH-2")
+
+
+async def _matrix_lh2(subject: Subject) -> None:
+    await test_provider_meets_lifecycle_hazard(subject, "LH-2")
+
+
 @pytest.mark.parametrize("subject", ["local"], indirect=True)
-@pytest.mark.parametrize(
-    "boundary",
-    [_daemon_lh7, test_a_not_a_regular_file_refusal_is_rejected_policy],
-    ids=["daemon-lh7", "reports-not-run"],
-)
+@pytest.mark.parametrize("boundary", [_matrix_lh2, _local_lh2], ids=["matrix", "reports-not-run"])
 async def test_an_unmeasurable_hazard_test_is_not_run(
     subject: Subject, boundary: Callable[[Subject], Coroutine[Any, Any, None]]
 ) -> None:
-    """Every hazard test boundary reports NOT RUN through the real fail-closed
-    liveness, never a failure, xfail or pass."""
+    """A hazard test whose fixture judges descendant_alive (LH-2) reports NOT RUN
+    through the real fail-closed liveness, never a failure, xfail or pass."""
     with (
         _unreadable_bystander(subject),
         pytest.raises(pytest.skip.Exception, match="NOT RUN: .*unreadable"),
     ):
         await boundary(subject)
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+async def test_a_hazard_judging_no_liveness_runs_beside_an_unreadable_process(
+    subject: Subject,
+) -> None:
+    """LH-7 names no descendant_alive, so a process whose environ cannot be read
+    does not make it NOT RUN: its file surface is still driven and judged."""
+    assert not any(
+        "descendant_alive" in alternative
+        for step in HAZARDS["LH-7"]["steps"]
+        for alternative in step.get("expect_one_of") or [step["expect"]]
+    )
+    probed: list[str] = []
+    file_exists = subject.provider.file_exists
+
+    async def observed(workspace: Workspace, path: str) -> bool:
+        probed.append(path)
+        return await file_exists(workspace, path)
+
+    subject.monkeypatch.setattr(subject.provider, "file_exists", observed)
+    with _unreadable_bystander(subject):
+        await run_hazard(subject, "LH-7")
+    assert probed == ["outputs/pipe"]
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+async def test_daemon_lh7_with_an_unestablished_given_is_not_run(subject: Subject) -> None:
+    """The real-daemon LH-7 boundary reports a `given` it cannot establish as
+    NOT RUN, never a failure, xfail or pass."""
+    subject.monkeypatch.setattr(
+        f"{__name__}._unestablished", lambda subject, given: "withheld by this test"
+    )
+    with pytest.raises(pytest.skip.Exception, match="NOT RUN: given .*withheld by this test"):
+        await _daemon_lh7(subject)
 
 
 @pytest.mark.integration
