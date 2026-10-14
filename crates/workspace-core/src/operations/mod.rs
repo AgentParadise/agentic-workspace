@@ -70,3 +70,9 @@ pub trait SupportsOperations: Send + Sync {
         workspace: &WorkspaceRef,
     ) -> impl Future<Output = FinalizationOutcome> + Send;
 }
+
+/// Resolves a credential reference to its value inside the provider. The
+/// value goes only where the binding says; no contract document carries it.
+pub trait CredentialResolver: Send + Sync {
+    fn resolve(&self, credential: &CredentialRef) -> Result<String, OperationError>;
+}

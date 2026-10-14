@@ -9,7 +9,9 @@ version.workspace = true
 [dependencies]
 agentic-workspace-core = { path = "../../crates/workspace-core" }
 serde_json.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 agentic-workspace-conformance = { path = "../../crates/workspace-conformance" }
 tempfile.workspace = true
