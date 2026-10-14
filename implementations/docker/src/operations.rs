@@ -281,10 +281,23 @@ struct Operation {
 }
 
 impl Progress {
+    /// Store `chunk`, copying to `channels` what the spool stored (redacted),
+    /// never the raw chunk.
     fn record(&mut self, chunk: &[u8], channel: Channel) {
-        self.spool.append(chunk);
+        let stored = self.spool.append(chunk, channel as usize);
+        self.keep(&stored, channel as usize);
+    }
+
+    /// Store every tail the spool held back: the readers have reached EOF.
+    fn finish_output(&mut self) {
+        for (channel, stored) in self.spool.finish() {
+            self.keep(&stored, channel);
+        }
+    }
+
+    fn keep(&mut self, stored: &[u8], channel: usize) {
         if let Some(channels) = &mut self.channels {
-            channels[channel as usize].extend_from_slice(chunk);
+            channels[channel].extend_from_slice(stored);
         }
     }
 }
@@ -820,6 +833,8 @@ impl DockerOperations {
     ) -> Result<Arc<Operation>, OperationError> {
         let secrets = self.resolve(&spec).await?;
         let names: Vec<String> = secrets.iter().map(|(name, _)| name.clone()).collect();
+        // Every resolved value is redacted from the output before it is stored.
+        let redact: Vec<Vec<u8>> = secrets.iter().map(|(_, v)| v.as_bytes().to_vec()).collect();
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let reference = OperationRef {
             workspace: WorkspaceRef {
@@ -858,7 +873,7 @@ impl DockerOperations {
             started_at: now_rfc3339(),
             progress: Mutex::new(Progress {
                 state: OperationState::Running,
-                spool: OperationSpool::new(self.retention),
+                spool: OperationSpool::with_redaction(self.retention, redact),
                 channels: self.separate_channels.then(Default::default),
                 leader: None,
                 leader_known: false,
@@ -946,6 +961,7 @@ async fn collect(docker: Docker, op: Arc<Operation>, mut child: tokio::process::
         });
     }
     op.update(|p| {
+        p.finish_output();
         p.leader_known = true;
         p.client_finished = true;
         p.client_code = code;
@@ -1302,6 +1318,30 @@ mod tests {
         let failure = output_failure(&op).expect("the stream error is reported");
         assert!(failure.contains("after 7 bytes: pipe broke"), "{failure}");
         assert!(failure.contains("not collected"), "{failure}");
+    }
+
+    #[tokio::test]
+    async fn a_resolved_value_never_reaches_the_spool_pages_or_channels() {
+        // Invented. Printed whole, split across two reads, and repeated.
+        const CANARY: &[u8] = b"canary-INVENTED-sk-7f3a";
+        let op = operation();
+        op.lock().spool = OperationSpool::with_redaction(
+            NonZeroU64::new(1 << 20).unwrap(),
+            vec![CANARY.to_vec()],
+        );
+        let (head, tail) = CANARY.split_at(11);
+        let whole = [b"whole ", CANARY, b"\nsplit ", head].concat();
+        let rest = [tail, b"\n"].concat();
+        pump(&op, scripted(vec![Ok(&whole), Ok(&rest)]), Channel::Stdout).await;
+        let repeated = [CANARY, CANARY, b" end:", head].concat();
+        pump(&op, scripted(vec![Ok(&repeated)]), Channel::Stderr).await;
+        op.update(|p| p.finish_output());
+        let (stdout, stderr) = channels(&op);
+        assert_eq!(stdout, b"whole [REDACTED]\nsplit [REDACTED]\n");
+        assert_eq!(stderr, [b"[REDACTED][REDACTED] end:", head].concat());
+        let stored = collected(&op);
+        assert_eq!(stored, [stdout, stderr].concat());
+        assert!(!stored.windows(CANARY.len()).any(|w| w == CANARY));
     }
 
     #[tokio::test]

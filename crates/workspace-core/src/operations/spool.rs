@@ -1,6 +1,15 @@
 //! Bounded, append-only operation output with opaque generation cursors.
+//!
+//! Credential values registered with [`OperationSpool::with_redaction`]
+//! never reach storage: each channel is scanned before its bytes are stored,
+//! every occurrence becomes [`REDACTED`], and a channel's tail that could
+//! still begin a value is held until the next append or
+//! [`OperationSpool::finish`] decides it. Offsets, `end`, retention and gaps
+//! all count stored (redacted) bytes, so cursors stay consistent whatever
+//! the marker's length. The rule is the Python spool's, checked against
+//! `tests/fixtures/output_redaction/cases.json`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +24,61 @@ use super::contract::{
 
 static GENERATIONS: AtomicU64 = AtomicU64::new(0);
 
+/// What a registered value is replaced with.
+pub const REDACTED: &[u8] = b"[REDACTED]";
+
+/// Replaces registered values in a byte stream, whatever its chunking: at
+/// each position the longest value that matches is replaced, and a position
+/// the stream has not yet decided is held until it is.
+#[derive(Default)]
+struct Redactor {
+    /// Longest first, so the longest wins at a position. Never empty values.
+    values: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for Redactor {
+    // Never the values themselves.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Redactor({} values)", self.values.len())
+    }
+}
+
+impl Redactor {
+    fn new(values: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        let mut values: Vec<Vec<u8>> = values.into_iter().filter(|v| !v.is_empty()).collect();
+        values.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+        values.dedup();
+        Self { values }
+    }
+
+    /// `(released, held)`: redacted bytes safe to store, and the raw tail
+    /// still undecided. `last` decides everything, so nothing is held.
+    fn scan(&self, data: &[u8], last: bool) -> (Vec<u8>, Vec<u8>) {
+        let mut out = Vec::with_capacity(data.len());
+        let mut at = 0;
+        while at < data.len() {
+            let tail = &data[at..];
+            let mut decided = false;
+            for value in &self.values {
+                if tail.starts_with(value) {
+                    out.extend_from_slice(REDACTED);
+                    at += value.len();
+                    decided = true;
+                    break;
+                }
+                if !last && value.len() > tail.len() && value.starts_with(tail) {
+                    return (out, tail.to_vec());
+                }
+            }
+            if !decided {
+                out.push(data[at]);
+                at += 1;
+            }
+        }
+        (out, Vec::new())
+    }
+}
+
 /// Output retained up to `retention_bytes`, read in pages no larger than the
 /// caller's bound once serialised. A cursor older than retention resumes at
 /// the oldest retained byte and reports the evicted count as an exact gap.
@@ -25,10 +89,20 @@ pub struct OperationSpool {
     retained: VecDeque<u8>,
     /// Absolute offset of the first retained byte.
     base: u64,
+    redactor: Redactor,
+    /// Per channel: raw bytes not yet stored because they may begin a value.
+    held: BTreeMap<usize, Vec<u8>>,
 }
 
 impl OperationSpool {
+    /// A spool that stores output exactly as appended.
     pub fn new(retention_bytes: NonZeroU64) -> Self {
+        Self::with_redaction(retention_bytes, Vec::new())
+    }
+
+    /// A spool that replaces every one of `values` with [`REDACTED`] before
+    /// storing. No values is [`OperationSpool::new`]; empty values are ignored.
+    pub fn with_redaction(retention_bytes: NonZeroU64, values: Vec<Vec<u8>>) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -39,6 +113,8 @@ impl OperationSpool {
             generation: format!("{nanos:x}{:x}{sequence:x}", std::process::id()),
             retained: VecDeque::new(),
             base: 0,
+            redactor: Redactor::new(values),
+            held: BTreeMap::new(),
         }
     }
 
@@ -47,8 +123,39 @@ impl OperationSpool {
         self.base + self.retained.len() as u64
     }
 
-    /// Append output, evicting the oldest bytes beyond retention.
-    pub fn append(&mut self, data: &[u8]) {
+    /// Append output read from `channel`, evicting the oldest bytes beyond
+    /// retention, and return the bytes this call stored. Channels are
+    /// redacted separately, since one is not interleaved with another.
+    pub fn append(&mut self, data: &[u8], channel: usize) -> Vec<u8> {
+        if self.redactor.values.is_empty() {
+            self.store(data);
+            return data.to_vec();
+        }
+        let mut pending = self.held.remove(&channel).unwrap_or_default();
+        pending.extend_from_slice(data);
+        let (released, held) = self.redactor.scan(&pending, false);
+        if !held.is_empty() {
+            self.held.insert(channel, held);
+        }
+        self.store(&released);
+        released
+    }
+
+    /// Decide and store every held tail once the collector has read its
+    /// last byte, returning what each channel stored. Call before the
+    /// terminal state is published, so `complete` covers the final bytes.
+    pub fn finish(&mut self) -> Vec<(usize, Vec<u8>)> {
+        let held = std::mem::take(&mut self.held);
+        held.into_iter()
+            .map(|(channel, tail)| {
+                let (released, _) = self.redactor.scan(&tail, true);
+                self.store(&released);
+                (channel, released)
+            })
+            .collect()
+    }
+
+    fn store(&mut self, data: &[u8]) {
         self.retained.extend(data);
         let excess = self.retained.len().saturating_sub(self.retention);
         self.retained.drain(..excess);
@@ -120,7 +227,10 @@ impl OperationSpool {
             next_cursor: self.encode(next),
             data_b64: Base64::try_from(STANDARD.encode(&data)).expect("STANDARD is padded base64"),
             gap,
-            complete: state.is_terminal() && size == 0 && next == self.end(),
+            complete: state.is_terminal()
+                && size == 0
+                && next == self.end()
+                && self.held.is_empty(),
             loss_detected: None,
         }
     }
@@ -184,7 +294,7 @@ mod tests {
     fn every_page_fits_its_bound_and_pages_concatenate_to_the_output() {
         let mut spool = OperationSpool::new(NonZeroU64::new(1 << 20).unwrap());
         let output: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
-        spool.append(&output);
+        spool.append(&output, 0);
         let (mut cursor, mut seen) = (None::<String>, Vec::new());
         loop {
             let page = spool
@@ -209,7 +319,7 @@ mod tests {
     #[test]
     fn the_last_bytes_are_not_complete_and_the_empty_page_after_them_is() {
         let mut spool = OperationSpool::new(NonZeroU64::new(1 << 20).unwrap());
-        spool.append(b"hello world\n");
+        spool.append(b"hello world\n", 0);
         let last = spool
             .page(&operation(), OperationState::Succeeded, None, 4096)
             .unwrap();
@@ -240,7 +350,7 @@ mod tests {
     #[test]
     fn a_cursor_older_than_retention_reports_the_exact_gap() {
         let mut spool = OperationSpool::new(NonZeroU64::new(8).unwrap());
-        spool.append(b"0123456789abcdef");
+        spool.append(b"0123456789abcdef", 0);
         let first = spool
             .page(&operation(), OperationState::Running, None, 4096)
             .unwrap();
@@ -292,7 +402,7 @@ mod tests {
                 let at = format!("generation width {generation}, key width {key}");
                 let mut spool = OperationSpool::new(NonZeroU64::new(64).unwrap());
                 spool.generation = "f".repeat(generation);
-                spool.append(&output);
+                spool.append(&output, 0);
                 let operation: OperationRef = serde_json::from_value(serde_json::json!({
                     "workspace": {"provider": "docker", "resource_id": "c1"},
                     "operation_id": "op-1",
@@ -311,6 +421,126 @@ mod tests {
                 assert!(second.gap.is_none(), "{at}");
             }
         }
+    }
+
+    fn drain(spool: &OperationSpool, max: usize) -> Vec<u8> {
+        let (mut cursor, mut seen) = (None::<String>, Vec::new());
+        loop {
+            let page = spool
+                .page(
+                    &operation(),
+                    OperationState::Succeeded,
+                    cursor.as_deref(),
+                    max,
+                )
+                .unwrap();
+            seen.extend(decoded(&page));
+            cursor = Some(page.next_cursor.to_string());
+            if page.complete {
+                let end = cursor.unwrap().rsplit_once(':').unwrap().1.parse::<u64>();
+                assert_eq!(end.unwrap(), spool.end());
+                return seen;
+            }
+        }
+    }
+
+    const CASES: &str = include_str!("../../../../tests/fixtures/output_redaction/cases.json");
+
+    #[test]
+    fn every_split_of_every_fixture_stores_the_same_redacted_bytes() {
+        let fixtures: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        assert_eq!(fixtures["marker"].as_str().unwrap().as_bytes(), REDACTED);
+        for case in fixtures["cases"].as_array().unwrap() {
+            let values: Vec<Vec<u8>> = case["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().as_bytes().to_vec())
+                .collect();
+            let output = case["output"].as_str().unwrap().as_bytes();
+            let stored = case["stored"].as_str().unwrap().as_bytes();
+            let mut splits = vec![vec![output.to_vec()]];
+            for k in 0..=output.len() {
+                splits.push(vec![output[..k].to_vec(), output[k..].to_vec()]);
+            }
+            splits.push(output.iter().map(|b| vec![*b]).collect());
+            for chunks in splits {
+                let mut spool = OperationSpool::with_redaction(
+                    NonZeroU64::new(1 << 20).unwrap(),
+                    values.clone(),
+                );
+                for chunk in &chunks {
+                    spool.append(chunk, 0);
+                }
+                spool.finish();
+                let at = format!("{} {chunks:?}", case["name"]);
+                assert_eq!(
+                    spool.retained.iter().copied().collect::<Vec<_>>(),
+                    stored,
+                    "{at}"
+                );
+                assert_eq!(drain(&spool, 320), stored, "{at}");
+                assert_eq!(spool.end(), stored.len() as u64, "{at}");
+            }
+        }
+    }
+
+    const CANARY: &[u8] = b"canary-INVENTED-sk-7f3a";
+
+    #[test]
+    fn a_value_split_across_interleaved_channels_is_redacted() {
+        let mut spool = OperationSpool::with_redaction(
+            NonZeroU64::new(1 << 20).unwrap(),
+            vec![CANARY.to_vec()],
+        );
+        spool.append(&[b"out:", &CANARY[..9]].concat(), 0);
+        spool.append(b"err line\n", 1);
+        spool.append(&[&CANARY[9..], b"\n"].concat(), 0);
+        spool.finish();
+        assert_eq!(drain(&spool, 4096), b"out:err line\n[REDACTED]\n");
+    }
+
+    #[test]
+    fn held_bytes_are_neither_counted_nor_complete_until_finished() {
+        let mut spool = OperationSpool::with_redaction(
+            NonZeroU64::new(1 << 20).unwrap(),
+            vec![CANARY.to_vec()],
+        );
+        spool.append(&[b"ok ", &CANARY[..5]].concat(), 0);
+        assert_eq!(spool.end(), 3);
+        let first = spool
+            .page(&operation(), OperationState::Succeeded, None, 4096)
+            .unwrap();
+        let after = spool
+            .page(
+                &operation(),
+                OperationState::Succeeded,
+                Some(first.next_cursor.as_str()),
+                4096,
+            )
+            .unwrap();
+        assert!(!after.complete);
+        spool.finish();
+        assert_eq!(drain(&spool, 4096), [b"ok ", &CANARY[..5]].concat());
+        assert!(!format!("{spool:?}").contains("canary"));
+    }
+
+    #[test]
+    fn retention_and_gaps_count_stored_bytes() {
+        let mut spool =
+            OperationSpool::with_redaction(NonZeroU64::new(12).unwrap(), vec![CANARY.to_vec()]);
+        spool.append(&[CANARY, b" tail-bytes"].concat(), 0);
+        spool.finish();
+        let stored = b"[REDACTED] tail-bytes";
+        assert_eq!(spool.end(), stored.len() as u64);
+        let page = spool
+            .page(&operation(), OperationState::Succeeded, None, 4096)
+            .unwrap();
+        assert_eq!(
+            page.gap.unwrap().lost_bytes,
+            NonZeroU64::new(stored.len() as u64 - 12)
+        );
+        assert_eq!(decoded(&page), stored[stored.len() - 12..]);
     }
 
     #[test]

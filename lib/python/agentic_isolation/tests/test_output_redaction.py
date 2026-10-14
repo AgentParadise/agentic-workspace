@@ -18,7 +18,6 @@ from agentic_isolation.config import WorkspaceConfig
 from agentic_isolation.contract import (
     CredentialBinding,
     CredentialRef,
-    ObservationPage,
     OperationRef,
 )
 from agentic_isolation.providers.base import run_to_completion
