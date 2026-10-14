@@ -189,6 +189,8 @@ struct Progress {
     leader_known: bool,
     /// The outcome a cancel or timeout asked for, recorded before signalling.
     requested: Option<OperationState>,
+    /// A termination is in flight; cleared when one fails, so it is retried.
+    terminating: bool,
     tracked: BTreeMap<String, String>,
     exit_code: Option<i64>,
     signal: Option<String>,
@@ -295,26 +297,40 @@ impl Docker {
         ))
     }
 
-    /// Cancel `op` once and wait for it to settle. Idempotent: a terminal or
-    /// already-ending operation is only waited for.
+    /// Cancel `op` and wait for it to settle. Idempotent: a terminal or
+    /// already-ending operation is only waited for. A failed termination is
+    /// retried by the next cancel, and an operation that has not ended is an
+    /// error, never a successful cancel.
     async fn cancel(&self, op: &Operation, grace: Duration) -> Result<(), OperationError> {
         let first = {
             let mut p = op.lock();
-            let first = !p.state.is_terminal() && p.requested.is_none();
+            let first = !p.state.is_terminal() && !p.terminating;
             if first {
-                p.requested = Some(OperationState::Cancelled);
+                p.terminating = true;
+                p.requested.get_or_insert(OperationState::Cancelled);
             }
             first
         };
         if first {
-            self.terminate(op, grace).await?;
+            if let Err(e) = self.terminate(op, grace).await {
+                op.update(|p| p.terminating = false);
+                return Err(e);
+            }
         }
         // `collect` settles once the client exits; a stopped container ends it.
-        op.wait_for(grace + KILL_WAIT + FINAL_OUTPUT * 2, |p| {
-            p.state.is_terminal()
-        })
-        .await;
-        Ok(())
+        let wait = grace + KILL_WAIT + FINAL_OUTPUT * 2;
+        match op.wait_for(wait, |p| p.state.is_terminal()).await {
+            true => Ok(()),
+            false => Err(error(
+                ErrorKind::ProviderUnavailable,
+                format!(
+                    "operation {} did not end within {}s of its cancellation",
+                    op.reference.operation_id,
+                    wait.as_secs()
+                ),
+                Some(&op.reference),
+            )),
+        }
     }
 
     /// TERM the operation, KILL after `grace`, confirm; else stop the
@@ -529,6 +545,7 @@ impl DockerOperations {
                 leader: None,
                 leader_known: false,
                 requested: None,
+                terminating: false,
                 tracked: BTreeMap::new(),
                 exit_code: None,
                 signal: None,
@@ -561,11 +578,15 @@ async fn collect(docker: Docker, op: Arc<Operation>, mut child: tokio::process::
         Err(_) => {
             let first = {
                 let mut p = op.lock();
-                p.requested.get_or_insert(OperationState::TimedOut) == &OperationState::TimedOut
+                p.requested.get_or_insert(OperationState::TimedOut);
+                !std::mem::replace(&mut p.terminating, true)
             };
             if first {
                 if let Err(e) = docker.terminate(&op, TIMEOUT_GRACE).await {
-                    op.update(|p| p.failures.push(e.message.to_string()));
+                    op.update(|p| {
+                        p.terminating = false;
+                        p.failures.push(e.message.to_string())
+                    });
                 }
             }
             match tokio::time::timeout(CLIENT_EXIT, child.wait()).await {
@@ -756,27 +777,30 @@ impl SupportsOperations for DockerOperations {
         Ok(op.status())
     }
 
+    /// Records are forgotten only once their operation has ended, so a failed
+    /// finalize stays resolvable and a retry cleans up again.
     async fn finalize(&self, workspace: &WorkspaceRef) -> FinalizationOutcome {
-        let mine: Vec<Arc<Operation>> = {
-            let mut records = self.records.lock().await;
-            let ours = |container: &String| container == workspace.resource_id.as_str();
-            let mine = records
+        let mine: Vec<((String, String), Arc<Operation>)> = match workspace.provider.as_str() {
+            "docker" => self
+                .records
+                .lock()
+                .await
                 .iter()
-                .filter(|((c, _), _)| ours(c))
-                .map(|(_, op)| op.clone())
-                .collect();
-            records.retain(|(container, _), _| !ours(container));
-            mine
+                .filter(|((c, _), _)| c == workspace.resource_id.as_str())
+                .map(|(key, op)| (key.clone(), op.clone()))
+                .collect(),
+            _ => Vec::new(),
         };
         let mut failures = Vec::new();
-        for op in mine {
-            if let Err(e) = self.docker.cancel(&op, TIMEOUT_GRACE).await {
-                failures.push(e.message.to_string());
-            } else if !op.lock().state.is_terminal() {
-                failures.push(format!(
-                    "operation {} did not end",
-                    op.reference.operation_id
-                ));
+        for (key, op) in mine {
+            match self.docker.cancel(&op, TIMEOUT_GRACE).await {
+                Err(e) => failures.push(e.message.to_string()),
+                Ok(()) => {
+                    let mut records = self.records.lock().await;
+                    if records.get(&key).is_some_and(|r| Arc::ptr_eq(r, &op)) {
+                        records.remove(&key);
+                    }
+                }
             }
         }
         match failures.is_empty() {

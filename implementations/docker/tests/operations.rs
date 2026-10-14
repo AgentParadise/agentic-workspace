@@ -21,11 +21,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// `exec` drops docker's own flags and runs the command here; `stop` is
-/// recorded. Every argv is appended to `docker.log` beside the script.
+/// recorded. Every argv is appended to `docker.log` beside the script. While
+/// a `fail` file sits beside it, signalling and `stop` both fail.
 fn fake_docker(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let script = dir.join("docker");
     let log = dir.join("docker.log");
+    let fail = dir.join("fail");
     std::fs::write(
         &script,
         format!(
@@ -43,11 +45,13 @@ exec)
         esac
     done
     shift
+    [ -e '{fail}' ] && [ "$4" = aw-signal ] && exit 1
     exec "$@" ;;
-stop) exit 0 ;;
+stop) [ -e '{fail}' ] && exit 1; exit 0 ;;
 esac
 "#,
-            log = log.display()
+            log = log.display(),
+            fail = fail.display()
         ),
     )
     .unwrap();
@@ -347,6 +351,68 @@ async fn finalize_ends_running_operations_and_forgets_them() {
         serde_json::to_value(&outcome).unwrap(),
         serde_json::json!({"state": "completed"})
     );
+    assert_eq!(
+        ops.status(&op).await.unwrap_err().kind,
+        ErrorKind::UnknownOperation
+    );
+}
+
+#[tokio::test]
+async fn failed_cleanup_stays_resolvable_and_a_retry_cleans_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let op = ops
+        .start(&workspace(), spec("k1", "echo $$; sleep 300", 60))
+        .await
+        .unwrap();
+    let page = ops
+        .observe(
+            &op,
+            ObserveRequest {
+                cursor: None,
+                max_bytes: 4096,
+                wait: Duration::from_secs(5),
+            },
+        )
+        .await
+        .unwrap();
+    let pid = String::from_utf8(STANDARD.decode(page.data_b64.as_str()).unwrap()).unwrap();
+    let pid = pid.trim().to_owned();
+    assert!(alive(&pid), "{pid:?}");
+
+    std::fs::write(dir.path().join("fail"), "").unwrap();
+    let error = ops
+        .cancel(&op, Duration::from_millis(100))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::ProviderUnavailable);
+    let outcome = serde_json::to_value(ops.finalize(&workspace()).await).unwrap();
+    assert_eq!(outcome["state"], "failed", "{outcome}");
+    assert_eq!(
+        outcome["error"]["kind"], "provider_unavailable",
+        "{outcome}"
+    );
+    assert!(alive(&pid));
+    assert_eq!(
+        ops.status(&op).await.unwrap().state,
+        OperationState::Running
+    );
+
+    std::fs::remove_file(dir.path().join("fail")).unwrap();
+    // Another provider's workspace with the same resource id is not ours.
+    let foreign: WorkspaceRef =
+        serde_json::from_value(serde_json::json!({"provider": "e2b", "resource_id": "c1"}))
+            .unwrap();
+    ops.finalize(&foreign).await;
+    assert!(alive(&pid));
+    assert_eq!(
+        ops.status(&op).await.unwrap().state,
+        OperationState::Running
+    );
+
+    let outcome = serde_json::to_value(ops.finalize(&workspace()).await).unwrap();
+    assert_eq!(outcome, serde_json::json!({"state": "completed"}));
+    assert!(!alive(&pid), "pid {pid} survived the retried finalize");
     assert_eq!(
         ops.status(&op).await.unwrap_err().kind,
         ErrorKind::UnknownOperation
