@@ -202,6 +202,11 @@ _CONTROL_SECONDS = 30.0
 # How long a killed control client is given to be reaped.
 _REAP_SECONDS = 5.0
 
+# How long a cancel waits for the wrapper's launch header, the trusted leader
+# it signals. One that has not come by then is never signalled: the cancel
+# stops the container instead, so a silent exec client cannot hold it.
+_LEADER_SECONDS = 30.0
+
 # How long a terminal operation keeps answering status and observe before its
 # spool is reclaimed. Same-key replay outlives it; see the module docstring.
 RECORD_RETENTION_SECONDS = 3600.0
@@ -725,14 +730,23 @@ class DockerOperations:
     async def cancel(self, ref: OperationRef, *, grace_seconds: float) -> OperationStatus:
         operation = self._lookup(ref)
         if operation.state not in TERMINAL_STATES:
+            # Waited for before taking the lock, never under it: a timeout
+            # takes `stopping` before it releases a header that never came.
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(_LEADER_SECONDS):
+                    await operation.leader_known.wait()
             # Requested under the lock, so no settlement can publish
             # `cancelled` until this termination has confirmed or failed.
             async with operation.stopping:
                 if operation.state in TERMINAL_STATES:
                     return self._status(operation)
                 operation.cancel_requested = True
+                if not operation.leader_known.is_set():
+                    self._note(
+                        operation,
+                        f"no launch header within {_LEADER_SECONDS:g}s; stopping the container",
+                    )
                 try:
-                    await operation.leader_known.wait()
                     await self._terminate_group(operation, grace_seconds=grace_seconds)
                 except asyncio.CancelledError:
                     # Recorded before the lock is released, so the settlement

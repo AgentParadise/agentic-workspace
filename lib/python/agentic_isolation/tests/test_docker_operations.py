@@ -1444,3 +1444,82 @@ async def test_a_stop_answered_removing_then_stopped_is_confirmed(
     status = ops._status(operation)
     assert status.state == "cancelled", status
     assert status.metadata["cancel_escalation"] == "container_stopped"
+
+
+# Third release review of #57, finding 1: a cancel before the launch header.
+# `exec` never prints the header or anything else until `stop` ends it, as the
+# daemon's stop ends a real exec client; every other command is FAKE_DOCKER's.
+SILENT_DOCKER = r"""#!/bin/sh
+case "$1" in
+exec) echo $$ > "$SILENT_PID"; exec sleep 600 ;;
+stop) kill "$(cat "$SILENT_PID")" 2>/dev/null ;;
+esac
+exec "$REAL_DOCKER" "$@"
+"""
+
+
+def _silent_ops(docker_env: Path, monkeypatch: pytest.MonkeyPatch) -> DockerOperations:
+    silent = docker_env / "silent-docker"
+    silent.write_text(SILENT_DOCKER)
+    silent.chmod(silent.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("SILENT_PID", str(docker_env / "silent.pid"))
+    monkeypatch.setenv("REAL_DOCKER", str(docker_env / "docker"))
+    ops = _ops(docker_env)
+    ops._docker = str(silent)
+    return ops
+
+
+async def _settle_silent_cancel(
+    docker_env: Path, operation: _Operation, cancel: asyncio.Task[object]
+) -> object:
+    """The cancel's status, or TimeoutError if it and the collector do not settle in 15s."""
+    try:
+        async with asyncio.timeout(15):
+            status = await cancel
+            await operation.collector  # type: ignore[misc]
+    finally:
+        for task in (cancel, operation.collector):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, OperationFailure):
+                    await task
+        with contextlib.suppress(ProcessLookupError, FileNotFoundError, ValueError):
+            os.kill(int((docker_env / "silent.pid").read_text()), signal.SIGKILL)
+    assert not operation.stopping.locked()
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    assert not pending, pending
+    return status
+
+
+async def test_cancel_before_the_launch_header_does_not_deadlock_the_timeout(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review's reproduction: timeout 1s, immediate cancel, silent client.
+
+    The cancel used to hold `stopping` while waiting for the header; the
+    timeout needed `stopping` before releasing that wait. Neither settled.
+    """
+    ops = _silent_ops(docker_env, monkeypatch)
+    ref = await ops.start(_workspace(), _spec("true", timeout_seconds=1))
+    operation = ops._operations[ref.operation_id]
+    cancel: asyncio.Task[object] = asyncio.create_task(ops.cancel(ref, grace_seconds=0))
+    status = await _settle_silent_cancel(docker_env, operation, cancel)
+    assert operation.timed_out
+    assert status.state in ("timed_out", "cancelled")  # type: ignore[attr-defined]
+    assert (await ops.status(ref)).state == status.state  # type: ignore[attr-defined]
+
+
+async def test_cancel_stops_the_container_when_the_launch_header_never_comes(
+    docker_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No timeout to rescue it: the cancel's own bounded wait fails closed."""
+    monkeypatch.setattr(docker_operations, "_LEADER_SECONDS", 0.5)
+    ops = _silent_ops(docker_env, monkeypatch)
+    ref = await ops.start(_workspace(), _spec("true", timeout_seconds=60))
+    operation = ops._operations[ref.operation_id]
+    cancel: asyncio.Task[object] = asyncio.create_task(ops.cancel(ref, grace_seconds=0))
+    status = await _settle_silent_cancel(docker_env, operation, cancel)
+    assert not operation.timed_out and operation.leader is None
+    assert status.state == "cancelled"  # type: ignore[attr-defined]
+    assert status.metadata["cancel_escalation"] == "container_stopped"  # type: ignore[attr-defined]
+    assert "launch header" in status.metadata["cancel_signal_failure"]  # type: ignore[attr-defined]
