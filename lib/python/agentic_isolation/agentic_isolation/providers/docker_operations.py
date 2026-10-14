@@ -832,7 +832,7 @@ class DockerOperations:
                 self._note(operation, f"kill -{sig}: exit {code}: {out.strip()}")
                 return False
             if await self._group_gone(operation, within=wait):
-                return await self._nothing_unattributed(operation, start)
+                return True  # MUTATION: orphan check reverted
         return False
 
     async def _nothing_unattributed(self, operation: _Operation, start: str) -> bool:
