@@ -147,7 +147,9 @@ exactly the run's processes; `removing` is sticky), not a daemon.
 Liveness fails closed (#68): a process that could be a workload (started
 after the harness, not a zombie, not gone) whose `/proc/<pid>/environ`
 cannot be read makes `descendant_alive` unmeasurable, and the cell is NOT
-RUN, never judged alive=false. A `given` the harness cannot establish is
+RUN, never judged alive=false. Liveness is measured only for a step whose
+alternatives judge `descendant_alive` (LH-1, LH-2 and LH-3), so it cannot
+stop LH-4 through LH-7, and their pins carry no `alive` field. A `given` the harness cannot establish is
 NOT RUN too, in both harnesses. A PASS records the alternative each step
 matched; where the outcome is deterministic it is asserted (Python
 `CONFIRMED`, Rust `pass [..]`), so a provider that starts answering a
@@ -161,7 +163,7 @@ non-root user with no Docker daemon. First miss per cell:
 | LH-1 | `hazard-double-fork-orphan` | PASS, step 1 matched `cancelled` (alternative 0) | PASS, or XFAIL APSS#146 (fixture gap, below) | PASS `[0, 0, 0]` |
 | LH-2 | `hazard-interrupted-cancel` | PASS, step 3 matched `cancelled` (0) | PASS, step 3 matched `cancelled` (0) | FAIL step 3 `cancel`: `kind=provider_unavailable ref=true alive=true` (unattributed) |
 | LH-3 | `hazard-cancel-before-launch-header` | FAIL step 1 `cancel`: not settled within 30 s | NOT RUN: `given launch_header_not_seen` cannot be set up | PASS `[0, 0, 0]` (was FAIL step 1 `cancel`, a stand-in artefact; below) |
-| LH-4 | `hazard-destroy-during-start` | FAIL step 0 `start`: returned an operation ref | PASS | FAIL step 0 `start`: returned a ref (`operation_key` the fixture's), `alive=false` |
+| LH-4 | `hazard-destroy-during-start` | FAIL step 0 `start`: returned an operation ref | PASS | FAIL step 0 `start`: returned a ref (`operation_key` the fixture's) |
 | LH-5 | `hazard-stuck-removal-timeout-settles` | PASS, step 1 matched `provider_unavailable` (1) | NOT RUN: `given backend_stuck_removing` cannot be set up | FAIL step 1 `observe`: not settled within 120 s |
 | LH-6 | `hazard-drain-with-gap-reports-loss` | PASS | PASS | FAIL step 2 `observe`: `state=succeeded complete=false gap={lost_bytes:8}`, no `loss_detected` |
 | LH-7 | `hazard-fifo-in-workspace` | NOT RUN here (no daemon); pinned FAIL step 2 `file_exists`: `exists=false` (real daemon, CI) | PASS | FAIL step 2 `file_exists`: not settled within 10 s |

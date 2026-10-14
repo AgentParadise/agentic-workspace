@@ -1214,6 +1214,9 @@ mod hazards {
         pub token: String,
         gate: Arc<Gate>,
         key: std::sync::Mutex<Option<String>>,
+        /// Liveness reads as unmeasurable, as when an unrelated process's
+        /// environ cannot be read.
+        pub hide_liveness: bool,
     }
 
     /// LH-4's credential resolver: the first resolve, while armed, says it
@@ -1272,6 +1275,7 @@ mod hazards {
                 token,
                 gate,
                 key: std::sync::Mutex::new(None),
+                hide_liveness: false,
             }
         }
 
@@ -1435,6 +1439,11 @@ mod hazards {
                 .count() as u32
         }
         fn descendant_alive(&self) -> Result<bool, Unmeasurable> {
+            if self.hide_liveness {
+                return Err(Unmeasurable(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                )));
+            }
             Ok(!live_processes(TOKEN, &self.token)?.is_empty())
         }
         /// Records the provider still resolves for the fixture's key, probed
@@ -1490,14 +1499,12 @@ mod hazards {
             "LH-3" => "pass [0, 0, 0]",
             // Finding: start returns a ref and launches into the container
             // destroyed while it resolved, instead of resource_lost/cancelled.
-            "LH-4" => "fail 0 start operation_key=\"exec-42:phase-1:fence-9:agent\" alive=false",
+            "LH-4" => "fail 0 start operation_key=\"exec-42:phase-1:fence-9:agent\"",
             // Finding: with the container stuck removing, the timed-out
             // operation's observe never completes within the 120s bound.
             "LH-5" => "fail 1 observe unsettled",
             // Finding: the gap page carries no loss_detected (0.2.1).
-            "LH-6" => {
-                "fail 2 observe state=\"succeeded\" complete=false gap={\"lost_bytes\":8} alive=false"
-            }
+            "LH-6" => "fail 2 observe state=\"succeeded\" complete=false gap={\"lost_bytes\":8}",
             // Finding: `collect` opens the FIFO and blocks past the 10s bound.
             "LH-7" => "fail 2 file_exists unsettled",
             _ => unreachable!(),
@@ -1699,6 +1706,22 @@ mod hazards {
         assert_eq!(bounded("passes", bound), CaseEnd::Passed);
     }
 
+    /// LH-6 judges no liveness, so liveness hidden on the host leaves its
+    /// verdict as measured; LH-1's cancel judges it, so it is not run.
+    #[tokio::test]
+    async fn hidden_liveness_stops_only_a_step_that_judges_it() {
+        let mut lh6 = StandIn::new("LH-6");
+        lh6.hide_liveness = true;
+        expect("LH-6", &drive_hazard(&fixture("LH-6"), &lh6).await);
+        let mut lh1 = StandIn::new("LH-1");
+        lh1.hide_liveness = true;
+        let verdict = drive_hazard(&fixture("LH-1"), &lh1).await;
+        assert!(
+            matches!(&verdict, HazardVerdict::NotRun { step: 1, call, .. } if call == "cancel"),
+            "{verdict:?}"
+        );
+    }
+
     /// The record probe counts a started operation, and none before it, so
     /// LH-4's `operation_records: 0` is measured, not the probe's blindness.
     #[tokio::test]
@@ -1840,7 +1863,7 @@ mod hazards {
             panic!("LH-1 did not fail on the confirmed cancel: {verdict:?}");
         };
         assert_eq!(call, "cancel");
-        assert!(measured.descendant_alive, "{verdict:?}");
+        assert_eq!(measured.descendant_alive, Some(true), "{verdict:?}");
         assert!(
             matches!(&measured.outcome, Outcome::Document(d) if d["state"] == "cancelled"),
             "{verdict:?}"

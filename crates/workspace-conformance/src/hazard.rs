@@ -5,8 +5,8 @@
 //! judges the measured outcome with [`judge`]. A [`HazardHarness`] (the
 //! hazard counterpart of [`crate::behaviour::BehaviourHarness`]) establishes
 //! each step's `given` conditions and measures `descendant_alive` (see
-//! [`live_processes`]) and launches; nothing here takes liveness from the
-//! fixture. A condition the harness cannot establish, or a call the trait has
+//! [`live_processes`]), for a step whose alternatives judge it, and launches;
+//! nothing here takes liveness from the fixture. A condition the harness cannot establish, or a call the trait has
 //! no method for, ends the run as [`HazardVerdict::NotRun`], never a pass.
 //!
 //! The Python harness (`lib/python/agentic_isolation/tests/test_behaviour_hazards.py`)
@@ -83,7 +83,9 @@ pub enum Outcome {
 pub struct Measured {
     pub outcome: Outcome,
     pub elapsed: Duration,
-    pub descendant_alive: bool,
+    /// `None` where no alternative of the step judges liveness, so it was not
+    /// measured: such a step cannot be unmeasurable.
+    pub descendant_alive: Option<bool>,
     pub launches: u32,
     pub operation_records: u32,
 }
@@ -102,11 +104,14 @@ impl fmt::Display for Mismatch {
             Self::Unsettled { bound, elapsed } => {
                 write!(f, "did not settle within {bound}s (took {elapsed:?})")
             }
-            Self::NoAlternative { measured } => write!(
-                f,
-                "{:?} with measured descendant_alive={} matched no alternative",
-                measured.outcome, measured.descendant_alive
-            ),
+            Self::NoAlternative { measured } => match measured.descendant_alive {
+                Some(alive) => write!(
+                    f,
+                    "{:?} with measured descendant_alive={alive} matched no alternative",
+                    measured.outcome
+                ),
+                None => write!(f, "{:?} matched no alternative", measured.outcome),
+            },
             Self::Launches { expected, measured } => {
                 write!(f, "measured {measured} launches, fixture says {expected}")
             }
@@ -148,7 +153,10 @@ impl Mismatch {
                         .collect::<Vec<_>>()
                         .join(" "),
                 };
-                format!("{fields} alive={}", measured.descendant_alive)
+                match measured.descendant_alive {
+                    Some(alive) => format!("{fields} alive={alive}"),
+                    None => fields,
+                }
             }
             Self::Launches { measured, .. } => format!("launches={measured}"),
             Self::OperationRecords { measured, .. } => format!("operation_records={measured}"),
@@ -203,7 +211,7 @@ fn matches(alternatives: &[Expectation], measured: &Measured) -> Option<usize> {
 fn matches_one(alternative: &Expectation, measured: &Measured) -> bool {
     if alternative
         .descendant_alive
-        .is_some_and(|alive| alive != measured.descendant_alive)
+        .is_some_and(|alive| Some(alive) != measured.descendant_alive)
     {
         return false;
     }
@@ -451,9 +459,16 @@ pub async fn drive_hazard<H: HazardHarness>(fixture: &HazardFixture, harness: &H
             }
         };
         let elapsed = began.elapsed();
-        let descendant_alive = match harness.descendant_alive() {
-            Ok(alive) => alive,
-            Err(unmeasurable) => return not_run(unmeasurable.to_string()),
+        // Measured only where an alternative judges it, so liveness hidden by
+        // an unrelated process cannot stop a step that never asks for it.
+        let judges_liveness = step
+            .alternatives()
+            .iter()
+            .any(|alt| alt.descendant_alive.is_some());
+        let descendant_alive = match judges_liveness.then(|| harness.descendant_alive()) {
+            None => None,
+            Some(Ok(alive)) => Some(alive),
+            Some(Err(unmeasurable)) => return not_run(unmeasurable.to_string()),
         };
         // Probed only when the step counts records: the probe may call the
         // provider (Docker's reads `status`), and LH-5 forbids a status call
@@ -653,7 +668,7 @@ mod tests {
         Measured {
             outcome,
             elapsed: Duration::from_millis(10),
-            descendant_alive,
+            descendant_alive: Some(descendant_alive),
             launches: 1,
             operation_records: 1,
         }
