@@ -43,6 +43,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from agentic_isolation.config import (
+    CredentialPolicyError,
+    check_credential_bindings,
+    check_env_targets,
+)
 from agentic_isolation.contract import (
     TERMINAL_STATES,
     EnforceableLimits,
@@ -151,6 +156,25 @@ def _members(table: _Table, leader: str, start: str, tracked: dict[str, str]) ->
     return {pid: s for pid, s in found.items() if int(pid) > 1}
 
 
+def _unattributed(table: _Table, start: str, tracked: dict[str, str]) -> list[str]:
+    """Orphans of the container's init that started after the operation's wrapper.
+
+    A descendant that left the group and lost its parent before cancel took
+    its first look was never tracked and has no parent chain back to the
+    operation, so nothing proves it is not ours. Anything adopted by init
+    since the wrapper started may be such an escapee; one started before it
+    cannot be.
+    """
+    return sorted(
+        (
+            pid
+            for pid, (ppid, _, child_start) in table.items()
+            if ppid == "1" and int(child_start) >= int(start) and tracked.get(pid) != child_start
+        ),
+        key=int,
+    )
+
+
 _Presence = Literal["running", "removing", "stopped", "gone"]
 
 # `docker rm -f` kills the container, which ends the exec client with the
@@ -158,6 +182,9 @@ _Presence = Literal["running", "removing", "stopped", "gone"]
 # reports `removing`, that status is no recorded outcome, so settlement waits
 # this long for the container to be gone before leaving `status` to re-probe.
 _REMOVAL_WAIT_SECONDS = 30.0
+# The same window is the operation's settlement deadline: once it has passed
+# with the container still `removing`, every retry (status, observe, a drain
+# through them) raises provider_unavailable instead of waiting on the daemon.
 
 # After a timeout terminates the group, the pipes are read this long for the
 # workload's final output (a TERM handler's last words) before giving up.
@@ -167,6 +194,13 @@ _FINAL_OUTPUT_SECONDS = 5.0
 # timeout settles even when the workload outlives a failed stop: at most
 # timeout + grace + 2s KILL wait + stop + these two windows after the start.
 _CLIENT_EXIT_SECONDS = 5.0
+
+# Every docker control command (inspect, stop, the cancel's execs) is given
+# this long before its client is killed and reaped and the command counts as
+# provider_unavailable, so a hung daemon cannot hold a settlement or a cancel.
+_CONTROL_SECONDS = 30.0
+# How long a killed control client is given to be reaped.
+_REAP_SECONDS = 5.0
 
 # How long a terminal operation keeps answering status and observe before its
 # spool is reclaimed. Same-key replay outlives it; see the module docstring.
@@ -208,11 +242,17 @@ class _Operation:
     signal: str | None = None
     ended_at: str | None = None
     cancel_requested: bool = False
+    # The cancel's termination returned: every process is confirmed gone or
+    # the container stopped. Only this publishes `cancelled`.
+    cancel_confirmed: bool = False
     escalated: bool = False
     # The escalation's `docker stop` could not be run or reported failure.
     stop_failed: bool = False
     # The spec's timeout fired; kept here so a settlement retry still knows.
     timed_out: bool = False
+    # Held while the group is being terminated, and by every settlement, so a
+    # cancel's outcome is decided only once its termination has confirmed.
+    stopping: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Every process seen as part of the operation at cancel, pid -> start.
     tracked: dict[str, str] = field(default_factory=dict)
     # Why signalling or stopping could not be done, `; `-joined.
@@ -220,6 +260,9 @@ class _Operation:
     collector: asyncio.Task[None] | None = None
     leader_known: asyncio.Event = field(default_factory=asyncio.Event)
     client_finished: bool = False
+    # Loop time after which a settlement still undecided by a `removing`
+    # container is provider_unavailable; set when the exec client finishes.
+    settle_by: float | None = None
     # Loop time the operation reached a terminal state; retention runs from here.
     settled_at: float | None = None
     # Per-channel copies (stdout, stderr), kept only when the caller asked.
@@ -262,6 +305,8 @@ class DockerOperations:
         # One lock per (workspace, operation_key) with a start in flight: a slow
         # credential resolver holds back only racing starts of the same key.
         self._launching: dict[tuple[str, str], _KeyLock] = {}
+        # Workspaces being forgotten: they admit no new start.
+        self._forgetting: set[str] = set()
         self._sequence = 0
 
     def describe(self) -> ProviderDescriptor:
@@ -300,6 +345,8 @@ class DockerOperations:
         container = workspace._handle
         if not isinstance(container, str) or not container:
             raise _error("unknown_operation", f"workspace {workspace.id} has no container")
+        if workspace.id in self._forgetting:
+            raise _error("unknown_operation", f"workspace {workspace.id} is being torn down")
         self._prune_expired()
         key = (workspace.id, spec.operation_key)
         # The key's lock spans the launch, so racing same-key starts see the
@@ -334,6 +381,14 @@ class DockerOperations:
                     existing.ref,
                 )
             return existing.ref
+        # Credential values ride in the docker client's own environment, so
+        # a name that steers that client (DOCKER_HOST, PATH, LD_PRELOAD...)
+        # is refused before anything is resolved or launched.
+        try:
+            check_credential_bindings(list(spec.credential_bindings))
+            check_env_targets(delivered_env or {})
+        except CredentialPolicyError as e:
+            raise OperationFailure(OperationError(kind="rejected_policy", message=str(e))) from e
         secrets = dict(delivered_env or {})
         for binding in spec.credential_bindings:
             if binding.delivery != "env":
@@ -420,8 +475,23 @@ class DockerOperations:
             if (replay := self._by_key.get(operation.key)) is not None and replay.ref == ref:
                 del self._by_key[operation.key]
 
-    def forget_workspace(self, workspace_id: str) -> None:
-        """Drop every record of a destroyed workspace, replay records included."""
+    async def forget_workspace(self, workspace_id: str) -> None:
+        """Drop every record of a destroyed workspace, replay records included.
+
+        New starts are refused first and starts already admitted are waited
+        out, so none records an operation after its workspace was forgotten.
+        """
+        self._forgetting.add(workspace_id)
+        try:
+            for key, launch in list(self._launching.items()):
+                if key[0] == workspace_id:
+                    async with launch.lock:
+                        pass
+            self._drop_records(workspace_id)
+        finally:
+            self._forgetting.discard(workspace_id)
+
+    def _drop_records(self, workspace_id: str) -> None:
         for operation in list(self._operations.values()):
             if operation.key[0] == workspace_id:
                 del self._operations[operation.ref.operation_id]
@@ -450,7 +520,8 @@ class DockerOperations:
         except TimeoutError:
             operation.timed_out = True
             try:
-                await self._terminate_group(operation, grace_seconds=1.0)
+                async with operation.stopping:
+                    await self._terminate_group(operation, grace_seconds=1.0)
             except OperationFailure as e:
                 # Even `docker stop` failed. Record why and settle anyway: an
                 # unsettled operation would hold every drain forever.
@@ -481,6 +552,7 @@ class DockerOperations:
                     await readers
             operation.leader_known.set()
         operation.client_finished = True
+        operation.settle_by = asyncio.get_running_loop().time() + _REMOVAL_WAIT_SECONDS
         await self._settle(operation, process.returncode, wait=True)
 
     async def _read_stdout(self, operation: _Operation, stream: asyncio.StreamReader) -> None:
@@ -518,14 +590,20 @@ class DockerOperations:
             operation.signal_failure = f"{operation.signal_failure}; {failure}"
 
     async def _settle(self, operation: _Operation, code: int | None, *, wait: bool) -> None:
-        """Decide the terminal state; `wait` waits out a removal in progress."""
+        """Decide the terminal state; `wait` waits out a removal in progress.
+
+        Waits for a cancel still confirming, which decides between cancelled
+        and failed.
+        """
+        async with operation.stopping:
+            await self._settle_stopped(operation, code, wait=wait)
+
+    async def _settle_stopped(self, operation: _Operation, code: int | None, *, wait: bool) -> None:
         if operation.state in TERMINAL_STATES:
             return
         try:
             presence = await (
-                self._settled_presence(operation.container)
-                if wait
-                else self._presence(operation.container)
+                self._settled_presence(operation) if wait else self._presence(operation.container)
             )
         except OperationFailure:
             # Cannot tell yet; `status` re-probes and answers provider_unavailable.
@@ -538,7 +616,11 @@ class DockerOperations:
             operation.changed.set()
             return
         operation.ended_at = _now()
-        if operation.cancel_requested:
+        if operation.cancel_requested and not operation.cancel_confirmed:
+            # The cancel could not confirm the operation ended: say so.
+            operation.exit_code = code
+            operation.state = "failed"
+        elif operation.cancel_requested:
             operation.state = "cancelled"
         elif operation.timed_out:
             operation.state = "timed_out"
@@ -554,10 +636,38 @@ class DockerOperations:
 
     async def status(self, ref: OperationRef) -> OperationStatus:
         operation = self._lookup(ref)
-        if operation.client_finished and operation.state not in TERMINAL_STATES:
-            await self._presence(operation.container)  # raises provider_unavailable
-            await self._settle(operation, operation.exit_code, wait=False)
+        await self._resettle(operation)
         return self._status(operation)
+
+    async def _resettle(self, operation: _Operation) -> None:
+        """Retry a settlement the collector left undecided; provider_unavailable if it still cannot.
+
+        Skipped while a cancel is confirming: the cancel settles once it has.
+        A container still `removing` past the settlement deadline is
+        provider_unavailable too, so no retry loop waits on it forever.
+        """
+        if (
+            operation.client_finished
+            and operation.state not in TERMINAL_STATES
+            and not operation.stopping.locked()
+        ):
+            presence = await self._presence(operation.container)  # raises provider_unavailable
+            if presence == "removing" and self._past_settlement(operation):
+                raise _error(
+                    "provider_unavailable",
+                    f"container {operation.container} is still being removed "
+                    f"{_REMOVAL_WAIT_SECONDS:g}s after the operation's client finished; "
+                    "its outcome cannot be settled until the daemon finishes removing it",
+                    operation.ref,
+                )
+            await self._settle(operation, operation.exit_code, wait=False)
+
+    @staticmethod
+    def _past_settlement(operation: _Operation) -> bool:
+        return (
+            operation.settle_by is not None
+            and asyncio.get_running_loop().time() >= operation.settle_by
+        )
 
     def _status(self, operation: _Operation) -> OperationStatus:
         metadata = dict(operation.spec.metadata)
@@ -598,6 +708,9 @@ class DockerOperations:
     ) -> ObservationPage:
         operation = self._lookup(ref)
         limit = min(max_bytes, self._max_page)
+        # The collector may have finished without deciding (daemon down, a
+        # removal in progress); without this a drain would wait on it forever.
+        await self._resettle(operation)
         page = operation.spool.page(ref, state=operation.state, cursor=cursor, max_page_bytes=limit)
         if page.complete or page.data_b64 or wait_seconds <= 0:
             return page
@@ -606,16 +719,31 @@ class DockerOperations:
             await asyncio.wait_for(operation.changed.wait(), timeout=wait_seconds)
         except TimeoutError:
             pass
+        await self._resettle(operation)
         return operation.spool.page(ref, state=operation.state, cursor=cursor, max_page_bytes=limit)
 
     async def cancel(self, ref: OperationRef, *, grace_seconds: float) -> OperationStatus:
         operation = self._lookup(ref)
         if operation.state not in TERMINAL_STATES:
-            operation.cancel_requested = True
-            await operation.leader_known.wait()
-            await self._terminate_group(operation, grace_seconds=grace_seconds)
+            # Requested under the lock, so no settlement can publish
+            # `cancelled` until this termination has confirmed or failed.
+            async with operation.stopping:
+                if operation.state in TERMINAL_STATES:
+                    return self._status(operation)
+                operation.cancel_requested = True
+                try:
+                    await operation.leader_known.wait()
+                    await self._terminate_group(operation, grace_seconds=grace_seconds)
+                except asyncio.CancelledError:
+                    # Recorded before the lock is released, so the settlement
+                    # it lets in publishes the unconfirmed outcome.
+                    self._note(operation, "cancel interrupted before termination was confirmed")
+                    raise
+                operation.cancel_confirmed = True
             if operation.collector is not None:
                 await operation.collector
+            # The collector may have settled before this cancel confirmed.
+            await self._resettle(operation)
         return self._status(operation)
 
     async def _terminate_group(self, operation: _Operation, *, grace_seconds: float) -> None:
@@ -625,8 +753,9 @@ class DockerOperations:
         a leader whose pid was reused, and signals by pid every descendant
         that escaped the group, so a confirmed cancel means all of them died.
         A docker client that cannot run while signalling also escalates. A
-        stop that cannot run or fails is recorded and raised as
-        provider_unavailable: the operation may still be running.
+        stop that cannot run, fails, or is not then observed `stopped` or
+        `gone` is recorded and raised as provider_unavailable: the operation
+        may still be running.
         """
         if operation.leader is not None and (refusal := await self._unsafe_leader(operation)):
             # Never signal init or our own group; stopping the container still
@@ -652,6 +781,34 @@ class DockerOperations:
                 f"docker stop {operation.container}: exit {code}: {out.strip()}",
                 operation.ref,
             )
+        # A stop that reported success is confirmed by the daemon's own state:
+        # only `stopped` or `gone` is evidence; `removing` is waited out, bounded.
+        deadline = asyncio.get_running_loop().time() + _REMOVAL_WAIT_SECONDS
+        try:
+            while (presence := await self._presence(operation.container)) == "removing":
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.1)
+        except OperationFailure:
+            operation.stop_failed = True
+            raise
+        if presence == "running":
+            operation.stop_failed = True
+            raise _error(
+                "provider_unavailable",
+                f"docker stop {operation.container} reported success but the container "
+                "is still running",
+                operation.ref,
+            )
+        if presence == "removing":
+            operation.stop_failed = True
+            raise _error(
+                "provider_unavailable",
+                f"docker stop {operation.container} reported success but the container "
+                f"is still being removed {_REMOVAL_WAIT_SECONDS:g}s later; its termination "
+                "is unconfirmed",
+                operation.ref,
+            )
 
     async def _signal_group(
         self, operation: _Operation, pid: str, start: str, grace_seconds: float
@@ -675,8 +832,29 @@ class DockerOperations:
                 self._note(operation, f"kill -{sig}: exit {code}: {out.strip()}")
                 return False
             if await self._group_gone(operation, within=wait):
-                return True
+                return await self._nothing_unattributed(operation, start)
         return False
+
+    async def _nothing_unattributed(self, operation: _Operation, start: str) -> bool:
+        """Whether no process the operation may have detached is left running.
+
+        Ownership of an orphan adopted by init cannot be proven, so any such
+        survivor fails the confirmation closed and cancel escalates to
+        stopping the container; that also ends unrelated detached processes
+        of the same workspace, which is the price of a confirmed cancel.
+        """
+        code, out = await self._exec(operation.container, "sh", "-c", _PROCESSES, "aw-processes")
+        if code != 0:
+            self._note(operation, f"process table: exit {code}: {out.strip()}")
+            return False
+        if orphans := _unattributed(_parse_table(out), start, operation.tracked):
+            self._note(
+                operation,
+                f"processes {orphans} were orphaned to init after the operation began "
+                "and may be its detached descendants; stopping the container",
+            )
+            return False
+        return True
 
     async def _unsafe_leader(self, operation: _Operation) -> str | None:
         """Why the leader's group must not be signalled, or None when it may be.
@@ -749,15 +927,38 @@ class DockerOperations:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        out, _ = await process.communicate()
+        try:
+            async with asyncio.timeout(_CONTROL_SECONDS):
+                out, _ = await process.communicate()
+        except TimeoutError:
+            await self._reap(process)
+            raise _error(
+                "provider_unavailable",
+                f"docker {' '.join(argv[:2])} did not answer within {_CONTROL_SECONDS:g}s",
+            ) from None
+        except asyncio.CancelledError:
+            await self._reap(process)
+            raise
         return process.returncode or 0, out.decode(errors="replace")
 
-    async def _settled_presence(self, container: str) -> _Presence:
-        """Presence, waiting out a removal in progress up to `_REMOVAL_WAIT_SECONDS`."""
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _REMOVAL_WAIT_SECONDS
-        while (presence := await self._presence(container)) == "removing":
-            if loop.time() >= deadline:
+    @staticmethod
+    async def _reap(process: asyncio.subprocess.Process) -> None:
+        """Kill an abandoned control client and reap it within `_REAP_SECONDS`.
+
+        `wait` also waits for the pipes, which a child of the client may still
+        hold; closing the transport drops them, so EOF is never waited for.
+        """
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        process._transport.close()  # type: ignore[attr-defined]  # noqa: SLF001
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_REAP_SECONDS):
+                await process.wait()
+
+    async def _settled_presence(self, operation: _Operation) -> _Presence:
+        """Presence, waiting out a removal in progress until the settlement deadline."""
+        while (presence := await self._presence(operation.container)) == "removing":
+            if self._past_settlement(operation):
                 break
             await asyncio.sleep(0.1)
         return presence

@@ -924,7 +924,7 @@ class WorkspaceDockerProvider(BaseProvider):
                 # A RETAINED one is not gone: it stays registered for a retry
                 # by ref, and so do its records.
                 if report.finalization.state == "completed":
-                    self._operations.forget_workspace(workspace.id)
+                    await self._operations.forget_workspace(workspace.id)
                 return report
         finally:
             # Drop the entry only once no caller holds it or waits on it.

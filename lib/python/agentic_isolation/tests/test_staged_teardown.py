@@ -244,7 +244,11 @@ class TestOperationRecordsFollowTheOutcome:
         _record(monkeypatch, [])
         provider = _provider()
         forgotten: list[str] = []
-        monkeypatch.setattr(provider._operations, "forget_workspace", forgotten.append)
+
+        async def _forget(workspace_id: str) -> None:
+            forgotten.append(workspace_id)
+
+        monkeypatch.setattr(provider._operations, "forget_workspace", _forget)
         d = tmp_path / "ws"
         d.mkdir()
 
