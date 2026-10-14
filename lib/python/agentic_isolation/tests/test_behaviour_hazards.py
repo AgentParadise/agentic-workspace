@@ -1221,6 +1221,36 @@ async def test_a_finding_xfails_only_on_its_pinned_miss() -> None:
         await _expect_finding(passes(), FINDINGS["docker", "LH-3"])
 
 
+async def _daemon_lh7(subject: Subject) -> None:
+    """The real-daemon LH-7 cell: its strict finding, or NOT RUN when liveness is
+    unmeasurable (#68), as in the matrix; never a failure, xfail or pass."""
+    try:
+        await _expect_finding(run_hazard(subject, "LH-7"), DOCKER_DAEMON_LH7)
+    except NotRun as reason:
+        pytest.skip(f"NOT RUN: {reason}")
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+async def test_an_unmeasurable_daemon_lh7_is_not_run(subject: Subject) -> None:
+    """A process the harness cannot read (on CI, one inside the daemon's
+    container) makes the real-daemon cell NOT RUN, through the same boundary."""
+    bystander = subprocess.Popen(["sleep", "60"])
+    readable = _environ
+
+    def hidden(entry: Path) -> bytes:
+        if entry.name == str(bystander.pid):
+            raise PermissionError(13, "Permission denied", str(entry / "environ"))
+        return readable(entry)
+
+    subject.monkeypatch.setattr(f"{__name__}._environ", hidden)
+    try:
+        with pytest.raises(pytest.skip.Exception, match="NOT RUN: .*unreadable"):
+            await _daemon_lh7(subject)
+    finally:
+        bystander.kill()
+        bystander.wait()
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(not WorkspaceDockerProvider.is_available(), reason="Docker not available")
 async def test_docker_daemon_meets_lh7_fifo(
@@ -1251,7 +1281,7 @@ async def test_docker_daemon_meets_lh7_fifo(
         launch_log_in_workload="/workspace/.launches",
     )
     try:
-        await _expect_finding(run_hazard(subject, "LH-7"), DOCKER_DAEMON_LH7)
+        await _daemon_lh7(subject)
     finally:
         subject.kill_leftovers()
         if workspace.id in provider._workspaces:
