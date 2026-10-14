@@ -9,8 +9,10 @@ upstream at once:
 2. serves a fake Anthropic Messages / OpenAI Responses upstream on loopback,
 3. runs the pinned CLI with the image env plus the presented env,
 4. prints one JSON report: every request the upstream saw (method, path,
-   headers, body), the CLI's exit, the full child env and every file left
-   under $HOME.
+   headers, body), the CLI's exit, the full child env, every file left in
+   the writable locations the child was given (its work dir, which holds
+   $HOME, its cwd and its $TMPDIR, plus the system temp dir), and every
+   location it could not read in full.
 
 It asserts nothing. The host owns the assertions, so the canaries it scans
 for never enter the sandbox.
@@ -22,14 +24,13 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-
-MAX_FILE_BYTES = 1 << 20
 
 
 def _sse(events: list[dict[str, object]]) -> bytes:
@@ -140,13 +141,48 @@ def _serve(port: int, seen: list[dict[str, object]]) -> ThreadingHTTPServer:
     return server
 
 
-def _files_under(root: Path) -> dict[str, str]:
-    found: dict[str, str] = {}
-    for path in sorted(root.rglob("*")):
-        if path.is_file() and not path.is_symlink():
-            data = path.read_bytes()[:MAX_FILE_BYTES]
-            found[str(path.relative_to(root))] = data.decode("utf-8", "replace")
-    return found
+def _inventory(roots: list[Path]) -> dict[str, object]:
+    """Read every regular file under `roots` in full, following symlinks.
+
+    Nothing is truncated or skipped silently: a path that cannot be resolved
+    (dangling or looping link) or read lands in `unscanned`, and the host
+    fails its cleanliness check on any entry there. Sockets and FIFOs hold no
+    bytes at rest; they are listed in `special`.
+    """
+    files: dict[str, str] = {}
+    unscanned: dict[str, str] = {}
+    special: list[str] = []
+    dirs_seen: set[Path] = set()
+
+    def visit(path: Path) -> None:
+        try:
+            real = path.resolve(strict=True)
+            mode = real.stat().st_mode
+        except (OSError, RuntimeError) as exc:
+            unscanned[str(path)] = f"unresolvable: {exc}"
+            return
+        if stat.S_ISDIR(mode):
+            if real in dirs_seen:
+                return
+            dirs_seen.add(real)
+            try:
+                children = sorted(path.iterdir())
+            except OSError as exc:
+                unscanned[str(path)] = f"unlistable: {exc}"
+                return
+            for child in children:
+                visit(child)
+        elif stat.S_ISREG(mode):
+            try:
+                files[str(path)] = real.read_bytes().decode("utf-8", "replace")
+            except OSError as exc:
+                unscanned[str(path)] = f"unreadable: {exc}"
+        else:
+            special.append(str(path))
+
+    for root in roots:
+        visit(root)
+    return {"files": files, "unscanned": unscanned, "special": special}
 
 
 def main(spec_path: str) -> None:
@@ -154,6 +190,8 @@ def main(spec_path: str) -> None:
     work = Path(tempfile.mkdtemp(prefix="credential-probe-"))
     home = work / "home"
     home.mkdir()
+    child_tmp = work / "tmp"
+    child_tmp.mkdir()
     for presented in spec["files"]:
         target = home / presented["path"]
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +201,7 @@ def main(spec_path: str) -> None:
         **os.environ,
         **{k: v.replace("{HOME}", str(home)) for k, v in spec["workspace_env"].items()},
         "HOME": str(home),
+        "TMPDIR": str(child_tmp),
         **spec["env"],
     }
     seen: list[dict[str, object]] = []
@@ -187,7 +226,7 @@ def main(spec_path: str) -> None:
             "stderr": run.stderr[-4000:],
             "requests": seen,
             "env": env,
-            "files": _files_under(home),
+            **_inventory([work, Path("/tmp"), Path(tempfile.gettempdir())]),
         },
         sys.stdout,
     )

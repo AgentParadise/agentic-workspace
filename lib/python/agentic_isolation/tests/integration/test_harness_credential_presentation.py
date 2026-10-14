@@ -8,11 +8,14 @@ the presenter's `wire_credential`, take `sha256(wire)` (what the broker
 stores), then `present(wire, base_url)`. Only the presentation crosses into
 a `--network none` container running the pinned image. There
 `harness_credential_probe.py` serves a fake upstream on loopback, runs the
-real CLI, and reports every request, the child env and every file under
-$HOME. This side then asserts:
+real CLI, and reports every request, the child env and every file in the
+child's writable locations (read in full, symlinks followed). This side then
+asserts:
 
 - exactly one request reached the upstream, at the class's model path,
-- its standard auth value hashes to `sha256(wire_credential(entropy))`,
+- it carries exactly one credential header, the class's standard one, once,
+  and that value hashes to `sha256(wire_credential(entropy))`,
+- the file inventory is complete: nothing was left unread,
 - no other credential header, env var or credential-shaped string is in the
   requests, the sandbox env or the sandbox files, and the host's synthetic
   upstream-key canaries appear nowhere.
@@ -198,9 +201,14 @@ def _assert_round_trip(
     paths = [(r["method"], r["path"].split("?", 1)[0]) for r in requests]
     assert paths == [("POST", harness.model_path)], paths
 
-    headers = {k.lower(): v for k, v in requests[0]["headers"]}
-    assert CREDENTIAL_HEADERS & set(headers) == {harness.auth_header}, sorted(headers)
-    value = headers[harness.auth_header]
+    # The raw header list, not a dict: a repeated header must not hide an
+    # earlier value behind a later one.
+    credential = [
+        (k.lower(), v) for k, v in requests[0]["headers"] if k.lower() in CREDENTIAL_HEADERS
+    ]
+    names = [k for k, _ in credential]
+    assert names == [harness.auth_header], names
+    value = credential[0][1]
     assert value.startswith(harness.auth_prefix), "unexpected auth scheme"
     auth = value.removeprefix(harness.auth_prefix)
     assert hashlib.sha256(auth.encode()).hexdigest() == stored_hash
@@ -211,6 +219,9 @@ def _assert_round_trip(
     # Every credential-named variable, presented or inherited, holds the wire.
     stray = sorted(k for k, v in env.items() if CREDENTIAL_ENV_NAME.search(k) and v != wire)
     assert not stray, f"credential env other than the capability: {stray}"
+    unscanned = report["unscanned"]
+    assert isinstance(unscanned, dict)
+    assert not unscanned, f"sandbox file inventory incomplete: {sorted(unscanned)}"
     files = report["files"]
     assert isinstance(files, dict)
     assert not [p for p, text in files.items() if wire in text], "capability written to disk"
