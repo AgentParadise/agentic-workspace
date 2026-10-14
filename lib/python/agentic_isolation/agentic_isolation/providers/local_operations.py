@@ -311,6 +311,9 @@ class LocalOperations:
         self._by_key: dict[tuple[str, str], _Operation] = {}
         # One lock per key: racing same-key starts see the first one's record.
         self._launching: dict[tuple[str, str], asyncio.Lock] = {}
+        # Workspaces torn down or being torn down: they admit no start, ever,
+        # since a launch after teardown would recreate the deleted directory.
+        self._closed: set[str] = set()
         self._sequence = 0
 
     def describe(self) -> ProviderDescriptor:
@@ -345,8 +348,11 @@ class LocalOperations:
                 "unsupported_capability",
                 f"local operations need Linux /proc; this platform is {sys.platform!r}",
             )
+        self._admit(workspace.id)
         key = (workspace.id, spec.operation_key)
         async with self._launching.setdefault(key, asyncio.Lock()):
+            # Teardown may have begun while this start waited for the key.
+            self._admit(workspace.id)
             existing = self._by_key.get(key)
             if existing is not None:
                 if existing.spec != spec:
@@ -358,6 +364,10 @@ class LocalOperations:
                     )
                 return existing.ref
             return await self._launch(workspace, spec, key, base_env)
+
+    def _admit(self, workspace_id: str) -> None:
+        if workspace_id in self._closed:
+            raise _error("unknown_operation", f"workspace {workspace_id} is torn down")
 
     async def _launch(
         self,
@@ -552,21 +562,34 @@ class LocalOperations:
     async def cancel(self, ref: OperationRef, *, grace_seconds: float) -> OperationStatus:
         operation = self._lookup(ref)
         if operation.state not in TERMINAL_STATES:
-            operation.cancel_requested = True
-            await self._terminate(operation, grace_seconds=grace_seconds)
+            await self._terminate(operation, grace_seconds=grace_seconds, cancelling=True)
             if operation.collector is not None:
                 await operation.collector
         return self._status(operation)
 
-    async def _terminate(self, operation: _Operation, *, grace_seconds: float) -> None:
+    async def _terminate(
+        self, operation: _Operation, *, grace_seconds: float, cancelling: bool = False
+    ) -> None:
         """TERM the group and every owned process, then KILL after the grace.
 
         A refused group (init, or our own) is never signalled as a group; its
         owned processes are signalled one by one and the refusal is recorded.
         Survivors of KILL mark the operation unconfirmed, so it settles failed.
+        A cancel is requested only under the lock, so the collector never sees
+        a request whose confirmation has not run; a confirmation interrupted
+        before it finished is recorded unconfirmed before the lock is released.
         """
         async with operation.stopping:
-            await self._signal_and_confirm(operation, grace_seconds=grace_seconds)
+            if operation.state in TERMINAL_STATES:
+                return
+            if cancelling:
+                operation.cancel_requested = True
+            try:
+                await self._signal_and_confirm(operation, grace_seconds=grace_seconds)
+            except BaseException:
+                operation.unconfirmed = True
+                self._note(operation, "cancel confirmation was interrupted before it completed")
+                raise
 
     async def _signal_and_confirm(self, operation: _Operation, *, grace_seconds: float) -> None:
         pgid = operation.process.pid
@@ -679,7 +702,17 @@ class LocalOperations:
             operation.signal_failure = f"{operation.signal_failure}; {failure}"
 
     async def forget_workspace(self, workspace_id: str) -> None:
-        """Cancel anything still running in a destroyed workspace and drop its records."""
+        """Cancel anything still running in a destroyed workspace and drop its records.
+
+        Admission closes first and starts already admitted are waited out, so
+        every operation they launch is cancelled here and none launches after
+        the caller deletes the workspace directory.
+        """
+        self._closed.add(workspace_id)
+        for key, launch in list(self._launching.items()):
+            if key[0] == workspace_id:
+                async with launch:
+                    pass
         for operation in [o for o in self._operations.values() if o.workspace_id == workspace_id]:
             await self.cancel(operation.ref, grace_seconds=1.0)
             del self._operations[operation.ref.operation_id]
