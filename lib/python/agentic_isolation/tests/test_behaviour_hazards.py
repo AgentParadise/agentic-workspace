@@ -43,6 +43,7 @@ import asyncio
 import base64
 import contextlib
 import faulthandler
+import functools
 import json
 import os
 import signal
@@ -51,7 +52,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1070,6 +1071,22 @@ def _unrelated_orphan() -> int:
     return int(parent.stdout)
 
 
+def _reports_not_run(
+    test: Callable[..., Coroutine[Any, Any, None]],
+) -> Callable[..., Coroutine[Any, Any, None]]:
+    """A test that drives a hazard reports NOT RUN when its liveness is
+    unmeasurable (#68), as the matrix does; never a failure, xfail or pass."""
+
+    @functools.wraps(test)
+    async def run(*args: Any, **kwargs: Any) -> None:
+        try:
+            await test(*args, **kwargs)
+        except NotRun as reason:
+            pytest.skip(f"NOT RUN: {reason}")
+
+    return run
+
+
 @pytest.mark.parametrize("subject", ["local"], indirect=True)
 @pytest.mark.xfail(
     raises=UnconfirmedOrphanCancel,
@@ -1077,6 +1094,7 @@ def _unrelated_orphan() -> int:
     reason="APSS#146 (AgentParadise/agent-paradise-standards-system#146): "
     + FIXTURE_GAPS["local", "LH-1"],
 )
+@_reports_not_run
 async def test_local_lh1_unconfirmed_orphan_is_the_apss146_gap(subject: Subject) -> None:
     """The host condition CI hit, made deterministic: an unrelated orphan adopted
     after the operation began is alive when LH-1 cancels. Local fails closed,
@@ -1123,6 +1141,7 @@ CONFIRM_WITHOUT_DESCENDANTS = {
 }
 
 
+@_reports_not_run
 async def test_lh1_fails_a_cancel_confirmed_while_a_descendant_lives(subject: Subject) -> None:
     """No vacuous pass: a provider whose cancel kills only the leader's group and
     reports confirmed must fail LH-1, on the cancel step, on measured liveness."""
@@ -1155,6 +1174,7 @@ async def test_an_unreadable_environ_is_not_run_not_dead(subject: Subject) -> No
 
 
 @pytest.mark.parametrize("subject", ["local"], indirect=True)
+@_reports_not_run
 async def test_a_probe_raising_an_untyped_error_is_a_fixture_mismatch(subject: Subject) -> None:
     async def untyped(workspace: Workspace, path: str) -> bool:
         raise ValueError("not a typed refusal")
@@ -1166,6 +1186,7 @@ async def test_a_probe_raising_an_untyped_error_is_a_fixture_mismatch(subject: S
 
 
 @pytest.mark.parametrize("subject", ["local"], indirect=True)
+@_reports_not_run
 async def test_a_not_a_regular_file_refusal_is_rejected_policy(subject: Subject) -> None:
     async def refuses(workspace: Workspace, path: str) -> bytes:
         raise NotARegularFileError(path)
@@ -1230,10 +1251,10 @@ async def _daemon_lh7(subject: Subject) -> None:
         pytest.skip(f"NOT RUN: {reason}")
 
 
-@pytest.mark.parametrize("subject", ["local"], indirect=True)
-async def test_an_unmeasurable_daemon_lh7_is_not_run(subject: Subject) -> None:
+@contextlib.contextmanager
+def _unreadable_bystander(subject: Subject) -> Iterator[None]:
     """A process the harness cannot read (on CI, one inside the daemon's
-    container) makes the real-daemon cell NOT RUN, through the same boundary."""
+    container or another user's), so liveness is unmeasurable."""
     bystander = subprocess.Popen(["sleep", "60"])
     readable = _environ
 
@@ -1244,11 +1265,28 @@ async def test_an_unmeasurable_daemon_lh7_is_not_run(subject: Subject) -> None:
 
     subject.monkeypatch.setattr(f"{__name__}._environ", hidden)
     try:
-        with pytest.raises(pytest.skip.Exception, match="NOT RUN: .*unreadable"):
-            await _daemon_lh7(subject)
+        yield
     finally:
         bystander.kill()
         bystander.wait()
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+@pytest.mark.parametrize(
+    "boundary",
+    [_daemon_lh7, test_a_not_a_regular_file_refusal_is_rejected_policy],
+    ids=["daemon-lh7", "reports-not-run"],
+)
+async def test_an_unmeasurable_hazard_test_is_not_run(
+    subject: Subject, boundary: Callable[[Subject], Coroutine[Any, Any, None]]
+) -> None:
+    """Every hazard test boundary reports NOT RUN through the real fail-closed
+    liveness, never a failure, xfail or pass."""
+    with (
+        _unreadable_bystander(subject),
+        pytest.raises(pytest.skip.Exception, match="NOT RUN: .*unreadable"),
+    ):
+        await boundary(subject)
 
 
 @pytest.mark.integration
