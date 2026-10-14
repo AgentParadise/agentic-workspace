@@ -55,7 +55,7 @@ from typing import Any
 
 import pytest
 
-from agentic_isolation.config import WorkspaceConfig
+from agentic_isolation.config import SecurityConfig, WorkspaceConfig
 from agentic_isolation.contract import (
     CredentialRef,
     ObservationPage,
@@ -170,6 +170,9 @@ class Subject:
     state_file: Path | None
     monkeypatch: pytest.MonkeyPatch
     ref: OperationRef | None = None
+    # Where the workload sees `launch_log`, when that is not the host path
+    # (a real container sees its workspace mount at /workspace).
+    launch_log_in_workload: str | None = None
     # Whether the resolver had been released each time destroy reached the
     # operation teardown: proof destroy began while start was still blocked.
     destroy_saw_release: list[bool] = field(default_factory=list)
@@ -180,7 +183,7 @@ class Subject:
         fields["environment"] = {
             **fields["environment"],
             TOKEN_VARIABLE: self.token,
-            "L": str(self.launch_log),
+            "L": self.launch_log_in_workload or str(self.launch_log),
         }
         if hazard == "LH-5":
             fields["timeout_seconds"] = 1
@@ -505,8 +508,10 @@ async def _call(
         if call in ("file_exists", "read_file"):
             return await _probe(subject, call, step["args"]["path"], step["settles_within_seconds"])
         if call == "finalize":
-            await provider.destroy(subject.workspace)
-            return Outcome(document={"state": "completed"})
+            report = await provider.destroy(subject.workspace)
+            # Docker returns a TeardownReport; Local returns nothing on success.
+            final = "completed" if report is None else report.finalization.state
+            return Outcome(document={"state": final})
     except OperationFailure as e:
         return _failure(e)
     raise AssertionError(f"{hazard}: the harness has no driver for call {call!r}")
@@ -646,8 +651,8 @@ FINDINGS: dict[tuple[str, str], str] = {
 }
 # Cases the harness cannot drive yet; each is reported as not run, never as a pass.
 NOT_RUN: dict[tuple[str, str], str] = {
-    ("docker", "LH-7"): "file_exists/read_file/destroy go through the Docker SDK, which the "
-    "stand-in docker CLI does not serve; needs a real-daemon fixture (follow-up)",
+    ("docker", "LH-7"): "the probes read the host workspace mount, which a stand-in container "
+    "does not have; run against a real daemon by test_docker_daemon_meets_lh7_fifo",
 }
 
 
@@ -709,3 +714,40 @@ async def test_lh1_fails_a_cancel_confirmed_while_a_descendant_lives(subject: Su
     message = str(caught.value)
     assert "LH-1 step 1 cancel" in message, message
     assert '"state":"cancelled"' in message and "descendant_alive=True" in message, message
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not WorkspaceDockerProvider.is_available(), reason="Docker not available")
+async def test_docker_daemon_meets_lh7_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LH-7 against a real container: a FIFO made inside it, probed and read
+    through the host mount, then a real teardown. Skips without Docker, like
+    tests/integration; CI python-compatibility has a daemon and runs it."""
+    gate = _Gate()
+    provider = WorkspaceDockerProvider(
+        default_image="python:3.12-slim", security=SecurityConfig.development(), credentials=gate
+    )
+    workspace = await provider.create(WorkspaceConfig(provider="docker", image="python:3.12-slim"))
+    root = Path(workspace.metadata["workspace_dir"])
+    (root / "repo").mkdir(exist_ok=True)
+    (root / "repo").chmod(0o777)
+    subject = Subject(
+        "docker",
+        provider,
+        provider._operations,
+        workspace,
+        root,
+        uuid.uuid4().hex,
+        root / ".launches",
+        gate,
+        None,
+        monkeypatch,
+        launch_log_in_workload="/workspace/.launches",
+    )
+    try:
+        await run_hazard(subject, "LH-7")
+    finally:
+        subject.kill_leftovers()
+        if workspace.id in provider._workspaces:
+            await provider.destroy(workspace)
