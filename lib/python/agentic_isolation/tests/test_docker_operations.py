@@ -1149,9 +1149,7 @@ async def test_unconfirmed_cancel_settles_failed_not_cancelled(
         return await real(*argv)
 
     monkeypatch.setattr(ops, "_docker_cmd", stop_fails)
-    ref, operation, cancel = await _cancel_with_held_confirmation(
-        ops, monkeypatch, confirmed=False
-    )
+    ref, operation, cancel = await _cancel_with_held_confirmation(ops, monkeypatch, confirmed=False)
     with pytest.raises(OperationFailure) as caught:
         await asyncio.wait_for(cancel, timeout=20)
     assert caught.value.error.kind == "provider_unavailable"
