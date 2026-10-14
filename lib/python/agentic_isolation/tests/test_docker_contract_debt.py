@@ -6,7 +6,9 @@ drives the provider and asserts on what reached the subprocess boundary.
 """
 
 import asyncio
+import contextlib
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -20,7 +22,7 @@ from agentic_isolation.providers.base import (
     UnsupportedLimitError,
     Workspace,
 )
-from agentic_isolation.providers.docker import WorkspaceDockerProvider
+from agentic_isolation.providers.docker import NotARegularFileError, WorkspaceDockerProvider
 from agentic_isolation.providers.docker_operations import DockerOperations
 from tests.test_docker_operations import FAKE_DOCKER
 
@@ -269,6 +271,86 @@ async def test_dot_dot_after_a_symlink_is_refused_not_folded(tmp_path: Path) -> 
 
     await provider.write_file(workspace, "nested/../inside", "ok")
     assert (root / "inside").read_text() == "ok"
+
+
+def _open_far_end_later(fifo: Path, flags: int, delay: float) -> None:
+    """Open the FIFO's other end after `delay`, so a blocked open fails the test, not hangs it."""
+
+    def run() -> None:
+        time.sleep(delay)
+        with contextlib.suppress(OSError):
+            os.close(os.open(fifo, flags | os.O_NONBLOCK))
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# Third release review of #57, finding 2: a FIFO the workload makes used to
+# block the provider's open, and with it the whole event loop.
+@pytest.mark.parametrize("operation", ["file_exists", "read_file", "write_file"])
+async def test_a_workload_fifo_never_blocks_the_event_loop(tmp_path: Path, operation: str) -> None:
+    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
+    workspace = _workspace(tmp_path)
+    fifo = Path(workspace.metadata["workspace_dir"]) / "artifact.md"
+    os.mkfifo(fifo)
+    far_end = os.O_RDONLY if operation == "write_file" else os.O_WRONLY
+    _open_far_end_later(fifo, far_end, delay=3.0)
+
+    began = time.monotonic()
+    if operation == "file_exists":
+        assert await provider.file_exists(workspace, "artifact.md") is False
+    elif operation == "read_file":
+        with pytest.raises(NotARegularFileError, match="not a regular file"):
+            await provider.read_file(workspace, "artifact.md")
+    else:
+        with pytest.raises(NotARegularFileError, match="not a regular file"):
+            await provider.write_file(workspace, "artifact.md", "never written")
+    assert time.monotonic() - began < 1.0
+
+
+@pytest.mark.parametrize("operation", ["file_exists", "read_file", "write_file"])
+async def test_a_fifo_swapped_in_after_the_check_is_never_waited_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: str
+) -> None:
+    """The type check before the open saw a regular file; the open itself must not block."""
+    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
+    workspace = _workspace(tmp_path)
+    fifo = Path(workspace.metadata["workspace_dir"]) / "artifact.md"
+    fifo.write_text("regular when checked")
+    real_open = os.open
+
+    def racing_open(
+        path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if dir_fd is not None and path == "artifact.md":
+            os.unlink("artifact.md", dir_fd=dir_fd)
+            os.mkfifo("artifact.md", dir_fd=dir_fd)
+        return real_open(path, flags, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", racing_open)
+    far_end = os.O_RDONLY if operation == "write_file" else os.O_WRONLY
+    _open_far_end_later(fifo, far_end, delay=3.0)
+
+    began = time.monotonic()
+    if operation == "file_exists":
+        assert await provider.file_exists(workspace, "artifact.md") is False
+    elif operation == "read_file":
+        with pytest.raises(NotARegularFileError, match="not a regular file"):
+            await provider.read_file(workspace, "artifact.md")
+    else:
+        with pytest.raises(NotARegularFileError, match="not a regular file"):
+            await provider.write_file(workspace, "artifact.md", "never written")
+    assert time.monotonic() - began < 1.0
+
+
+async def test_exists_still_answers_true_for_files_and_directories(tmp_path: Path) -> None:
+    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
+    workspace = _workspace(tmp_path)
+    (Path(workspace.metadata["workspace_dir"]) / "dir").mkdir()
+    await provider.write_file(workspace, "dir/file.txt", "ok")
+
+    assert await provider.file_exists(workspace, "dir")
+    assert await provider.file_exists(workspace, "dir/file.txt")
+    assert not await provider.file_exists(workspace, "dir/missing.txt")
 
 
 async def test_write_file_still_writes_nested_paths_inside(tmp_path: Path) -> None:

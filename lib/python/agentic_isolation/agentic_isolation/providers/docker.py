@@ -21,6 +21,7 @@ import math
 import os
 import posixpath
 import shutil
+import stat
 import tempfile
 import time
 import uuid
@@ -813,14 +814,14 @@ class WorkspaceDockerProvider(BaseProvider):
         workspace: Workspace,
         path: str,
     ) -> bool:
-        """Check if a file exists in the workspace."""
+        """Whether a file or directory exists here; a FIFO, socket or device does not."""
         workspace_dir = workspace.metadata.get("workspace_dir")
         if not workspace_dir:
             return False
 
         try:
             fd = _open_contained(Path(workspace_dir), path, os.O_RDONLY)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotARegularFileError):
             return False
         os.close(fd)
         return True
@@ -1186,6 +1187,14 @@ class WorkspaceDockerProvider(BaseProvider):
             logger.warning("docker rm -f %s failed; the container may still exist", container_name)
 
 
+class NotARegularFileError(ValueError):
+    """A workspace path names a FIFO, socket or device, which the file helpers never open.
+
+    Opening a FIFO waits for its other end, which would hold the event loop,
+    and a device node the workload made would reach the host's device.
+    """
+
+
 class ContainerRemovalError(RuntimeError):
     """`docker rm` failed during teardown. The workspace is still registered."""
 
@@ -1251,7 +1260,8 @@ def _open_contained(root: Path, path: str, flags: int, *, create_parents: bool =
     Every component, including each `..`, is resolved against a descriptor
     this walk opened itself with O_NOFOLLOW, so the check and the use are the
     same system call: a symlink the workload swaps in at any moment is
-    refused, never followed, and `..` can never climb above `root`.
+    refused, never followed, and `..` can never climb above `root`. A FIFO,
+    socket or device is refused with NotARegularFileError and never waited on.
     """
     if Path(path).is_absolute():
         raise ValueError(f"workspace path {path!r} must be relative to the workspace")
@@ -1261,6 +1271,11 @@ def _open_contained(root: Path, path: str, flags: int, *, create_parents: bool =
 
     def escapes() -> ValueError:
         return ValueError(f"workspace path {path!r} escapes the workspace directory")
+
+    def not_regular() -> NotARegularFileError:
+        return NotARegularFileError(
+            f"workspace path {path!r} is not a regular file (a FIFO, socket or device)"
+        )
 
     nofollow = os.O_NOFOLLOW | os.O_CLOEXEC
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
@@ -1283,15 +1298,32 @@ def _open_contained(root: Path, path: str, flags: int, *, create_parents: bool =
                 if e.errno in (errno.ELOOP, errno.ENOTDIR):
                     raise escapes() from e
                 raise
+        # Checked before the open so a device node is never opened at all, and
+        # again on the descriptor, which the workload cannot swap.
+        with contextlib.suppress(FileNotFoundError):
+            if _is_special(os.stat(name, dir_fd=stack[-1], follow_symlinks=False).st_mode):
+                raise not_regular()
         try:
-            return os.open(name, flags | nofollow, 0o644, dir_fd=stack[-1])
+            # O_NONBLOCK: a FIFO swapped in after the check opens at once (or
+            # fails ENXIO) instead of waiting for a writer or reader.
+            leaf = os.open(name, flags | nofollow | os.O_NONBLOCK, 0o644, dir_fd=stack[-1])
         except OSError as e:
             if e.errno == errno.ELOOP:
                 raise escapes() from e
+            if e.errno == errno.ENXIO:  # a FIFO with no reader, or a socket
+                raise not_regular() from e
             raise
+        if _is_special(os.fstat(leaf).st_mode):
+            os.close(leaf)
+            raise not_regular()
+        return leaf
     finally:
         for fd in stack:
             os.close(fd)
+
+
+def _is_special(mode: int) -> bool:
+    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
 
 
 def _relative_workdir(cwd: str | None) -> str:
