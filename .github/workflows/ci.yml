@@ -207,6 +207,8 @@ jobs:
           DOCKER_CONFORMANCE_RESULT: ${{ needs.docker-conformance.result }}
           MUTATION_RUNNER_RESULT: ${{ needs.mutation-evidence-runner.result }}
           MUTATIONS_NOT_MERGED_RESULT: ${{ needs.mutations-not-merged.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           test "$RUST_QUALITY_RESULT" = success
           test "$RUST_TEST_RESULT" = success
@@ -217,5 +219,10 @@ jobs:
           test "$DOCKER_RESULT" = success
           test "$DOCKER_CONFORMANCE_RESULT" = success
           test "$MUTATION_RUNNER_RESULT" = success
-          # Skipped on pushes and release PRs; only a failure blocks.
-          test "$MUTATIONS_NOT_MERGED_RESULT" != failure
+          # Must RUN and pass on a PR into main; skipped is right everywhere
+          # else. A cancelled check proves nothing, so it never passes.
+          if [ "$EVENT_NAME" = pull_request ] && [ "$BASE_REF" = main ]; then
+            test "$MUTATIONS_NOT_MERGED_RESULT" = success
+          else
+            test "$MUTATIONS_NOT_MERGED_RESULT" = skipped
+          fi

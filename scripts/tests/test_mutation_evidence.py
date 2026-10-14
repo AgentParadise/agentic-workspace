@@ -597,3 +597,9 @@ def test_run_name_carries_the_pr_and_the_dispatch_nonce() -> None:
     value = line.removeprefix("run-name:").strip()
     assert value.startswith('"') and value.endswith('"'), line
     assert "${{ inputs.pr }}" in value and "${{ inputs.dispatch_id }}" in value
+
+
+def test_every_run_reinstalls_so_built_local_dependencies_see_the_mutant() -> None:
+    args = me.pytest_args(("tests/test_x.py",))
+    assert args[:4] == ["uv", "run", "--locked", "--reinstall"]
+    assert args[-2:] == ["--", "tests/test_x.py"]

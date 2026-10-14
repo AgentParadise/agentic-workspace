@@ -441,8 +441,12 @@ def parse_pytest_output(output: str) -> tuple[tuple[str, ...], int, int, int]:
 def pytest_args(tests: tuple[str, ...]) -> list[str]:
     # `-m ""` so no marker expression in a project's addopts can deselect a
     # named test into a vacuous pass.
+    # `--reinstall`: some projects install their local dependencies as built
+    # wheels, not editable (tests/consumer_contracts does). Without a rebuild a
+    # mutant's source never reaches the installed copy and every run tests the
+    # baseline wheel: a false SURVIVED, and after restore a stale mutant.
     return [
-        "uv", "run", "--locked", "pytest", "-m", "", "-p", "no:cacheprovider",
+        "uv", "run", "--locked", "--reinstall", "pytest", "-m", "", "-p", "no:cacheprovider",
         "--color=no", "-rfEsxX", "--", *tests,
     ]  # fmt: skip
 
