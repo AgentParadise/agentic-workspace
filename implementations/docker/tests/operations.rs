@@ -63,7 +63,10 @@ fn write_executable(path: &Path, body: &str) {
 /// makes it report success and do nothing, or a `stop-keeps-running` file
 /// leaves the container reported running after the KILLs. `container inspect` says the
 /// container is running or exited, or gone while a `gone` file sits beside
-/// it, or cannot reach the daemon while a `down` file does.
+/// it, or cannot reach the daemon while a `down` file does, or is stuck
+/// `removing` while a `removing` file does. While a `late-exec` file sits
+/// beside it, an operation's `exec` waits 3s before it runs anything, so its
+/// launch header comes late.
 fn fake_docker(dir: &Path) -> PathBuf {
     let script = dir.join("docker");
     let log = dir.join("docker.log");
@@ -77,6 +80,7 @@ fn fake_docker(dir: &Path) -> PathBuf {
 printf '%s\n' "$*" >> '{log}'
 case "$1" in
 exec)
+    [ -e '{dir}/late-exec' ] && case " $* " in *" aw-operation "*) sleep 3 ;; esac
     shift
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -106,6 +110,7 @@ stop)
 container)
     [ -e '{down}' ] && {{ echo 'Cannot connect to the Docker daemon' >&2; exit 1; }}
     [ -e '{gone}' ] && {{ echo 'Error: No such container: c1' >&2; exit 1; }}
+    [ -e '{dir}/removing' ] && {{ echo removing; exit 0; }}
     [ -e '{dir}/stopped' ] && {{ echo exited; exit 0; }}
     echo running ;;
 esac
@@ -1164,8 +1169,8 @@ fn credential_bindings_without_a_resolver_are_rejected_policy() {
 mod hazards {
     use super::*;
     use agentic_workspace_conformance::hazard::{
-        HazardFixture, HazardHarness, HazardVerdict, Unmeasurable, drive_hazard, live_processes,
-        load_hazards, vendored_behaviour_dir,
+        HazardFixture, HazardHarness, HazardVerdict, Outcome, Unmeasurable, drive_hazard,
+        live_processes, load_hazards, vendored_behaviour_dir,
     };
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1181,7 +1186,10 @@ mod hazards {
             "LH-2" => "trap '' TERM; while :; do sleep 0.1; done",
             "LH-6" => "printf 'lost-it retained output\\n'",
             // The stand-in ignores `-w`; its marker names the "container".
-            "LH-7" => "mkdir -p \"$AW_STANDIN/outputs\" && mkfifo \"$AW_STANDIN/outputs/pipe\"",
+            // `ws` is the file surface's workspace root; see `StandIn::file`.
+            "LH-7" => {
+                "mkdir -p \"$AW_STANDIN/ws/outputs\" && mkfifo \"$AW_STANDIN/ws/outputs/pipe\""
+            }
             _ => "exec sleep 300",
         }
     }
@@ -1199,6 +1207,35 @@ mod hazards {
         pub provider: P,
         pub dir: tempfile::TempDir,
         pub token: String,
+        gate: Arc<Gate>,
+        key: std::sync::Mutex<Option<String>>,
+    }
+
+    /// LH-4's credential resolver: the first resolve, while armed, says it
+    /// has begun and waits to be released; every resolve then answers as
+    /// `Vault` does.
+    #[derive(Default)]
+    struct Gate {
+        armed: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    struct GatedVault(Arc<Gate>);
+
+    impl CredentialResolver for GatedVault {
+        fn resolve<'a>(
+            &'a self,
+            credential: &'a CredentialRef,
+        ) -> Pin<Box<dyn Future<Output = Result<String, OperationError>> + Send + 'a>> {
+            Box::pin(async move {
+                if self.0.armed.swap(false, Ordering::SeqCst) {
+                    self.0.entered.notify_one();
+                    self.0.release.notified().await;
+                }
+                Vault.resolve(credential).await
+            })
+        }
     }
 
     impl StandIn<DockerOperations> {
@@ -1214,15 +1251,27 @@ mod hazards {
             // This process stands for the container's init, so a detached
             // descendant reparents to "pid 1" as it would in a container.
             become_subreaper(dir.path());
+            if hazard == "LH-3" {
+                std::fs::write(dir.path().join("late-exec"), "").unwrap();
+            }
+            let gate = Arc::new(Gate::default());
+            gate.armed.store(hazard == "LH-4", Ordering::SeqCst);
             // LH-6's provider descriptor: the 16-byte retention the gap needs.
             let retention = if hazard == "LH-6" { 16 } else { 1 << 20 };
-            let provider = ops(dir.path(), retention, 1 << 16).with_credentials(Arc::new(Vault));
+            let provider = ops(dir.path(), retention, 1 << 16)
+                .with_credentials(Arc::new(GatedVault(gate.clone())));
             let token = format!("rust-lh-{}-{}", std::process::id(), unique());
             Self {
                 provider: wrap(provider),
                 dir,
                 token,
+                gate,
+                key: std::sync::Mutex::new(None),
             }
+        }
+
+        fn standin(&self, file: &str) -> PathBuf {
+            self.dir.path().join(file)
         }
     }
 
@@ -1239,6 +1288,29 @@ mod hazards {
                     .args(["-KILL", &pid.to_string()])
                     .status();
             }
+            // A file-surface read still blocked opening LH-7's FIFO is let go:
+            // a writer that opens and closes gives it end of file.
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NONBLOCK: i32 = 0o4000;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(O_NONBLOCK)
+                .open(self.standin("ws/outputs/pipe"));
+            self.gate.release.notify_one();
+        }
+    }
+
+    /// How a `WorkspaceError` from the file surface reads as an APSS kind:
+    /// a refused path is policy, anything else the provider's own failure.
+    fn file_error(error: &agentic_workspace_core::WorkspaceError) -> Outcome {
+        use agentic_workspace_core::WorkspaceError as E;
+        let kind = match error {
+            E::UnsafePath(_) | E::InvalidHandle(_) => "rejected_policy",
+            _ => "internal",
+        };
+        Outcome::Error {
+            kind: kind.into(),
+            has_ref: false,
         }
     }
 
@@ -1261,18 +1333,97 @@ mod hazards {
                 // The fixture's offsets count the workload's output only.
                 spec.as_object_mut().unwrap().remove("launch_marker");
             }
+            *self.key.lock().unwrap() = spec["operation_key"].as_str().map(str::to_owned);
             serde_json::from_value(spec).unwrap()
         }
         fn establish(&self, hazard: &str, given: &str) -> Result<(), String> {
             match given {
                 // The workload forks it; liveness is measured, not assumed.
-                "detached_descendant" | "timeout_elapsed" | "fifo_in_workspace" => Ok(()),
+                "detached_descendant" | "timeout_elapsed" => Ok(()),
                 "observation_gap" if hazard == "LH-6" => Ok(()),
+                // `late-exec` holds the exec back, so no workload runs yet.
+                "launch_header_not_seen" => match live_processes(TOKEN, &self.token) {
+                    Ok(live) if live.is_empty() => Ok(()),
+                    Ok(live) => Err(format!("the workload already runs: {live:?}")),
+                    Err(unmeasurable) => Err(unmeasurable.to_string()),
+                },
+                // Made true by `alongside`, while the start resolves.
+                "destroyed_during_credential_resolution" if hazard == "LH-4" => Ok(()),
+                "workspace_destroyed" if self.standin("gone").exists() => Ok(()),
+                "backend_stuck_removing" => {
+                    std::fs::write(self.standin("removing"), "").map_err(|e| e.to_string())
+                }
+                "fifo_in_workspace" => {
+                    use std::os::unix::fs::FileTypeExt;
+                    match std::fs::symlink_metadata(self.standin("ws/outputs/pipe")) {
+                        Ok(meta) if meta.file_type().is_fifo() => Ok(()),
+                        other => Err(format!("outputs/pipe is not a FIFO: {other:?}")),
+                    }
+                }
                 other => Err(format!("the stand-in docker cannot produce {other}")),
             }
         }
+        async fn alongside(&self, _hazard: &str, given: &str) -> Result<(), String> {
+            if given != "destroyed_during_credential_resolution" {
+                return Ok(());
+            }
+            let entered =
+                tokio::time::timeout(Duration::from_secs(5), self.gate.entered.notified()).await;
+            if entered.is_err() {
+                self.gate.release.notify_one();
+                return Err("start never reached credential resolution".into());
+            }
+            // The backend loses the container and the workspace is torn
+            // down through the trait's boundary while start still resolves.
+            std::fs::write(self.standin("gone"), "").map_err(|e| e.to_string())?;
+            let destroyed = workspace();
+            let finalize = self.provider.finalize(&destroyed);
+            tokio::pin!(finalize);
+            let early = tokio::time::timeout(Duration::from_millis(200), &mut finalize).await;
+            self.gate.release.notify_one();
+            if early.is_err() {
+                finalize.await;
+            }
+            Ok(())
+        }
+        /// The Rust Docker provider's file surface is `WorkspaceProvider::
+        /// collect`, read here on a thread of its own so a read that never
+        /// returns is bounded by the step, not this test.
+        async fn file(&self, call: &str, path: &str) -> Result<Outcome, String> {
+            use agentic_workspace_core::{WorkspaceHandle, WorkspaceProvider};
+            use agentic_workspace_docker::NetworkPolicy;
+            let files = agentic_workspace_docker::DockerProvider::new(
+                self.dir.path(),
+                "stand-in",
+                NetworkPolicy::None,
+            )
+            .map_err(|e| e.to_string())?;
+            let root = std::fs::canonicalize(self.standin("ws")).map_err(|e| e.to_string())?;
+            let handle = WorkspaceHandle {
+                id: "ws".into(),
+                working_directory: root.clone(),
+                root,
+                provider_reference: Some("agentic-workspace-ws".into()),
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let relative = PathBuf::from(path);
+            std::thread::spawn(move || {
+                let _ = tx.send(files.collect(&handle, &[relative]));
+            });
+            let collected = rx.await.map_err(|_| "the collect thread died".to_owned())?;
+            Ok(match (call, collected) {
+                ("file_exists", Ok(_)) => Outcome::Document(serde_json::json!({
+                    "path": path, "exists": true, "regular_file": true,
+                })),
+                ("read_file", Ok(artifacts)) => Outcome::Document(serde_json::json!({
+                    "path": path, "bytes": artifacts.first().map_or(0, |a| a.bytes.len()),
+                })),
+                (_, Err(error)) => file_error(&error),
+                (other, Ok(_)) => return Err(format!("no file call {other}")),
+            })
+        }
         fn launches(&self) -> u32 {
-            std::fs::read_to_string(self.dir.path().join("docker.log"))
+            std::fs::read_to_string(self.standin("docker.log"))
                 .unwrap_or_default()
                 .lines()
                 .filter(|l| l.starts_with("exec -i ") && l.contains(&self.token))
@@ -1281,8 +1432,25 @@ mod hazards {
         fn descendant_alive(&self) -> Result<bool, Unmeasurable> {
             Ok(!live_processes(TOKEN, &self.token)?.is_empty())
         }
-        fn operation_records(&self) -> Option<u32> {
-            None
+        /// Records the provider still resolves for the fixture's key, probed
+        /// through public `status`: its operation ids are `c1-op<n>`, issued
+        /// in sequence, so the first eight cover every start a hazard makes.
+        async fn operation_records(&self) -> Option<u32> {
+            let key = self.key.lock().unwrap().clone()?;
+            let mut held = 0;
+            for n in 1..=8 {
+                let reference: OperationRef = serde_json::from_value(serde_json::json!({
+                    "workspace": {"provider": "docker", "resource_id": "c1"},
+                    "operation_id": format!("c1-op{n}"),
+                    "operation_key": key,
+                }))
+                .unwrap();
+                match self.provider.status(&reference).await {
+                    Err(e) if e.kind == ErrorKind::UnknownOperation => {}
+                    _ => held += 1,
+                }
+            }
+            Some(held)
         }
         fn awaits_exit(&self, hazard: &str) -> bool {
             matches!(hazard, "LH-6" | "LH-7")
@@ -1304,12 +1472,19 @@ mod hazards {
             // TERM-ignoring workload still alive. Not established whether the
             // stand-in's stop or the provider is at fault: COVERAGE.md.
             "LH-2" => "fail 3 cancel",
-            "LH-3" => "not run 1 cancel",
-            "LH-4" => "not run 0 start",
-            "LH-5" => "not run 1 observe",
+            // Finding: the cancel before the launch header ends
+            // provider_unavailable after ~9s, the late workload alive.
+            "LH-3" => "fail 1 cancel",
+            // Finding: start returns a ref and launches into the container
+            // destroyed while it resolved, instead of resource_lost/cancelled.
+            "LH-4" => "fail 0 start",
+            // Finding: with the container stuck removing, the timed-out
+            // operation's observe never completes within the 120s bound.
+            "LH-5" => "fail 1 observe",
             // Finding: the gap page carries no loss_detected (0.2.1).
             "LH-6" => "fail 2 observe",
-            "LH-7" => "not run 2 file_exists",
+            // Finding: `collect` opens the FIFO and blocks past the 10s bound.
+            "LH-7" => "fail 2 file_exists",
             _ => unreachable!(),
         };
         assert_eq!(summary, expected, "{hazard}: {verdict:?}");
@@ -1348,6 +1523,18 @@ mod hazards {
     #[tokio::test]
     async fn lh7_fifo_in_workspace() {
         run("LH-7").await;
+    }
+
+    /// The record probe counts a started operation, and none before it, so
+    /// LH-4's `operation_records: 0` is measured, not the probe's blindness.
+    #[tokio::test]
+    async fn operation_records_counts_a_started_operation() {
+        let harness = StandIn::new("LH-1");
+        let lh1 = fixture("LH-1");
+        let spec = harness.spec("LH-1", &lh1.steps[0].args["spec"]);
+        assert_eq!(harness.operation_records().await, Some(0));
+        harness.provider.start(&workspace(), spec).await.unwrap();
+        assert_eq!(harness.operation_records().await, Some(1));
     }
 
     /// The mutation: a cancel that terminates nothing and reports confirmed.

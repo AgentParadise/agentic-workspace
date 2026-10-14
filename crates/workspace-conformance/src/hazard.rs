@@ -18,6 +18,7 @@ use agentic_workspace_core::operations::{
 use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -235,9 +236,21 @@ pub trait HazardHarness {
     fn launches(&self) -> u32;
     /// Live processes carrying this run's token, detached ones included.
     fn descendant_alive(&self) -> Result<bool, Unmeasurable>;
+    /// Run alongside the step's call, for a `given` that only holds while
+    /// the call is in flight (LH-4's destroy during credential resolution).
+    /// An `Err` says it could not be made true, and the step is not run.
+    fn alongside(&self, _hazard: &str, _given: &str) -> impl Future<Output = Result<(), String>> {
+        async { Ok(()) }
+    }
+    /// Answer a file call (`file_exists`, `read_file`) through the provider's
+    /// file surface. `Err` says there is none, and the step is not run.
+    fn file(&self, call: &str, _path: &str) -> impl Future<Output = Result<Outcome, String>> {
+        let reason = format!("this harness has no file surface for {call}");
+        async move { Err(reason) }
+    }
     /// Operation records the provider holds for the workspace, when it
     /// exposes that; `None` makes a step that counts them not run.
-    fn operation_records(&self) -> Option<u32>;
+    fn operation_records(&self) -> impl Future<Output = Option<u32>>;
     /// Whether `hazard`'s workload is short and the fixture's next steps
     /// assume it has exited: `start` then waits for a terminal status.
     fn awaits_exit(&self, hazard: &str) -> bool;
@@ -360,6 +373,10 @@ pub async fn drive_hazard<H: HazardHarness>(fixture: &HazardFixture, harness: &H
                                 Err(error) => break Ok(error_outcome(&error)),
                             }
                         },
+                        "file_exists" | "read_file" => {
+                            let path = step.args["path"].as_str().unwrap_or_default();
+                            harness.file(call, path).await
+                        }
                         other => Err(format!(
                             "SupportsOperations has no {other}; no Rust provider surface serves it"
                         )),
@@ -367,9 +384,17 @@ pub async fn drive_hazard<H: HazardHarness>(fixture: &HazardFixture, harness: &H
                 }
             }
         };
-        let outcome = match tokio::time::timeout(bound, call).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(reason)) => return not_run(reason),
+        let during = async {
+            for given in &step.given {
+                harness.alongside(hazard, given).await?;
+            }
+            Ok::<(), String>(())
+        };
+        let outcome = match tokio::time::timeout(bound, async { tokio::join!(call, during) }).await
+        {
+            Ok((_, Err(reason))) => return not_run(reason),
+            Ok((Ok(outcome), Ok(()))) => outcome,
+            Ok((Err(reason), Ok(()))) => return not_run(reason),
             Err(_) => {
                 return HazardVerdict::Fail {
                     step: index,
@@ -386,7 +411,7 @@ pub async fn drive_hazard<H: HazardHarness>(fixture: &HazardFixture, harness: &H
             Ok(alive) => alive,
             Err(unmeasurable) => return not_run(unmeasurable.to_string()),
         };
-        let operation_records = match (step.operation_records, harness.operation_records()) {
+        let operation_records = match (step.operation_records, harness.operation_records().await) {
             (Some(_), None) => {
                 return not_run("the provider does not expose its operation records".into());
             }
