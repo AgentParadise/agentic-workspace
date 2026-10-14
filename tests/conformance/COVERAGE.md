@@ -144,13 +144,13 @@ exactly the run's processes; `removing` is sticky), not a daemon.
 
 | Hazard | Fixture | Python Docker | Python Local | Rust Docker |
 |---|---|---|---|---|
-| LH-1 | `hazard-double-fork-orphan` | PASS | PASS | PASS |
+| LH-1 | `hazard-double-fork-orphan` | PASS | PASS (FAIL seen in CI, below) | PASS |
 | LH-2 | `hazard-interrupted-cancel` | PASS | FAIL | FAIL (unattributed) |
 | LH-3 | `hazard-cancel-before-launch-header` | FAIL | PASS (condition N/A) | NOT RUN |
 | LH-4 | `hazard-destroy-during-start` | FAIL | FAIL | NOT RUN |
 | LH-5 | `hazard-stuck-removal-timeout-settles` | PASS | PASS (condition N/A) | NOT RUN |
 | LH-6 | `hazard-drain-with-gap-reports-loss` | FAIL | FAIL | FAIL |
-| LH-7 | `hazard-fifo-in-workspace` | daemon only (see below) | FAIL | NOT RUN |
+| LH-7 | `hazard-fifo-in-workspace` | FAIL (real daemon) | FAIL | NOT RUN |
 
 Python LH-4 drives each provider's public `destroy` (for Docker, only the
 container boundary `_measure_usage`/`_stop`/`_remove` is a logged stand-in),
@@ -179,6 +179,15 @@ Findings (each left to a follow-up):
 - Rust Docker LH-2: the retried `cancel` returns `provider_unavailable`
   after 7 s with the TERM-ignoring workload still measured alive. Not yet
   attributed: it may be the stand-in's `stop` rather than the provider.
+- Python Docker LH-7 (real daemon, CI run 38593606789): `file_exists` on the
+  FIFO returns `exists: false, regular_file: false`; the fixture needs
+  `exists: true, regular_file: false` or `rejected_policy`. Held as
+  `xfail(strict=True)` on `test_docker_daemon_meets_lh7_fifo`.
+- Local LH-1, intermittent and host-dependent (CI run 38593606789; passed at
+  the previous head's CI and locally 5/5): when a foreign subreaper adopts the
+  detached descendant, `cancel` settles `failed` (`cancel_signal_failure`:
+  "orphaned to a reaper ... not signalled"), which matches neither allowed
+  outcome. Not pinned, because it does not reproduce deterministically.
 - Local LH-7: `read_file` opens a writer-less FIFO on the event loop and
   blocks; the harness's watchdog thread has to open the write end to free it.
 

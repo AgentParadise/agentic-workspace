@@ -718,6 +718,12 @@ async def test_lh1_fails_a_cancel_confirmed_while_a_descendant_lives(subject: Su
 
 @pytest.mark.integration
 @pytest.mark.skipif(not WorkspaceDockerProvider.is_available(), reason="Docker not available")
+@pytest.mark.xfail(
+    raises=FixtureMismatch,
+    strict=True,
+    reason="file_exists reports the FIFO as exists=false; the fixture needs exists=true, "
+    "regular_file=false or rejected_policy",
+)
 async def test_docker_daemon_meets_lh7_fifo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
