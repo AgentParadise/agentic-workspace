@@ -21,4 +21,4 @@ thiserror = "2"
 tempfile = "3"
 wait-timeout = "0.2"
 sha2 = "0.11"
-apss-workspace-standard = { git = "https://github.com/AgentParadise/agent-paradise-standards-system", rev = "3bdbc3382371af5c9bedbc2f6de07037ae081c7e", package = "apss-v1-0006-workspace" }
+apss-workspace-standard = { git = "https://github.com/AgentParadise/agent-paradise-standards-system", rev = "ee926c6e44c0e37ad524e0ee265ffc4fabb714fc", package = "apss-v1-0006-workspace" }

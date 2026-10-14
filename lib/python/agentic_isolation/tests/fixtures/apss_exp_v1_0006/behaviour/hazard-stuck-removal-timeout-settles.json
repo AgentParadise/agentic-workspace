@@ -1,0 +1,224 @@
+{
+  "description": "The operation's timeout elapses while the backend keeps reporting removal in progress forever. The timeout drain, driven by observe with no status call before it, completes within its total bound as timed_out or fails as provider_unavailable, and status then stays settled.",
+  "hazard": "LH-5",
+  "steps": [
+    {
+      "call": "start",
+      "args": {
+        "spec": {
+          "schema": "apss.workspace-operation/v1",
+          "execution_id": "exec-42",
+          "operation_key": "exec-42:phase-1:fence-9:agent",
+          "argv": [
+            "agent",
+            "--print",
+            "--output-format",
+            "stream-json"
+          ],
+          "working_directory": "repo",
+          "environment": {
+            "LANG": "C.UTF-8"
+          },
+          "credential_bindings": [
+            {
+              "ref": {
+                "name": "github-app",
+                "scope": "repo:acme/widgets"
+              },
+              "delivery": "env",
+              "target": "GH_TOKEN"
+            }
+          ],
+          "launch_marker": {
+            "argv0": "agent-launch",
+            "line": "APSS-LAUNCH 6f1e9c"
+          },
+          "timeout_seconds": 60,
+          "metadata": {
+            "phase_id": "phase-1"
+          }
+        }
+      },
+      "expect": {
+        "schema": "workspace-operation.schema.json#/$defs/operationRef",
+        "document": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        }
+      },
+      "launches": 1
+    },
+    {
+      "call": "observe",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        },
+        "cursor": "g1:0"
+      },
+      "given": [
+        "timeout_elapsed",
+        "backend_stuck_removing"
+      ],
+      "repeat_until_complete": true,
+      "settles_within_seconds": 120,
+      "expect_one_of": [
+        {
+          "schema": "workspace-observation.schema.json",
+          "document": {
+            "schema": "apss.workspace-observation/v1",
+            "ref": {
+              "workspace": {
+                "provider": "docker",
+                "resource_id": "ws-7f3a"
+              },
+              "operation_id": "op-0001",
+              "operation_key": "exec-42:phase-1:fence-9:agent"
+            },
+            "state": "timed_out",
+            "cursor": "g1:0",
+            "next_cursor": "g1:0",
+            "data_b64": "",
+            "complete": true
+          }
+        },
+        {
+          "schema": "workspace-status.schema.json",
+          "document": {
+            "schema": "apss.workspace-status/v1",
+            "kind": "provider_unavailable",
+            "message": "backend reports removal in progress for ws-7f3a past the drain bound",
+            "ref": {
+              "workspace": {
+                "provider": "docker",
+                "resource_id": "ws-7f3a"
+              },
+              "operation_id": "op-0001",
+              "operation_key": "exec-42:phase-1:fence-9:agent"
+            }
+          }
+        }
+      ],
+      "launches": 1
+    },
+    {
+      "call": "status",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        }
+      },
+      "given": [
+        "backend_stuck_removing"
+      ],
+      "settles_within_seconds": 10,
+      "expect_one_of": [
+        {
+          "schema": "workspace-status.schema.json",
+          "document": {
+            "schema": "apss.workspace-status/v1",
+            "ref": {
+              "workspace": {
+                "provider": "docker",
+                "resource_id": "ws-7f3a"
+              },
+              "operation_id": "op-0001",
+              "operation_key": "exec-42:phase-1:fence-9:agent"
+            },
+            "state": "timed_out",
+            "execution_id": "exec-42",
+            "metadata": {},
+            "exit_code": null,
+            "signal": "SIGKILL"
+          }
+        },
+        {
+          "schema": "workspace-status.schema.json",
+          "document": {
+            "schema": "apss.workspace-status/v1",
+            "kind": "provider_unavailable",
+            "message": "backend reports removal in progress for ws-7f3a past the drain bound",
+            "ref": {
+              "workspace": {
+                "provider": "docker",
+                "resource_id": "ws-7f3a"
+              },
+              "operation_id": "op-0001",
+              "operation_key": "exec-42:phase-1:fence-9:agent"
+            }
+          }
+        }
+      ],
+      "launches": 1
+    },
+    {
+      "call": "status",
+      "args": {
+        "ref": {
+          "workspace": {
+            "provider": "docker",
+            "resource_id": "ws-7f3a"
+          },
+          "operation_id": "op-0001",
+          "operation_key": "exec-42:phase-1:fence-9:agent"
+        }
+      },
+      "given": [
+        "backend_stuck_removing"
+      ],
+      "settles_within_seconds": 10,
+      "expect_one_of": [
+        {
+          "schema": "workspace-status.schema.json",
+          "document": {
+            "schema": "apss.workspace-status/v1",
+            "ref": {
+              "workspace": {
+                "provider": "docker",
+                "resource_id": "ws-7f3a"
+              },
+              "operation_id": "op-0001",
+              "operation_key": "exec-42:phase-1:fence-9:agent"
+            },
+            "state": "timed_out",
+            "execution_id": "exec-42",
+            "metadata": {},
+            "exit_code": null,
+            "signal": "SIGKILL"
+          }
+        },
+        {
+          "schema": "workspace-status.schema.json",
+          "document": {
+            "schema": "apss.workspace-status/v1",
+            "kind": "provider_unavailable",
+            "message": "backend reports removal in progress for ws-7f3a past the drain bound",
+            "ref": {
+              "workspace": {
+                "provider": "docker",
+                "resource_id": "ws-7f3a"
+              },
+              "operation_id": "op-0001",
+              "operation_key": "exec-42:phase-1:fence-9:agent"
+            }
+          }
+        }
+      ],
+      "launches": 1
+    }
+  ]
+}
