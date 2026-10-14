@@ -22,8 +22,9 @@ credential binding and launch marker are kept.
 
 Harness readings, where Python has no literal counterpart of a fixture call:
 - an abandoned call is `asyncio.CancelledError`, read as kind `cancelled`;
-- `destroy` is the provider's operation teardown, `forget_workspace`, so the
-  Docker stand-in needs no daemon;
+- `destroy` is the provider's public `destroy`. For Docker the container
+  boundary (`_measure_usage`, `_stop`, `_remove`) is a stand-in that logs to
+  the stand-in docker's log, so the rest of teardown runs without a daemon;
 - LH-7 `finalize` is Local `destroy` returning (no TeardownReport exists for
   Local), read as `completed`.
 
@@ -67,6 +68,7 @@ from agentic_isolation.providers.docker_operations import DockerOperations
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 from agentic_isolation.providers.local_operations import LocalOperations
 from agentic_isolation.providers.operation_spool import OperationFailure
+from agentic_isolation.providers.teardown_report import TeardownUsage
 
 from ._apss_contract import FIXTURES
 
@@ -167,6 +169,9 @@ class Subject:
     state_file: Path | None
     monkeypatch: pytest.MonkeyPatch
     ref: OperationRef | None = None
+    # Whether the resolver had been released each time destroy reached the
+    # operation teardown: proof destroy began while start was still blocked.
+    destroy_saw_release: list[bool] = field(default_factory=list)
 
     def spec(self, fixture_spec: dict[str, Any], hazard: str) -> OperationSpec:
         fields = dict(fixture_spec)
@@ -228,7 +233,17 @@ class Subject:
         )
 
     async def destroy(self) -> None:
-        await self.operations.forget_workspace(self.workspace.id)
+        await self.provider.destroy(self.workspace)
+
+    def watch_destroy(self) -> None:
+        """Record, inside the public destroy, whether the resolver was released yet."""
+        forget = self.operations.forget_workspace
+
+        async def recorded(workspace_id: str) -> None:
+            self.destroy_saw_release.append(self.gate.release.is_set())
+            await forget(workspace_id)
+
+        self.monkeypatch.setattr(self.operations, "forget_workspace", recorded)
 
     def kill_leftovers(self) -> None:
         # Only processes carrying this run's token: the workload and what it forked.
@@ -259,8 +274,15 @@ async def subject(
             credentials=gate, retention_bytes=1 << 20, max_page_bytes=1 << 16, docker=str(fake)
         )
         provider._operations = operations
+        _stand_in_container_boundary(provider, tmp_path / "docker.log", monkeypatch)
+        # Its own directory: Docker destroy deletes the workspace path.
+        (tmp_path / "ws").mkdir()
         workspace = Workspace(
-            id="ws1", provider="docker", path=tmp_path, config=WorkspaceConfig(), _handle="c1"
+            id="ws1",
+            provider="docker",
+            path=tmp_path / "ws",
+            config=WorkspaceConfig(),
+            _handle="c1",
         )
         made = Subject(
             "docker",
@@ -295,6 +317,30 @@ async def subject(
         yield made
     finally:
         made.kill_leftovers()
+
+
+def _stand_in_container_boundary(
+    provider: WorkspaceDockerProvider, log: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Docker SDK calls teardown makes, logged instead of sent to a daemon."""
+
+    def logged(line: str) -> None:
+        with log.open("a") as f:
+            f.write(line + "\n")
+
+    async def measure_usage(container_name: str) -> TeardownUsage:
+        return TeardownUsage()
+
+    async def stop(container_name: str) -> None:
+        logged(f"stop {container_name}")
+
+    async def remove(container_name: str) -> bool:
+        logged(f"rm {container_name}")
+        return True
+
+    monkeypatch.setattr(provider, "_measure_usage", measure_usage)
+    monkeypatch.setattr(provider, "_stop", stop)
+    monkeypatch.setattr(provider, "_remove", remove)
 
 
 # --- Given conditions -------------------------------------------------------
@@ -374,6 +420,7 @@ async def _call(
             spec = subject.spec(step["args"]["spec"], hazard)
             if "destroyed_during_credential_resolution" in given:
                 subject.gate.armed = True
+                subject.watch_destroy()
                 starting = asyncio.ensure_future(provider.start(subject.workspace, spec))
                 await subject.gate.entered.wait()
                 # destroy begins while the start is blocked; the resolver then
@@ -385,6 +432,12 @@ async def _call(
                     ref = await starting
                 finally:
                     await destroying
+                    # Not a fixture expectation: the harness's own proof that the
+                    # race it claims to drive is the one that ran.
+                    assert subject.destroy_saw_release[:1] == [False], (
+                        f"{subject.name}: destroy did not reach operation teardown "
+                        f"before the resolver was released ({subject.destroy_saw_release})"
+                    )
             else:
                 if hazard == "LH-3" and subject.name == "docker":
                     subject.monkeypatch.setenv("FAKE_DOCKER_EXEC_DELAY", "300")
