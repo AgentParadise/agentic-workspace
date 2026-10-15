@@ -36,7 +36,11 @@ from agentic_isolation.providers.base import (
 )
 from agentic_isolation.providers.docker import ContainerRemovalError, WorkspaceDockerProvider
 from agentic_isolation.providers.local import WorkspaceLocalProvider
-from agentic_isolation.providers.teardown_report import TeardownReport, TeardownUsage
+from agentic_isolation.providers.teardown_report import (
+    DeleteFallback,
+    TeardownReport,
+    TeardownUsage,
+)
 
 if TYPE_CHECKING:
     from agentic_isolation.providers.interactive_tmux import InteractiveTmuxProvider
@@ -64,6 +68,7 @@ __all__ = [
     # Base types
     "WorkspaceProvider",
     "SupportsStagedTeardown",
+    "DeleteFallback",
     "TeardownReport",
     "TeardownUsage",
     "SupportsWorkspaceLogs",

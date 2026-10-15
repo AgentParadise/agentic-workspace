@@ -19,3 +19,4 @@ Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D war
 `cargo test --workspace`, and the affected Python package tests before committing.
 
 - Never commit absolute home paths or real infrastructure hostnames. See [docs/PII-HYGIENE.md](docs/PII-HYGIENE.md).
+- Mutation evidence (do new tests kill the bug?) runs on a GitHub runner, not locally. See [docs/mutation-evidence.md](docs/mutation-evidence.md).
