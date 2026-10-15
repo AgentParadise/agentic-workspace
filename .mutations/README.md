@@ -9,7 +9,7 @@ Delete this directory in a final commit before merge (`mutations-not-merged`).
 Dispatch:
 
 ```
-gh workflow run mutation-evidence.yml --ref main -f pr=<PR> \
+gh workflow run mutation-evidence.yml --ref main -f pr=79 \
   -f tests="lib/python/agentic_isolation/tests/test_security_config.py::TestSecurityConfig::test_to_docker_run_args_includes_all_flags lib/python/agentic_isolation/tests/test_security_config.py::TestResolveRuntime::test_explicit_runc_never_probes_docker lib/python/agentic_isolation/tests/test_security_config.py::TestResolveRuntime::test_every_explicit_runtime_is_named_in_docker_run_args lib/python/agentic_isolation/tests/test_security_config.py::TestResolveRuntime::test_auto_on_runc_only_host_emits_runtime_runc lib/python/agentic_isolation/tests/test_security_config.py::TestResolveRuntime::test_auto_ignores_kata lib/python/agentic_isolation/tests/test_security_config.py::TestResolveRuntime::test_auto_with_runsc_alias_running_runc_is_runc lib/python/agentic_isolation/tests/test_docker_runtime.py::test_auto_on_runc_only_host_runs_runc lib/python/agentic_isolation/tests/test_docker_runtime.py::test_explicit_runc_runs_under_runc_and_is_recorded lib/python/agentic_isolation/tests/integration/test_docker_contract_conformance.py::test_container_runs_under_the_resolved_runtime"
 ```
 
