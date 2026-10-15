@@ -22,7 +22,8 @@ from agentic_isolation.providers.base import (
     UnsupportedLimitError,
     Workspace,
 )
-from agentic_isolation.providers.docker import NotARegularFileError, WorkspaceDockerProvider
+from agentic_isolation.providers.contained_files import NotARegularFileError
+from agentic_isolation.providers.docker import WorkspaceDockerProvider
 from agentic_isolation.providers.docker_operations import DockerOperations
 from tests.test_docker_operations import FAKE_DOCKER
 

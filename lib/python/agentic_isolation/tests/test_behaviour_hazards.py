@@ -69,7 +69,8 @@ from agentic_isolation.contract import (
     OperationStatus,
 )
 from agentic_isolation.providers.base import Workspace
-from agentic_isolation.providers.docker import NotARegularFileError, WorkspaceDockerProvider
+from agentic_isolation.providers.contained_files import NotARegularFileError
+from agentic_isolation.providers.docker import WorkspaceDockerProvider
 from agentic_isolation.providers.docker_operations import DockerOperations
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 from agentic_isolation.providers.local_operations import LocalOperations
