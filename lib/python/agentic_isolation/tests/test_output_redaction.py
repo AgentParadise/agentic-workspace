@@ -21,6 +21,7 @@ from agentic_isolation.contract import (
     OperationRef,
 )
 from agentic_isolation.providers.base import run_to_completion
+from agentic_isolation.providers.docker_operations import DockerOperations
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 from agentic_isolation.providers.operation_spool import REDACTED, OperationFailure, OperationSpool
 from tests.test_docker_operations import (
@@ -190,6 +191,50 @@ async def test_docker_pages_spool_and_channels_never_carry_the_canary(
     )
     assert stderr == b"[REDACTED][REDACTED] rep\n"
     assert data.count(REDACTED) == 5
+
+
+class _ByName:
+    """Resolves each invented ref to its own invented value."""
+
+    async def resolve(self, ref: CredentialRef) -> str:
+        return f"invented-{ref.name}-value-1927"
+
+
+@pytest.mark.parametrize("delivered", [False, True], ids=["binding", "delivered_env"])
+async def test_docker_registers_a_value_overwritten_by_a_repeated_target(
+    docker_env: Path,  # noqa: F811
+    delivered: bool,
+) -> None:
+    # The workload learns the overwritten value some other way; it was still
+    # resolved or delivered, so it is still registered.
+    ops = DockerOperations(
+        credentials=_ByName(),
+        retention_bytes=1 << 20,
+        max_page_bytes=1 << 16,
+        docker=str(docker_env / "docker"),
+    )
+    names = ("second",) if delivered else ("first", "second")
+    bindings = tuple(
+        CredentialBinding(
+            ref=CredentialRef(name=name, scope="test"), delivery="env", target="AW_TOKEN"
+        )
+        for name in names
+    )
+    ref = await ops.start(
+        _workspace(),
+        _spec(
+            "printf '%s\\n' invented-first-value-1927 \"$AW_TOKEN\"",
+            credential_bindings=bindings,
+        ),
+        separate_channels=True,
+        delivered_env={"AW_TOKEN": "invented-first-value-1927"} if delivered else None,
+    )
+    data = _data(await _pages(ops, ref))
+    stdout, _ = ops.channels(ref)
+    for observed in (data, stdout):
+        assert b"invented-first-value-1927" not in observed
+        assert b"invented-second-value-1927" not in observed
+    assert data == b"[REDACTED]\n[REDACTED]\n"
 
 
 async def test_docker_without_registered_values_stores_output_verbatim(

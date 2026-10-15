@@ -416,6 +416,10 @@ class DockerOperations:
         except CredentialPolicyError as e:
             raise OperationFailure(OperationError(kind="rejected_policy", message=str(e))) from e
         secrets = dict(delivered_env or {})
+        # Every value delivered or resolved, kept apart from `secrets`: two
+        # bindings may name one target, and the overwritten value must still
+        # be registered.
+        resolved = list(secrets.values())
         for binding in spec.credential_bindings:
             if binding.delivery != "env":
                 raise OperationFailure(
@@ -433,6 +437,7 @@ class DockerOperations:
                     )
                 )
             secrets[binding.target] = await self._credentials.resolve(binding.ref)
+            resolved.append(secrets[binding.target])
         self._sequence += 1
         ref = OperationRef(
             workspace=WorkspaceRef(provider="docker", resource_id=container),
@@ -444,7 +449,7 @@ class DockerOperations:
             spec=spec,
             container=container,
             spool=OperationSpool(
-                retention_bytes=self._retention, redact=(*redact, *secrets.values())
+                retention_bytes=self._retention, redact=(*redact, *resolved)
             ),
             started_at=_now(),
             key=key,
