@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py b/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py
+index 6167056..ab4dcdc 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py
+@@ -92,7 +92,7 @@ def _open_contained(root: Path, path: str, flags: int, *, create_parents: bool =
+ 
+ 
+ def _is_special(mode: int) -> bool:
+-    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
++    return stat.S_ISSOCK(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
+ 
+ 
+ def exists_contained(root: Path, path: str) -> tuple[bool, bool]:

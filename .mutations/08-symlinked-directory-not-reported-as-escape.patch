@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py b/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py
+index 6167056..7c911d6 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py
+@@ -64,8 +64,6 @@ def _open_contained(root: Path, path: str, flags: int, *, create_parents: bool =
+             try:
+                 stack.append(os.open(part, directory_flags, dir_fd=stack[-1]))
+             except OSError as e:
+-                if e.errno in (errno.ELOOP, errno.ENOTDIR):
+-                    raise escapes() from e
+                 raise
+         # Checked before the open so a device node is never opened at all, and
+         # again on the descriptor, which the workload cannot swap.
