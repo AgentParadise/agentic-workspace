@@ -14,6 +14,7 @@ Named tests: `lib/python/agentic_isolation/tests/test_output_redaction.py` and
 | 07 | Docker drops caller-registered values | `test_docker_pages_spool_and_channels_never_carry_the_canary`, live test |
 | 08 | Local drops resolved values | `test_local_final_output_never_carries_the_canary` |
 | 09 | Docker replay ignores the redaction policy | `test_docker_replay_is_bound_to_its_redaction_values` |
+| 10 | Refusal message spells the marker, echoing a value inside it (verify round 2) | `test_a_registration_replacement_could_leave_or_rebuild_is_refused[value-equals-marker]`, `[value-inside-marker]`, `[value-one-marker-byte]` |
 
 Rust mutations cannot run through this workflow (pytest node ids only); they
 were run locally and are recorded in the fix report. Delete `.mutations/`
