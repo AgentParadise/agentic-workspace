@@ -797,6 +797,44 @@ mod tests {
     }
 
     #[test]
+    fn pages_drained_before_any_eviction_carry_no_loss() {
+        let mut spool = OperationSpool::with_redaction(
+            NonZeroU64::new(64).unwrap(),
+            vec![b"invented-token".to_vec()],
+        )
+        .unwrap();
+        spool.append(b"invented-token tail-bytes and more");
+        spool.finish();
+        let whole = spool
+            .page(&operation(), OperationState::Succeeded, None, 4096)
+            .unwrap();
+        let envelope = serde_json::to_vec(&whole).unwrap().len() - whole.data_b64.as_str().len();
+        let bound = envelope + 8;
+        let (mut cursor, mut seen, mut pages) = (None, Vec::new(), 0);
+        loop {
+            let page = spool
+                .page(
+                    &operation(),
+                    OperationState::Succeeded,
+                    cursor.as_deref(),
+                    bound,
+                )
+                .unwrap();
+            pages += 1;
+            let wire: serde_json::Value = serde_json::to_value(&page).unwrap();
+            assert_eq!(wire.get("gap"), None, "page {pages}");
+            assert_eq!(wire.get("loss_detected"), None, "page {pages}");
+            seen.extend(decoded(&page));
+            cursor = Some(page.next_cursor.to_string());
+            if page.complete {
+                break;
+            }
+        }
+        assert!(pages >= 3, "{pages}");
+        assert_eq!(seen, b"[REDACTED] tail-bytes and more");
+    }
+
+    #[test]
     fn a_foreign_cursor_is_unknown_operation() {
         let spool = OperationSpool::new(NonZeroU64::new(8).unwrap());
         let other = OperationSpool::new(NonZeroU64::new(8).unwrap());
