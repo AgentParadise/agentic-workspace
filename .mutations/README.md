@@ -5,6 +5,7 @@ Delete this directory in a final commit before merge (`mutations-not-merged`).
 | Patch | Bug it restores | Killing tests |
 |---|---|---|
 | `01-omit-runtime-for-runc.patch` | `to_docker_run_args()` omits `--runtime` when the resolved runtime is runc | see node ids below |
+| `02-never-name-runtime.patch` | `to_docker_run_args()` never emits `--runtime` (still resolves, so resolution errors keep raising) | the gvisor, kata and sysbox parameters of `test_every_explicit_runtime_is_named_in_docker_run_args`, which patch 01 leaves passing by design |
 
 Dispatch:
 
