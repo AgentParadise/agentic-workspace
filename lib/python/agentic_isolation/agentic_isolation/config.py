@@ -629,9 +629,9 @@ class SecurityConfig:
                     raise AppArmorProfileNotLoadedError(name)
                 args.append(f"--security-opt=apparmor={name}")
 
-        resolved = self.resolve_runtime()
-        if resolved.effective is not WorkspaceRuntime.RUNC:
-            args.append(f"--runtime={resolved.alias}")
+        # Always named, runc included: the daemon's default-runtime need not be
+        # runc, and the container must run under what resolve_runtime() recorded.
+        args.append(f"--runtime={self.resolve_runtime().alias}")
 
         return args
 
