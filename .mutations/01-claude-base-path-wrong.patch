@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/credentials.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/credentials.py
+index 182ecb2..204142b 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/credentials.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/credentials.py
+@@ -24,7 +24,7 @@ class ClaudeApiKeyPresenter:
+     def present(self, wire: SecretStr, base_url: str) -> PresentedCredentials:
+         return PresentedCredentials(
+             env={
+-                "ANTHROPIC_BASE_URL": SecretStr(f"{base_url.rstrip('/')}/anthropic"),
++                "ANTHROPIC_BASE_URL": SecretStr(f"{base_url.rstrip('/')}/wrong"),
+                 "ANTHROPIC_API_KEY": wire,
+             }
+         )

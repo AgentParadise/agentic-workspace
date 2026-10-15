@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/codex/credentials.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/codex/credentials.py
+index e81e37e..ffd8925 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/codex/credentials.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/codex/credentials.py
+@@ -52,7 +52,7 @@ class CodexApiKeyPresenter:
+                 f"base_url = {provider_url}",
+                 'wire_api = "responses"',
+                 f'env_key = "{API_KEY_ENV}"',
+-                "supports_websockets = false",
++                "supports_websockets = true",
+                 "",
+             ]
+         )
