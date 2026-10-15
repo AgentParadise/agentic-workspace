@@ -15,7 +15,7 @@ use agentic_workspace_core::operations::{
     CredentialDelivery, CredentialResolver, EnforceableLimits, ErrorKind, FinalizationOutcome,
     FinalizationStage, FinalizationState, NonEmpty, ObservationDescriptor, ObservationIntegrity,
     ObservationPage, ObserveRequest, OperationError, OperationRef, OperationSpec, OperationSpool,
-    OperationState, OperationStatus, ProviderDescriptor, SecurityProfile, StatusSchema,
+    OperationState, OperationStatus, ProviderDescriptor, Redaction, SecurityProfile, StatusSchema,
     SupportsOperations, WorkspaceRef,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -274,6 +274,8 @@ struct Progress {
 struct Operation {
     reference: OperationRef,
     spec: OperationSpec,
+    /// The caller's registration; a same-key replay must register an equal set.
+    redaction: Redaction,
     container: String,
     started_at: String,
     progress: Mutex<Progress>,
@@ -281,10 +283,23 @@ struct Operation {
 }
 
 impl Progress {
+    /// Store `chunk`, copying to `channels` what the spool stored (redacted),
+    /// never the raw chunk.
     fn record(&mut self, chunk: &[u8], channel: Channel) {
-        self.spool.append(chunk);
+        let stored = self.spool.append_channel(chunk, channel as usize);
+        self.keep(&stored, channel as usize);
+    }
+
+    /// Store every tail the spool held back: the readers have reached EOF.
+    fn finish_output(&mut self) {
+        for (channel, stored) in self.spool.finish() {
+            self.keep(&stored, channel);
+        }
+    }
+
+    fn keep(&mut self, stored: &[u8], channel: usize) {
         if let Some(channels) = &mut self.channels {
-            channels[channel as usize].extend_from_slice(chunk);
+            channels[channel].extend_from_slice(stored);
         }
     }
 }
@@ -817,9 +832,19 @@ impl DockerOperations {
         &self,
         container: &str,
         spec: OperationSpec,
+        redaction: Redaction,
     ) -> Result<Arc<Operation>, OperationError> {
         let secrets = self.resolve(&spec).await?;
         let names: Vec<String> = secrets.iter().map(|(name, _)| name.clone()).collect();
+        // Every registered and resolved value is redacted from the output
+        // before it is stored.
+        let redact: Vec<Vec<u8>> = redaction
+            .values()
+            .map(<[u8]>::to_vec)
+            .chain(secrets.iter().map(|(_, v)| v.as_bytes().to_vec()))
+            .collect();
+        // Refused before anything is launched.
+        let spool = OperationSpool::with_redaction(self.retention, redact)?;
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let reference = OperationRef {
             workspace: WorkspaceRef {
@@ -858,7 +883,7 @@ impl DockerOperations {
             started_at: now_rfc3339(),
             progress: Mutex::new(Progress {
                 state: OperationState::Running,
-                spool: OperationSpool::new(self.retention),
+                spool,
                 channels: self.separate_channels.then(Default::default),
                 leader: None,
                 leader_known: false,
@@ -877,6 +902,7 @@ impl DockerOperations {
             }),
             changed: Notify::new(),
             spec,
+            redaction,
         });
         // A failed write means the client already died; `collect` settles it.
         let _ = stdin.write_all(preamble.as_bytes()).await;
@@ -946,6 +972,7 @@ async fn collect(docker: Docker, op: Arc<Operation>, mut child: tokio::process::
         });
     }
     op.update(|p| {
+        p.finish_output();
         p.leader_known = true;
         p.client_finished = true;
         p.client_code = code;
@@ -1051,6 +1078,16 @@ impl SupportsOperations for DockerOperations {
         workspace: &WorkspaceRef,
         spec: OperationSpec,
     ) -> Result<OperationRef, OperationError> {
+        self.start_redacted(workspace, spec, Redaction::default())
+            .await
+    }
+
+    async fn start_redacted(
+        &self,
+        workspace: &WorkspaceRef,
+        spec: OperationSpec,
+        redaction: Redaction,
+    ) -> Result<OperationRef, OperationError> {
         if workspace.provider.as_str() != "docker" {
             return Err(error(
                 ErrorKind::UnknownOperation,
@@ -1078,6 +1115,17 @@ impl SupportsOperations for DockerOperations {
                     Some(&existing.reference),
                 ));
             }
+            // A replay must not claim a registration the spool never had.
+            if existing.redaction != redaction {
+                return Err(error(
+                    ErrorKind::Conflict,
+                    format!(
+                        "operation_key {:?} already started with different redaction values",
+                        key.1
+                    ),
+                    Some(&existing.reference),
+                ));
+            }
             return Ok(existing.reference.clone());
         }
         // Checked under the key's lock: a finalize marks first, then waits
@@ -1090,7 +1138,7 @@ impl SupportsOperations for DockerOperations {
                 None,
             ));
         }
-        let operation = self.launch(&key.0, spec).await?;
+        let operation = self.launch(&key.0, spec, redaction).await?;
         let reference = operation.reference.clone();
         guard(&self.records).insert(key, operation);
         Ok(reference)
@@ -1273,6 +1321,7 @@ mod tests {
                 client_code: None,
             }),
             changed: Notify::new(),
+            redaction: Redaction::default(),
         }
     }
 
@@ -1302,6 +1351,31 @@ mod tests {
         let failure = output_failure(&op).expect("the stream error is reported");
         assert!(failure.contains("after 7 bytes: pipe broke"), "{failure}");
         assert!(failure.contains("not collected"), "{failure}");
+    }
+
+    #[tokio::test]
+    async fn a_resolved_value_never_reaches_the_spool_pages_or_channels() {
+        // Invented. Printed whole, split across two reads, and repeated.
+        const CANARY: &[u8] = b"canary-INVENTED-sk-7f3a";
+        let op = operation();
+        op.lock().spool = OperationSpool::with_redaction(
+            NonZeroU64::new(1 << 20).unwrap(),
+            vec![CANARY.to_vec()],
+        )
+        .unwrap();
+        let (head, tail) = CANARY.split_at(11);
+        let whole = [b"whole ", CANARY, b"\nsplit ", head].concat();
+        let rest = [tail, b"\n"].concat();
+        pump(&op, scripted(vec![Ok(&whole), Ok(&rest)]), Channel::Stdout).await;
+        let repeated = [CANARY, CANARY, b" end:", head].concat();
+        pump(&op, scripted(vec![Ok(&repeated)]), Channel::Stderr).await;
+        op.update(|p| p.finish_output());
+        let (stdout, stderr) = channels(&op);
+        assert_eq!(stdout, b"whole [REDACTED]\nsplit [REDACTED]\n");
+        assert_eq!(stderr, [b"[REDACTED][REDACTED] end:", head].concat());
+        let stored = collected(&op);
+        assert_eq!(stored, [stdout, stderr].concat());
+        assert!(!stored.windows(CANARY.len()).any(|w| w == CANARY));
     }
 
     #[tokio::test]

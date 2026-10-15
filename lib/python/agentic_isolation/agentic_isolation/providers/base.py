@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -464,8 +464,18 @@ class SupportsOperations(Protocol):
         """What this provider can enforce, published before any launch."""
         ...
 
-    async def start(self, workspace: Workspace, spec: OperationSpec) -> OperationRef:
+    async def start(
+        self, workspace: Workspace, spec: OperationSpec, *, redact: Collection[str] = ()
+    ) -> OperationRef:
         """Accept `spec` and return without waiting for it to end.
+
+        `redact` registers credential values the workload might print. The
+        provider replaces each with `[REDACTED]` before its output is stored,
+        so no page, spool or final output carries them; the values it resolves
+        from `spec.credential_bindings` are registered for it. None registered
+        means output is stored exactly as printed. A replay of the same key
+        must register the same set of values (order and empty values do not
+        matter); a different set raises `conflict`, naming no value.
 
         The same `(workspace, operation_key)` with an equal spec returns the
         original ref and launches nothing, however many callers race. The
@@ -505,14 +515,25 @@ async def run_to_completion(
     provider: SupportsOperations,
     workspace: Workspace,
     spec: OperationSpec,
+    *,
+    redact: Collection[str] = (),
 ) -> tuple[OperationStatus, bytes]:
     """Start `spec`, drain its output and return the terminal status and bytes.
 
     The bytes are the operation's observation stream: everything the workload
-    wrote to stdout and stderr, in arrival order, with no channel identity.
-    Callers that must parse stdout alone use `WorkspaceProvider.execute`.
+    wrote to stdout and stderr, in arrival order, with no channel identity,
+    and with every `redact` value replaced (see `SupportsOperations.start`).
+    A redacting spool may release a held tail after later bytes from the
+    other channel. Callers that must parse stdout alone use
+    `WorkspaceProvider.execute`. With no `redact` values the provider is
+    called exactly as before the option existed, so a provider whose `start`
+    predates it keeps working.
     """
-    return await drain_operation(provider, await provider.start(workspace, spec))
+    if redact:
+        ref = await provider.start(workspace, spec, redact=redact)
+    else:
+        ref = await provider.start(workspace, spec)
+    return await drain_operation(provider, ref)
 
 
 async def drain_operation(

@@ -165,7 +165,7 @@ non-root user with no Docker daemon. First miss per cell:
 | LH-3 | `hazard-cancel-before-launch-header` | FAIL step 1 `cancel`: not settled within 30 s | NOT RUN: `given launch_header_not_seen` cannot be set up | PASS `[0, 0, 0]` (was FAIL step 1 `cancel`, a stand-in artefact; below) |
 | LH-4 | `hazard-destroy-during-start` | FAIL step 0 `start`: returned an operation ref | PASS | FAIL step 0 `start`: returned a ref (`operation_key` the fixture's) |
 | LH-5 | `hazard-stuck-removal-timeout-settles` | PASS, step 1 matched `provider_unavailable` (1) | NOT RUN: `given backend_stuck_removing` cannot be set up | FAIL step 1 `observe`: not settled within 120 s |
-| LH-6 | `hazard-drain-with-gap-reports-loss` | PASS | PASS | FAIL step 2 `observe`: `state=succeeded complete=false gap={lost_bytes:8}`, no `loss_detected` |
+| LH-6 | `hazard-drain-with-gap-reports-loss` | PASS | PASS | PASS `[0, 0, 0, 0]` (was FAIL step 2 `observe`, no `loss_detected`; below) |
 | LH-7 | `hazard-fifo-in-workspace` | NOT RUN here (no daemon); pinned FAIL step 2 `file_exists`: `exists=false` (real daemon, CI) | PASS | FAIL step 2 `file_exists`: not settled within 10 s |
 
 Python LH-4 drives each provider's public `destroy` (for Docker, only the
@@ -195,10 +195,6 @@ Findings (each left to a follow-up):
 - Docker LH-4: a `start` blocked in credential resolution, raced by
   the public `destroy`, still returns a ref (step 0 matched neither
   `resource_lost` nor `cancelled`).
-- Rust Docker LH-6: the gap is reported correctly (`lost_bytes: 8`), but no
-  page carries the 0.2.1 `loss_detected` marker. (Python Docker and Local
-  share `OperationSpool`, which carries a crossed gap in its cursors, so
-  every page from the gap on carries `loss_detected`.)
 - Rust Docker LH-3 is no longer a finding. It was recorded as
   `provider_unavailable` after about 9 s with the late workload measured
   alive. That workload was the stand-in's: its held-back `exec` slept before
@@ -209,6 +205,9 @@ Findings (each left to a follow-up):
   again, the cancel confirms `cancelled` and the cell passes, matching
   alternative 0 at every step. `hazards::a_late_exec_into_a_stopped_container_is_refused`
   pins the stand-in behaviour.
+- Rust Docker LH-6 is no longer a finding. The Rust spool now carries a
+  crossed gap in its cursors (the `:lossy` suffix the Python spool uses), so
+  the gap page and every later page carry `loss_detected`.
 - Rust Docker LH-4: `start` blocked in credential resolution, while the
   container is lost and `finalize` runs, returns a ref and launches once
   (fixture: `resource_lost` or `cancelled`, 0 launches).

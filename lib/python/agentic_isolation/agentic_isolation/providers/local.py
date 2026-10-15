@@ -15,7 +15,7 @@ import stat
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection
 from pathlib import Path
 
 from agentic_isolation.config import WorkspaceConfig
@@ -150,10 +150,12 @@ class WorkspaceLocalProvider(BaseProvider):
         """What this provider can enforce: little, and it says so."""
         return self._operations.describe()
 
-    async def start(self, workspace: Workspace, spec: OperationSpec) -> OperationRef:
+    async def start(
+        self, workspace: Workspace, spec: OperationSpec, *, redact: Collection[str] = ()
+    ) -> OperationRef:
         """Start `spec` as a host process in the workspace directory."""
         return await self._operations.start(
-            workspace, spec, base_env=self._build_exec_env(workspace)
+            workspace, spec, base_env=self._build_exec_env(workspace), redact=redact
         )
 
     async def status(self, ref: OperationRef) -> OperationStatus:
