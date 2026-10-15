@@ -29,6 +29,15 @@ static GENERATIONS: AtomicU64 = AtomicU64::new(0);
 /// What a registered value is replaced with.
 pub const REDACTED: &[u8] = b"[REDACTED]";
 
+/// Whether an inserted [`REDACTED`] could leave or rebuild `value`. An
+/// occurrence that overlaps a marker either lies inside it or crosses one of
+/// its ends, so it holds the marker's first or last byte. A value with
+/// neither, and not inside the marker, can only come from workload bytes.
+fn overlaps_marker(value: &[u8]) -> bool {
+    let ends = [REDACTED[0], REDACTED[REDACTED.len() - 1]];
+    REDACTED.windows(value.len()).any(|w| w == value) || value.iter().any(|b| ends.contains(b))
+}
+
 /// Replaces registered values in a byte stream, whatever its chunking: at
 /// each position the longest value that matches is replaced, and a position
 /// the stream has not yet decided is held until it is.
@@ -46,11 +55,26 @@ impl std::fmt::Debug for Redactor {
 }
 
 impl Redactor {
-    fn new(values: impl IntoIterator<Item = Vec<u8>>) -> Self {
+    /// Refuses a registration that replacement could leave in, or build
+    /// into, stored or channel bytes. The error never names the value.
+    fn new(values: impl IntoIterator<Item = Vec<u8>>) -> Result<Self, OperationError> {
         let mut values: Vec<Vec<u8>> = values.into_iter().filter(|v| !v.is_empty()).collect();
+        if values.iter().any(|v| overlaps_marker(v)) {
+            let marker = String::from_utf8_lossy(REDACTED);
+            return Err(OperationError::new(
+                ErrorKind::RejectedPolicy,
+                format!(
+                    "a registered redaction value lies inside {marker:?} or holds {:?} or {:?}; \
+                     replacement could leave or rebuild it, so it cannot be redacted",
+                    char::from(REDACTED[0]),
+                    char::from(REDACTED[REDACTED.len() - 1]),
+                ),
+                None,
+            ));
+        }
         values.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
         values.dedup();
-        Self { values }
+        Ok(Self { values })
     }
 
     /// `(released, held)`: redacted bytes safe to store, and the raw tail
@@ -84,7 +108,6 @@ impl Redactor {
 /// Output retained up to `retention_bytes`, read in pages no larger than the
 /// caller's bound once serialised. A cursor older than retention resumes at
 /// the oldest retained byte and reports the evicted count as an exact gap.
-#[derive(Debug)]
 pub struct OperationSpool {
     retention: usize,
     generation: String,
@@ -99,15 +122,45 @@ pub struct OperationSpool {
     merged_held: Vec<u8>,
 }
 
+impl std::fmt::Debug for OperationSpool {
+    // Lengths only: retained and held bytes can hold a value still undecided.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationSpool")
+            .field("retention", &self.retention)
+            .field("generation", &self.generation)
+            .field("base", &self.base)
+            .field("retained_len", &self.retained.len())
+            .field("redactor", &self.redactor)
+            .field(
+                "held_lens",
+                &self
+                    .held
+                    .iter()
+                    .map(|(c, h)| (c, h.len()))
+                    .collect::<Vec<_>>(),
+            )
+            .field("merged_held_len", &self.merged_held.len())
+            .finish()
+    }
+}
+
 impl OperationSpool {
     /// A spool that stores output exactly as appended.
     pub fn new(retention_bytes: NonZeroU64) -> Self {
-        Self::with_redaction(retention_bytes, Vec::new())
+        Self::assemble(retention_bytes, Redactor::default())
     }
 
     /// A spool that replaces every one of `values` with [`REDACTED`] before
     /// storing. No values is [`OperationSpool::new`]; empty values are ignored.
-    pub fn with_redaction(retention_bytes: NonZeroU64, values: Vec<Vec<u8>>) -> Self {
+    /// A value the marker could leave or rebuild is `rejected_policy`.
+    pub fn with_redaction(
+        retention_bytes: NonZeroU64,
+        values: Vec<Vec<u8>>,
+    ) -> Result<Self, OperationError> {
+        Ok(Self::assemble(retention_bytes, Redactor::new(values)?))
+    }
+
+    fn assemble(retention_bytes: NonZeroU64, redactor: Redactor) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -118,7 +171,7 @@ impl OperationSpool {
             generation: format!("{nanos:x}{:x}{sequence:x}", std::process::id()),
             retained: VecDeque::new(),
             base: 0,
-            redactor: Redactor::new(values),
+            redactor,
             held: BTreeMap::new(),
             merged_held: Vec::new(),
         }
@@ -494,7 +547,8 @@ mod tests {
                 let mut spool = OperationSpool::with_redaction(
                     NonZeroU64::new(1 << 20).unwrap(),
                     values.clone(),
-                );
+                )
+                .unwrap();
                 for chunk in &chunks {
                     spool.append(chunk);
                 }
@@ -546,7 +600,8 @@ mod tests {
                 let mut spool = OperationSpool::with_redaction(
                     NonZeroU64::new(1 << 20).unwrap(),
                     values.clone(),
-                );
+                )
+                .unwrap();
                 let mut copies: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
                 for (channel, chunk) in &appends {
                     let released = spool.append_channel(chunk, *channel);
@@ -579,7 +634,8 @@ mod tests {
         let mut spool = OperationSpool::with_redaction(
             NonZeroU64::new(1 << 20).unwrap(),
             vec![CANARY.to_vec()],
-        );
+        )
+        .unwrap();
         spool.append(&[b"out:", &CANARY[..9]].concat());
         spool.append_channel(b"err line\n", 1);
         spool.append(&[&CANARY[9..], b"\n"].concat());
@@ -592,7 +648,8 @@ mod tests {
         let mut spool = OperationSpool::with_redaction(
             NonZeroU64::new(1 << 20).unwrap(),
             vec![CANARY.to_vec()],
-        );
+        )
+        .unwrap();
         spool.append(&[b"ok ", &CANARY[..5]].concat());
         assert_eq!(spool.end(), 3);
         let first = spool
@@ -613,9 +670,55 @@ mod tests {
     }
 
     #[test]
+    fn debug_never_shows_held_or_stored_bytes_in_any_encoding() {
+        // The shorter value is complete but held: a longer one may follow.
+        let short = b"canary-INVENTED-short";
+        let mut spool = OperationSpool::with_redaction(
+            NonZeroU64::new(1000).unwrap(),
+            vec![short.to_vec(), [short.as_slice(), b"-longer"].concat()],
+        )
+        .unwrap();
+        spool.append(b"stored ");
+        spool.append_channel(short, 1);
+        assert_eq!(spool.end(), 7);
+        let debug = format!("{spool:?}");
+        for shown in [format!("{short:?}"), format!("{:?}", b"stored ")] {
+            let numbers = shown.trim_matches(['[', ']']);
+            assert!(!debug.contains(numbers), "{debug}");
+        }
+        assert!(!debug.contains("canary"), "{debug}");
+    }
+
+    #[test]
+    fn a_registration_the_marker_could_leave_or_rebuild_is_refused() {
+        let fixtures: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        for case in fixtures["refused_registrations"].as_array().unwrap() {
+            let values: Vec<&str> = case["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            let error = OperationSpool::with_redaction(
+                NonZeroU64::new(64).unwrap(),
+                values.iter().map(|v| v.as_bytes().to_vec()).collect(),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::RejectedPolicy, "{}", case["name"]);
+            for value in values {
+                // A value inside the marker is in any message naming it.
+                if !REDACTED.windows(value.len()).any(|w| w == value.as_bytes()) {
+                    assert!(!error.message.as_str().contains(value), "{}", case["name"]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn retention_and_gaps_count_stored_bytes() {
         let mut spool =
-            OperationSpool::with_redaction(NonZeroU64::new(12).unwrap(), vec![CANARY.to_vec()]);
+            OperationSpool::with_redaction(NonZeroU64::new(12).unwrap(), vec![CANARY.to_vec()])
+                .unwrap();
         spool.append(&[CANARY, b" tail-bytes"].concat());
         spool.finish();
         let stored = b"[REDACTED] tail-bytes";

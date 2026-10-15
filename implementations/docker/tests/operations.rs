@@ -938,6 +938,29 @@ async fn two_channels_never_form_a_registered_value_in_storage() {
 }
 
 #[tokio::test]
+async fn a_value_the_marker_could_rebuild_is_refused_before_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops = ops(dir.path(), 1 << 20, 1 << 16);
+    let launched = dir.path().join("launched");
+    let script = format!("printf x > '{}'", launched.display());
+    let values = ["invented-token", "prefix[REDACTED]suffix"];
+    let error = ops
+        .start_redacted(
+            &workspace(),
+            spec("k1", &script, 60),
+            Redaction::new(values),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::RejectedPolicy, "{error:?}");
+    for value in values {
+        assert!(!format!("{error:?}").contains(value), "{error:?}");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!launched.exists());
+}
+
+#[tokio::test]
 async fn a_replay_must_register_the_same_redaction_values() {
     let dir = tempfile::tempdir().unwrap();
     let ops = ops(dir.path(), 1 << 20, 1 << 16);

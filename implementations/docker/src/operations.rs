@@ -843,6 +843,8 @@ impl DockerOperations {
             .map(<[u8]>::to_vec)
             .chain(secrets.iter().map(|(_, v)| v.as_bytes().to_vec()))
             .collect();
+        // Refused before anything is launched.
+        let spool = OperationSpool::with_redaction(self.retention, redact)?;
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let reference = OperationRef {
             workspace: WorkspaceRef {
@@ -881,7 +883,7 @@ impl DockerOperations {
             started_at: now_rfc3339(),
             progress: Mutex::new(Progress {
                 state: OperationState::Running,
-                spool: OperationSpool::with_redaction(self.retention, redact),
+                spool,
                 channels: self.separate_channels.then(Default::default),
                 leader: None,
                 leader_known: false,
@@ -1359,7 +1361,8 @@ mod tests {
         op.lock().spool = OperationSpool::with_redaction(
             NonZeroU64::new(1 << 20).unwrap(),
             vec![CANARY.to_vec()],
-        );
+        )
+        .unwrap();
         let (head, tail) = CANARY.split_at(11);
         let whole = [b"whole ", CANARY, b"\nsplit ", head].concat();
         let rest = [tail, b"\n"].concat();
