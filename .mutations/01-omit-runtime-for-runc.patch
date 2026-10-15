@@ -1,0 +1,17 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/config.py b/lib/python/agentic_isolation/agentic_isolation/config.py
+index bd5ab04..207c206 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/config.py
++++ b/lib/python/agentic_isolation/agentic_isolation/config.py
+@@ -629,9 +629,9 @@ class SecurityConfig:
+                     raise AppArmorProfileNotLoadedError(name)
+                 args.append(f"--security-opt=apparmor={name}")
+ 
+-        # Always named, runc included: the daemon's default-runtime need not be
+-        # runc, and the container must run under what resolve_runtime() recorded.
+-        args.append(f"--runtime={self.resolve_runtime().alias}")
++        resolved = self.resolve_runtime()
++        if resolved.effective is not WorkspaceRuntime.RUNC:
++            args.append(f"--runtime={resolved.alias}")
+ 
+         return args
+ 

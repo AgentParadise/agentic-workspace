@@ -96,7 +96,7 @@ class WorkspaceDockerProvider(BaseProvider):
     - --read-only: Immutable root filesystem
     - --tmpfs: Writable /tmp and /home/agent in memory
     - --pids-limit: Process count limit
-    - --runtime=runsc: gVisor sandbox (if available)
+    - --runtime=<alias>: the resolved runtime, always named (gVisor if available)
 
     Usage:
         provider = WorkspaceDockerProvider()

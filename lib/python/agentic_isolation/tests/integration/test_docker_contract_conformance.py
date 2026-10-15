@@ -15,6 +15,7 @@ import asyncio
 import os
 import sys
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -23,6 +24,7 @@ from agentic_isolation import (
     SecurityConfig,
     WorkspaceConfig,
     WorkspaceDockerProvider,
+    WorkspaceRuntime,
 )
 from agentic_isolation.contract import CredentialBinding, CredentialRef
 
@@ -121,3 +123,42 @@ async def test_unenforceable_disk_limit_is_refused_against_a_real_daemon() -> No
         await provider.create(
             WorkspaceConfig(provider="docker", image=IMAGE, limits=ResourceLimits(disk="1g"))
         )
+
+
+@pytest.mark.parametrize("runtime", [WorkspaceRuntime.RUNC, None], ids=["runc", "auto"])
+async def test_container_runs_under_the_resolved_runtime(
+    monkeypatch: pytest.MonkeyPatch, runtime: WorkspaceRuntime | None
+) -> None:
+    # A daemon whose default-runtime is runc reports Runtime "runc" whether or
+    # not --runtime was passed, so the docker run argv is checked as well.
+    real_spawn = asyncio.create_subprocess_exec
+    argvs: list[list[str]] = []
+
+    async def recording_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        argvs.append([str(arg) for arg in args])
+        return await real_spawn(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording_spawn)
+    security = replace(SecurityConfig.development(), runtime=runtime)
+    resolved = security.resolve_runtime()
+    provider = WorkspaceDockerProvider(default_image=IMAGE, security=security)
+    workspace = await provider.create(WorkspaceConfig(provider="docker", image=IMAGE))
+    try:
+        inspect = await real_spawn(
+            "docker",
+            "inspect",
+            "--format",
+            "{{.HostConfig.Runtime}}",
+            workspace.metadata["container_id"],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await inspect.communicate()
+    finally:
+        await provider.destroy(workspace)
+
+    assert inspect.returncode == 0, stderr.decode(errors="replace")
+    assert stdout.decode().strip() == resolved.alias
+    assert workspace.metadata["runtime_alias"] == resolved.alias
+    (run,) = [argv for argv in argvs if argv[:3] == ["docker", "run", "-d"]]
+    assert f"--runtime={resolved.alias}" in run

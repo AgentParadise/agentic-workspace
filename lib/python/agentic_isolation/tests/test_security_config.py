@@ -62,8 +62,8 @@ class TestSecurityConfig:
         assert "--tmpfs=/tmp:rw,noexec,nosuid,size=256m" in args
         assert "--tmpfs=/home/agent:rw,exec,nosuid,size=128m,uid=1000,gid=1000" in args
         assert "--pids-limit=256" in args
-        # runc is Docker's default, so no runtime flag
-        assert not any(arg.startswith("--runtime") for arg in args)
+        # Named even for runc: the daemon's default-runtime need not be runc.
+        assert [arg for arg in args if arg.startswith("--runtime")] == ["--runtime=runc"]
 
     def test_to_docker_run_args_respects_disabled_features(self) -> None:
         """Disabled features should not appear in docker args."""
@@ -260,18 +260,36 @@ class TestResolveRuntime:
         queries = docker_host({**RUNC, **RUNSC})
         config = SecurityConfig(runtime=WorkspaceRuntime.RUNC)
 
-        assert _runtime_args(config.to_docker_run_args()) == []
+        assert _runtime_args(config.to_docker_run_args()) == ["--runtime=runc"]
         assert queries == []
+
+    @pytest.mark.parametrize("runtime", list(WorkspaceRuntime))
+    def test_every_explicit_runtime_is_named_in_docker_run_args(
+        self, docker_host: Callable[[Mapping[str, object]], list[str]], runtime: WorkspaceRuntime
+    ) -> None:
+        # One host with every runtime registered, so only the request decides.
+        # A new WorkspaceRuntime fails here until it is given its alias.
+        alias = {
+            WorkspaceRuntime.RUNC: "runc",
+            WorkspaceRuntime.GVISOR: "runsc",
+            WorkspaceRuntime.KATA: "kata",
+            WorkspaceRuntime.SYSBOX: "sysbox-runc",
+        }[runtime]
+        docker_host({**RUNC, **RUNSC, **KATA, "sysbox-runc": {"path": "/usr/bin/sysbox-runc"}})
+        config = SecurityConfig(runtime=runtime)
+
+        assert _runtime_args(config.to_docker_run_args()) == [f"--runtime={alias}"]
+        assert config.resolve_runtime().alias == alias
 
     # Regression guards: auto mode is today's default and passed before AW-1 too.
 
-    def test_auto_on_runc_only_host_emits_no_runtime(
+    def test_auto_on_runc_only_host_emits_runtime_runc(
         self, docker_host: Callable[[Mapping[str, object]], list[str]]
     ) -> None:
         docker_host(RUNC)
         config = SecurityConfig()
 
-        assert _runtime_args(config.to_docker_run_args()) == []
+        assert _runtime_args(config.to_docker_run_args()) == ["--runtime=runc"]
         resolved = config.resolve_runtime()
         assert resolved.requested is None
         assert resolved.effective is WorkspaceRuntime.RUNC
@@ -292,7 +310,7 @@ class TestResolveRuntime:
     ) -> None:
         docker_host({**RUNC, **KATA})
 
-        assert _runtime_args(SecurityConfig().to_docker_run_args()) == []
+        assert _runtime_args(SecurityConfig().to_docker_run_args()) == ["--runtime=runc"]
 
     def test_auto_with_runtime_type_only_runsc_uses_runsc(
         self, docker_host: Callable[[Mapping[str, object]], list[str]]
@@ -315,6 +333,8 @@ class TestResolveRuntime:
         docker_host({**RUNC, "runsc": {"path": "/usr/bin/runc"}})
 
         assert SecurityConfig().resolve_runtime().effective is WorkspaceRuntime.RUNC
+        # The builtin runc, not the misleading "runsc" alias.
+        assert _runtime_args(SecurityConfig().to_docker_run_args()) == ["--runtime=runc"]
 
     def test_auto_without_docker_cli_is_runc(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(SecurityConfig, "_docker_runtimes", None)
