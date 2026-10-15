@@ -1,0 +1,30 @@
+{
+  "marker": "[REDACTED]",
+  "cases": [
+    {"name": "no-values-stores-verbatim", "values": [], "output": "tok=canary-INVENTED-sk-0000\n", "stored": "tok=canary-INVENTED-sk-0000\n"},
+    {"name": "whole-value", "values": ["canary-INVENTED-sk-0000"], "output": "tok=canary-INVENTED-sk-0000\n", "stored": "tok=[REDACTED]\n"},
+    {"name": "repeated-and-adjacent", "values": ["canary-INVENTED-sk-0000"], "output": "a canary-INVENTED-sk-0000canary-INVENTED-sk-0000 b canary-INVENTED-sk-0000", "stored": "a [REDACTED][REDACTED] b [REDACTED]"},
+    {"name": "value-at-end-of-stream", "values": ["canary-INVENTED-sk-0000"], "output": "end:canary-INVENTED-sk-0000", "stored": "end:[REDACTED]"},
+    {"name": "unfinished-prefix-at-end-is-kept", "values": ["canary-INVENTED-sk-0000"], "output": "almost canary-INVENTED-sk-000", "stored": "almost canary-INVENTED-sk-000"},
+    {"name": "self-overlapping-value", "values": ["aXaXb-INVENTED"], "output": "aXaXaXb-INVENTED.", "stored": "aX[REDACTED]."},
+    {"name": "longest-value-wins-at-a-position", "values": ["inv-key", "inv-key-LONGER-0001"], "output": "x=inv-key-LONGER-0001 y=inv-key z=inv-key-LONG", "stored": "x=[REDACTED] y=[REDACTED] z=[REDACTED]-LONG"},
+    {"name": "value-inside-another", "values": ["INVENTED", "sk-INVENTED-tail"], "output": "sk-INVENTED-tail INVENTED", "stored": "[REDACTED] [REDACTED]"},
+    {"name": "two-values-back-to-back", "values": ["canary-ONE-INVENTED", "canary-TWO-INVENTED"], "output": "canary-ONE-INVENTEDcanary-TWO-INVENTED\n", "stored": "[REDACTED][REDACTED]\n"},
+    {"name": "multibyte-value", "values": ["sécret-☃-INVENTED"], "output": "v=sécret-☃-INVENTED;", "stored": "v=[REDACTED];"}
+  ],
+  "channel_cases": [
+    {"name": "two-channels-each-hold-half-at-eof", "values": ["canary-INVENTED-canary-INVENTED-"], "appends": [[0, "canary-INVENTED-"], [1, "canary-INVENTED-"]], "stored": "[REDACTED]"},
+    {"name": "split-on-one-channel-around-another", "values": ["canary-INVENTED-sk-1"], "appends": [[0, "out:canary-I"], [1, "err\n"], [0, "NVENTED-sk-1\n"]], "stored": "out:err\n[REDACTED]\n"},
+    {"name": "held-tail-released-after-another-channel", "values": ["sk-INVENTED-9"], "appends": [[0, "a sk-INV"], [1, "ENTED-9 b\n"], [0, "\n"]], "stored": "a ENTED-9 b\nsk-INV\n"},
+    {"name": "no-values-interleaves-verbatim", "values": [], "appends": [[0, "canary-INVENTED-"], [1, "canary-INVENTED-"]], "stored": "canary-INVENTED-canary-INVENTED-"}
+  ],
+  "refused_registrations": [
+    {"name": "value-equals-marker", "values": ["[REDACTED]"]},
+    {"name": "value-inside-marker", "values": ["REDACTED"]},
+    {"name": "value-one-marker-byte", "values": ["E"]},
+    {"name": "value-contains-marker", "values": ["invented-token", "prefix[REDACTED]suffix"]},
+    {"name": "value-crosses-marker-end", "values": ["invented-token", "D]suffix"]},
+    {"name": "value-crosses-marker-start", "values": ["prefix[RE"]},
+    {"name": "one-bad-value-refuses-the-set", "values": ["canary-INVENTED-sk-7f3a", "canary-INVENTED-]"]}
+  ]
+}

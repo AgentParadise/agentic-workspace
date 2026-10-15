@@ -10,12 +10,25 @@ A cursor is `<generation>:<offset>`, suffixed `:lossy` once the drain that
 holds it has crossed a retention gap. The generation is fresh per spool, so a
 cursor from another operation is recognised as foreign rather than read as an
 offset into the wrong stream. Consumers treat cursors as opaque.
+
+Credential values registered at construction never reach storage: each
+channel is scanned before its bytes are stored, every occurrence is replaced
+by `REDACTED`, and a channel's tail that could still be the start of a value
+is held back until the next append or `finish` decides it. The merged stream
+the channels interleave into is scanned again before storing, since two
+channels' fragments can meet there. Offsets, `end`,
+retention and `gap.lost_bytes` all count stored (redacted) bytes, so cursors
+stay consistent whatever the marker's length. The rule is the same as the
+Rust spool's, checked against `tests/fixtures/output_redaction/cases.json`.
 """
 
 from __future__ import annotations
 
 import base64
+import hmac
+import secrets
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 
 from agentic_isolation.contract import (
@@ -45,10 +58,122 @@ class _Position:
     lossy: bool = False
 
 
-class OperationSpool:
-    """Append-only bytes with bounded retention and opaque, generation-tagged cursors."""
+REDACTED = b"[REDACTED]"
 
-    def __init__(self, *, retention_bytes: int) -> None:
+
+def _overlaps_marker(value: bytes) -> bool:
+    """Whether an inserted `REDACTED` could leave or rebuild `value`.
+
+    An occurrence that overlaps a marker either lies inside it or crosses one
+    of its ends, so it holds the marker's first or last byte. A value with
+    neither, and not inside the marker, can only come from workload bytes.
+    """
+    return value in REDACTED or REDACTED[:1] in value or REDACTED[-1:] in value
+
+
+def check_redaction(values: Collection[str | bytes]) -> None:
+    """Refuse a registration that replacement could leave in, or build into,
+    stored or channel bytes. The error never names the value."""
+    encoded = (v.encode() if isinstance(v, str) else bytes(v) for v in values)
+    if any(_overlaps_marker(v) for v in encoded if v):
+        raise OperationFailure(
+            OperationError(
+                kind="rejected_policy",
+                # Lowercase and never spelling the marker: a value refused
+                # for lying inside the marker would otherwise be echoed here.
+                message=(
+                    "a registered redaction value overlaps the redaction marker; "
+                    "replacement could leave or rebuild it, so it cannot be redacted"
+                ),
+            )
+        )
+
+
+# Keys `redaction_policy`, so a fingerprint means nothing outside this process.
+_POLICY_KEY = secrets.token_bytes(32)
+
+
+def redaction_policy(values: Collection[str | bytes]) -> bytes:
+    """An opaque fingerprint of a registration, never the values themselves.
+
+    Equal for equal sets of non-empty values in any order, which is how
+    `OutputRedactor` treats them. A replayed start compares it with the
+    original's: a key cannot be replayed under a different registration.
+    """
+    encoded = sorted({v.encode() if isinstance(v, str) else bytes(v) for v in values} - {b""})
+    mac = hmac.new(_POLICY_KEY, digestmod="sha256")
+    for value in encoded:
+        mac.update(len(value).to_bytes(8, "big"))
+        mac.update(value)
+    return mac.digest()
+
+
+class OutputRedactor:
+    """Replaces registered values in a byte stream, whatever its chunking.
+
+    The output is a function of the whole stream: at each position the
+    longest registered value that matches is replaced, and a position whose
+    match the stream has not yet decided is held until it is.
+    """
+
+    def __init__(self, values: Collection[str | bytes]) -> None:
+        check_redaction(values)
+        encoded = {v.encode() if isinstance(v, str) else bytes(v) for v in values}
+        # An empty value hides nothing; longest first so it wins at a position.
+        self._values = sorted((v for v in encoded if v), key=len, reverse=True)
+
+    def __bool__(self) -> bool:
+        return bool(self._values)
+
+    def __repr__(self) -> str:
+        # Never the values themselves.
+        return f"OutputRedactor({len(self._values)} values)"
+
+    def scan(self, data: bytes, *, final: bool) -> tuple[bytes, bytes]:
+        """`(released, held)`: redacted bytes safe to store, and the raw tail
+        still undecided. `final` decides everything, so nothing is held."""
+        out = bytearray()
+        i = 0
+        while True:
+            at, value = self._next(data, i, final)
+            if at < 0:
+                out += data[i:]
+                return bytes(out), b""
+            out += data[i:at]
+            if value is None:
+                return bytes(out), data[at:]
+            out += REDACTED
+            i = at + len(value)
+
+    def _next(self, data: bytes, start: int, final: bool) -> tuple[int, bytes | None]:
+        """The first position from `start` holding a whole value (and the
+        longest such value), or undecided (`None`), or `-1` for neither."""
+        best, found = -1, None
+        for value in self._values:
+            at = data.find(value, start)
+            if at >= 0 and (best < 0 or at < best):
+                best, found = at, value
+        if final:
+            return best, found
+        n = len(data)
+        last = n if best < 0 else best + 1
+        for at in range(max(start, n - len(self._values[0]) + 1), last):
+            tail = data[at:]
+            # Undecided: a value longer than what is left could still start
+            # here (at `best`, longer than the whole value found there).
+            if any(len(v) > len(tail) and v.startswith(tail) for v in self._values):
+                return at, None
+        return best, found
+
+
+class OperationSpool:
+    """Append-only bytes with bounded retention and opaque, generation-tagged cursors.
+
+    `redact` registers credential values that must never be stored or paged;
+    with none registered the spool stores output exactly as appended.
+    """
+
+    def __init__(self, *, retention_bytes: int, redact: Collection[str | bytes] = ()) -> None:
         if retention_bytes < 1:
             raise ValueError("retention_bytes must be at least 1")
         self._retention = retention_bytes
@@ -56,14 +181,53 @@ class OperationSpool:
         self._retained = bytearray()
         # Absolute offset of the first retained byte; everything before it was evicted.
         self._base = 0
+        self._redactor = OutputRedactor(redact)
+        # Per channel: raw bytes not yet stored because they may begin a value.
+        self._held: dict[int, bytes] = {}
+        # Channel-redacted bytes not yet stored because, merged with another
+        # channel's next bytes, they may begin a value.
+        self._merged_held = b""
 
     @property
     def end(self) -> int:
         """Absolute offset one past the last byte ever appended."""
         return self._base + len(self._retained)
 
-    def append(self, data: bytes) -> None:
-        """Append collector output, evicting the oldest bytes beyond retention."""
+    def append(self, data: bytes, *, channel: int = 0) -> bytes:
+        """Append collector output read from `channel`; return that channel's
+        redacted bytes, for a caller that keeps its own per-channel copy.
+
+        Each channel is redacted on its own, then the merged stream is
+        redacted again before storing, so neither copy holds a value.
+        """
+        if not self._redactor:
+            self._store(data)
+            return data
+        released, held = self._redactor.scan(self._held.pop(channel, b"") + data, final=False)
+        if held:
+            self._held[channel] = held
+        self._merge(released, final=False)
+        return released
+
+    def finish(self) -> dict[int, bytes]:
+        """Decide and store every held tail: the collector has read its last
+        byte. Returns what each channel released. Call before the terminal
+        state is published, so `complete` covers the final bytes."""
+        released = {}
+        for channel, held in sorted(self._held.items()):
+            released[channel], _ = self._redactor.scan(held, final=True)
+            self._merge(released[channel], final=False)
+        self._held.clear()
+        if self._redactor:
+            self._merge(b"", final=True)
+        return released
+
+    def _merge(self, data: bytes, *, final: bool) -> None:
+        """Store channel-redacted bytes once the merged stream decides them."""
+        released, self._merged_held = self._redactor.scan(self._merged_held + data, final=final)
+        self._store(released)
+
+    def _store(self, data: bytes) -> None:
         self._retained.extend(data)
         excess = len(self._retained) - self._retention
         if excess > 0:
@@ -137,7 +301,10 @@ class OperationSpool:
             data_b64=base64.b64encode(data).decode("ascii"),
             gap=MISSING if gap is None else gap,
             loss_detected=True if lossy else MISSING,
-            complete=state in TERMINAL_STATES and next_offset == self.end,
+            complete=state in TERMINAL_STATES
+            and next_offset == self.end
+            and not self._held
+            and not self._merged_held,
         )
 
     def _encode(self, offset: int, *, lossy: bool) -> str:

@@ -59,6 +59,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -79,7 +80,12 @@ from agentic_isolation.contract import (
     WorkspaceRef,
 )
 from agentic_isolation.providers.base import CredentialResolver, Workspace
-from agentic_isolation.providers.operation_spool import OperationFailure, OperationSpool
+from agentic_isolation.providers.operation_spool import (
+    OperationFailure,
+    OperationSpool,
+    check_redaction,
+    redaction_policy,
+)
 
 # Values published in tests/fixtures/apss_exp_v1_0006/valid/workspace-provider/local.json.
 RETENTION_BYTES = 1 << 20
@@ -277,6 +283,8 @@ class _Operation:
     token: str
     # Clock ticks since boot before launch; every descendant started later.
     born: int
+    # `redaction_policy` of the caller's registration; a replay must match it.
+    policy: bytes = field(default_factory=lambda: redaction_policy(()), repr=False)
     # Inode of the output pipe; whoever still holds it keeps the operation open.
     pipe: int | None = None
     changed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -338,12 +346,19 @@ class LocalOperations:
         )
 
     async def start(
-        self, workspace: Workspace, spec: OperationSpec, *, base_env: dict[str, str]
+        self,
+        workspace: Workspace,
+        spec: OperationSpec,
+        *,
+        base_env: dict[str, str],
+        redact: Collection[str] = (),
     ) -> OperationRef:
         """Accept `spec` once per `(workspace, operation_key)`.
 
         `base_env` is the environment the provider's `execute` would use; the
-        spec's overlay and resolved credentials are laid over it.
+        spec's overlay and resolved credentials are laid over it. `redact`
+        registers credential values the workload may print; they, and every
+        value resolved here, are replaced before the spool stores them.
         """
         if sys.platform != "linux":
             # Ownership, confirmation and cancel all read /proc.
@@ -365,8 +380,16 @@ class LocalOperations:
                         "with a different spec",
                         existing.ref,
                     )
+                # A replay must not claim a registration the spool never had.
+                if existing.policy != redaction_policy(redact):
+                    raise _error(
+                        "conflict",
+                        f"operation_key {spec.operation_key!r} already started "
+                        "with different redaction values",
+                        existing.ref,
+                    )
                 return existing.ref
-            return await self._launch(workspace, spec, key, base_env)
+            return await self._launch(workspace, spec, key, base_env, redact)
 
     def _admit(self, workspace_id: str) -> None:
         if workspace_id in self._closed:
@@ -378,6 +401,7 @@ class LocalOperations:
         spec: OperationSpec,
         key: tuple[str, str],
         base_env: dict[str, str],
+        redact: Collection[str],
     ) -> OperationRef:
         root = workspace.path.resolve()
         cwd = (root / spec.working_directory).resolve()
@@ -387,6 +411,7 @@ class LocalOperations:
                 f"working_directory {spec.working_directory!r} leaves workspace {workspace.id}",
             )
         env = {**base_env, **spec.environment}
+        resolved: list[str] = []
         for binding in spec.credential_bindings:
             if binding.delivery != "env":
                 raise _error(
@@ -399,6 +424,9 @@ class LocalOperations:
                     "credential bindings need a CredentialResolver; none was injected",
                 )
             env[binding.target] = await self._credentials.resolve(binding.ref)
+            resolved.append(env[binding.target])
+        # Refused before launch, not when the spool is built after it.
+        check_redaction((*redact, *resolved))
         # Teardown may have begun while a resolver held this start; it waits
         # for this start's key, so nothing it must cancel launches after it.
         self._admit(workspace.id)
@@ -454,11 +482,12 @@ class LocalOperations:
             ref=ref,
             spec=spec,
             workspace_id=workspace.id,
-            spool=OperationSpool(retention_bytes=self._retention),
+            spool=OperationSpool(retention_bytes=self._retention, redact=(*redact, *resolved)),
             started_at=_now(),
             process=process,
             token=token,
             born=born,
+            policy=redaction_policy(redact),
             pipe=inode,
         )
         operation.collector = asyncio.create_task(self._collect(operation, output, transport))
@@ -492,6 +521,7 @@ class LocalOperations:
                 with contextlib.suppress(asyncio.CancelledError):
                     await reader
             transport.close()
+        operation.spool.finish()
         # A cancel still confirming decides between cancelled and failed.
         async with operation.stopping:
             self._settle(operation, process.returncode)

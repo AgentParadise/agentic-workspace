@@ -9,12 +9,47 @@
 mod contract;
 mod spool;
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 pub use contract::*;
 pub use spool::OperationSpool;
+
+/// Credential values a caller registers when it starts an operation. The
+/// provider replaces each with `[REDACTED]` before the output is stored, so
+/// no page or final output carries them. A set: order, duplicates and empty
+/// values do not matter, and `Debug` never prints a value.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Redaction(BTreeSet<Vec<u8>>);
+
+impl Redaction {
+    pub fn new<V: Into<Vec<u8>>>(values: impl IntoIterator<Item = V>) -> Self {
+        Self(
+            values
+                .into_iter()
+                .map(Into::into)
+                .filter(|v| !v.is_empty())
+                .collect(),
+        )
+    }
+
+    /// No values: output is stored exactly as printed.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.iter().map(Vec::as_slice)
+    }
+}
+
+impl std::fmt::Debug for Redaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Redaction({} values)", self.0.len())
+    }
+}
 
 /// One `observe` request: where to resume, the largest serialised page the
 /// caller accepts, and how long to wait for new output when there is none.
@@ -51,6 +86,30 @@ pub trait SupportsOperations: Send + Sync {
         workspace: &WorkspaceRef,
         spec: OperationSpec,
     ) -> impl Future<Output = Result<OperationRef, OperationError>> + Send;
+
+    /// [`SupportsOperations::start`], registering `redaction`: those values,
+    /// and any the provider resolves from `spec`, never reach the operation's
+    /// stored output or pages. A same-key replay must register an equal set,
+    /// or it is `conflict` naming no value. The default serves only an empty
+    /// set and refuses any other as `unsupported_capability`, so a provider
+    /// that cannot redact never claims it did.
+    fn start_redacted(
+        &self,
+        workspace: &WorkspaceRef,
+        spec: OperationSpec,
+        redaction: Redaction,
+    ) -> impl Future<Output = Result<OperationRef, OperationError>> + Send {
+        async move {
+            if redaction.is_empty() {
+                return self.start(workspace, spec).await;
+            }
+            Err(OperationError::new(
+                ErrorKind::UnsupportedCapability,
+                "this provider cannot redact registered values from operation output",
+                None,
+            ))
+        }
+    }
 
     /// The operation's state, from a channel the workload cannot write.
     fn status(

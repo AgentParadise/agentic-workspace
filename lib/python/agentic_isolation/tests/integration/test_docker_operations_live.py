@@ -230,3 +230,47 @@ async def test_k_leader_numbered_like_our_group_is_still_signalled_in_its_namesp
     assert "cancel_escalation" not in status.metadata, status.metadata
     result = await provider.execute(workspace, "echo alive")
     assert (result.exit_code, result.stdout) == (0, "alive\n")
+
+
+# Invented, held only by the caller; `SECRET` is the resolved binding.
+CALLER_CANARY = "canary-INVENTED-caller-5e1d"
+# `$T` is the resolved value, `$1` the caller's: each printed whole, split
+# across two writes at every offset (a sleep makes them separate reads),
+# repeated on stderr, then an unfinished prefix of the caller's at EOF.
+_CANARY_SCRIPT = (
+    'C="$1"; for V in "$T" "$C"; do '
+    "printf 'whole %s\\n' \"$V\"; "
+    "k=1; while [ $k -lt ${#V} ]; do "
+    'printf %s "$V" | head -c $k; sleep 0.02; '
+    'printf %s "$V" | tail -c +$((k + 1)); echo; k=$((k + 1)); done; '
+    'printf \'%s%s rep\\n\' "$V" "$V" >&2; done; '
+    'printf \'eof %s\' "$(printf %s "$C" | head -c 9)"'
+)
+
+
+async def test_d_resolved_and_registered_values_never_reach_a_page_or_the_spool(
+    live: tuple[WorkspaceDockerProvider, Workspace],
+) -> None:
+    provider, workspace = live
+    binding = CredentialBinding(
+        ref=CredentialRef(name="github", scope="repo"), delivery="env", target="T"
+    )
+    spec = _spec(
+        _CANARY_SCRIPT,
+        argv=("sh", "-c", _CANARY_SCRIPT, "sh", CALLER_CANARY),
+        credential_bindings=(binding,),
+    )
+    ref = await provider.start(workspace, spec, redact=[CALLER_CANARY])
+    pages = await _drain(provider, ref)
+    data = b"".join(base64.b64decode(p.data_b64) for p in pages)
+    stored = bytes(provider._operations._operations[ref.operation_id].spool._retained)
+    for value in (SECRET, CALLER_CANARY):
+        assert value.encode() not in data, data
+        assert value.encode() not in stored
+        assert all(value not in p.model_dump_json() for p in pages)
+    # Per value: whole, a split at each of len - 1 offsets, and two repeats.
+    assert data.count(b"[REDACTED]") == len(SECRET) + len(CALLER_CANARY) + 4, data
+    # The unfinished prefix is held until EOF, so it is stored last, after
+    # whatever the other channel wrote meanwhile.
+    assert data.endswith(CALLER_CANARY[:9].encode()), data
+    assert pages[-1].state == "succeeded"
