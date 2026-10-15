@@ -1,0 +1,232 @@
+name: Mutation Evidence
+
+# Proves that named tests KILL reviewed mutation patches committed on a PR.
+# Ported from syntropic137 (syntropic137/syntropic137#1941). Dispatch only:
+#
+#   gh workflow run mutation-evidence.yml --ref main -f pr=<N> \
+#     -f tests="lib/python/agentic_isolation/tests/test_x.py::test_y"
+#
+# Each `*.patch` under `.mutations/` on the PR head is one mutation of non-test
+# source. The named tests must pass on the unmutated head first, then every
+# patch must be killed. Node ids are repo-relative; each runs in its own uv
+# project (lib/python/<pkg>, tests/consumer_contracts) as CI runs it. The
+# runner is scripts/mutation_evidence.py; read its docstring for exactly what
+# KILLED and SURVIVED do and do not prove. See docs/mutation-evidence.md.
+#
+# Delete `.mutations/` before merge: ci.yml `mutations-not-merged` fails any PR
+# into main that still carries it. The PR comment this writes is the record.
+#
+# SECURITY MODEL. This runs PR code ON THE RUNNER HOST: the tests here drive
+# real Docker containers, so they need the daemon, and a sandbox holding the
+# Docker socket is the host anyway (syntropic137's runner can sandbox; this
+# one cannot). So:
+# - Inputs reach shell only through env vars and are validated by the trusted
+#   script before anything else runs. No free-form expressions are accepted.
+# - Fork PRs are refused: only branches in this repository.
+# - The workflow and runner come from the dispatched ref (`trusted/`), never
+#   from the PR head (`pr/`).
+# - The job that runs PR code has `contents: read`, no secrets, no persisted
+#   credentials and no uv cache, and the whole workflow runs with
+#   `cache-mode: none`: PR code on the host can recover the Actions runtime
+#   token, and a dispatch on main could otherwise write default-branch caches
+#   that other workflows restore. (actionlint 1.7.12 predates the key;
+#   .github/actionlint.yaml ignores exactly that error for this file.)
+# - `pull-requests: write` exists only in the comment job, on a fresh runner.
+# - Limit: PR code shares the host with the runner, so a PR written to forge
+#   its own verdict could. The evidence is for honest PR code, not a boundary.
+
+run-name: "Mutation evidence for PR #${{ inputs.pr }} ${{ inputs.dispatch_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Pull request number'
+        required: true
+        type: number
+      tests:
+        description: 'Space-separated repo-relative pytest node ids'
+        required: true
+        type: string
+      mutations_dir:
+        description: 'Directory of *.patch files on the PR head, under .mutations/'
+        required: false
+        default: '.mutations/'
+        type: string
+      dispatch_id:
+        description: 'Optional nonce shown in the run name, so a dispatcher can find its own run'
+        required: false
+        default: ''
+        type: string
+
+permissions: {}
+
+cache-mode: none
+
+# Dispatch-only, so a newer run for the same PR always supersedes the older.
+concurrency:
+  group: mutation-evidence-pr-${{ inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: Validate inputs and resolve PR head
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
+        with:
+          enable-cache: false
+
+      - name: Validate inputs
+        env:
+          MUTATION_PR: ${{ inputs.pr }}
+          MUTATION_TESTS: ${{ inputs.tests }}
+          MUTATION_DIR: ${{ inputs.mutations_dir }}
+          MUTATION_DISPATCH_ID: ${{ inputs.dispatch_id }}
+        run: uv run --no-project --no-config python scripts/mutation_evidence.py validate
+
+      - name: Resolve PR head
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          REPO: ${{ github.repository }}
+        run: |
+          pr_json="$(gh api "repos/$REPO/pulls/$PR")"
+          state="$(jq -r .state <<<"$pr_json")"
+          head_repo="$(jq -r .head.repo.full_name <<<"$pr_json")"
+          sha="$(jq -r .head.sha <<<"$pr_json")"
+          if [ "$state" != open ]; then
+            echo "::error::PR #$PR is $state; evidence is only gathered for open PRs"
+            exit 1
+          fi
+          if [ "$head_repo" != "$REPO" ]; then
+            echo "::error::PR #$PR comes from $head_repo; fork PRs are refused"
+            exit 1
+          fi
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::unexpected head sha: $sha"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "PR #$PR head: \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+  evidence:
+    name: Baseline and mutations
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted tooling (dispatched ref)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: trusted
+          persist-credentials: false
+
+      - name: Checkout PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: pr
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
+        with:
+          enable-cache: false
+
+      # Same host setup as ci.yml: the Codex sandbox tests need this profile
+      # (lib/python/agentic_isolation/agentic_isolation/apparmor/README.md).
+      - name: Load Codex sandbox AppArmor profile
+        run: sudo apparmor_parser -r pr/lib/python/agentic_isolation/agentic_isolation/apparmor/agentic-codex-sandbox
+
+      - name: Run baseline and every mutation
+        working-directory: trusted
+        env:
+          MUTATION_PR: ${{ inputs.pr }}
+          MUTATION_TESTS: ${{ inputs.tests }}
+          MUTATION_DIR: ${{ inputs.mutations_dir }}
+          MUTATION_DISPATCH_ID: ${{ inputs.dispatch_id }}
+          MUTATION_SHA: ${{ needs.resolve.outputs.sha }}
+          TERM: dumb
+          NO_COLOR: "1"
+          COLUMNS: "200"
+        run: >-
+          uv run --no-project --no-config python scripts/mutation_evidence.py
+          run --root "$GITHUB_WORKSPACE/pr" --report "$RUNNER_TEMP/mutation-evidence.md"
+
+      - name: Job summary
+        if: always()
+        env:
+          REPORT: ${{ runner.temp }}/mutation-evidence.md
+        run: |
+          if [ -s "$REPORT" ]; then
+            cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No report was written; read the step log." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutation-evidence
+          path: ${{ runner.temp }}/mutation-evidence.md
+          if-no-files-found: ignore
+          retention-days: 30
+
+  comment:
+    name: Post evidence on the PR
+    needs: [resolve, evidence]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: mutation-evidence
+          path: report
+
+      - name: Create or update the marker comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          RESULT: ${{ needs.evidence.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          marker='<!-- mutation-evidence -->'
+          body="$RUNNER_TEMP/body.md"
+          if [ -s report/mutation-evidence.md ]; then
+            head -c 60000 report/mutation-evidence.md > "$body"
+          else
+            # shellcheck disable=SC2016 # literal backticks are markdown
+            printf '%s\n## Mutation evidence\n\n**FAIL** | PR #%s | head `%s` | [run](%s)\n\nThe evidence job ended `%s` before writing a report. Read the run log.\n' \
+              "$marker" "$PR" "$SHA" "$RUN_URL" "$RESULT" > "$body"
+          fi
+          existing="$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq "[.[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\")))][0].id // empty" \
+            | head -n1)"
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F "body=@$body" >/dev/null
+            echo "updated comment $existing"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F "body=@$body" >/dev/null
+            echo "created comment"
+          fi

@@ -9,7 +9,8 @@ fixture, decides what happened:
   whose `exec` is late or whose container is stuck `removing`, a credential
   resolver gated on `destroy`, a retention smaller than the output, a FIFO.
 - `descendant_alive` is measured from `/proc`: any live process carrying this
-  run's token in its environment, detached descendants included.
+  run's token in its environment, detached descendants included. It is
+  measured only for a step whose alternatives judge it.
 - `launches` is measured from a log every workload appends to as it starts.
 - `settles_within_seconds` is enforced by `asyncio.timeout` and, for calls
   that could block the event loop, by a watchdog thread outside it.
@@ -29,8 +30,9 @@ Harness readings, where Python has no literal counterpart of a fixture call:
   Local), read as `completed`.
 
 A provider that fails a fixture is a finding: it is listed in
-`tests/conformance/COVERAGE.md` and marked `xfail(strict=True)` here, so the
-case still runs every time and a fix turns it into an unexpected pass.
+`tests/conformance/COVERAGE.md` and pinned in `FINDINGS` by its first miss's
+(step, call, outcome fields). The case still runs every time; exactly that
+miss is an expected failure, and a fix or any other miss fails.
 
 Run locally as `setsid -w uv run --extra dev pytest`; process cleanup signals
 only processes carrying this run's token.
@@ -42,6 +44,7 @@ import asyncio
 import base64
 import contextlib
 import faulthandler
+import functools
 import json
 import os
 import signal
@@ -50,7 +53,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -66,7 +69,7 @@ from agentic_isolation.contract import (
     OperationStatus,
 )
 from agentic_isolation.providers.base import Workspace
-from agentic_isolation.providers.docker import WorkspaceDockerProvider
+from agentic_isolation.providers.docker import NotARegularFileError, WorkspaceDockerProvider
 from agentic_isolation.providers.docker_operations import DockerOperations
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 from agentic_isolation.providers.local_operations import LocalOperations
@@ -151,14 +154,53 @@ class FixtureMismatch(AssertionError):
         *,
         hazard: str | None = None,
         step: int | None = None,
+        call: str | None = None,
         outcome: Outcome | None = None,
         alive: bool | None = None,
+        settled: bool = True,
     ) -> None:
         super().__init__(message)
         self.hazard = hazard
         self.step = step
+        self.call = call
         self.outcome = outcome
         self.alive = alive
+        self.settled = settled
+
+    def fields(self) -> dict[str, Any]:
+        """The measured outcome as fields a pin compares: never the message."""
+        if not self.settled:
+            return {"settled": False}
+        return {} if self.outcome is None else self.outcome.fields()
+
+
+class NotRun(Exception):  # noqa: N818 - a verdict, as in the Rust HazardVerdict::NotRun
+    """The step could not be executed as the fixture says: never a pass, never a finding."""
+
+
+@dataclass(frozen=True)
+class Finding:
+    """A known provider defect, pinned where and how it first misses.
+
+    A miss at another step or call, or with other outcome fields, is not this
+    finding, so it fails rather than staying expected.
+    """
+
+    step: int
+    call: str
+    outcome: dict[str, Any]
+    reason: str
+
+    def holds(self, error: FixtureMismatch) -> bool:
+        fields = error.fields()
+        return (
+            error.step == self.step
+            and error.call == self.call
+            and all(fields.get(key, _ABSENT) == value for key, value in self.outcome.items())
+        )
+
+
+_ABSENT = object()
 
 
 class UnconfirmedOrphanCancel(FixtureMismatch):
@@ -241,19 +283,38 @@ class Subject:
         return self.launches()
 
     def alive(self) -> list[int]:
-        """Live, non-zombie processes carrying this run's token: measured, not declared."""
+        """Live, non-zombie processes carrying this run's token: measured, not declared.
+
+        Fails closed (AgentParadise/agentic-workspace#68): a process that could
+        be a workload but whose environment cannot be read makes liveness
+        unmeasurable, raised as NotRun, never counted as not ours. A process
+        older than this harness cannot be a workload it launched, and one that
+        exits during the scan, or is a zombie, is gone; none is a candidate.
+        """
         needle = f"{TOKEN_VARIABLE}={self.token}".encode()
+        harness_began = _started(Path("/proc/self"))
         found = []
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit() or int(entry.name) == os.getpid():
                 continue
             try:
-                if needle not in (entry / "environ").read_bytes().split(b"\0"):
+                if _started(entry) < harness_began or _zombie(entry):
                     continue
-                if "\nState:\tZ" in (entry / "status").read_text():
+                try:
+                    environ = _environ(entry)
+                except PermissionError:
+                    if _exiting(entry):
+                        continue
+                    raise
+                if needle not in environ.split(b"\0"):
                     continue
-            except OSError:
+            except (FileNotFoundError, ProcessLookupError):
                 continue
+            except OSError as e:
+                raise NotRun(
+                    f"descendant liveness is unmeasurable: {entry}/environ is unreadable "
+                    f"({e}); AgentParadise/agentic-workspace#68"
+                ) from e
             found.append(int(entry.name))
         return found
 
@@ -281,11 +342,42 @@ class Subject:
 
     def kill_leftovers(self) -> None:
         # Only processes carrying this run's token: the workload and what it forked.
-        for pid in self.alive():
+        # Where liveness is unmeasurable there is nothing this can attribute.
+        try:
+            pids = self.alive()
+        except NotRun:
+            return
+        for pid in pids:
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def _started(entry: Path) -> int:
+    """When the process began, in clock ticks since boot (proc(5) stat field 22)."""
+    return int((entry / "stat").read_text().rsplit(")", 1)[1].split()[19])
+
+
+def _zombie(entry: Path) -> bool:
+    return "\nState:\tZ" in (entry / "status").read_text()
+
+
+def _exiting(entry: Path) -> bool:
+    """Whether a process whose environ is hidden is on its way out.
+
+    An exiting process hides its environ from the moment it drops its memory,
+    a little before it becomes a zombie, so it is given a moment to get there.
+    """
+    for _ in range(5):
+        if _zombie(entry):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _environ(entry: Path) -> bytes:
+    return (entry / "environ").read_bytes()
 
 
 #: Outer per-test bound, above every fixture's summed settlement bounds. It
@@ -417,6 +509,37 @@ async def _settled(subject: Subject, *, within: float = 10.0) -> None:
     raise AssertionError(f"{subject.name}: the LH-1 descendant never appeared")
 
 
+# `given` conditions only a stand-in docker can hold, and why anything else cannot.
+_STAND_IN_GIVENS = {
+    "launch_header_not_seen": "Local learns its leader at spawn and has no launch-header "
+    "phase; a real daemon's exec cannot be held back",
+    "backend_stuck_removing": "Local has no backend to be stuck removing; a real daemon "
+    "cannot be made to stick",
+}
+# `given` conditions every subject establishes: by its workload (detached_descendant,
+# fifo_in_workspace), its spec (timeout_elapsed) or the step's driver in `_call`.
+_DRIVEN_GIVENS = frozenset(
+    {
+        "detached_descendant",
+        "caller_cancelled_during_confirmation",
+        "destroyed_during_credential_resolution",
+        "workspace_destroyed",
+        "observation_gap",
+        "fifo_in_workspace",
+        "timeout_elapsed",
+    }
+)
+
+
+def _unestablished(subject: Subject, given: str) -> str | None:
+    """Why `given` cannot be made true for `subject`, or None when it can."""
+    if given in _STAND_IN_GIVENS:
+        return None if subject.state_file is not None else _STAND_IN_GIVENS[given]
+    if given in _DRIVEN_GIVENS:
+        return None
+    return "the harness has no way to establish it"
+
+
 # --- Calls and matching ----------------------------------------------------
 
 
@@ -428,6 +551,18 @@ class Outcome:
     kind: str | None = None
     has_ref: bool = False
     pages: list[ObservationPage] = field(default_factory=list)
+
+    def fields(self) -> dict[str, Any]:
+        """The stable outcome fields a pin names: kind and ref, or the document's outcome."""
+        if self.kind is not None:
+            return {"kind": self.kind, "ref": self.has_ref}
+        doc = self.document
+        if isinstance(doc, OperationRef):
+            return {"operation_ref": True}
+        if isinstance(doc, OperationStatus | ObservationPage):
+            dumped = doc.model_dump(by_alias=True, exclude_none=True)
+            return {key: dumped[key] for key in _OUTCOME_FIELDS if key in dumped}
+        return {key: value for key, value in (doc or {}).items() if key in _OUTCOME_FIELDS}
 
     def describe(self) -> str:
         if self.kind is not None:
@@ -443,7 +578,17 @@ def _failure(error: OperationFailure) -> Outcome:
     return Outcome(kind=error.error.kind, has_ref=isinstance(error.error.ref, OperationRef))
 
 
-def _matches(alternative: dict[str, Any], outcome: Outcome, alive: bool) -> bool:
+def _matches(
+    alternatives: list[dict[str, Any]], outcome: Outcome, alive: bool | None
+) -> int | None:
+    """The index of the first alternative `outcome` matches, or None."""
+    return next(
+        (i for i, alternative in enumerate(alternatives) if _match(alternative, outcome, alive)),
+        None,
+    )
+
+
+def _match(alternative: dict[str, Any], outcome: Outcome, alive: bool | None) -> bool:
     want = alternative["document"]
     if "descendant_alive" in alternative and alternative["descendant_alive"] != alive:
         return False
@@ -470,6 +615,9 @@ async def _call(
 ) -> Outcome:
     call = step["call"]
     given = set(step.get("given", ()))
+    for condition in sorted(given):
+        if (reason := _unestablished(subject, condition)) is not None:
+            raise NotRun(f"given {condition} cannot be set up: {reason}")
     provider = subject.provider
     try:
         if call == "start":
@@ -521,7 +669,8 @@ async def _call(
                     return Outcome(kind="cancelled", has_ref=True)
             return Outcome(document=await provider.cancel(ref, grace_seconds=GRACE_SECONDS))
         if call == "observe":
-            if "backend_stuck_removing" in given and subject.state_file is not None:
+            if "backend_stuck_removing" in given:
+                assert subject.state_file is not None
                 subject.state_file.write_text("removing\n")
             cursor = state.get("cursor")
             if "observation_gap" in given:
@@ -596,6 +745,8 @@ async def _probe(subject: Subject, call: str, path: str, bound: float) -> Outcom
             pass
 
     threading.Thread(target=watchdog, daemon=True).start()
+    outcome: Outcome | None
+    untyped: Exception | None = None
     try:
         if call == "file_exists":
             exists = await subject.provider.file_exists(subject.workspace, path)
@@ -608,12 +759,22 @@ async def _probe(subject: Subject, call: str, path: str, bound: float) -> Outcom
             outcome = Outcome(document={"path": path, "data": data})
     except OperationFailure as e:
         outcome = _failure(e)
+    except NotARegularFileError:
+        # Docker's typed refusal to read a non-regular file is the policy refusal.
+        outcome = Outcome(kind="rejected_policy")
     except OSError as e:
         outcome = Outcome(kind=f"untyped {type(e).__name__}")
+    except Exception as e:  # noqa: BLE001 - any other type is the finding, named below
+        untyped = e
+        outcome = None
     finally:
         done.set()
     if overran.is_set():
-        raise FixtureMismatch(f"{call} {path} blocked past its {bound}s bound")
+        raise FixtureMismatch(f"{call} {path} blocked past its {bound}s bound", settled=False)
+    if outcome is None:
+        raise FixtureMismatch(
+            f"{call} {path}: untyped error {type(untyped).__name__}: {untyped}"
+        ) from untyped
     return outcome
 
 
@@ -625,13 +786,20 @@ def _summary(alternative: dict[str, Any]) -> str:
     return f"{json.dumps(fields)} alive={alternative.get('descendant_alive')}"
 
 
-async def run_hazard(subject: Subject, hazard: str) -> None:
-    """Drive every step of `hazard` against `subject`; raise FixtureMismatch on the first miss."""
+async def run_hazard(subject: Subject, hazard: str) -> list[int]:
+    """Drive every step of `hazard` against `subject`.
+
+    Returns the index of the alternative each step matched. Raises
+    FixtureMismatch on the first miss, or NotRun when a step's `given`, or the
+    liveness its alternatives judge, cannot be established.
+    """
     fixture = HAZARDS[hazard]
     if "provider" in fixture:
         _small_retention(subject)
     state: dict[str, Any] = {}
+    matched: list[int] = []
     for index, step in enumerate(fixture["steps"]):
+        call = step["call"]
         bound = step.get("settles_within_seconds", 30)
         began = time.monotonic()
         try:
@@ -639,44 +807,104 @@ async def run_hazard(subject: Subject, hazard: str) -> None:
                 outcome = await _call(subject, step, hazard, state)
         except TimeoutError as e:
             raise FixtureMismatch(
-                f"{hazard} step {index} {step['call']}: did not settle within {bound}s"
-            ) from e
-        elapsed = time.monotonic() - began
-        alive = bool(subject.alive())
-        alternatives = step.get("expect_one_of") or [step["expect"]]
-        where = f"{subject.name} {hazard} step {index} {step['call']} ({elapsed:.1f}s)"
-        if not any(_matches(alt, outcome, alive) for alt in alternatives):
-            raise FixtureMismatch(
-                f"{where}: got {outcome.describe()} with descendant_alive={alive} "
-                f"(measured pids {subject.alive()}); none of "
-                + "; ".join(_summary(a) for a in alternatives),
+                f"{subject.name} {hazard} step {index} {call}: did not settle within {bound}s",
                 hazard=hazard,
                 step=index,
-                outcome=outcome,
-                alive=alive,
+                call=call,
+                settled=False,
+            ) from e
+        except FixtureMismatch as e:
+            if e.step is not None:
+                raise
+            raise FixtureMismatch(
+                f"{subject.name} {hazard} step {index} {call}: {e}",
+                hazard=hazard,
+                step=index,
+                call=call,
+                outcome=e.outcome,
+                settled=e.settled,
+            ) from e
+        elapsed = time.monotonic() - began
+        alternatives = step.get("expect_one_of") or [step["expect"]]
+        # Measured only where an alternative judges it: a step that names no
+        # descendant_alive needs no liveness, so it cannot be unmeasurable.
+        pids = subject.alive() if any("descendant_alive" in a for a in alternatives) else None
+        alive = None if pids is None else bool(pids)
+        where = f"{subject.name} {hazard} step {index} {call} ({elapsed:.1f}s)"
+        miss = {"hazard": hazard, "step": index, "call": call, "outcome": outcome, "alive": alive}
+        if (alternative := _matches(alternatives, outcome, alive)) is None:
+            measured = (
+                "" if pids is None else f" with descendant_alive={alive} (measured pids {pids})"
             )
+            raise FixtureMismatch(
+                f"{where}: got {outcome.describe()}{measured}; none of "
+                + "; ".join(_summary(a) for a in alternatives),
+                **miss,
+            )
+        matched.append(alternative)
         if (
             "launches" in step
             and (n := await subject.settled_launches(step["launches"])) != step["launches"]
         ):
             raise FixtureMismatch(
-                f"{where}: measured {n} launches, fixture says {step['launches']}"
+                f"{where}: measured {n} launches, fixture says {step['launches']}", **miss
             )
         if "operation_records" in step and subject.records() != step["operation_records"]:
             raise FixtureMismatch(
                 f"{where}: provider holds {subject.records()} operation records, "
-                f"fixture says {step['operation_records']}"
+                f"fixture says {step['operation_records']}",
+                **miss,
             )
+    return matched
 
 
-# Findings: (provider, hazard) -> what the harness measured. Each is a provider
-# defect left to a follow-up (this change does not touch provider behaviour).
-FINDINGS: dict[tuple[str, str], str] = {
-    ("docker", "LH-3"): "cancel waits _LEADER_SECONDS (30s) for the header before stopping, "
-    "so it cannot settle within the 30s bound",
-    ("docker", "LH-4"): "a start blocked in credential resolution launches after destroy began; "
-    "the later start is unknown_operation, not resource_lost",
+# Findings: (provider, hazard) -> the first miss the harness measured. Each is a
+# provider defect left to a follow-up (this change does not touch provider behaviour).
+FINDINGS: dict[tuple[str, str], Finding] = {
+    ("docker", "LH-3"): Finding(
+        1,
+        "cancel",
+        {"settled": False},
+        "cancel waits _LEADER_SECONDS (30s) for the header before stopping, "
+        "so it cannot settle within the 30s bound",
+    ),
+    ("docker", "LH-4"): Finding(
+        0,
+        "start",
+        {"operation_ref": True},
+        "a start blocked in credential resolution launches after destroy began and returns a ref",
+    ),
 }
+# The real-daemon LH-7 run (test_docker_daemon_meets_lh7_fifo).
+DOCKER_DAEMON_LH7 = Finding(
+    2,
+    "file_exists",
+    {"exists": False},
+    "file_exists reports the FIFO as exists=false; the fixture needs exists=true, "
+    "regular_file=false or rejected_policy",
+)
+# Cells whose outcome is deterministic: step -> the alternative it must match.
+# A provider that starts answering a looser alternative here goes red.
+CONFIRMED: dict[tuple[str, str], dict[int, int]] = {
+    ("docker", "LH-1"): {1: 0},
+    ("docker", "LH-2"): {3: 0},
+    # The stuck removal settles provider_unavailable, never timed_out.
+    ("docker", "LH-5"): {1: 1},
+    ("local", "LH-2"): {3: 0},
+}
+
+
+async def _expect_finding(run: Awaitable[Any], finding: Finding) -> None:
+    """Strict: exactly `finding`'s miss xfails; a pass or any other miss fails."""
+    try:
+        await run
+    except FixtureMismatch as miss:
+        if finding.holds(miss):
+            pytest.xfail(f"{finding.reason}: {miss}")
+        raise
+    pytest.fail(f"[XPASS(strict)] {finding.reason}: the cell now passes; drop its pin")
+
+
 # Fixture limitations: (provider, hazard) -> the one mismatch the 0.2.1 fixture
 # wrongly rejects. Only that mismatch is expected; any other verdict fails.
 FIXTURE_GAPS: dict[tuple[str, str], str] = {
@@ -720,37 +948,36 @@ async def _run_classified(subject: Subject, hazard: str) -> None:
 NOT_RUN: dict[tuple[str, str], str] = {
     ("docker", "LH-7"): "the probes read the host workspace mount, which a stand-in container "
     "does not have; run against a real daemon by test_docker_daemon_meets_lh7_fifo",
-    # AgentParadise/agentic-workspace#68: these passed with `given` never set up.
-    ("local", "LH-3"): "launch_header_not_seen cannot be set up: Local learns its leader at "
-    "spawn and has no launch-header phase",
-    ("local", "LH-5"): "backend_stuck_removing cannot be set up: Local has no backend to be "
-    "stuck removing",
 }
 
 
 @pytest.mark.parametrize("hazard", sorted(HAZARDS))
-async def test_provider_meets_lifecycle_hazard(
-    subject: Subject, hazard: str, request: pytest.FixtureRequest
-) -> None:
-    if (subject.name, hazard) in NOT_RUN:
-        pytest.skip(f"NOT RUN: {NOT_RUN[subject.name, hazard]}")
-    if (subject.name, hazard) in FINDINGS:
-        request.applymarker(
-            pytest.mark.xfail(
-                raises=FixtureMismatch, strict=True, reason=FINDINGS[subject.name, hazard]
-            )
+async def test_provider_meets_lifecycle_hazard(subject: Subject, hazard: str) -> None:
+    cell = (subject.name, hazard)
+    if cell in NOT_RUN:
+        pytest.skip(f"NOT RUN: {NOT_RUN[cell]}")
+    try:
+        if cell in FINDINGS:
+            await _expect_finding(run_hazard(subject, hazard), FINDINGS[cell])
+            return
+        if cell in FIXTURE_GAPS:
+            # Not a mark: the adoption that triggers it is host-dependent, so a
+            # pass is a pass. Only UnconfirmedOrphanCancel is excused; any other
+            # mismatch propagates and fails. The strict expected failure is
+            # test_local_lh1_unconfirmed_orphan_is_the_apss146_gap.
+            try:
+                await _run_classified(subject, hazard)
+            except UnconfirmedOrphanCancel as gap:
+                pytest.xfail(f"APSS#146: {FIXTURE_GAPS[cell]}: {gap}")
+            return
+        matched = await run_hazard(subject, hazard)
+    except NotRun as reason:
+        pytest.skip(f"NOT RUN: {reason}")
+    for step, alternative in CONFIRMED.get(cell, {}).items():
+        assert matched[step] == alternative, (
+            f"{cell} step {step} matched alternative {matched[step]}, not the deterministic "
+            f"{alternative}: {HAZARDS[hazard]['steps'][step]['expect_one_of'][alternative]}"
         )
-    if (subject.name, hazard) in FIXTURE_GAPS:
-        # Not a mark: the adoption that triggers it is host-dependent, so a
-        # pass is a pass. Only UnconfirmedOrphanCancel is excused; any other
-        # mismatch propagates and fails. The strict expected failure is
-        # test_local_lh1_unconfirmed_orphan_is_the_apss146_gap.
-        try:
-            await _run_classified(subject, hazard)
-        except UnconfirmedOrphanCancel as gap:
-            pytest.xfail(f"APSS#146: {FIXTURE_GAPS[subject.name, hazard]}: {gap}")
-        return
-    await run_hazard(subject, hazard)
 
 
 def test_every_hazard_fixture_is_driven() -> None:
@@ -852,6 +1079,22 @@ def _unrelated_orphan() -> int:
     return int(parent.stdout)
 
 
+def _reports_not_run(
+    test: Callable[..., Coroutine[Any, Any, None]],
+) -> Callable[..., Coroutine[Any, Any, None]]:
+    """A test that drives a hazard reports NOT RUN when its liveness is
+    unmeasurable (#68), as the matrix does; never a failure, xfail or pass."""
+
+    @functools.wraps(test)
+    async def run(*args: Any, **kwargs: Any) -> None:
+        try:
+            await test(*args, **kwargs)
+        except NotRun as reason:
+            pytest.skip(f"NOT RUN: {reason}")
+
+    return run
+
+
 @pytest.mark.parametrize("subject", ["local"], indirect=True)
 @pytest.mark.xfail(
     raises=UnconfirmedOrphanCancel,
@@ -859,6 +1102,7 @@ def _unrelated_orphan() -> int:
     reason="APSS#146 (AgentParadise/agent-paradise-standards-system#146): "
     + FIXTURE_GAPS["local", "LH-1"],
 )
+@_reports_not_run
 async def test_local_lh1_unconfirmed_orphan_is_the_apss146_gap(subject: Subject) -> None:
     """The host condition CI hit, made deterministic: an unrelated orphan adopted
     after the operation began is alive when LH-1 cancels. Local fails closed,
@@ -905,6 +1149,7 @@ CONFIRM_WITHOUT_DESCENDANTS = {
 }
 
 
+@_reports_not_run
 async def test_lh1_fails_a_cancel_confirmed_while_a_descendant_lives(subject: Subject) -> None:
     """No vacuous pass: a provider whose cancel kills only the leader's group and
     reports confirmed must fail LH-1, on the cancel step, on measured liveness."""
@@ -919,14 +1164,181 @@ async def test_lh1_fails_a_cancel_confirmed_while_a_descendant_lives(subject: Su
     assert '"state":"cancelled"' in message and "descendant_alive=True" in message, message
 
 
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+async def test_an_unreadable_environ_is_not_run_not_dead(subject: Subject) -> None:
+    """Liveness fails closed (#68): a workload whose environ cannot be read is
+    unmeasurable, so the cell is NOT RUN rather than judged alive=false."""
+    readable = _environ
+
+    def hidden(entry: Path) -> bytes:
+        environ = readable(entry)
+        if f"{TOKEN_VARIABLE}={subject.token}".encode() in environ.split(b"\0"):
+            raise PermissionError(13, "Permission denied", str(entry / "environ"))
+        return environ
+
+    subject.monkeypatch.setattr(f"{__name__}._environ", hidden)
+    with pytest.raises(NotRun, match="unreadable"):
+        await run_hazard(subject, "LH-2")
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+@_reports_not_run
+async def test_a_probe_raising_an_untyped_error_is_a_fixture_mismatch(subject: Subject) -> None:
+    async def untyped(workspace: Workspace, path: str) -> bool:
+        raise ValueError("not a typed refusal")
+
+    subject.monkeypatch.setattr(subject.provider, "file_exists", untyped)
+    with pytest.raises(FixtureMismatch, match="untyped error ValueError") as caught:
+        await run_hazard(subject, "LH-7")
+    assert (caught.value.step, caught.value.call) == (2, "file_exists")
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+@_reports_not_run
+async def test_a_not_a_regular_file_refusal_is_rejected_policy(subject: Subject) -> None:
+    async def refuses(workspace: Workspace, path: str) -> bytes:
+        raise NotARegularFileError(path)
+
+    subject.monkeypatch.setattr(subject.provider, "read_file", refuses)
+    matched = await run_hazard(subject, "LH-7")
+    read = HAZARDS["LH-7"]["steps"][3]["expect_one_of"][matched[3]]["document"]
+    assert read["kind"] == "rejected_policy"
+
+
+def _miss(step: int, call: str, **fields: Any) -> FixtureMismatch:
+    settled = fields.pop("settled", True)
+    outcome = Outcome(document=fields) if fields else None
+    return FixtureMismatch("miss", step=step, call=call, outcome=outcome, settled=settled)
+
+
+@pytest.mark.parametrize(
+    "miss",
+    [
+        pytest.param(_miss(2, "status", settled=False), id="other-step"),
+        pytest.param(_miss(1, "status", settled=False), id="other-call"),
+        pytest.param(_miss(1, "cancel", state="failed"), id="other-outcome"),
+    ],
+)
+async def test_a_finding_that_misses_elsewhere_fails(miss: FixtureMismatch) -> None:
+    """A pin is (step, call, outcome): any other miss propagates as itself."""
+
+    async def fails() -> None:
+        raise miss
+
+    # An xfail escaping here would report this test as expected-failed, not
+    # failed, so taking the miss for the finding is turned into a failure.
+    try:
+        await _expect_finding(fails(), FINDINGS["docker", "LH-3"])
+    except pytest.xfail.Exception:
+        pytest.fail(f"a miss at step {miss.step} {miss.call} was taken for the pinned finding")
+    except FixtureMismatch as caught:
+        assert caught is miss
+    else:
+        pytest.fail("the miss produced no verdict")
+
+
+async def test_a_finding_xfails_only_on_its_pinned_miss() -> None:
+    async def fails() -> None:
+        raise _miss(1, "cancel", settled=False)
+
+    async def passes() -> None:
+        return None
+
+    with pytest.raises(pytest.xfail.Exception):
+        await _expect_finding(fails(), FINDINGS["docker", "LH-3"])
+    with pytest.raises(pytest.fail.Exception, match="XPASS"):
+        await _expect_finding(passes(), FINDINGS["docker", "LH-3"])
+
+
+async def _daemon_lh7(subject: Subject) -> None:
+    """The real-daemon LH-7 cell: its strict finding, or NOT RUN when a step
+    cannot be executed, as in the matrix; never a failure, xfail or pass."""
+    try:
+        await _expect_finding(run_hazard(subject, "LH-7"), DOCKER_DAEMON_LH7)
+    except NotRun as reason:
+        pytest.skip(f"NOT RUN: {reason}")
+
+
+@contextlib.contextmanager
+def _unreadable_bystander(subject: Subject) -> Iterator[None]:
+    """A process the harness cannot read (on CI, one inside the daemon's
+    container or another user's), so liveness is unmeasurable."""
+    bystander = subprocess.Popen(["sleep", "60"])
+    readable = _environ
+
+    def hidden(entry: Path) -> bytes:
+        if entry.name == str(bystander.pid):
+            raise PermissionError(13, "Permission denied", str(entry / "environ"))
+        return readable(entry)
+
+    subject.monkeypatch.setattr(f"{__name__}._environ", hidden)
+    try:
+        yield
+    finally:
+        bystander.kill()
+        bystander.wait()
+
+
+@_reports_not_run
+async def _local_lh2(subject: Subject) -> None:
+    await run_hazard(subject, "LH-2")
+
+
+async def _matrix_lh2(subject: Subject) -> None:
+    await test_provider_meets_lifecycle_hazard(subject, "LH-2")
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+@pytest.mark.parametrize("boundary", [_matrix_lh2, _local_lh2], ids=["matrix", "reports-not-run"])
+async def test_an_unmeasurable_hazard_test_is_not_run(
+    subject: Subject, boundary: Callable[[Subject], Coroutine[Any, Any, None]]
+) -> None:
+    """A hazard test whose fixture judges descendant_alive (LH-2) reports NOT RUN
+    through the real fail-closed liveness, never a failure, xfail or pass."""
+    with (
+        _unreadable_bystander(subject),
+        pytest.raises(pytest.skip.Exception, match="NOT RUN: .*unreadable"),
+    ):
+        await boundary(subject)
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+async def test_a_hazard_judging_no_liveness_runs_beside_an_unreadable_process(
+    subject: Subject,
+) -> None:
+    """LH-7 names no descendant_alive, so a process whose environ cannot be read
+    does not make it NOT RUN: its file surface is still driven and judged."""
+    assert not any(
+        "descendant_alive" in alternative
+        for step in HAZARDS["LH-7"]["steps"]
+        for alternative in step.get("expect_one_of") or [step["expect"]]
+    )
+    probed: list[str] = []
+    file_exists = subject.provider.file_exists
+
+    async def observed(workspace: Workspace, path: str) -> bool:
+        probed.append(path)
+        return await file_exists(workspace, path)
+
+    subject.monkeypatch.setattr(subject.provider, "file_exists", observed)
+    with _unreadable_bystander(subject):
+        await run_hazard(subject, "LH-7")
+    assert probed == ["outputs/pipe"]
+
+
+@pytest.mark.parametrize("subject", ["local"], indirect=True)
+async def test_daemon_lh7_with_an_unestablished_given_is_not_run(subject: Subject) -> None:
+    """The real-daemon LH-7 boundary reports a `given` it cannot establish as
+    NOT RUN, never a failure, xfail or pass."""
+    subject.monkeypatch.setattr(
+        f"{__name__}._unestablished", lambda subject, given: "withheld by this test"
+    )
+    with pytest.raises(pytest.skip.Exception, match="NOT RUN: given .*withheld by this test"):
+        await _daemon_lh7(subject)
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(not WorkspaceDockerProvider.is_available(), reason="Docker not available")
-@pytest.mark.xfail(
-    raises=FixtureMismatch,
-    strict=True,
-    reason="file_exists reports the FIFO as exists=false; the fixture needs exists=true, "
-    "regular_file=false or rejected_policy",
-)
 async def test_docker_daemon_meets_lh7_fifo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -955,7 +1367,7 @@ async def test_docker_daemon_meets_lh7_fifo(
         launch_log_in_workload="/workspace/.launches",
     )
     try:
-        await run_hazard(subject, "LH-7")
+        await _daemon_lh7(subject)
     finally:
         subject.kill_leftovers()
         if workspace.id in provider._workspaces:
