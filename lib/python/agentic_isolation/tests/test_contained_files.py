@@ -12,6 +12,7 @@ import pytest
 
 from agentic_isolation.providers import contained_files, docker
 from agentic_isolation.providers.contained_files import exists_contained
+from tests.test_docker_contract_debt import _open_far_end_later
 
 
 @pytest.fixture
@@ -36,6 +37,27 @@ def test_a_fifo_exists_but_is_not_regular_and_is_never_waited_on(root: Path) -> 
     assert time.monotonic() - began < 1.0
 
 
+def test_a_fifo_is_refused_before_it_is_ever_opened(
+    monkeypatch: pytest.MonkeyPatch, root: Path
+) -> None:
+    # A device node is the case this guards, but making one needs CAP_MKNOD,
+    # so a FIFO stands in: the descriptor check alone would open it first.
+    os.mkfifo(root / "artifact.md")
+    real_open = os.open
+    opened: list[object] = []
+
+    def recording_open(
+        path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        opened.append(path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", recording_open)
+
+    assert exists_contained(root, "artifact.md") == (True, False)
+    assert "artifact.md" not in opened
+
+
 def test_a_fifo_swapped_in_after_the_check_is_still_not_regular(
     monkeypatch: pytest.MonkeyPatch, root: Path
 ) -> None:
@@ -51,6 +73,9 @@ def test_a_fifo_swapped_in_after_the_check_is_still_not_regular(
         return real_open(path, flags, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os, "open", racing_open)
+    # An open that waits on the FIFO is released after 3 s, so it fails the
+    # timing check below instead of hanging the run.
+    _open_far_end_later(root / "artifact.md", os.O_WRONLY, delay=3.0)
 
     began = time.monotonic()
     assert exists_contained(root, "artifact.md") == (True, False)
