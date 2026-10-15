@@ -1,0 +1,12 @@
+# The claude-cli workspace image the live harness tests run by default.
+#
+# Release publishing (.github/workflows/release-images.yml) pushes by digest
+# and commits no pin back here; the release pin lives in the consumer. This
+# line is copied from syntropic137
+# packages/syn-shared/src/syn_shared/settings/workspace_images.py,
+# PINNED_DIGESTS[WorkspaceImageProvider.CLAUDE_CLI], with the repository name
+# from workspace_image_name (the claude-cli image publishes as
+# agentic-workspace-claude). Update it when that pin moves.
+#
+# The image carries both CLIs the tests drive: claude 2.1.293 and codex 0.160.1.
+ghcr.io/agentparadise/agentic-workspace-claude@sha256:b3f39a3577a46dee75347ce0db7803014ab4569083c7aa353be63643df810231

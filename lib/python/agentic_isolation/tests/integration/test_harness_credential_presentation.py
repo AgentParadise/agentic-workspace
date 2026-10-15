@@ -26,10 +26,10 @@ read are scanned too. This side then asserts:
 
 Requirements:
     - Docker
-    - the claude-cli image; the release pin is
-      ghcr.io/agentparadise/agentic-workspace-claude@sha256:b3f39a3577a46dee75347ce0db7803014ab4569083c7aa353be63643df810231
-      (set AGENTIC_CLAUDE_CLI_IMAGE), or one built from this tree with
-      `uv run scripts/build-provider.py claude-cli`
+    - the claude-cli image: the release pin in `claude-cli.release-pin`,
+      pulled when the daemon lacks it, or AGENTIC_CLAUDE_CLI_IMAGE (e.g. one
+      built from this tree with `uv run scripts/build-provider.py claude-cli`).
+      No Docker, or a failed pull, fails the tests; they never skip.
 
 Run with:
     uv run pytest -m integration tests/integration/test_harness_credential_presentation.py -v
@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import secrets
 import subprocess
@@ -53,8 +52,8 @@ from agentic_isolation.harnesses.claude.credentials import ClaudeApiKeyPresenter
 from agentic_isolation.harnesses.codex.credentials import CodexApiKeyPresenter
 from agentic_isolation.harnesses.credentials import PresentedCredentials
 from tests.integration.harness_credential_scan import CommandLines, scan_container
+from tests.integration.release_image import ReleaseImageError, release_image
 
-IMAGE = os.environ.get("AGENTIC_CLAUDE_CLI_IMAGE", "agentic-workspace-claude-cli:latest")
 PROBE = Path(__file__).with_name("harness_credential_probe.py")
 PORT = 18080
 # The broker authority as the sandbox sees it; loopback because the
@@ -83,24 +82,15 @@ HOST_CANARIES = {
 }
 
 
-def _image_available() -> bool:
+pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(scope="module")
+def image() -> str:
     try:
-        result = subprocess.run(
-            ["docker", "image", "inspect", IMAGE], capture_output=True, check=False
-        )
-    except FileNotFoundError:
-        return False
-    return result.returncode == 0
-
-
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        not _image_available(),
-        reason=f"Docker or {IMAGE} not available; "
-        "run `uv run scripts/build-provider.py claude-cli`",
-    ),
-]
+        return release_image()
+    except ReleaseImageError as e:
+        pytest.fail(str(e), pytrace=False)
 
 
 @dataclass(frozen=True)
@@ -155,7 +145,7 @@ CLASSES = {
 
 
 def _docker(
-    mount: Path, *argv: str, name: str | None = None, stdin: str | None = None
+    image: str, mount: Path, *argv: str, name: str | None = None, stdin: str | None = None
 ) -> subprocess.CompletedProcess[str]:
     # Named runs are kept after exit for the host scan; the caller removes them.
     keep = ["--name", name] if name else ["--rm"]
@@ -173,7 +163,7 @@ def _docker(
             argv[0],
             "-v",
             f"{mount}:/probe:ro",
-            IMAGE,
+            image,
             *argv[1:],
         ],
         input=stdin,
@@ -259,12 +249,12 @@ def _assert_round_trip(
 
 @pytest.mark.parametrize("name", sorted(CLASSES))
 def test_pinned_cli_sends_only_the_wire_capability(
-    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    name: str, image: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     for key, canary in HOST_CANARIES.items():
         monkeypatch.setenv(key, canary)
     harness = CLASSES[name]
-    version = _docker(tmp_path, *harness.version_argv)
+    version = _docker(image, tmp_path, *harness.version_argv)
     assert version.stdout.strip() == harness.version, version.stderr
 
     entropy = SecretStr(secrets.token_urlsafe(32))
@@ -281,6 +271,7 @@ def test_pinned_cli_sends_only_the_wire_capability(
     try:
         with CommandLines(container) as cmdlines:
             run = _docker(
+                image,
                 tmp_path,
                 "python3",
                 "/probe/probe.py",
