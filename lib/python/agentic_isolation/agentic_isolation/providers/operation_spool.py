@@ -79,9 +79,10 @@ def check_redaction(values: Collection[str | bytes]) -> None:
         raise OperationFailure(
             OperationError(
                 kind="rejected_policy",
+                # Lowercase and never spelling the marker: a value refused
+                # for lying inside the marker would otherwise be echoed here.
                 message=(
-                    f"a registered redaction value lies inside {REDACTED.decode()!r} "
-                    f"or holds {REDACTED[:1].decode()!r} or {REDACTED[-1:].decode()!r}; "
+                    "a registered redaction value overlaps the redaction marker; "
                     "replacement could leave or rebuild it, so it cannot be redacted"
                 ),
             )

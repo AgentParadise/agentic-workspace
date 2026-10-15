@@ -278,9 +278,9 @@ async def test_local_final_output_never_carries_the_canary(tmp_path: Path) -> No
 def _assert_refused_naming_no_value(failure: OperationFailure, values: list[str]) -> None:
     assert failure.error.kind == "rejected_policy"
     for value in values:
-        # A value inside the marker is in any message that names the marker.
-        if value.encode() not in REDACTED:
-            assert value not in failure.error.message
+        assert value not in failure.error.message
+        assert value not in str(failure)
+        assert value not in repr(failure)
 
 
 @pytest.mark.parametrize("name", sorted(_REFUSED))

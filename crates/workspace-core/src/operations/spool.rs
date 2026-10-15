@@ -64,15 +64,12 @@ impl Redactor {
     fn new(values: impl IntoIterator<Item = Vec<u8>>) -> Result<Self, OperationError> {
         let mut values: Vec<Vec<u8>> = values.into_iter().filter(|v| !v.is_empty()).collect();
         if values.iter().any(|v| overlaps_marker(v)) {
-            let marker = String::from_utf8_lossy(REDACTED);
+            // Lowercase and never spelling the marker: a value refused for
+            // lying inside the marker would otherwise be echoed here.
             return Err(OperationError::new(
                 ErrorKind::RejectedPolicy,
-                format!(
-                    "a registered redaction value lies inside {marker:?} or holds {:?} or {:?}; \
-                     replacement could leave or rebuild it, so it cannot be redacted",
-                    char::from(REDACTED[0]),
-                    char::from(REDACTED[REDACTED.len() - 1]),
-                ),
+                "a registered redaction value overlaps the redaction marker; \
+                 replacement could leave or rebuild it, so it cannot be redacted",
                 None,
             ));
         }
@@ -725,11 +722,10 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(error.kind, ErrorKind::RejectedPolicy, "{}", case["name"]);
+            let serialized = serde_json::to_string(&error).unwrap();
             for value in values {
-                // A value inside the marker is in any message naming it.
-                if !REDACTED.windows(value.len()).any(|w| w == value.as_bytes()) {
-                    assert!(!error.message.as_str().contains(value), "{}", case["name"]);
-                }
+                assert!(!error.message.as_str().contains(value), "{}", case["name"]);
+                assert!(!serialized.contains(value), "{}", case["name"]);
             }
         }
     }
