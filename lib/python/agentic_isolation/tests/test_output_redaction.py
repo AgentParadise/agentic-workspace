@@ -39,6 +39,7 @@ _FIXTURES = json.loads(
 )
 _CASES = {case["name"]: case for case in _FIXTURES["cases"]}
 _CHANNEL_CASES = {case["name"]: case for case in _FIXTURES["channel_cases"]}
+_REFUSED = {case["name"]: case["values"] for case in _FIXTURES["refused_registrations"]}
 CANARY = "canary-INVENTED-sk-7f3a"
 REF = OperationRef.model_validate(
     {
@@ -270,6 +271,57 @@ async def test_local_final_output_never_carries_the_canary(tmp_path: Path) -> No
         assert data.endswith(b"tail " + CANARY[:6].encode())
         spool = next(iter(provider._operations._operations.values())).spool
         _assert_clean(bytes(spool._retained))
+    finally:
+        await provider.destroy(workspace)
+
+
+def _assert_refused_naming_no_value(failure: OperationFailure, values: list[str]) -> None:
+    assert failure.error.kind == "rejected_policy"
+    for value in values:
+        # A value inside the marker is in any message that names the marker.
+        if value.encode() not in REDACTED:
+            assert value not in failure.error.message
+
+
+@pytest.mark.parametrize("name", sorted(_REFUSED))
+def test_a_registration_replacement_could_leave_or_rebuild_is_refused(name: str) -> None:
+    with pytest.raises(OperationFailure) as refused:
+        OperationSpool(retention_bytes=64, redact=_REFUSED[name])
+    _assert_refused_naming_no_value(refused.value, _REFUSED[name])
+
+
+async def test_docker_refuses_a_marker_overlapping_value_before_launch(
+    docker_env: Path,  # noqa: F811
+) -> None:
+    ops = _ops(docker_env)
+    values = _REFUSED["value-contains-marker"]
+    with pytest.raises(OperationFailure) as refused:
+        await ops.start(
+            _workspace(), _spec("printf prefixinvented-tokensuffix"), redact=values
+        )
+    _assert_refused_naming_no_value(refused.value, values)
+    assert ops._operations == {}
+
+
+async def test_local_refuses_a_resolved_marker_overlapping_value_before_launch(
+    tmp_path: Path,
+) -> None:
+    class Resolver:
+        async def resolve(self, ref: CredentialRef) -> str:
+            return "canary-INVENTED-]"
+
+    provider = WorkspaceLocalProvider(
+        base_dir=tmp_path, allow_insecure=True, credentials=Resolver()
+    )
+    workspace = await provider.create(WorkspaceConfig())
+    try:
+        with pytest.raises(OperationFailure) as refused:
+            await provider.start(
+                workspace, _spec("printf x > launched", credential_bindings=_BOUND)
+            )
+        _assert_refused_naming_no_value(refused.value, ["canary-INVENTED-]"])
+        await asyncio.sleep(0.5)
+        assert not (workspace.path / "launched").exists()
     finally:
         await provider.destroy(workspace)
 

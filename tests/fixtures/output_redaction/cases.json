@@ -17,5 +17,14 @@
     {"name": "split-on-one-channel-around-another", "values": ["canary-INVENTED-sk-1"], "appends": [[0, "out:canary-I"], [1, "err\n"], [0, "NVENTED-sk-1\n"]], "stored": "out:err\n[REDACTED]\n"},
     {"name": "held-tail-released-after-another-channel", "values": ["sk-INVENTED-9"], "appends": [[0, "a sk-INV"], [1, "ENTED-9 b\n"], [0, "\n"]], "stored": "a ENTED-9 b\nsk-INV\n"},
     {"name": "no-values-interleaves-verbatim", "values": [], "appends": [[0, "canary-INVENTED-"], [1, "canary-INVENTED-"]], "stored": "canary-INVENTED-canary-INVENTED-"}
+  ],
+  "refused_registrations": [
+    {"name": "value-equals-marker", "values": ["[REDACTED]"]},
+    {"name": "value-inside-marker", "values": ["REDACTED"]},
+    {"name": "value-one-marker-byte", "values": ["E"]},
+    {"name": "value-contains-marker", "values": ["invented-token", "prefix[REDACTED]suffix"]},
+    {"name": "value-crosses-marker-end", "values": ["invented-token", "D]suffix"]},
+    {"name": "value-crosses-marker-start", "values": ["prefix[RE"]},
+    {"name": "one-bad-value-refuses-the-set", "values": ["canary-INVENTED-sk-7f3a", "canary-INVENTED-]"]}
   ]
 }

@@ -83,6 +83,7 @@ from agentic_isolation.providers.base import CredentialResolver, Workspace
 from agentic_isolation.providers.operation_spool import (
     OperationFailure,
     OperationSpool,
+    check_redaction,
     redaction_policy,
 )
 
@@ -424,6 +425,8 @@ class LocalOperations:
                 )
             env[binding.target] = await self._credentials.resolve(binding.ref)
             resolved.append(env[binding.target])
+        # Refused before launch, not when the spool is built after it.
+        check_redaction((*redact, *resolved))
         # Teardown may have begun while a resolver held this start; it waits
         # for this start's key, so nothing it must cancel launches after it.
         self._admit(workspace.id)

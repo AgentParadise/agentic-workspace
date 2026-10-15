@@ -61,6 +61,33 @@ class _Position:
 REDACTED = b"[REDACTED]"
 
 
+def _overlaps_marker(value: bytes) -> bool:
+    """Whether an inserted `REDACTED` could leave or rebuild `value`.
+
+    An occurrence that overlaps a marker either lies inside it or crosses one
+    of its ends, so it holds the marker's first or last byte. A value with
+    neither, and not inside the marker, can only come from workload bytes.
+    """
+    return value in REDACTED or REDACTED[:1] in value or REDACTED[-1:] in value
+
+
+def check_redaction(values: Collection[str | bytes]) -> None:
+    """Refuse a registration that replacement could leave in, or build into,
+    stored or channel bytes. The error never names the value."""
+    encoded = (v.encode() if isinstance(v, str) else bytes(v) for v in values)
+    if any(_overlaps_marker(v) for v in encoded if v):
+        raise OperationFailure(
+            OperationError(
+                kind="rejected_policy",
+                message=(
+                    f"a registered redaction value lies inside {REDACTED.decode()!r} "
+                    f"or holds {REDACTED[:1].decode()!r} or {REDACTED[-1:].decode()!r}; "
+                    "replacement could leave or rebuild it, so it cannot be redacted"
+                ),
+            )
+        )
+
+
 # Keys `redaction_policy`, so a fingerprint means nothing outside this process.
 _POLICY_KEY = secrets.token_bytes(32)
 
@@ -89,6 +116,7 @@ class OutputRedactor:
     """
 
     def __init__(self, values: Collection[str | bytes]) -> None:
+        check_redaction(values)
         encoded = {v.encode() if isinstance(v, str) else bytes(v) for v in values}
         # An empty value hides nothing; longest first so it wins at a position.
         self._values = sorted((v for v in encoded if v), key=len, reverse=True)
