@@ -26,6 +26,10 @@ use super::contract::{
 
 static GENERATIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Suffixes a cursor once the drain holding it has crossed a retention gap,
+/// so every later page carries `loss_detected`, as the Python spool does.
+const LOSSY: &str = ":lossy";
+
 /// What a registered value is replaced with.
 pub const REDACTED: &[u8] = b"[REDACTED]";
 
@@ -252,14 +256,15 @@ impl OperationSpool {
         cursor: Option<&str>,
         max_page_bytes: usize,
     ) -> Result<ObservationPage, OperationError> {
-        let mut start = self.resolve(operation, cursor)?;
+        let (mut start, lossy) = self.resolve(operation, cursor)?;
         let gap = NonZeroU64::new(self.base.saturating_sub(start)).map(|lost| ObservationGap {
             lost_bytes: Some(lost),
         });
+        let lossy = lossy || gap.is_some();
         start = start.max(self.base);
         let available = usize::try_from(self.end() - start).unwrap_or(usize::MAX);
         let fits = |size| {
-            let page = self.build(operation, state, cursor, start, size, gap);
+            let page = self.build(operation, state, cursor, start, size, (gap, lossy));
             serde_json::to_vec(&page).is_ok_and(|bytes| bytes.len() <= max_page_bytes)
         };
         if !fits(0) {
@@ -282,7 +287,7 @@ impl OperationSpool {
             let mid = lo + (hi - lo).div_ceil(2);
             if fits(mid) { lo = mid } else { hi = mid - 1 }
         }
-        Ok(self.build(operation, state, cursor, start, lo, gap))
+        Ok(self.build(operation, state, cursor, start, lo, (gap, lossy)))
     }
 
     fn build(
@@ -292,7 +297,8 @@ impl OperationSpool {
         cursor: Option<&str>,
         start: u64,
         size: usize,
-        gap: Option<ObservationGap>,
+        // The gap this page reports, and whether its drain has lost bytes.
+        (gap, lossy): (Option<ObservationGap>, bool),
     ) -> ObservationPage {
         let lo = usize::try_from(start - self.base).unwrap_or(usize::MAX);
         let data: Vec<u8> = self.retained.range(lo..lo + size).copied().collect();
@@ -302,7 +308,7 @@ impl OperationSpool {
             operation: operation.clone(),
             state,
             cursor: self.cursor_or_origin(cursor),
-            next_cursor: self.encode(next),
+            next_cursor: self.encode(next, lossy),
             data_b64: Base64::try_from(STANDARD.encode(&data)).expect("STANDARD is padded base64"),
             gap,
             complete: state.is_terminal()
@@ -310,26 +316,29 @@ impl OperationSpool {
                 && next == self.end()
                 && self.held.is_empty()
                 && self.merged_held.is_empty(),
-            loss_detected: None,
+            loss_detected: lossy.then_some(true),
         }
     }
 
     fn cursor_or_origin(&self, cursor: Option<&str>) -> NonEmpty {
         cursor
             .and_then(|c| NonEmpty::try_from(c).ok())
-            .unwrap_or_else(|| self.encode(0))
+            .unwrap_or_else(|| self.encode(0, false))
     }
 
-    fn encode(&self, offset: u64) -> NonEmpty {
-        NonEmpty::try_from(format!("{}:{offset}", self.generation)).expect("never empty")
+    fn encode(&self, offset: u64, lossy: bool) -> NonEmpty {
+        let suffix = if lossy { LOSSY } else { "" };
+        NonEmpty::try_from(format!("{}:{offset}{suffix}", self.generation)).expect("never empty")
     }
 
     fn resolve(
         &self,
         operation: &OperationRef,
         cursor: Option<&str>,
-    ) -> Result<u64, OperationError> {
-        let Some(cursor) = cursor else { return Ok(0) };
+    ) -> Result<(u64, bool), OperationError> {
+        let Some(cursor) = cursor else {
+            return Ok((0, false));
+        };
         let unknown = |why: &str| {
             OperationError::new(
                 ErrorKind::UnknownOperation,
@@ -340,7 +349,11 @@ impl OperationSpool {
                 Some(operation.clone()),
             )
         };
-        let offset = cursor
+        let (position, lossy) = match cursor.strip_suffix(LOSSY) {
+            Some(position) => (position, true),
+            None => (cursor, false),
+        };
+        let offset = position
             .rsplit_once(':')
             .filter(|(generation, _)| *generation == self.generation)
             .and_then(|(_, offset)| offset.parse::<u64>().ok())
@@ -348,7 +361,7 @@ impl OperationSpool {
         if offset > self.end() {
             return Err(unknown("is beyond the end of"));
         }
-        Ok(offset)
+        Ok((offset, lossy))
     }
 }
 
@@ -436,7 +449,14 @@ mod tests {
         let origin = first.cursor.to_string();
         assert_eq!(first.gap.unwrap().lost_bytes, NonZeroU64::new(8));
         assert_eq!(decoded(&first), b"89abcdef");
-        let (generation, next) = first.next_cursor.as_str().rsplit_once(':').unwrap();
+        // The drain crossed a gap, so its cursor carries the loss on.
+        let (generation, next) = first
+            .next_cursor
+            .as_str()
+            .strip_suffix(LOSSY)
+            .unwrap()
+            .rsplit_once(':')
+            .unwrap();
         assert_eq!(next, "16");
         assert_eq!(format!("{generation}:0"), origin);
     }
@@ -490,7 +510,7 @@ mod tests {
                 .unwrap();
                 // Both pages of the retention-gap fixture: six bytes and the
                 // exact gap from the origin, then the bytes straight after.
-                let origin = spool.encode(0).to_string();
+                let origin = spool.encode(0, false).to_string();
                 let first = smallest_page_holding(&spool, &operation, &origin, 6);
                 assert_eq!(decoded(&first), output[64..70], "{at}");
                 assert_eq!(first.gap.unwrap().lost_bytes, NonZeroU64::new(64), "{at}");
@@ -734,10 +754,57 @@ mod tests {
     }
 
     #[test]
+    fn loss_is_sticky_from_a_redacted_gap_to_the_final_empty_page() {
+        let mut spool = OperationSpool::with_redaction(
+            NonZeroU64::new(12).unwrap(),
+            vec![b"invented-token".to_vec()],
+        )
+        .unwrap();
+        spool.append(b"invented-token tail-bytes");
+        spool.finish();
+        // Pages a few bytes larger than the envelope, so the drain crosses
+        // the gap and then reads on.
+        let whole = spool
+            .page(&operation(), OperationState::Succeeded, None, 4096)
+            .unwrap();
+        let envelope = serde_json::to_vec(&whole).unwrap().len() - whole.data_b64.as_str().len();
+        let bound = envelope + LOSSY.len() + 8;
+        let mut page = spool
+            .page(&operation(), OperationState::Succeeded, None, bound)
+            .unwrap();
+        assert!(page.gap.is_some());
+        let mut pages = 1;
+        loop {
+            assert_eq!(page.loss_detected, Some(true), "page {pages}");
+            if page.complete {
+                break;
+            }
+            page = spool
+                .page(
+                    &operation(),
+                    OperationState::Succeeded,
+                    Some(page.next_cursor.as_str()),
+                    bound,
+                )
+                .unwrap();
+            assert!(page.gap.is_none(), "page {pages}");
+            pages += 1;
+        }
+        assert!(pages >= 3, "{pages}");
+        assert!(decoded(&page).is_empty());
+        // A drain that never crossed a gap reports no loss.
+        let fresh = spool.encode(spool.base, false).to_string();
+        let page = spool
+            .page(&operation(), OperationState::Succeeded, Some(&fresh), 4096)
+            .unwrap();
+        assert_eq!(page.loss_detected, None);
+    }
+
+    #[test]
     fn a_foreign_cursor_is_unknown_operation() {
         let spool = OperationSpool::new(NonZeroU64::new(8).unwrap());
         let other = OperationSpool::new(NonZeroU64::new(8).unwrap());
-        let foreign = other.encode(0).to_string();
+        let foreign = other.encode(0, false).to_string();
         let error = spool
             .page(&operation(), OperationState::Running, Some(&foreign), 4096)
             .unwrap_err();

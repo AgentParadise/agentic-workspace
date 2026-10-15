@@ -1602,8 +1602,8 @@ mod hazards {
             // Finding: with the container stuck removing, the timed-out
             // operation's observe never completes within the 120s bound.
             "LH-5" => "fail 1 observe unsettled",
-            // Finding: the gap page carries no loss_detected (0.2.1).
-            "LH-6" => "fail 2 observe state=\"succeeded\" complete=false gap={\"lost_bytes\":8}",
+            // The gap page and every page after it carry loss_detected.
+            "LH-6" => "pass [0, 0, 0, 0]",
             // Finding: `collect` opens the FIFO and blocks past the 10s bound.
             "LH-7" => "fail 2 file_exists unsettled",
             _ => unreachable!(),
