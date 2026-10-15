@@ -1,0 +1,13 @@
+diff --git a/crates/workspace-core/src/operations/spool.rs b/crates/workspace-core/src/operations/spool.rs
+index d2fb1b2..0c0144d 100644
+--- a/crates/workspace-core/src/operations/spool.rs
++++ b/crates/workspace-core/src/operations/spool.rs
+@@ -313,7 +313,7 @@ impl OperationSpool {
+                 && next == self.end()
+                 && self.held.is_empty()
+                 && self.merged_held.is_empty(),
+-            loss_detected: lossy.then_some(true),
++            loss_detected: None,
+         }
+     }
+ 
