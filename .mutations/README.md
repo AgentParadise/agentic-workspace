@@ -5,8 +5,11 @@ Each patch reintroduces one bug in
 and nothing else. The runner reads only `*.patch`. This directory is deleted
 before merge (CI job `mutations-not-merged`).
 
-The verifier's original nine probes were lost with its workspace, so these were
-rewritten from the code. Node ids below are relative to
+The verifier's original nine probes were lost with its workspace; only their
+one-line descriptions survive in the PR body. These were rewritten from the
+code and cover all nine: old 01 is 16, 02 is 12, 03 is 13, 04 is 17, 05 is 06
+and 07, 06 is 10, 07 is 11, 08 is 15 (base `Exception` here, `RuntimeError`
+there; the same bug), and 09 is 01. Patches 02-05, 08, 09 and 14 are new. Node ids below are relative to
 `lib/python/agentic_isolation`; the workflow's `tests` input (repo-relative) is
 at the end.
 
@@ -27,6 +30,8 @@ at the end.
 | `13-exists-reports-a-directory-as-regular` | `exists_contained` skips the `S_ISREG` check on the descriptor | `tests/test_contained_files.py::test_a_directory_exists_but_is_not_regular` |
 | `14-exists-raises-for-a-missing-file` | `exists_contained` lets `FileNotFoundError` out instead of answering `(False, False)` | `tests/test_contained_files.py::test_a_missing_file_does_not_exist[missing.md]`, `[missing/plan.md]` |
 | `15-not-regular-error-is-not-a-valueerror` | `NotARegularFileError` loses its `ValueError` base | `tests/test_contained_files.py::test_docker_still_exports_the_error_it_raises` |
+| `16-exists-reports-a-regular-file-as-not-regular` | `exists_contained` answers `(True, False)` for every opened file | `tests/test_contained_files.py::test_a_regular_file_exists_and_is_regular`, `::test_dotdot_that_stays_inside_the_root_resolves` |
+| `17-exists-reports-a-missing-file-as-existing` | `exists_contained` answers `(True, False)` for a missing leaf or parent | `tests/test_contained_files.py::test_a_missing_file_does_not_exist[missing.md]`, `[missing/plan.md]` |
 
 ## The hang, and why patch 01 is safe to ship
 

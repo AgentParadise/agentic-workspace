@@ -1,0 +1,12 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py b/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py
+index 6167056..a6fd90c 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/contained_files.py
+@@ -111,6 +111,6 @@ def exists_contained(root: Path, path: str) -> tuple[bool, bool]:
+     except NotARegularFileError:
+         return True, False
+     try:
+-        return True, stat.S_ISREG(os.fstat(fd).st_mode)
++        return True, False
+     finally:
+         os.close(fd)
