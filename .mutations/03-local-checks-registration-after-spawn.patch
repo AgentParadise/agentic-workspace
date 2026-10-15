@@ -1,0 +1,12 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/local_operations.py b/lib/python/agentic_isolation/agentic_isolation/providers/local_operations.py
+index 14b45da..0b8233c 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/local_operations.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/local_operations.py
+@@ -426,7 +426,6 @@ class LocalOperations:
+             env[binding.target] = await self._credentials.resolve(binding.ref)
+             resolved.append(env[binding.target])
+         # Refused before launch, not when the spool is built after it.
+-        check_redaction((*redact, *resolved))
+         # Teardown may have begun while a resolver held this start; it waits
+         # for this start's key, so nothing it must cancel launches after it.
+         self._admit(workspace.id)

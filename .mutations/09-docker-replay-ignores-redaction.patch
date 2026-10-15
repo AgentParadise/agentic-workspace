@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_operations.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_operations.py
+index edc743a..6d41e13 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_operations.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_operations.py
+@@ -399,7 +399,7 @@ class DockerOperations:
+                     existing.ref,
+                 )
+             # A replay must not claim a registration the spool never had.
+-            if existing.policy != redaction_policy(redact):
++            if False:
+                 raise _error(
+                     "conflict",
+                     f"operation_key {spec.operation_key!r} already started "

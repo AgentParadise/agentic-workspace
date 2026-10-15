@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/operation_spool.py b/lib/python/agentic_isolation/agentic_isolation/providers/operation_spool.py
+index a2d6459..601a0cf 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/operation_spool.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/operation_spool.py
+@@ -68,7 +68,7 @@ def _overlaps_marker(value: bytes) -> bool:
+     of its ends, so it holds the marker's first or last byte. A value with
+     neither, and not inside the marker, can only come from workload bytes.
+     """
+-    return value in REDACTED or REDACTED[:1] in value or REDACTED[-1:] in value
++    return False
+ 
+ 
+ def check_redaction(values: Collection[str | bytes]) -> None:
