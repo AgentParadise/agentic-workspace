@@ -59,13 +59,13 @@ def test_a_pages_before_any_eviction_carry_no_loss() -> None:
     spool.append(f"{TOKEN} tail-bytes and more".encode())
     spool.finish()
     pages = _drain(spool, None, _small_page(spool))
+    for index, page in enumerate(pages):
+        assert "gap" not in page, index
+        assert "loss_detected" not in page, index
     assert len(pages) >= 3, pages
     assert b"".join(base64.b64decode(p["data_b64"]) for p in pages) == (
         b"[REDACTED] tail-bytes and more"
     )
-    for page in pages:
-        assert "gap" not in page
-        assert "loss_detected" not in page
 
 
 def test_b_the_gap_page_carries_loss() -> None:
@@ -91,9 +91,9 @@ def test_c_loss_is_sticky_to_the_completing_page_without_a_gap() -> None:
     stored = b"head [REDACTED] middle [REDACTED] and then the tail-bytes"
     pages = _drain(spool, first.next_cursor, _small_page(spool))
     assert pages[0]["gap"] == {"lost_bytes": len(stored) - 40 - len(b"head ")}
-    assert len(pages) >= 3, pages
     for index, page in enumerate(pages):
         assert page.get("loss_detected") is True, index
+    assert len(pages) >= 3, pages
     for page in pages[1:]:
         assert "gap" not in page
     assert pages[-1]["complete"] is True
@@ -104,10 +104,10 @@ def test_d_a_fresh_drain_after_eviction_carries_loss_on_every_page() -> None:
     spool.append(f"head {TOKEN} middle {TOKEN} and then the tail-bytes".encode())
     spool.finish()
     pages = _drain(spool, None, _small_page(spool))
+    for index, page in enumerate(pages):
+        assert page.get("loss_detected") is True, index
     assert len(pages) >= 3, pages
     assert (
         b"".join(base64.b64decode(p["data_b64"]) for p in pages)
         == (b"head [REDACTED] middle [REDACTED] and then the tail-bytes"[-40:])
     )
-    for index, page in enumerate(pages):
-        assert page.get("loss_detected") is True, index
