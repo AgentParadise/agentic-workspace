@@ -6,6 +6,7 @@ hook commands, with PATH controlled so a missing or hung interpreter is real.
 
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -251,7 +252,7 @@ def _hook(
     )
 
 
-PYTHON = f'exec "{sys.executable}" "$@"'
+PYTHON = f'exec {shlex.quote(sys.executable)} "$@"'
 
 
 def _claude(kind: str, **fields: object) -> dict[str, object]:
@@ -368,7 +369,7 @@ def test_interpreter_without_package_denies_launch(
 ) -> None:
     """An interpreter that cannot import the recorder exits 1; still a denial."""
     base = Path(sys.base_prefix) / "bin" / "python3"
-    environment.update(_bin(tmp_path, f'exec "{base}" -I "$@"'))
+    environment.update(_bin(tmp_path, f'exec {shlex.quote(str(base))} -I "$@"'))
     result = _hook(environment, _claude("PreToolUse"))
     assert (result.returncode, result.stderr) == (2, FAILURE_MESSAGE.encode() + b"\n")
 
@@ -376,7 +377,7 @@ def test_interpreter_without_package_denies_launch(
 def test_hung_interpreter_is_killed_and_denied_before_harness_timeout(
     tmp_path: Path, environment: dict[str, str]
 ) -> None:
-    environment.update(_bin(tmp_path, f"exec {SLEEP} 60"))
+    environment.update(_bin(tmp_path, f"exec {shlex.quote(SLEEP)} 60"))
     started = time.monotonic()
     result = _hook(environment, _claude("PreToolUse"), watchdog=1)
     assert time.monotonic() - started < 10
@@ -505,7 +506,7 @@ def _shim_after_commit(directory: Path, action: str) -> str:
     )
     script = directory / "recorder_shim.py"
     script.write_text(code)
-    return f'exec "{sys.executable}" "{script}" "$@"'
+    return f'exec {shlex.quote(sys.executable)} {shlex.quote(str(script))} "$@"'
 
 
 def test_watchdog_after_commit_records_hook_watchdog(
