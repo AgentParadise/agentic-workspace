@@ -1270,12 +1270,17 @@ fn credential_bindings_without_a_resolver_are_rejected_policy() {
 
 // --- APSS 0.2.1 lifecycle hazards (LH-1..LH-7) -------------------------------
 
-mod hazards {
+/// Run by the `hazards` test target under its own harness, not libtest's:
+/// a hazard whose liveness cannot be measured ends NOT RUN, a runtime skip
+/// libtest cannot express (#78). Here it holds no test, so it is dead code.
+#[allow(dead_code)]
+pub(crate) mod hazards {
     use super::*;
     use agentic_workspace_conformance::hazard::{
         HazardFixture, HazardHarness, HazardVerdict, Outcome, Unmeasurable, drive_hazard,
         live_processes, live_processes_in, load_hazards, vendored_behaviour_dir,
     };
+    use libtest_mimic::{Arguments, Completion, Trial};
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1293,15 +1298,75 @@ mod hazards {
         }
     }
 
-    /// End a hazard test as its body reports: judged, its assertions held, or
-    /// NOT RUN. libtest has no runtime skip, so a NOT RUN test is tallied
-    /// `ok`; its reason is written to stderr directly, past libtest's capture,
-    /// so the run's log names every test that was not run.
-    fn reports_not_run(ran: Result<(), NotRun>) {
-        use std::io::Write as _;
-        if let Err(NotRun(reason)) = ran {
-            let _ = writeln!(std::io::stderr(), "NOT RUN: {reason}");
+    /// How a hazard test ends as its body reports: judged, its assertions
+    /// held, or NOT RUN, tallied ignored with its reason, never passed.
+    fn completion(ran: Result<(), NotRun>) -> Completion {
+        match ran {
+            Ok(()) => Completion::Completed,
+            Err(NotRun(reason)) => Completion::ignored_with(format!("NOT RUN: {reason}")),
         }
+    }
+
+    /// The hazard test `name`, ending as `body` reports; a panic fails it.
+    fn hazard(name: &str, body: impl FnOnce() -> Result<(), NotRun> + Send + 'static) -> Trial {
+        Trial::ignorable_test(format!("hazards::{name}"), move || Ok(completion(body())))
+    }
+
+    /// `body` to completion on its own runtime, as `#[tokio::test]` would.
+    fn on_tokio(body: impl Future<Output = Result<(), NotRun>>) -> Result<(), NotRun> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(body)
+    }
+
+    /// Every hazard test, in the order libtest would list them.
+    fn trials() -> Vec<Trial> {
+        vec![
+            Trial::test("hazards::hazard_case", || {
+                hazard_case();
+                Ok(())
+            })
+            .with_ignored_flag(true),
+            hazard("a_late_exec_into_a_stopped_container_is_refused", || {
+                on_tokio(async { late_exec_refused(StandIn::new("LH-3")).await })
+            }),
+            hazard("lh1_double_fork_orphan_before_cancel", || case("LH-1")),
+            hazard("lh2_interrupted_cancel", || case("LH-2")),
+            hazard("lh3_cancel_before_launch_header", || case("LH-3")),
+            hazard("lh4_destroy_during_start", || case("LH-4")),
+            hazard("lh5_stuck_removal_settles", || case("LH-5")),
+            hazard("lh6_drain_with_gap_reports_loss", || case("LH-6")),
+            hazard("lh7_fifo_in_workspace", || case("LH-7")),
+            hazard(
+                "a_synchronously_blocked_case_fails_within_its_bound_and_the_next_runs",
+                a_synchronously_blocked_case_fails_within_its_bound_and_the_next_runs,
+            ),
+            hazard("hidden_liveness_stops_only_a_step_that_judges_it", || {
+                on_tokio(hidden_liveness_stops_only_a_step_that_judges_it())
+            }),
+            hazard("operation_records_counts_a_started_operation", || {
+                on_tokio(operation_records_counts_a_started_operation())
+            }),
+            hazard(
+                "lh1_fails_a_cancel_confirmed_while_a_descendant_lives",
+                || on_tokio(async { confirmed_cancel_fails(confirms_blindly()).await }),
+            ),
+            hazard(
+                "an_unreadable_proc_makes_each_liveness_test_not_run",
+                || on_tokio(an_unreadable_proc_makes_each_liveness_test_not_run()),
+            ),
+            hazard(
+                "the_harness_tallies_not_run_as_ignored_never_passed",
+                the_harness_tallies_not_run_as_ignored_never_passed,
+            ),
+        ]
+    }
+
+    /// The `hazards` test target's harness.
+    pub(crate) fn main() {
+        libtest_mimic::run(&Arguments::from_args(), trials()).exit();
     }
 
     /// What each hazard's workload does once the provider launches it.
@@ -1781,19 +1846,17 @@ mod hazards {
             .status();
     }
 
-    /// `case` passes in its bounded session, or reports NOT RUN.
-    fn assert_passes(case: &str) {
+    /// `case` passes in its bounded session, or ends NOT RUN.
+    fn case(case: &str) -> Result<(), NotRun> {
         match bounded(case, CASE_BOUND) {
-            CaseEnd::Passed => {}
-            CaseEnd::NotRun(reason) => reports_not_run(Err(NotRun(reason))),
+            CaseEnd::Passed => Ok(()),
+            CaseEnd::NotRun(reason) => Err(NotRun(reason)),
             end => panic!("{case} in its bounded session ended {end:?}"),
         }
     }
 
     /// The entry point `bounded` runs in the case process. Ignored, so a
     /// plain `cargo test` never runs a case outside its bound.
-    #[test]
-    #[ignore = "one hazard case, run by `bounded` in its own session"]
     fn hazard_case() {
         let Ok(case) = std::env::var(CASE) else {
             return;
@@ -1824,11 +1887,6 @@ mod hazards {
 
     /// The stand-in models a stopped container: an operation exec held back
     /// past a `stop` never runs its workload, so nothing is measured alive.
-    #[tokio::test]
-    async fn a_late_exec_into_a_stopped_container_is_refused() {
-        reports_not_run(late_exec_refused(StandIn::new("LH-3")).await);
-    }
-
     async fn late_exec_refused(harness: StandIn<DockerOperations>) -> Result<(), NotRun> {
         let lh3 = fixture("LH-3");
         let spec = harness.spec("LH-3", &lh3.steps[0].args["spec"]);
@@ -1846,41 +1904,12 @@ mod hazards {
         Ok(())
     }
 
-    #[test]
-    fn lh1_double_fork_orphan_before_cancel() {
-        assert_passes("LH-1");
-    }
-    #[test]
-    fn lh2_interrupted_cancel() {
-        assert_passes("LH-2");
-    }
-    #[test]
-    fn lh3_cancel_before_launch_header() {
-        assert_passes("LH-3");
-    }
-    #[test]
-    fn lh4_destroy_during_start() {
-        assert_passes("LH-4");
-    }
-    #[test]
-    fn lh5_stuck_removal_settles() {
-        assert_passes("LH-5");
-    }
-    #[test]
-    fn lh6_drain_with_gap_reports_loss() {
-        assert_passes("LH-6");
-    }
-    #[test]
-    fn lh7_fifo_in_workspace() {
-        assert_passes("LH-7");
-    }
-
     /// The bound holds where Tokio's cannot: a case blocked synchronously in
     /// setup is killed, session and all, within it; a failing case fails; the
     /// next case still runs and passes; and a NOT RUN case ends NOT RUN, not
     /// passed.
-    #[test]
-    fn a_synchronously_blocked_case_fails_within_its_bound_and_the_next_runs() {
+    fn a_synchronously_blocked_case_fails_within_its_bound_and_the_next_runs() -> Result<(), NotRun>
+    {
         let bound = Duration::from_secs(5);
         match bounded("blocks-synchronously", bound) {
             CaseEnd::OutOfBound(elapsed) => {
@@ -1894,12 +1923,12 @@ mod hazards {
             bounded("not-run", bound),
             CaseEnd::NotRun("the not-run proof case".into())
         );
+        Ok(())
     }
 
     /// LH-6 judges no liveness, so liveness hidden on the host leaves its
     /// verdict as measured; LH-1's cancel judges it, so it is not run.
-    #[tokio::test]
-    async fn hidden_liveness_stops_only_a_step_that_judges_it() {
+    async fn hidden_liveness_stops_only_a_step_that_judges_it() -> Result<(), NotRun> {
         let lh6 = StandIn::new("LH-6").with_unreadable_proc();
         expect("LH-6", &drive_hazard(&fixture("LH-6"), &lh6).await);
         let lh1 = StandIn::new("LH-1").with_unreadable_proc();
@@ -1908,18 +1937,19 @@ mod hazards {
             matches!(&verdict, HazardVerdict::NotRun { step: 1, call, .. } if call == "cancel"),
             "{verdict:?}"
         );
+        Ok(())
     }
 
     /// The record probe counts a started operation, and none before it, so
     /// LH-4's `operation_records: 0` is measured, not the probe's blindness.
-    #[tokio::test]
-    async fn operation_records_counts_a_started_operation() {
+    async fn operation_records_counts_a_started_operation() -> Result<(), NotRun> {
         let harness = StandIn::new("LH-1");
         let lh1 = fixture("LH-1");
         let spec = harness.spec("LH-1", &lh1.steps[0].args["spec"]);
         assert_eq!(harness.operation_records().await, Some(0));
         harness.provider.start(&workspace(), spec).await.unwrap();
         assert_eq!(harness.operation_records().await, Some(1));
+        Ok(())
     }
 
     /// Passes every call through, naming each in order.
@@ -2027,13 +2057,6 @@ mod hazards {
         }
     }
 
-    /// No vacuous pass: a cancel confirmed while the measured descendant
-    /// lives must fail LH-1 on the cancel step.
-    #[tokio::test]
-    async fn lh1_fails_a_cancel_confirmed_while_a_descendant_lives() {
-        reports_not_run(confirmed_cancel_fails(confirms_blindly()).await);
-    }
-
     fn confirms_blindly() -> StandIn<ConfirmsBlindly> {
         StandIn::with("LH-1", |inner| ConfirmsBlindly {
             inner,
@@ -2041,6 +2064,8 @@ mod hazards {
         })
     }
 
+    /// No vacuous pass: a cancel confirmed while the measured descendant
+    /// lives must fail LH-1 on the cancel step.
     async fn confirmed_cancel_fails(harness: StandIn<ConfirmsBlindly>) -> Result<(), NotRun> {
         use agentic_workspace_conformance::hazard::{Mismatch, Outcome};
         let verdict = drive_hazard(&fixture("LH-1"), &harness).await;
@@ -2069,8 +2094,7 @@ mod hazards {
 
     /// Every hazard test that judges liveness reports NOT RUN, neither a pass
     /// nor a panic, when the process table cannot be read (#78).
-    #[tokio::test]
-    async fn an_unreadable_proc_makes_each_liveness_test_not_run() {
+    async fn an_unreadable_proc_makes_each_liveness_test_not_run() -> Result<(), NotRun> {
         let not_run = |ran: Result<(), NotRun>| {
             assert!(
                 matches!(&ran, Err(NotRun(reason)) if reason.contains("4242 is unreadable")),
@@ -2083,5 +2107,45 @@ mod hazards {
         not_run(judge("LH-3", &lh3).await);
         not_run(late_exec_refused(StandIn::new("LH-3").with_unreadable_proc()).await);
         not_run(confirmed_cancel_fails(confirms_blindly().with_unreadable_proc()).await);
+        Ok(())
+    }
+
+    /// Through this harness, a hazard test that cannot measure liveness is
+    /// tallied ignored with its reason, never passed, whether it ran here or
+    /// in its bounded session; a judged test still passes and a failing one
+    /// still fails (#78).
+    fn the_harness_tallies_not_run_as_ignored_never_passed() -> Result<(), NotRun> {
+        let reason = |ran| match completion(ran) {
+            Completion::Ignored { reason } => reason,
+            Completion::Completed => None,
+        };
+        assert_eq!(
+            reason(Err(NotRun("why".into()))).as_deref(),
+            Some("NOT RUN: why")
+        );
+        assert_eq!(reason(Ok(())), None);
+        let args = Arguments {
+            test_threads: Some(1),
+            ..Arguments::default()
+        };
+        let tally = libtest_mimic::run(
+            &args,
+            vec![
+                hazard("unreadable_proc", || {
+                    on_tokio(async {
+                        late_exec_refused(StandIn::new("LH-3").with_unreadable_proc()).await
+                    })
+                }),
+                hazard("bounded_not_run", || case("not-run")),
+                hazard("judged", || case("passes")),
+                hazard("fails", || case("fails")),
+            ],
+        );
+        assert_eq!(
+            (tally.num_passed, tally.num_ignored, tally.num_failed),
+            (1, 2, 1),
+            "passed, NOT RUN, failed"
+        );
+        Ok(())
     }
 }
