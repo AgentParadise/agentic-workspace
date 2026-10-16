@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -16,6 +17,15 @@ from agentic_isolation.harnesses import ExecFn
 from agentic_isolation.providers.base import ExecuteResult
 
 
+def _python_shim(directory: Path, interpreter: str) -> Path:
+    """Write a `python3` in directory that execs interpreter, path taken literally."""
+    directory.mkdir()
+    python = directory / "python3"
+    python.write_text(f'#!/bin/sh\nexec {shlex.quote(interpreter)} "$@"\n')
+    python.chmod(0o700)
+    return python
+
+
 @pytest.fixture
 def workspace_execute(tmp_path: Path) -> ExecFn:
     """Run reader commands as the workspace image would, on this host.
@@ -25,11 +35,7 @@ def workspace_execute(tmp_path: Path) -> ExecFn:
     on a PATH of its own, so the result does not depend on whichever `python3`
     the invoking shell happens to resolve (#71).
     """
-    binary = tmp_path / "workspace-bin"
-    binary.mkdir()
-    python = binary / "python3"
-    python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    python.chmod(0o700)
+    binary = _python_shim(tmp_path / "workspace-bin", sys.executable).parent
     environment = {**os.environ, "PATH": str(binary)}
 
     async def execute(command: str, **kwargs: object) -> ExecuteResult:
@@ -48,6 +54,18 @@ def workspace_execute(tmp_path: Path) -> ExecFn:
         )
 
     return execute
+
+
+def test_python_shim_execs_interpreter_path_without_shell_expansion(tmp_path: Path) -> None:
+    interpreter = tmp_path / "venv $HOME `false` \"q\" 'a'" / "python"
+    interpreter.parent.mkdir()
+    interpreter.write_text('#!/bin/sh\nprintf "%s|" exact "$@"\n')
+    interpreter.chmod(0o700)
+    python = _python_shim(tmp_path / "workspace-bin", str(interpreter))
+
+    result = subprocess.run([python, "-m", "a b"], capture_output=True, text=True, timeout=10)
+
+    assert (result.returncode, result.stdout) == (0, "exact|-m|a b|")
 
 
 @pytest.mark.asyncio
