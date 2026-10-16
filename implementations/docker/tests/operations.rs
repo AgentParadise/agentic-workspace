@@ -1274,12 +1274,35 @@ mod hazards {
     use super::*;
     use agentic_workspace_conformance::hazard::{
         HazardFixture, HazardHarness, HazardVerdict, Outcome, Unmeasurable, drive_hazard,
-        live_processes, load_hazards, vendored_behaviour_dir,
+        live_processes, live_processes_in, load_hazards, vendored_behaviour_dir,
     };
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TOKEN: &str = "AW_HARNESS_RUN";
+
+    /// A hazard test that could not measure the liveness it judges: NOT RUN,
+    /// as the matrix reports such a cell (#68, #78). Never a pass, never a
+    /// failure: the provider was not judged.
+    #[derive(Debug, PartialEq)]
+    struct NotRun(String);
+
+    impl From<Unmeasurable> for NotRun {
+        fn from(unmeasurable: Unmeasurable) -> Self {
+            NotRun(unmeasurable.to_string())
+        }
+    }
+
+    /// End a hazard test as its body reports: judged, its assertions held, or
+    /// NOT RUN. libtest has no runtime skip, so a NOT RUN test is tallied
+    /// `ok`; its reason is written to stderr directly, past libtest's capture,
+    /// so the run's log names every test that was not run.
+    fn reports_not_run(ran: Result<(), NotRun>) {
+        use std::io::Write as _;
+        if let Err(NotRun(reason)) = ran {
+            let _ = writeln!(std::io::stderr(), "NOT RUN: {reason}");
+        }
+    }
 
     /// What each hazard's workload does once the provider launches it.
     fn workload(hazard: &str) -> &'static str {
@@ -1313,9 +1336,11 @@ mod hazards {
         pub token: String,
         gate: Arc<Gate>,
         key: std::sync::Mutex<Option<String>>,
-        /// Liveness reads as unmeasurable, as when an unrelated process's
-        /// environ cannot be read.
-        pub hide_liveness: bool,
+        /// The process table liveness is read from: the host's `/proc`, or
+        /// the fake one `with_unreadable_proc` builds.
+        proc: PathBuf,
+        /// Why a liveness read was unmeasurable, once one was.
+        unmeasured: std::sync::Mutex<Option<String>>,
     }
 
     /// LH-4's credential resolver: the first resolve, while armed, says it
@@ -1374,7 +1399,43 @@ mod hazards {
                 token,
                 gate,
                 key: std::sync::Mutex::new(None),
-                hide_liveness: false,
+                proc: PathBuf::from("/proc"),
+                unmeasured: std::sync::Mutex::new(None),
+            }
+        }
+
+        /// Liveness read from a process table whose one candidate hides its
+        /// environment, as an unrelated process's does under hidepid or
+        /// another uid: an `environ` that cannot be read as a file, whoever
+        /// runs the test. Cleanup still reads the host's `/proc`.
+        pub fn with_unreadable_proc(mut self) -> Self {
+            let proc = self.standin("proc");
+            let stat = |ticks: u64| format!("1 (sh) S {}{ticks} 0\n", "0 ".repeat(18));
+            std::fs::create_dir_all(proc.join("self")).unwrap();
+            std::fs::write(proc.join("self/stat"), stat(100)).unwrap();
+            let hidden = proc.join("4242");
+            std::fs::create_dir_all(hidden.join("environ")).unwrap();
+            std::fs::write(hidden.join("stat"), stat(200)).unwrap();
+            std::fs::write(hidden.join("status"), "Name:\tsh\nState:\tS\n").unwrap();
+            self.proc = proc;
+            self
+        }
+
+        /// This run's live tokened processes. An unmeasurable read is kept,
+        /// so the test reports NOT RUN rather than the verdict it stopped.
+        fn live(&self) -> Result<Vec<u32>, Unmeasurable> {
+            live_processes_in(&self.proc, TOKEN, &self.token).inspect_err(|unmeasurable| {
+                let mut unmeasured = self.unmeasured.lock().unwrap();
+                unmeasured.get_or_insert_with(|| unmeasurable.to_string());
+            })
+        }
+
+        /// NOT RUN once any liveness read was unmeasurable: a verdict driven
+        /// past one judged nothing about the provider.
+        fn measured(&self) -> Result<(), NotRun> {
+            match self.unmeasured.lock().unwrap().clone() {
+                Some(reason) => Err(NotRun(reason)),
+                None => Ok(()),
             }
         }
 
@@ -1450,7 +1511,7 @@ mod hazards {
                 "detached_descendant" | "timeout_elapsed" => Ok(()),
                 "observation_gap" if hazard == "LH-6" => Ok(()),
                 // `late-exec` holds the exec back, so no workload runs yet.
-                "launch_header_not_seen" => match live_processes(TOKEN, &self.token) {
+                "launch_header_not_seen" => match self.live() {
                     Ok(live) if live.is_empty() => Ok(()),
                     Ok(live) => Err(format!("the workload already runs: {live:?}")),
                     Err(unmeasurable) => Err(unmeasurable.to_string()),
@@ -1538,12 +1599,7 @@ mod hazards {
                 .count() as u32
         }
         fn descendant_alive(&self) -> Result<bool, Unmeasurable> {
-            if self.hide_liveness {
-                return Err(Unmeasurable(std::io::Error::from(
-                    std::io::ErrorKind::PermissionDenied,
-                )));
-            }
-            Ok(!live_processes(TOKEN, &self.token)?.is_empty())
+            Ok(!self.live()?.is_empty())
         }
         /// Records the provider still resolves for the fixture's key, probed
         /// through public `status`: its operation ids are `c1-op<n>`, issued
@@ -1611,20 +1667,28 @@ mod hazards {
         assert_eq!(summary, expected, "{hazard}: {verdict:?}");
     }
 
-    async fn run(hazard: &str) {
-        let harness = StandIn::new(hazard);
-        let verdict = drive_hazard(&fixture(hazard), &harness).await;
+    async fn run(hazard: &str) -> Result<(), NotRun> {
+        judge(hazard, &StandIn::new(hazard)).await
+    }
+
+    /// `hazard` driven on `harness`, its verdict held to `expect`'s, unless
+    /// liveness could not be measured.
+    async fn judge(hazard: &str, harness: &StandIn<DockerOperations>) -> Result<(), NotRun> {
+        let verdict = drive_hazard(&fixture(hazard), harness).await;
+        harness.measured()?;
         expect(hazard, &verdict);
+        Ok(())
     }
 
     /// LH-5 through a decorator that records each provider call, so the
     /// fixture's "no status call before observe" is measured, not assumed.
-    async fn lh5() {
+    async fn lh5() -> Result<(), NotRun> {
         let harness = StandIn::with("LH-5", |inner| Records {
             inner,
             calls: std::sync::Mutex::new(Vec::new()),
         });
         let verdict = drive_hazard(&fixture("LH-5"), &harness).await;
+        harness.measured()?;
         let calls = harness.provider.calls.lock().unwrap().clone();
         let observe = calls.iter().position(|c| *c == "observe");
         assert_eq!(calls.first(), Some(&"start"), "{calls:?}");
@@ -1634,6 +1698,7 @@ mod hazards {
             "status called before LH-5's first observe: {calls:?}"
         );
         expect("LH-5", &verdict);
+        Ok(())
     }
 
     // --- The per-case bound ---------------------------------------------------
@@ -1650,12 +1715,16 @@ mod hazards {
     /// Names the case `hazard_case` runs; unset, it runs nothing.
     const CASE: &str = "AW_HAZARD_CASE";
     /// Where the case writes once it has run to the end, so a filter that
-    /// selects no test is never read as a pass.
+    /// selects no test is never read as a pass: empty when it was judged,
+    /// `NOT_RUN` and the reason when it was not run.
     const CASE_DONE: &str = "AW_HAZARD_CASE_DONE";
+    const NOT_RUN: &str = "NOT RUN: ";
 
     #[derive(Debug, PartialEq)]
     enum CaseEnd {
         Passed,
+        /// The case ran to the end NOT RUN, for this reason.
+        NotRun(String),
         /// The case process exited without completing: a failed assertion
         /// or a panic. Its output is in the test's.
         Failed(std::process::ExitStatus),
@@ -1683,10 +1752,13 @@ mod hazards {
         let session = format!("-{}", child.id());
         let end = loop {
             if let Some(status) = child.try_wait().unwrap() {
-                break if status.success() && marker.exists() {
-                    CaseEnd::Passed
-                } else {
-                    CaseEnd::Failed(status)
+                let report = std::fs::read_to_string(&marker);
+                break match report {
+                    Ok(report) if status.success() => match report.strip_prefix(NOT_RUN) {
+                        Some(reason) => CaseEnd::NotRun(reason.to_owned()),
+                        None => CaseEnd::Passed,
+                    },
+                    _ => CaseEnd::Failed(status),
                 };
             }
             if began.elapsed() >= bound {
@@ -1709,9 +1781,13 @@ mod hazards {
             .status();
     }
 
+    /// `case` passes in its bounded session, or reports NOT RUN.
     fn assert_passes(case: &str) {
-        let end = bounded(case, CASE_BOUND);
-        assert_eq!(end, CaseEnd::Passed, "{case} in its bounded session");
+        match bounded(case, CASE_BOUND) {
+            CaseEnd::Passed => {}
+            CaseEnd::NotRun(reason) => reports_not_run(Err(NotRun(reason))),
+            end => panic!("{case} in its bounded session ended {end:?}"),
+        }
     }
 
     /// The entry point `bounded` runs in the case process. Ignored, so a
@@ -1726,25 +1802,34 @@ mod hazards {
             .enable_all()
             .build()
             .unwrap();
-        match case.as_str() {
+        let ran = match case.as_str() {
             "LH-5" => runtime.block_on(lh5()),
             // The guard's own proof cases, below.
             "blocks-synchronously" => {
                 let _harness = StandIn::new("LH-1");
                 std::thread::sleep(Duration::from_secs(3600));
+                Ok(())
             }
             "fails" => panic!("the failing proof case"),
-            "passes" => {}
+            "passes" => Ok(()),
+            "not-run" => Err(NotRun("the not-run proof case".into())),
             hazard => runtime.block_on(run(hazard)),
-        }
-        std::fs::write(std::env::var(CASE_DONE).unwrap(), "").unwrap();
+        };
+        let report = match ran {
+            Ok(()) => String::new(),
+            Err(NotRun(reason)) => format!("{NOT_RUN}{reason}"),
+        };
+        std::fs::write(std::env::var(CASE_DONE).unwrap(), report).unwrap();
     }
 
     /// The stand-in models a stopped container: an operation exec held back
     /// past a `stop` never runs its workload, so nothing is measured alive.
     #[tokio::test]
     async fn a_late_exec_into_a_stopped_container_is_refused() {
-        let harness = StandIn::new("LH-3");
+        reports_not_run(late_exec_refused(StandIn::new("LH-3")).await);
+    }
+
+    async fn late_exec_refused(harness: StandIn<DockerOperations>) -> Result<(), NotRun> {
         let lh3 = fixture("LH-3");
         let spec = harness.spec("LH-3", &lh3.steps[0].args["spec"]);
         let started = harness.provider.start(&workspace(), spec).await;
@@ -1755,9 +1840,10 @@ mod hazards {
         assert!(stop.success());
         tokio::time::sleep(Duration::from_secs(4)).await;
         assert!(
-            !harness.descendant_alive().unwrap(),
+            !harness.descendant_alive()?,
             "the held-back workload ran after stop (start: {started:?})"
         );
+        Ok(())
     }
 
     #[test]
@@ -1790,8 +1876,9 @@ mod hazards {
     }
 
     /// The bound holds where Tokio's cannot: a case blocked synchronously in
-    /// setup is killed, session and all, within it; a failing case fails; and
-    /// the next case still runs and passes.
+    /// setup is killed, session and all, within it; a failing case fails; the
+    /// next case still runs and passes; and a NOT RUN case ends NOT RUN, not
+    /// passed.
     #[test]
     fn a_synchronously_blocked_case_fails_within_its_bound_and_the_next_runs() {
         let bound = Duration::from_secs(5);
@@ -1803,17 +1890,19 @@ mod hazards {
         }
         assert!(matches!(bounded("fails", bound), CaseEnd::Failed(_)));
         assert_eq!(bounded("passes", bound), CaseEnd::Passed);
+        assert_eq!(
+            bounded("not-run", bound),
+            CaseEnd::NotRun("the not-run proof case".into())
+        );
     }
 
     /// LH-6 judges no liveness, so liveness hidden on the host leaves its
     /// verdict as measured; LH-1's cancel judges it, so it is not run.
     #[tokio::test]
     async fn hidden_liveness_stops_only_a_step_that_judges_it() {
-        let mut lh6 = StandIn::new("LH-6");
-        lh6.hide_liveness = true;
+        let lh6 = StandIn::new("LH-6").with_unreadable_proc();
         expect("LH-6", &drive_hazard(&fixture("LH-6"), &lh6).await);
-        let mut lh1 = StandIn::new("LH-1");
-        lh1.hide_liveness = true;
+        let lh1 = StandIn::new("LH-1").with_unreadable_proc();
         let verdict = drive_hazard(&fixture("LH-1"), &lh1).await;
         assert!(
             matches!(&verdict, HazardVerdict::NotRun { step: 1, call, .. } if call == "cancel"),
@@ -1942,17 +2031,25 @@ mod hazards {
     /// lives must fail LH-1 on the cancel step.
     #[tokio::test]
     async fn lh1_fails_a_cancel_confirmed_while_a_descendant_lives() {
-        use agentic_workspace_conformance::hazard::{Mismatch, Outcome};
-        let harness = StandIn::with("LH-1", |inner| ConfirmsBlindly {
+        reports_not_run(confirmed_cancel_fails(confirms_blindly()).await);
+    }
+
+    fn confirms_blindly() -> StandIn<ConfirmsBlindly> {
+        StandIn::with("LH-1", |inner| ConfirmsBlindly {
             inner,
             applied: AtomicUsize::new(0),
-        });
+        })
+    }
+
+    async fn confirmed_cancel_fails(harness: StandIn<ConfirmsBlindly>) -> Result<(), NotRun> {
+        use agentic_workspace_conformance::hazard::{Mismatch, Outcome};
         let verdict = drive_hazard(&fixture("LH-1"), &harness).await;
         assert_eq!(
             harness.provider.applied.load(Ordering::SeqCst),
             1,
             "the mutation never ran"
         );
+        harness.measured()?;
         let HazardVerdict::Fail {
             step: 1,
             call,
@@ -1967,5 +2064,24 @@ mod hazards {
             matches!(&measured.outcome, Outcome::Document(d) if d["state"] == "cancelled"),
             "{verdict:?}"
         );
+        Ok(())
+    }
+
+    /// Every hazard test that judges liveness reports NOT RUN, neither a pass
+    /// nor a panic, when the process table cannot be read (#78).
+    #[tokio::test]
+    async fn an_unreadable_proc_makes_each_liveness_test_not_run() {
+        let not_run = |ran: Result<(), NotRun>| {
+            assert!(
+                matches!(&ran, Err(NotRun(reason)) if reason.contains("4242 is unreadable")),
+                "{ran:?}"
+            )
+        };
+        let lh1 = StandIn::new("LH-1").with_unreadable_proc();
+        not_run(judge("LH-1", &lh1).await);
+        let lh3 = StandIn::new("LH-3").with_unreadable_proc();
+        not_run(judge("LH-3", &lh3).await);
+        not_run(late_exec_refused(StandIn::new("LH-3").with_unreadable_proc()).await);
+        not_run(confirmed_cancel_fails(confirms_blindly().with_unreadable_proc()).await);
     }
 }
