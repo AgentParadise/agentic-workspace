@@ -51,7 +51,10 @@ def test_real_exporter_captures_and_reads_exact_native_bytes_without_store(tmp_p
         text=True,
         check=True,
     )
-    assert json.loads(result.stdout)["stored"] == 1, result.stderr
+    # The finalizer discards exporter output and always exits 0, so its own
+    # status line is the only success signal; the spool read below proves it.
+    assert result.stdout == "", result.stdout
+    assert "[local-capture] sweep persisted;" in result.stderr, result.stderr
     # Original source can disappear after capture without losing the envelope.
     (native / "native-test.jsonl").unlink()
     env[ExporterEnv.SPOOL_DIR] = str(
