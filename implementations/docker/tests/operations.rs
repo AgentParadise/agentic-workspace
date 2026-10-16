@@ -1904,7 +1904,7 @@ pub(crate) mod hazards {
         assert!(stop.success());
         tokio::time::sleep(Duration::from_secs(4)).await;
         assert!(
-            !harness.descendant_alive()?,
+            !harness.descendant_alive().unwrap(),
             "the held-back workload ran after stop (start: {started:?})"
         );
         Ok(())
