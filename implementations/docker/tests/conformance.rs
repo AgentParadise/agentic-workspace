@@ -2,7 +2,9 @@
 mod process_tree_cancel;
 
 use agentic_workspace_conformance::{assert_basic_lifecycle, minimal_manifest};
-use agentic_workspace_core::{CommandSpec, SecurityProfile, WorkspaceProvider};
+use agentic_workspace_core::{
+    CommandSpec, LaunchManifest, SecurityProfile, WorkspaceHandle, WorkspaceProvider,
+};
 use agentic_workspace_docker::{CODEX_IMAGE_LABEL, DockerProvider, NetworkPolicy};
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -30,6 +32,80 @@ fn require_or_skip_docker() -> bool {
     }
 }
 
+/// A provisioned workspace destroyed when dropped, so a failed assertion or
+/// unwrap never leaves its container behind. Drop ignores the result: it may
+/// run while unwinding, where a second panic aborts, and a test may already
+/// have destroyed the workspace (destroy is idempotent).
+struct Provisioned<'a> {
+    provider: &'a DockerProvider,
+    handle: WorkspaceHandle,
+}
+
+impl Drop for Provisioned<'_> {
+    fn drop(&mut self) {
+        let _ = self.provider.destroy(&self.handle);
+    }
+}
+
+impl std::ops::Deref for Provisioned<'_> {
+    type Target = WorkspaceHandle;
+
+    fn deref(&self) -> &WorkspaceHandle {
+        &self.handle
+    }
+}
+
+/// Provision under an execution id unique to this run, so a concurrent or
+/// retried run never meets a container left by another.
+fn provision<'a>(provider: &'a DockerProvider, manifest: &LaunchManifest) -> Provisioned<'a> {
+    let mut manifest = manifest.clone();
+    manifest.execution_id = unique_id(&manifest.execution_id);
+    let handle = provider.provision(&manifest).unwrap();
+    Provisioned { provider, handle }
+}
+
+fn unique_id(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{prefix}-{}-{nanos:x}", std::process::id())
+}
+
+fn container_exists(name: &str) -> bool {
+    Command::new("docker")
+        .args(["container", "inspect", name])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+#[test]
+fn a_panicking_test_still_removes_its_container() {
+    if !require_or_skip_docker() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let provider =
+        DockerProvider::new(root.path(), "python:3.12-slim", NetworkPolicy::None).unwrap();
+    let manifest = minimal_manifest("docker-panic-cleanup", SecurityProfile::Isolated);
+    let mut container = None;
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let handle = provision(&provider, &manifest);
+        let name = handle.provider_reference.clone().unwrap();
+        assert!(container_exists(&name), "{name} was never created");
+        container = Some(name);
+        panic!("an assertion failing mid-test");
+    }));
+    assert!(unwound.is_err());
+    let container = container.unwrap();
+    assert!(
+        !container_exists(&container),
+        "{container} survived the panic"
+    );
+}
+
 #[test]
 fn passes_shared_functional_conformance() {
     if !require_or_skip_docker() {
@@ -38,7 +114,7 @@ fn passes_shared_functional_conformance() {
     let root = tempfile::tempdir().unwrap();
     let provider =
         DockerProvider::new(root.path(), "python:3.12-slim", NetworkPolicy::None).unwrap();
-    let manifest = minimal_manifest("docker-conformance", SecurityProfile::Isolated);
+    let manifest = minimal_manifest(unique_id("docker-conformance"), SecurityProfile::Isolated);
     assert_basic_lifecycle(
         &provider,
         &manifest,
@@ -98,7 +174,7 @@ fn enforces_isolation_and_kills_timed_out_container() {
     let mut manifest = minimal_manifest("docker-security", SecurityProfile::Isolated);
     manifest.limits.memory_mb = Some(128);
     manifest.limits.cpu_millis = Some(500);
-    let handle = provider.provision(&manifest).unwrap();
+    let handle = provision(&provider, &manifest);
     let container = handle.provider_reference.as_deref().unwrap();
 
     let inspection = Command::new("docker")
@@ -160,7 +236,7 @@ fn enforces_isolation_and_kills_timed_out_container() {
 
 fn user_namespace_probe(provider: &DockerProvider, id: &str) -> (bool, String) {
     let manifest = minimal_manifest(id, SecurityProfile::Isolated);
-    let handle = provider.provision(&manifest).unwrap();
+    let handle = provision(provider, &manifest);
     let container = handle.provider_reference.clone().unwrap();
     let inspection = Command::new("docker")
         .args([
@@ -320,12 +396,8 @@ fn codex_mount_policy_admits_bwrap_and_denies_sensitive_mounts() {
     build_images();
     let root = tempfile::tempdir().unwrap();
     let provider = DockerProvider::new(root.path(), CODEX_IMAGE, NetworkPolicy::None).unwrap();
-    let handle = provider
-        .provision(&minimal_manifest(
-            "docker-mount-policy",
-            SecurityProfile::Isolated,
-        ))
-        .unwrap();
+    let manifest = minimal_manifest("docker-mount-policy", SecurityProfile::Isolated);
+    let handle = provision(&provider, &manifest);
     let result = provider
         .execute(
             &handle,
@@ -375,4 +447,321 @@ fn codex_mount_policy_admits_bwrap_and_denies_sensitive_mounts() {
         checked += 1;
     }
     assert_eq!(checked, 41, "{stdout}");
+}
+
+/// The Rust `SupportsOperations` against a real container: cancel ends the
+/// leader, a grandchild, a child that left the group and a TERM-trapper,
+/// confirmed through the container's own `/proc`, without a container stop.
+#[test]
+fn operations_cancel_the_whole_tree_in_a_real_container() {
+    use agentic_workspace_core::operations::{
+        ObserveRequest, OperationSpec, OperationState, SupportsOperations, WorkspaceRef,
+    };
+    use agentic_workspace_docker::operations::DockerOperations;
+    use base64::Engine as _;
+
+    if !require_or_skip_docker() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let provider =
+        DockerProvider::new(root.path(), "python:3.12-slim", NetworkPolicy::None).unwrap();
+    let manifest = minimal_manifest("docker-operations", SecurityProfile::Isolated);
+    let handle = provision(&provider, &manifest);
+    let container = handle.provider_reference.clone().unwrap();
+    let workspace: WorkspaceRef =
+        serde_json::from_value(serde_json::json!({"provider": "docker", "resource_id": container}))
+            .unwrap();
+    let spec: OperationSpec = serde_json::from_value(serde_json::json!({
+        "execution_id": "exec-docker",
+        "operation_key": "k1",
+        "argv": ["sh", "-c", "trap '' TERM; \
+            (trap '' TERM; while :; do sleep 1; done) & echo trapper $!; \
+            (sleep 300 & echo grandchild $!; wait) & \
+            setsid sleep 300 & echo escapee $!; \
+            echo leader $$; wait"],
+        "working_directory": manifest.workspace.working_directory,
+        "environment": {},
+        "credential_bindings": [],
+        "timeout_seconds": 120,
+        "metadata": {},
+    }))
+    .unwrap();
+    let ops = DockerOperations::new(
+        "docker",
+        std::num::NonZeroU64::new(1 << 20).unwrap(),
+        std::num::NonZeroU64::new(1 << 16).unwrap(),
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (status, pids) = runtime.block_on(async {
+        let op = ops.start(&workspace, spec).await.unwrap();
+        let (mut pids, mut cursor) = (Vec::<String>::new(), None);
+        while pids.len() < 4 {
+            let request = ObserveRequest {
+                cursor,
+                max_bytes: 4096,
+                wait: Duration::from_secs(10),
+            };
+            let page = ops.observe(&op, request).await.unwrap();
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(page.data_b64.as_str())
+                .unwrap();
+            let text = String::from_utf8(data).unwrap();
+            pids.extend(
+                text.split_whitespace()
+                    .filter(|w| w.parse::<u32>().is_ok())
+                    .map(String::from),
+            );
+            cursor = Some(page.next_cursor.to_string());
+            assert!(!page.complete, "ended before cancel: {text}");
+        }
+        (ops.cancel(&op, Duration::from_secs(1)).await.unwrap(), pids)
+    });
+    assert_eq!(status.state, OperationState::Cancelled);
+    assert!(
+        !status.metadata.get().contains_key("escalation"),
+        "{status:?}"
+    );
+    for pid in &pids {
+        let stat = Command::new("docker")
+            .args(["exec", &container, "cat", &format!("/proc/{pid}/stat")])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&stat.stdout);
+        let live = stat.status.success() && !text.rsplit_once(") ").unwrap().1.starts_with('Z');
+        assert!(!live, "pid {pid} survived cancel");
+    }
+    provider.destroy(&handle).unwrap();
+}
+
+/// Resolves every credential to one invented value.
+struct InventedVault;
+
+/// Invented values: one a credential binding resolves, one only the caller holds.
+const RESOLVED_CANARY: &str = "canary-INVENTED-resolved-41c9";
+const CALLER_CANARY: &str = "canary-INVENTED-caller-5e1d";
+
+impl agentic_workspace_core::operations::CredentialResolver for InventedVault {
+    fn resolve<'a>(
+        &'a self,
+        _credential: &'a agentic_workspace_core::operations::CredentialRef,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<String, agentic_workspace_core::operations::OperationError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(RESOLVED_CANARY.to_owned()) })
+    }
+}
+
+/// The Rust `SupportsOperations` against a real container: a workload prints
+/// a resolved credential and a caller-registered value whole, split across
+/// two writes at every offset, repeated on stderr, and as an unfinished
+/// prefix at EOF, and neither value is ever in a page.
+#[test]
+fn operations_never_page_a_registered_or_resolved_value_in_a_real_container() {
+    use agentic_workspace_core::operations::{
+        ObserveRequest, OperationSpec, OperationState, Redaction, SupportsOperations, WorkspaceRef,
+    };
+    use agentic_workspace_docker::operations::DockerOperations;
+    use base64::Engine as _;
+
+    if !require_or_skip_docker() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let provider =
+        DockerProvider::new(root.path(), "python:3.12-slim", NetworkPolicy::None).unwrap();
+    let manifest = minimal_manifest("docker-redaction", SecurityProfile::Isolated);
+    let handle = provision(&provider, &manifest);
+    let container = handle.provider_reference.clone().unwrap();
+    let workspace: WorkspaceRef =
+        serde_json::from_value(serde_json::json!({"provider": "docker", "resource_id": container}))
+            .unwrap();
+    // `$T` is the resolved value, `$1` the caller's. Split writes are
+    // separated by a sleep so they reach the collector as separate reads.
+    let script = "C=\"$1\"; for V in \"$T\" \"$C\"; do \
+        printf 'whole %s\\n' \"$V\"; \
+        k=1; while [ $k -lt ${#V} ]; do \
+          printf %s \"$V\" | head -c $k; sleep 0.02; \
+          printf %s \"$V\" | tail -c +$((k + 1)); echo; k=$((k + 1)); \
+        done; \
+        printf '%s%s rep\\n' \"$V\" \"$V\" >&2; \
+      done; printf 'eof %s' \"$(printf %s \"$C\" | head -c 9)\"";
+    let spec: OperationSpec = serde_json::from_value(serde_json::json!({
+        "execution_id": "exec-docker",
+        "operation_key": "redaction",
+        "argv": ["sh", "-c", script, "sh", CALLER_CANARY],
+        "working_directory": manifest.workspace.working_directory,
+        "environment": {},
+        "credential_bindings": [{
+            "ref": {"name": "invented", "scope": "test"},
+            "delivery": "env",
+            "target": "T",
+        }],
+        "timeout_seconds": 120,
+        "metadata": {},
+    }))
+    .unwrap();
+    let ops = DockerOperations::new(
+        "docker",
+        std::num::NonZeroU64::new(1 << 20).unwrap(),
+        std::num::NonZeroU64::new(1 << 16).unwrap(),
+    )
+    .with_credentials(std::sync::Arc::new(InventedVault));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, output) = runtime.block_on(async {
+        let op = ops
+            .start_redacted(&workspace, spec, Redaction::new([CALLER_CANARY]))
+            .await
+            .unwrap();
+        let (mut output, mut cursor) = (Vec::new(), None);
+        loop {
+            let request = ObserveRequest {
+                cursor,
+                max_bytes: 4096,
+                wait: Duration::from_secs(10),
+            };
+            let page = ops.observe(&op, request).await.unwrap();
+            output.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(page.data_b64.as_str())
+                    .unwrap(),
+            );
+            cursor = Some(page.next_cursor.to_string());
+            if page.complete {
+                return (page.state, output);
+            }
+        }
+    });
+    let text = String::from_utf8(output).unwrap();
+    assert_eq!(state, OperationState::Succeeded, "{text}");
+    for value in [RESOLVED_CANARY, CALLER_CANARY] {
+        assert!(!text.contains(value), "{text}");
+    }
+    // Per value: whole, a split at each of len - 1 offsets, and two repeats.
+    let expected = [RESOLVED_CANARY, CALLER_CANARY]
+        .iter()
+        .map(|v| v.len() + 2)
+        .sum::<usize>();
+    assert_eq!(text.matches("[REDACTED]").count(), expected, "{text}");
+    // The unfinished prefix is held until EOF, so it is stored last, after
+    // whatever the other channel wrote meanwhile.
+    assert!(text.ends_with(&CALLER_CANARY[..9]), "{text}");
+    provider.destroy(&handle).unwrap();
+}
+
+/// The Rust `SupportsOperations` against a real container: a double-forked
+/// descendant that the container's init adopted before cancel first looked
+/// has no parent chain back to the operation, so cancel must fail closed into
+/// a container stop, confirmed stopped, and nothing of the operation survives.
+#[test]
+fn operations_cancel_stops_the_container_for_a_double_forked_orphan() {
+    use agentic_workspace_core::operations::{
+        ObserveRequest, OperationSpec, OperationState, SupportsOperations, WorkspaceRef,
+    };
+    use agentic_workspace_docker::operations::DockerOperations;
+    use base64::Engine as _;
+
+    if !require_or_skip_docker() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let provider =
+        DockerProvider::new(root.path(), "python:3.12-slim", NetworkPolicy::None).unwrap();
+    let manifest = minimal_manifest("docker-operations-orphan", SecurityProfile::Isolated);
+    let handle = provision(&provider, &manifest);
+    let container = handle.provider_reference.clone().unwrap();
+    let workspace: WorkspaceRef =
+        serde_json::from_value(serde_json::json!({"provider": "docker", "resource_id": container}))
+            .unwrap();
+    let spec: OperationSpec = serde_json::from_value(serde_json::json!({
+        "execution_id": "exec-docker",
+        "operation_key": "k1",
+        "argv": ["sh", "-c",
+            "setsid sh -c 'sleep 300 & echo orphan $!' & wait; echo leader $$; sleep 300"],
+        "working_directory": manifest.workspace.working_directory,
+        "environment": {},
+        "credential_bindings": [],
+        "timeout_seconds": 120,
+        "metadata": {},
+    }))
+    .unwrap();
+    let ops = DockerOperations::new(
+        "docker",
+        std::num::NonZeroU64::new(1 << 20).unwrap(),
+        std::num::NonZeroU64::new(1 << 16).unwrap(),
+    );
+    let stat = |pid: &str| {
+        let out = Command::new("docker")
+            .args(["exec", &container, "cat", &format!("/proc/{pid}/stat")])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        out.status.success().then_some(text)
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (status, pids) = runtime.block_on(async {
+        let op = ops.start(&workspace, spec).await.unwrap();
+        let (mut pids, mut cursor) = (Vec::<String>::new(), None);
+        while pids.len() < 2 {
+            let request = ObserveRequest {
+                cursor,
+                max_bytes: 4096,
+                wait: Duration::from_secs(10),
+            };
+            let page = ops.observe(&op, request).await.unwrap();
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(page.data_b64.as_str())
+                .unwrap();
+            let text = String::from_utf8(data).unwrap();
+            pids.extend(
+                text.split_whitespace()
+                    .filter(|w| w.parse::<u32>().is_ok())
+                    .map(String::from),
+            );
+            cursor = Some(page.next_cursor.to_string());
+            assert!(!page.complete, "ended before cancel: {text}");
+        }
+        // Its parent has exited and the container's init adopted it.
+        let adopted = || {
+            stat(&pids[0]).is_some_and(|s| {
+                s.rsplit_once(") ").unwrap().1.split_whitespace().nth(1) == Some("1")
+            })
+        };
+        for _ in 0..50 {
+            if adopted() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(adopted(), "orphan {} was never adopted by init", pids[0]);
+        (ops.cancel(&op, Duration::from_secs(1)).await.unwrap(), pids)
+    });
+    assert_eq!(status.state, OperationState::Cancelled);
+    assert_eq!(
+        status.metadata.get().get("escalation").map(String::as_str),
+        Some("container_stopped"),
+        "{status:?}"
+    );
+    let state = Command::new("docker")
+        .args([
+            "container",
+            "inspect",
+            "-f",
+            "{{.State.Status}}",
+            &container,
+        ])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&state.stdout);
+    assert!(state.trim() != "running", "container still {state}");
+    // A stopped container runs nothing, so no identity can have survived.
+    for pid in &pids {
+        assert!(stat(pid).is_none(), "pid {pid} survived cancel");
+    }
+    provider.destroy(&handle).unwrap();
 }

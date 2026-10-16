@@ -39,6 +39,7 @@ import contextlib
 import os
 import posixpath
 import signal
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -63,7 +64,11 @@ from agentic_isolation.contract import (
     WorkspaceRef,
 )
 from agentic_isolation.providers.base import CredentialResolver, Workspace
-from agentic_isolation.providers.operation_spool import OperationFailure, OperationSpool
+from agentic_isolation.providers.operation_spool import (
+    OperationFailure,
+    OperationSpool,
+    redaction_policy,
+)
 
 # Runs as the exec's main process. Reads the launch marker's argv0 and line
 # from stdin into shell variables (never an argv or an exported variable),
@@ -229,6 +234,8 @@ class _Replay:
 
     spec: OperationSpec
     ref: OperationRef
+    # `redaction_policy` of the caller's registration; a replay must match it.
+    policy: bytes = field(default_factory=lambda: redaction_policy(()), repr=False)
 
 
 @dataclass
@@ -339,8 +346,13 @@ class DockerOperations:
         *,
         delivered_env: dict[str, str] | None = None,
         separate_channels: bool = False,
+        redact: Collection[str] = (),
     ) -> OperationRef:
         """Accept `spec` once per `(workspace, operation_key)`.
+
+        `redact` registers credential values the workload may print; they,
+        and every value this provider resolves or delivers, are replaced in
+        the spool, its pages and `channels` before anything is stored.
 
         `delivered_env` and `separate_channels` are for the legacy `execute`
         path only: values the caller already holds, delivered exactly like
@@ -361,7 +373,7 @@ class DockerOperations:
         try:
             async with launch.lock:
                 return await self._start_locked(
-                    workspace, spec, key, container, delivered_env, separate_channels
+                    workspace, spec, key, container, delivered_env, separate_channels, redact
                 )
         finally:
             launch.users -= 1
@@ -376,6 +388,7 @@ class DockerOperations:
         container: str,
         delivered_env: dict[str, str] | None,
         separate_channels: bool,
+        redact: Collection[str],
     ) -> OperationRef:
         existing = self._by_key.get(key)
         if existing is not None:
@@ -383,6 +396,14 @@ class DockerOperations:
                 raise _error(
                     "conflict",
                     f"operation_key {spec.operation_key!r} already started with a different spec",
+                    existing.ref,
+                )
+            # A replay must not claim a registration the spool never had.
+            if existing.policy != redaction_policy(redact):
+                raise _error(
+                    "conflict",
+                    f"operation_key {spec.operation_key!r} already started "
+                    "with different redaction values",
                     existing.ref,
                 )
             return existing.ref
@@ -395,6 +416,10 @@ class DockerOperations:
         except CredentialPolicyError as e:
             raise OperationFailure(OperationError(kind="rejected_policy", message=str(e))) from e
         secrets = dict(delivered_env or {})
+        # Every value delivered or resolved, kept apart from `secrets`: two
+        # bindings may name one target, and the overwritten value must still
+        # be registered.
+        resolved = list(secrets.values())
         for binding in spec.credential_bindings:
             if binding.delivery != "env":
                 raise OperationFailure(
@@ -412,6 +437,7 @@ class DockerOperations:
                     )
                 )
             secrets[binding.target] = await self._credentials.resolve(binding.ref)
+            resolved.append(secrets[binding.target])
         self._sequence += 1
         ref = OperationRef(
             workspace=WorkspaceRef(provider="docker", resource_id=container),
@@ -422,7 +448,9 @@ class DockerOperations:
             ref=ref,
             spec=spec,
             container=container,
-            spool=OperationSpool(retention_bytes=self._retention),
+            spool=OperationSpool(
+                retention_bytes=self._retention, redact=(*redact, *resolved)
+            ),
             started_at=_now(),
             key=key,
             channels=(bytearray(), bytearray()) if separate_channels else None,
@@ -444,7 +472,7 @@ class DockerOperations:
             process.stdin.close()
         operation.collector = asyncio.create_task(self._collect(operation, process))
         self._operations[ref.operation_id] = operation
-        self._by_key[key] = _Replay(spec=spec, ref=ref)
+        self._by_key[key] = _Replay(spec=spec, ref=ref, policy=redaction_policy(redact))
         return ref
 
     def client_argv(
@@ -556,6 +584,8 @@ class DockerOperations:
                 with contextlib.suppress(asyncio.CancelledError):
                     await readers
             operation.leader_known.set()
+        for channel, stored in operation.spool.finish().items():
+            self._keep(operation, stored, channel=channel)
         operation.client_finished = True
         operation.settle_by = asyncio.get_running_loop().time() + _REMOVAL_WAIT_SECONDS
         await self._settle(operation, process.returncode, wait=True)
@@ -581,10 +611,16 @@ class DockerOperations:
 
     @staticmethod
     def _record(operation: _Operation, chunk: bytes, *, channel: Literal[0, 1]) -> None:
-        operation.spool.append(chunk)
-        if operation.channels is not None:
-            operation.channels[channel].extend(chunk)
+        DockerOperations._keep(
+            operation, operation.spool.append(chunk, channel=channel), channel=channel
+        )
         operation.changed.set()
+
+    @staticmethod
+    def _keep(operation: _Operation, stored: bytes, *, channel: int) -> None:
+        """Copy what the spool stored, never the raw chunk, to `channels`."""
+        if operation.channels is not None:
+            operation.channels[channel].extend(stored)
 
     @staticmethod
     def _note(operation: _Operation, failure: str) -> None:

@@ -7,18 +7,21 @@ useful for development and testing without Docker overhead.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import shutil
+import stat
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection
 from pathlib import Path
 
 from agentic_isolation.config import WorkspaceConfig
 from agentic_isolation.contract import (
     ObservationPage,
+    OperationError,
     OperationRef,
     OperationSpec,
     OperationStatus,
@@ -32,6 +35,7 @@ from agentic_isolation.providers.base import (
     resolve_env_credentials,
 )
 from agentic_isolation.providers.local_operations import LocalOperations
+from agentic_isolation.providers.operation_spool import OperationFailure
 
 logger = logging.getLogger(__name__)
 
@@ -146,10 +150,12 @@ class WorkspaceLocalProvider(BaseProvider):
         """What this provider can enforce: little, and it says so."""
         return self._operations.describe()
 
-    async def start(self, workspace: Workspace, spec: OperationSpec) -> OperationRef:
+    async def start(
+        self, workspace: Workspace, spec: OperationSpec, *, redact: Collection[str] = ()
+    ) -> OperationRef:
         """Start `spec` as a host process in the workspace directory."""
         return await self._operations.start(
-            workspace, spec, base_env=self._build_exec_env(workspace)
+            workspace, spec, base_env=self._build_exec_env(workspace), redact=redact
         )
 
     async def status(self, ref: OperationRef) -> OperationStatus:
@@ -256,13 +262,27 @@ class WorkspaceLocalProvider(BaseProvider):
         workspace: Workspace,
         path: str,
     ) -> str:
-        """Read a file from the workspace."""
+        """Read a file from the workspace.
+
+        A FIFO, socket or device is refused as `rejected_policy` and never
+        waited on: it is checked before the open and again on the descriptor,
+        and O_NONBLOCK lets a FIFO swapped in between open at once.
+        """
         file_path = workspace.path / path.lstrip("/")
 
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {path}")
-
-        with open(file_path, encoding="utf-8") as f:
+        if _is_special(file_path.stat().st_mode):
+            raise _not_regular(path)
+        try:
+            fd = os.open(file_path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError as e:
+            if e.errno == errno.ENXIO:  # a socket
+                raise _not_regular(path) from e
+            raise
+        with open(fd, encoding="utf-8") as f:
+            if _is_special(os.fstat(fd).st_mode):
+                raise _not_regular(path)
             return f.read()
 
     async def file_exists(
@@ -336,3 +356,13 @@ class WorkspaceLocalProvider(BaseProvider):
 
         async for line in self._read_stream_lines(proc, timeout_seconds):
             yield line
+
+
+def _is_special(mode: int) -> bool:
+    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
+
+
+def _not_regular(path: str) -> OperationFailure:
+    return OperationFailure(
+        OperationError(kind="rejected_policy", message=f"{path} is not a regular file")
+    )

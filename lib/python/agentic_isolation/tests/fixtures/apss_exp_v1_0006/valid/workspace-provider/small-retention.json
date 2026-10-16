@@ -1,0 +1,22 @@
+{
+  "schema": "apss.workspace-provider/v1",
+  "provider": "docker",
+  "security_profile": "isolated",
+  "enforceable_limits": {
+    "cpu": true,
+    "memory": true,
+    "disk": false,
+    "network": true,
+    "timeout": true
+  },
+  "capabilities": [],
+  "observation": {
+    "retention_bytes": 16,
+    "max_page_bytes": 4096,
+    "integrity": "exact"
+  },
+  "interactive": false,
+  "environment_kinds": [
+    "oci-image"
+  ]
+}

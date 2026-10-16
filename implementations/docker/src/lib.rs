@@ -1,5 +1,7 @@
 //! Docker implementation of the provider-neutral workspace lifecycle.
 
+pub mod operations;
+
 use agentic_workspace_core::{
     Artifact, CommandSpec, ExecutionResult, LaunchManifest, SecurityProfile, WorkspaceError,
     WorkspaceHandle, WorkspaceProvider, execute_process, materialize_file, validate_identifier,

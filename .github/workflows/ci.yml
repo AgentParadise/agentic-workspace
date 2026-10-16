@@ -31,15 +31,17 @@ jobs:
       # lib/python/agentic_isolation/agentic_isolation/apparmor/README.md).
       - name: Load Codex sandbox AppArmor profile
         run: sudo apparmor_parser -r lib/python/agentic_isolation/agentic_isolation/apparmor/agentic-codex-sandbox
-      - run: cargo test --workspace
+      # Process tests (the LH hazards among them) run in their own session,
+      # so they signal only groups inside it, under an outer wall-clock bound.
+      - run: setsid -w timeout -k 30 1200 cargo test --workspace
       - name: Verify APSS pin
         run: |
           grep -F 'id: EXP-V1-0006' APSS.yaml
-          grep -F 'version: "=0.2.0"' APSS.yaml
+          grep -F 'version: "=0.2.1"' APSS.yaml
           grep -F 'id = "EXP-V1-0006"' apss.lock
-          grep -F 'version = "0.2.0"' apss.lock
-          grep -F 'rev=3bdbc3382371af5c9bedbc2f6de07037ae081c7e#3bdbc3382371af5c9bedbc2f6de07037ae081c7e' Cargo.lock
-          cargo tree -p agentic-workspace-core | grep -F 'apss-v1-0006-workspace v0.2.0'
+          grep -F 'version = "0.2.1"' apss.lock
+          grep -F 'rev=ee926c6e44c0e37ad524e0ee265ffc4fabb714fc#ee926c6e44c0e37ad524e0ee265ffc4fabb714fc' Cargo.lock
+          cargo tree -p agentic-workspace-core | grep -F 'apss-v1-0006-workspace v0.2.1'
 
   rust-test:
     strategy:
@@ -56,7 +58,10 @@ jobs:
       - name: Load Codex sandbox AppArmor profile
         if: runner.os == 'Linux'
         run: sudo apparmor_parser -r lib/python/agentic_isolation/agentic_isolation/apparmor/agentic-codex-sandbox
-      - run: cargo test --workspace
+      - if: runner.os == 'Linux'
+        run: setsid -w timeout -k 30 1200 cargo test --workspace
+      - if: runner.os != 'Linux'
+        run: cargo test --workspace
 
   itmux-test:
     runs-on: ubuntu-latest
@@ -85,7 +90,15 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
       - run: uv sync --locked --all-extras
-      - run: uv run pytest -q
+      # Every invocation runs in its own session (`setsid -w`), so process
+      # tests signal only groups inside it, under an outer wall-clock bound.
+      # The hazard harness is named in its own step and excluded here, so it
+      # is never selected by a run that is not isolated and bounded for it.
+      - run: setsid -w timeout -k 30 900 uv run pytest -q --ignore=tests/test_behaviour_hazards.py
+      - name: APSS lifecycle-hazard behaviour harness
+        if: matrix.package == 'agentic_isolation'
+        timeout-minutes: 10
+        run: setsid -w timeout -k 30 480 uv run pytest -q -rsx tests/test_behaviour_hazards.py
 
   consumer-contracts:
     runs-on: ubuntu-latest
@@ -145,10 +158,41 @@ jobs:
           REQUIRE_DOCKER_CONFORMANCE: "1"
         run: cargo test -p agentic-workspace-docker --test conformance
 
+  mutation-evidence-runner:
+    # Unit tests for scripts/mutation_evidence.py, the runner behind the
+    # dispatch-only mutation-evidence.yml.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
+      - run: uv run --no-project --with pytest==8.3.5 pytest -q -p no:cacheprovider scripts/tests
+
+  mutations-not-merged:
+    # .mutations/ holds PR-scoped evidence patches for mutation-evidence.yml.
+    # Kept on main they rot as the code moves, so the PR comment is the record
+    # and the directory is deleted before merge. Red while the patches are on
+    # the branch is expected: it is the "not mergeable yet" signal.
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Refuse .mutations/ on main
+        run: |
+          if [ -n "$(git ls-files -- .mutations)" ]; then
+            echo "::error::delete .mutations/ before merge; evidence is in the mutation-evidence comment"
+            git ls-files -- .mutations
+            exit 1
+          fi
+          echo "no .mutations/ on this head"
+
   required:
     name: Required CI
     if: always()
-    needs: [rust-quality, rust-test, itmux-test, python-compatibility, consumer-contracts, plugin-hooks, docker-context, docker-conformance]
+    needs: [rust-quality, rust-test, itmux-test, python-compatibility, consumer-contracts, plugin-hooks, docker-context, docker-conformance, mutation-evidence-runner, mutations-not-merged]
     runs-on: ubuntu-latest
     steps:
       - name: Verify required jobs
@@ -161,6 +205,10 @@ jobs:
           PLUGIN_HOOKS_RESULT: ${{ needs.plugin-hooks.result }}
           DOCKER_RESULT: ${{ needs.docker-context.result }}
           DOCKER_CONFORMANCE_RESULT: ${{ needs.docker-conformance.result }}
+          MUTATION_RUNNER_RESULT: ${{ needs.mutation-evidence-runner.result }}
+          MUTATIONS_NOT_MERGED_RESULT: ${{ needs.mutations-not-merged.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           test "$RUST_QUALITY_RESULT" = success
           test "$RUST_TEST_RESULT" = success
@@ -170,3 +218,11 @@ jobs:
           test "$PLUGIN_HOOKS_RESULT" = success
           test "$DOCKER_RESULT" = success
           test "$DOCKER_CONFORMANCE_RESULT" = success
+          test "$MUTATION_RUNNER_RESULT" = success
+          # Must RUN and pass on a PR into main; skipped is right everywhere
+          # else. A cancelled check proves nothing, so it never passes.
+          if [ "$EVENT_NAME" = pull_request ] && [ "$BASE_REF" = main ]; then
+            test "$MUTATIONS_NOT_MERGED_RESULT" = success
+          else
+            test "$MUTATIONS_NOT_MERGED_RESULT" = skipped
+          fi

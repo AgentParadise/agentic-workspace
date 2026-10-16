@@ -9,6 +9,9 @@ and skip counts. CI job: python-compatibility (agentic_isolation).
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 from agentic_isolation import (
@@ -62,3 +65,31 @@ async def test_a_quiet_workload_is_measured_and_not_oom_killed() -> None:
     assert report.usage.oom_kills == 0
     assert report.usage.oom_killed is False
     assert report.usage.cpu_usage_seconds is not None
+
+
+async def test_root_owned_mode_000_files_do_not_retain_the_workspace(tmp_path: Path) -> None:
+    """The syntropic137 CI failure: the runner uid cannot delete what the
+    container's root wrote, so teardown went through the container fallback."""
+    provider = WorkspaceDockerProvider(
+        default_image=IMAGE,
+        security=SecurityConfig.development(),
+        workspace_base_dir=str(tmp_path),
+    )
+    workspace = await provider.create(_config("256m"))
+    workspace_dir = Path(workspace.metadata["workspace_dir"])
+    try:
+        result = await provider.execute(
+            workspace,
+            "mkdir /workspace/owned && echo x > /workspace/owned/locked"
+            " && chmod 000 /workspace/owned/locked /workspace/owned",
+            timeout=60,
+        )
+        assert result.exit_code == 0, result
+    finally:
+        report = await provider.destroy(workspace)
+
+    assert report.finalization.state == "completed", report
+    assert not workspace_dir.exists()
+    if os.geteuid() != 0:
+        # A root host deletes it alone; only another uid needs the fallback.
+        assert report.usage.delete_fallback == "deleted"

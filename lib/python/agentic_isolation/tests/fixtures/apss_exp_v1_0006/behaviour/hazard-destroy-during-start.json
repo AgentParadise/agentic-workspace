@@ -1,0 +1,122 @@
+{
+  "description": "destroy runs while a start is blocked in credential resolution. The blocked start fails without launching, nothing launches after destroy, and once each call returns the provider holds no operation record for the workspace.",
+  "hazard": "LH-4",
+  "steps": [
+    {
+      "call": "start",
+      "args": {
+        "spec": {
+          "schema": "apss.workspace-operation/v1",
+          "execution_id": "exec-42",
+          "operation_key": "exec-42:phase-1:fence-9:agent",
+          "argv": [
+            "agent",
+            "--print",
+            "--output-format",
+            "stream-json"
+          ],
+          "working_directory": "repo",
+          "environment": {
+            "LANG": "C.UTF-8"
+          },
+          "credential_bindings": [
+            {
+              "ref": {
+                "name": "github-app",
+                "scope": "repo:acme/widgets"
+              },
+              "delivery": "env",
+              "target": "GH_TOKEN"
+            }
+          ],
+          "launch_marker": {
+            "argv0": "agent-launch",
+            "line": "APSS-LAUNCH 6f1e9c"
+          },
+          "timeout_seconds": 3600,
+          "metadata": {
+            "phase_id": "phase-1"
+          }
+        }
+      },
+      "given": [
+        "destroyed_during_credential_resolution"
+      ],
+      "settles_within_seconds": 30,
+      "expect_one_of": [
+        {
+          "schema": "workspace-status.schema.json",
+          "document": {
+            "schema": "apss.workspace-status/v1",
+            "kind": "resource_lost",
+            "message": "workspace ws-7f3a destroyed while resolving credential github-app"
+          }
+        },
+        {
+          "schema": "workspace-status.schema.json",
+          "document": {
+            "schema": "apss.workspace-status/v1",
+            "kind": "cancelled",
+            "message": "start abandoned: workspace ws-7f3a destroyed"
+          }
+        }
+      ],
+      "launches": 0,
+      "operation_records": 0
+    },
+    {
+      "call": "start",
+      "args": {
+        "spec": {
+          "schema": "apss.workspace-operation/v1",
+          "execution_id": "exec-42",
+          "operation_key": "exec-42:phase-1:fence-9:agent",
+          "argv": [
+            "agent",
+            "--print",
+            "--output-format",
+            "stream-json"
+          ],
+          "working_directory": "repo",
+          "environment": {
+            "LANG": "C.UTF-8"
+          },
+          "credential_bindings": [
+            {
+              "ref": {
+                "name": "github-app",
+                "scope": "repo:acme/widgets"
+              },
+              "delivery": "env",
+              "target": "GH_TOKEN"
+            }
+          ],
+          "launch_marker": {
+            "argv0": "agent-launch",
+            "line": "APSS-LAUNCH 6f1e9c"
+          },
+          "timeout_seconds": 3600,
+          "metadata": {
+            "phase_id": "phase-1"
+          }
+        }
+      },
+      "given": [
+        "workspace_destroyed"
+      ],
+      "settles_within_seconds": 10,
+      "expect_one_of": [
+        {
+          "schema": "workspace-status.schema.json",
+          "document": {
+            "schema": "apss.workspace-status/v1",
+            "kind": "resource_lost",
+            "message": "workspace ws-7f3a was destroyed"
+          }
+        }
+      ],
+      "launches": 0,
+      "operation_records": 0
+    }
+  ]
+}

@@ -58,6 +58,10 @@
             }
           }
         },
+        "loss_detected": {
+          "description": "Since 0.2.1. True when this generation lost bytes to retention before next_cursor, on this page or an earlier one of the same drain. Required on the completing page of a drain that lost bytes; absent means no loss is claimed.",
+          "const": true
+        },
         "complete": {
           "type": "boolean"
         }

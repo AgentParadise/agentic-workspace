@@ -29,6 +29,8 @@ class ObservationPage(ContractModel):
     next_cursor: NonEmptyStr
     data_b64: Annotated[str, Field(pattern=_BASE64)]
     gap: ObservationGap | MISSING = MISSING
+    # Since 0.2.1: this drain lost bytes to retention before `next_cursor`.
+    loss_detected: Literal[True] | MISSING = MISSING
     complete: bool
 
     @model_validator(mode="after")

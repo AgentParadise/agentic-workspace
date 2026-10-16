@@ -1,12 +1,13 @@
-# EXP-V1-0006 0.2.0 Contract Provenance
+# EXP-V1-0006 0.2.1 Contract Provenance
 
 - Source repository: `AgentParadise/agent-paradise-standards-system`
-- Source commit: `3bdbc3382371af5c9bedbc2f6de07037ae081c7e` (merge of APSS#143)
+- Source commit: `ee926c6e44c0e37ad524e0ee265ffc4fabb714fc` (merge of APSS#145)
 - Source path: `standards-experimental/v1/EXP-V1-0006-workspace/`
-- Experiment version: `0.2.0`
+- Experiment version: `0.2.1`
 - Vendored here: `schemas/` (all eleven schema files, byte-for-byte)
 - Vendored to `lib/python/agentic_isolation/tests/fixtures/apss_exp_v1_0006/`:
-  `fixtures/` (valid, invalid, behaviour and launch-v1, byte-for-byte)
+  `fixtures/` (valid, invalid, behaviour, launch-v1 and
+  `file-probe.schema.json`, byte-for-byte)
 
 The source commit must equal the `apss-workspace-standard` rev in the root
 `Cargo.toml`; `tests/test_contract_provenance.py` enforces it and checks every
@@ -22,20 +23,28 @@ pin, this record and the files in one change.
 | `agentic_isolation/contract/schemas/environment-ref.schema.json` | `997945ed7b759070facf241a1c1bba307c8f5e810bdd2e91f360e3a0002f1394` |
 | `agentic_isolation/contract/schemas/workspace-finalization.schema.json` | `d5a540f7fd9bd490b785015d6c9783fa6fd3260cfa1208ba70b5c5bb2edf476d` |
 | `agentic_isolation/contract/schemas/workspace-launch.schema.json` | `a16ad5dea0b4cb4119bc0fe967628a5eb906e7bc3bdef7d6c13cb45679863008` |
-| `agentic_isolation/contract/schemas/workspace-observation.schema.json` | `db5ef70c44e0c0b391195cab8d8705f216d45b84c8aea2f38f5dc09e3a9995c4` |
+| `agentic_isolation/contract/schemas/workspace-observation.schema.json` | `102404a958f9644f7ccaf6488d12734ea146b12dfe8f0de39a1f2a424db5a6e5` |
 | `agentic_isolation/contract/schemas/workspace-operation.schema.json` | `aabe6a41d532e49d83cb7bf4c041aeaade168d4e4bb34beac07ed2355064b70e` |
 | `agentic_isolation/contract/schemas/workspace-provider.schema.json` | `0868a146761327a4fadfe47af61cd6c238aa06241fb84f8f227cf9b4ecb988a5` |
 | `agentic_isolation/contract/schemas/workspace-ref.schema.json` | `76ff2bb6c266d1523dd1675a74f04f806f9b9154b87ab2c2807bc26fbceae960` |
 | `agentic_isolation/contract/schemas/workspace-result.schema.json` | `d04cfb7004af6672f06cf6245beb3de4026ad3bdaea7dacd6d90000838ac9696` |
 | `agentic_isolation/contract/schemas/workspace-status.schema.json` | `e941fbf144ca5bfcf36f60f58494333012ea20f45073e14cb580124e7a60312e` |
-| `tests/fixtures/apss_exp_v1_0006/README.md` | `d1ac4262d022349f18327ff6abf5a724d0cbbd491f72e9d1a5739be9f8a04ee2` |
+| `tests/fixtures/apss_exp_v1_0006/README.md` | `c17a3eb5a9298985bdb3b186eb5b6d6319f61a1a0711636a781e2ce776dea4f5` |
 | `tests/fixtures/apss_exp_v1_0006/behaviour/cancel-twice-terminal-once.json` | `356a6ddf54f156877b75b971629204f5bc06f8879a79ecd680e2102abfa2ea8e` |
 | `tests/fixtures/apss_exp_v1_0006/behaviour/cursor-after-retention-gap.json` | `bf6e99ed67356d9802e2b161469b23cff832949bede131702544012d1dc6f7e2` |
+| `tests/fixtures/apss_exp_v1_0006/behaviour/hazard-cancel-before-launch-header.json` | `a0d30dafc208dc9759d0a581497aa447b242303fa53a9eace485cf73ede17396` |
+| `tests/fixtures/apss_exp_v1_0006/behaviour/hazard-destroy-during-start.json` | `5514ab997f13c2cb62511e240c28fe2e003e5dae1a972df62586a3437dbba760` |
+| `tests/fixtures/apss_exp_v1_0006/behaviour/hazard-double-fork-orphan.json` | `98301495567b74ab252ccbda0961a9d5463dc32579fd7bc20cab835d5c0855be` |
+| `tests/fixtures/apss_exp_v1_0006/behaviour/hazard-drain-with-gap-reports-loss.json` | `cfa2e85adfcee7177c446a0eae43eae5260e6fe871acecb68fcd5833ba8d2999` |
+| `tests/fixtures/apss_exp_v1_0006/behaviour/hazard-fifo-in-workspace.json` | `af23f22d9262e7d2c4e7935058269b772ea870f422738c05b2a11da0bfa05f8b` |
+| `tests/fixtures/apss_exp_v1_0006/behaviour/hazard-interrupted-cancel.json` | `b99cb63694efe053437bab53aff7f91776e62aa701fc5a9729203670541cd387` |
+| `tests/fixtures/apss_exp_v1_0006/behaviour/hazard-stuck-removal-timeout-settles.json` | `5ec373c5677e9bc312ebc43c99a99eeb86617e727f9f69dd536e48afaf54313a` |
 | `tests/fixtures/apss_exp_v1_0006/behaviour/late-read-drains-then-complete.json` | `8fcf11e185ec909f984b8584ea0aa2301d11cc18918db080dde68e4cdb3db461` |
 | `tests/fixtures/apss_exp_v1_0006/behaviour/required-capture-unknown-success-false.json` | `3bfd1eb12168dba3043a74cbec2f97472b7b0023d0a509b4563b66491fbf761c` |
 | `tests/fixtures/apss_exp_v1_0006/behaviour/same-key-different-spec-conflict.json` | `e432cacb4e7022f833baeac0bd0965edc926af263037fa29ac077dc38b8117fd` |
 | `tests/fixtures/apss_exp_v1_0006/behaviour/start-same-key-one-launch.json` | `b1320230a764bb33fcceb0789728e44e88bf31703dad95530cf3246029c33f55` |
 | `tests/fixtures/apss_exp_v1_0006/behaviour/unknown-ref-typed-error.json` | `593decee879d4707f7908110958d1ae3cfd0400797c6dff832cd887fd6c68f9f` |
+| `tests/fixtures/apss_exp_v1_0006/file-probe.schema.json` | `e25a565097c1179d16a154e7b67e10557e87de108f537d83aa8bf9534222b22f` |
 | `tests/fixtures/apss_exp_v1_0006/invalid/complete-on-pending.json` | `c80fa675e7e64454c7d3eebfe0b47749448363c8f103f11b317a2105270b67b7` |
 | `tests/fixtures/apss_exp_v1_0006/invalid/complete-on-running.json` | `bb32a71644c3a24cf4a28f8b0ff4fc55bfd67a797dd26b6bc1be41d119ede08b` |
 | `tests/fixtures/apss_exp_v1_0006/invalid/content-ref-bad-digest.json` | `d79d675abab6b0a876235a8937dae5e4fb409a1cff996dbce9b64f28ec0f31aa` |
@@ -95,6 +104,7 @@ pin, this record and the files in one change.
 | `tests/fixtures/apss_exp_v1_0006/valid/workspace-operation/minimal.json` | `0cb4df5e05136bcde1d7a478efcf5360caaa74ea9e86f2625ca06a59ef3e01d0` |
 | `tests/fixtures/apss_exp_v1_0006/valid/workspace-provider/docker.json` | `49c5dfe08eee0b4d7523af3762767133461c71c0aefef779e4ae6f3aad893dc1` |
 | `tests/fixtures/apss_exp_v1_0006/valid/workspace-provider/local.json` | `43a2ff1422a33d36dfc3fccc9d5314ef65624a1948c02285b02ba76ce6edfe1d` |
+| `tests/fixtures/apss_exp_v1_0006/valid/workspace-provider/small-retention.json` | `edf4386fe7a482760803637c5b420d63bcc2a617e8a6ca1829d74641fff7d33d` |
 | `tests/fixtures/apss_exp_v1_0006/valid/workspace-ref/minimal.json` | `51a4339a5382f7a2e9faad450cd7a71bfd08967d7bac89e899d3b63b2ff3f260` |
 | `tests/fixtures/apss_exp_v1_0006/valid/workspace-result/capture-not-required.json` | `f4ed0f6b3703409ddd114a124a5e7f9aaad4efe626a062570ee0ed5748e3e7bc` |
 | `tests/fixtures/apss_exp_v1_0006/valid/workspace-result/capture-required-unknown.json` | `6d5b8f96d50ab677fe3945fb0e367a7e3dbab520d461af787cfc3bd91772d219` |

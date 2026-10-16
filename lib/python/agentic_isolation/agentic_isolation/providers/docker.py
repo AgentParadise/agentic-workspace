@@ -14,18 +14,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import errno
 import json
 import logging
 import math
 import os
 import posixpath
 import shutil
-import stat
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -57,9 +55,17 @@ from agentic_isolation.providers.base import (
     drain_operation,
     resolve_env_credentials,
 )
+from agentic_isolation.providers.contained_files import (
+    NotARegularFileError,
+    _open_contained,
+)
 from agentic_isolation.providers.docker_operations import DockerOperations
 from agentic_isolation.providers.operation_spool import OperationFailure
-from agentic_isolation.providers.teardown_report import TeardownReport, TeardownUsage
+from agentic_isolation.providers.teardown_report import (
+    DeleteFallback,
+    TeardownReport,
+    TeardownUsage,
+)
 
 # Security tmpfs targets that an explicit mount may never replace or sit beneath:
 # /home/agent holds harness configuration and credentials, /tmp and /var/agentic
@@ -90,7 +96,7 @@ class WorkspaceDockerProvider(BaseProvider):
     - --read-only: Immutable root filesystem
     - --tmpfs: Writable /tmp and /home/agent in memory
     - --pids-limit: Process count limit
-    - --runtime=runsc: gVisor sandbox (if available)
+    - --runtime=<alias>: the resolved runtime, always named (gVisor if available)
 
     Usage:
         provider = WorkspaceDockerProvider()
@@ -697,9 +703,11 @@ class WorkspaceDockerProvider(BaseProvider):
         """SupportsOperations: published before any launch."""
         return self._operations.describe()
 
-    async def start(self, workspace: Workspace, spec: OperationSpec) -> OperationRef:
+    async def start(
+        self, workspace: Workspace, spec: OperationSpec, *, redact: Collection[str] = ()
+    ) -> OperationRef:
         """SupportsOperations: accept `spec`; idempotent per operation_key."""
-        return await self._operations.start(workspace, spec)
+        return await self._operations.start(workspace, spec, redact=redact)
 
     async def status(self, ref: OperationRef) -> OperationStatus:
         """SupportsOperations: status from the daemon-reported exit code."""
@@ -1036,7 +1044,8 @@ class WorkspaceDockerProvider(BaseProvider):
                     usage=usage,
                 )
 
-        delete_failures = self._delete_workspace_dir(workspace)
+        delete_failures, delete_fallback = await self._delete_workspace_dir(workspace)
+        usage = replace(usage, delete_fallback=delete_fallback)
         if delete_failures:
             # `completed` would claim a directory that is still on disk, so the
             # workspace stays retained under the same ref for a retry.
@@ -1110,23 +1119,207 @@ class WorkspaceDockerProvider(BaseProvider):
             return None
         return out.decode(errors="replace")
 
-    def _delete_workspace_dir(self, workspace: Workspace) -> tuple[str, ...]:
+    async def _delete_workspace_dir(
+        self, workspace: Workspace
+    ) -> tuple[tuple[str, ...], DeleteFallback | None]:
         """Delete the host workspace directory. Irreversible.
 
-        Returns what could not be deleted, empty when the directory is gone. An
-        already absent directory is success, so a retry is idempotent.
+        Returns what could not be deleted, empty when the directory is gone,
+        and how the container fallback went when it was needed. An already
+        absent directory is success, so a retry is idempotent. A directory
+        that is not one this provider created under its base directory is
+        refused and left untouched.
+
+        The container writes as its own uid, so files it leaves in
+        subdirectories it created can be undeletable by this process (CI
+        runners are the common case). On `PermissionError` the contents are
+        deleted from a short-lived root container instead, and the emptied
+        directory, which this process created, is removed here.
         """
         workspace_dir = workspace.metadata.get("workspace_dir")
-        if not workspace_dir:
-            return ()
-        error: OSError | None = None
-        try:
-            shutil.rmtree(workspace_dir)
-        except OSError as exc:
-            error = exc
+        if not workspace_dir or not os.path.lexists(workspace_dir):
+            return (), None
+        # Checked before ANY delete, host or container: a path outside the
+        # base directory is never this provider's to remove.
+        if self._owned_workspace_dir(workspace, workspace_dir) is None:
+            return (f"{workspace_dir}: refused: {self._NOT_OWNED}",), None
+        error = _rmtree(workspace_dir)
+        fallback: DeleteFallback | None = None
+        why = ""
+        if isinstance(error, PermissionError):
+            fallback, why = await self._delete_contents_in_container(workspace, workspace_dir)
+            if fallback == "deleted":
+                error = _rmtree(workspace_dir)
         if not os.path.lexists(workspace_dir):
-            return ()
-        return (f"{workspace_dir}: {error!r}" if error else f"{workspace_dir}: still present",)
+            return (), fallback
+        detail = f"{workspace_dir}: {error!r}" if error else f"{workspace_dir}: still present"
+        if why:
+            return (detail, f"container delete {fallback}: {why}"), fallback
+        return (detail,), fallback
+
+    #: Bounds the whole `docker run` of the fallback delete.
+    _DELETE_TIMEOUT_SECONDS = 60.0
+    #: Bounds removing the fallback's container after its run failed.
+    _DELETE_CLEANUP_TIMEOUT_SECONDS = 15.0
+    #: Where the workspace directory is mounted inside the fallback container.
+    _DELETE_TARGET = "/workspace-delete"
+
+    #: Why a workspace directory is refused for deletion.
+    _NOT_OWNED = "not a directory this provider created under its base directory"
+
+    def _owned_workspace_dir(self, workspace: Workspace, workspace_dir: str) -> Path | None:
+        """`workspace_dir` resolved, or None when this provider did not create it.
+
+        Only a real directory directly under the provider's base directory
+        qualifies: `ws-<id>` under `workspace_base_dir`, or the
+        `agentic-ws-` mkdtemp directory when no base is configured. A symlink,
+        or a path resolving anywhere else (a symlinked ancestor included), is
+        refused, so neither the host nor the root container ever deletes a
+        directory the provider did not create.
+        """
+        path = Path(workspace_dir)
+        if path.is_symlink() or not path.is_dir():
+            return None
+        if self._workspace_base_dir is not None:
+            if path.name != workspace.id:
+                return None
+            base = self._workspace_base_dir
+        else:
+            if not path.name.startswith("agentic-ws-"):
+                return None
+            base = Path(tempfile.gettempdir()).resolve()
+        resolved = path.resolve()
+        return resolved if resolved == base / path.name else None
+
+    def _delete_mount_source(self, workspace: Workspace, workspace_dir: str) -> str | None:
+        """The Docker host path of `workspace_dir`, or None when it is not ours."""
+        owned = self._owned_workspace_dir(workspace, workspace_dir)
+        if owned is None:
+            return None
+        if self._workspace_host_dir is not None and self._workspace_base_dir is not None:
+            source = str(self._workspace_host_dir / owned.name)
+        else:
+            source = str(owned)
+        # `--mount` is comma separated; a comma would smuggle in an option.
+        return None if "," in source else source
+
+    def _delete_contents_command(self, workspace: Workspace, source: str) -> list[str]:
+        """`docker run` deleting everything under `source`, as root, offline.
+
+        `find -delete` never follows symlinks and unlinks them as entries, so
+        nothing outside the mount is touched. DAC_OVERRIDE is the one
+        capability root needs to unlink entries in another uid's directories,
+        including mode 000 ones; everything else stays dropped.
+        """
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            f"{workspace._handle}-delete",
+            "--network",
+            "none",
+            "--pull",
+            "never",
+            "--user",
+            "0:0",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "DAC_OVERRIDE",
+            "--security-opt",
+            "no-new-privileges",
+            "--read-only",
+            "--pids-limit",
+            "64",
+            "--entrypoint",
+            "find",
+            "--mount",
+            f"type=bind,source={source},target={self._DELETE_TARGET}",
+            workspace.metadata["image_id"],
+            self._DELETE_TARGET,
+            "-mindepth",
+            "1",
+            "-delete",
+        ]
+
+    async def _delete_contents_in_container(
+        self, workspace: Workspace, workspace_dir: str
+    ) -> tuple[DeleteFallback, str]:
+        """Empty `workspace_dir` from a root container. Never raises.
+
+        Uses the workspace's own image, which is already local: no pull, and
+        no second image to trust. Returns the outcome and why it was not
+        `deleted` (empty when it was).
+        """
+        source = self._delete_mount_source(workspace, workspace_dir)
+        if source is None:
+            return "refused", self._NOT_OWNED
+        if not workspace.metadata.get("image_id"):
+            return "refused", "no workspace image recorded to run the delete in"
+        cmd = self._delete_contents_command(workspace, source)
+        name = f"{workspace._handle}-delete"
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self._DELETE_TIMEOUT_SECONDS
+            )
+        except asyncio.CancelledError:
+            # The cancellation is what propagates; a cleanup error must not
+            # replace it.
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    await self._terminate(proc)
+                    await asyncio.shield(self._remove_delete_container(name))
+            raise
+        except Exception as exc:  # noqa: BLE001 - reported as retained, never raised
+            why = repr(exc)
+            if proc is not None:
+                # Killing the client leaves the container running; `rm -f`
+                # stops it before it deletes anything more.
+                with contextlib.suppress(Exception):
+                    await self._terminate(proc)
+                left = await self._remove_delete_container(name)
+                if left:
+                    why = f"{why}; {left}"
+            return "failed", why
+        if proc.returncode != 0:
+            detail = stderr.decode(errors="replace").strip()[-500:]
+            return "failed", f"docker run exited {proc.returncode}: {detail}"
+        return "deleted", ""
+
+    async def _remove_delete_container(self, name: str) -> str:
+        """`docker rm -f` the fallback's container, bounded. Raises only on cancellation.
+
+        Returns why the container may still exist, empty when it is gone.
+        Unlike `_remove`, a stalled client is killed after
+        `_DELETE_CLEANUP_TIMEOUT_SECONDS`, so the fallback stays bounded.
+        """
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker",
+                "rm",
+                "-f",
+                name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            code = await asyncio.wait_for(proc.wait(), timeout=self._DELETE_CLEANUP_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    await self._terminate(proc)
+            raise
+        except Exception as exc:  # noqa: BLE001 - reported with the failed fallback
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    await self._terminate(proc)
+            return f"docker rm -f {name} failed: {exc!r}"
+        return "" if code == 0 else f"docker rm -f {name} exited {code}"
 
     async def _stop(self, container_name: str) -> None:
         """`docker stop`, then snapshot the logs it caused to be written."""
@@ -1187,12 +1380,13 @@ class WorkspaceDockerProvider(BaseProvider):
             logger.warning("docker rm -f %s failed; the container may still exist", container_name)
 
 
-class NotARegularFileError(ValueError):
-    """A workspace path names a FIFO, socket or device, which the file helpers never open.
-
-    Opening a FIFO waits for its other end, which would hold the event loop,
-    and a device node the workload made would reach the host's device.
-    """
+def _rmtree(path: str) -> OSError | None:
+    """`shutil.rmtree`, returning its error instead of raising it."""
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        return exc
+    return None
 
 
 class ContainerRemovalError(RuntimeError):
@@ -1252,78 +1446,6 @@ def _usage_from_cgroup(text: str, *, oom_killed: bool | None) -> TeardownUsage:
         oom_kills=oom_kills,
         oom_killed=oom_killed,
     )
-
-
-def _open_contained(root: Path, path: str, flags: int, *, create_parents: bool = False) -> int:
-    """Open `path` under `root` and return its descriptor, or raise (APSS W-3.2-b).
-
-    Every component, including each `..`, is resolved against a descriptor
-    this walk opened itself with O_NOFOLLOW, so the check and the use are the
-    same system call: a symlink the workload swaps in at any moment is
-    refused, never followed, and `..` can never climb above `root`. A FIFO,
-    socket or device is refused with NotARegularFileError and never waited on.
-    """
-    if Path(path).is_absolute():
-        raise ValueError(f"workspace path {path!r} must be relative to the workspace")
-    *parents, name = PurePosixPath(path).parts or (".",)
-    if name in (".", ".."):
-        raise ValueError(f"workspace path {path!r} names no file in the workspace")
-
-    def escapes() -> ValueError:
-        return ValueError(f"workspace path {path!r} escapes the workspace directory")
-
-    def not_regular() -> NotARegularFileError:
-        return NotARegularFileError(
-            f"workspace path {path!r} is not a regular file (a FIFO, socket or device)"
-        )
-
-    nofollow = os.O_NOFOLLOW | os.O_CLOEXEC
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
-    # The root itself is the provider's own path; only what lies beneath it
-    # is writable by the workload.
-    stack = [os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)]
-    try:
-        for part in parents:
-            if part == "..":
-                if len(stack) == 1:
-                    raise escapes()
-                os.close(stack.pop())
-                continue
-            if create_parents:
-                with contextlib.suppress(FileExistsError):
-                    os.mkdir(part, 0o755, dir_fd=stack[-1])
-            try:
-                stack.append(os.open(part, directory_flags, dir_fd=stack[-1]))
-            except OSError as e:
-                if e.errno in (errno.ELOOP, errno.ENOTDIR):
-                    raise escapes() from e
-                raise
-        # Checked before the open so a device node is never opened at all, and
-        # again on the descriptor, which the workload cannot swap.
-        with contextlib.suppress(FileNotFoundError):
-            if _is_special(os.stat(name, dir_fd=stack[-1], follow_symlinks=False).st_mode):
-                raise not_regular()
-        try:
-            # O_NONBLOCK: a FIFO swapped in after the check opens at once (or
-            # fails ENXIO) instead of waiting for a writer or reader.
-            leaf = os.open(name, flags | nofollow | os.O_NONBLOCK, 0o644, dir_fd=stack[-1])
-        except OSError as e:
-            if e.errno == errno.ELOOP:
-                raise escapes() from e
-            if e.errno == errno.ENXIO:  # a FIFO with no reader, or a socket
-                raise not_regular() from e
-            raise
-        if _is_special(os.fstat(leaf).st_mode):
-            os.close(leaf)
-            raise not_regular()
-        return leaf
-    finally:
-        for fd in stack:
-            os.close(fd)
-
-
-def _is_special(mode: int) -> bool:
-    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
 
 
 def _relative_workdir(cwd: str | None) -> str:

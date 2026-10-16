@@ -35,3 +35,12 @@
 - Resolution: WILL-FIX
 - Tests affected: Local skill and capture conformance
 - Review date: 2026-10-22
+
+## DISC-005: Python operation spool completes on the page carrying the last bytes
+
+- Reference: APSS 3bdbc33 behaviour fixture `late-read-drains-then-complete`; plan exit test PR 3 (j), "drains the rest, and only then `complete`"
+- Implementation: The Rust spool (`crates/workspace-core/src/operations/spool.rs`) marks only the empty end page of a terminal operation `complete`, as the fixture expects. The Python spool (`providers/operation_spool.py`) marks the page that reaches the end complete, so a reader sees `complete` one page earlier.
+- Impact: Both readers collect the same bytes. A Python caller never receives the fixture's empty complete page.
+- Resolution: WILL-FIX in the Python provider, out of scope for the Rust PR, which does not change Python providers
+- Tests affected: Python observation conformance
+- Review date: 2026-10-22

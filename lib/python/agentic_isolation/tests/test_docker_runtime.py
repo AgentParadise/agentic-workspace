@@ -79,9 +79,24 @@ async def test_auto_on_runc_only_host_runs_runc(
     workspace = await provider.create(WorkspaceConfig(provider="docker"))
 
     (argv,) = spawned
-    assert not any(str(arg).startswith("--runtime") for arg in argv)
+    assert [arg for arg in argv if str(arg).startswith("--runtime")] == ["--runtime=runc"]
     assert workspace.metadata["runtime_requested"] == "auto"
     assert workspace.metadata["runtime_effective"] == "runc"
+    assert workspace.metadata["runtime_alias"] == "runc"
+
+
+async def test_explicit_runc_runs_under_runc_and_is_recorded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider, spawned = _provider(monkeypatch, tmp_path, {**RUNC, **KATA})
+    security = SecurityConfig(runtime=WorkspaceRuntime.RUNC)
+
+    workspace = await provider.create(WorkspaceConfig(provider="docker", security=security))
+
+    (argv,) = spawned
+    assert [arg for arg in argv if str(arg).startswith("--runtime")] == ["--runtime=runc"]
+    assert workspace.metadata["runtime_requested"] == "runc"
+    assert workspace.metadata["runtime_alias"] == "runc"
 
 
 async def test_unregistered_runtime_is_refused_before_anything_is_created(

@@ -59,6 +59,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -79,7 +80,12 @@ from agentic_isolation.contract import (
     WorkspaceRef,
 )
 from agentic_isolation.providers.base import CredentialResolver, Workspace
-from agentic_isolation.providers.operation_spool import OperationFailure, OperationSpool
+from agentic_isolation.providers.operation_spool import (
+    OperationFailure,
+    OperationSpool,
+    check_redaction,
+    redaction_policy,
+)
 
 # Values published in tests/fixtures/apss_exp_v1_0006/valid/workspace-provider/local.json.
 RETENTION_BYTES = 1 << 20
@@ -129,6 +135,7 @@ def _error(
         "rejected_policy",
         "unsupported_capability",
         "provider_unavailable",
+        "resource_lost",
     ],
     message: str,
     ref: OperationRef | None = None,
@@ -276,6 +283,8 @@ class _Operation:
     token: str
     # Clock ticks since boot before launch; every descendant started later.
     born: int
+    # `redaction_policy` of the caller's registration; a replay must match it.
+    policy: bytes = field(default_factory=lambda: redaction_policy(()), repr=False)
     # Inode of the output pipe; whoever still holds it keeps the operation open.
     pipe: int | None = None
     changed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -289,6 +298,8 @@ class _Operation:
     tracked: dict[int, int] = field(default_factory=dict)
     signal_failure: str | None = None
     unconfirmed: bool = False
+    # A cancel's signal and confirm ran to the end; an interrupted one did not.
+    cancel_confirmed: bool = False
     # Held while a cancel or timeout signals and confirms; settling waits on it.
     stopping: asyncio.Lock = field(default_factory=asyncio.Lock)
     collector: asyncio.Task[None] | None = None
@@ -335,12 +346,19 @@ class LocalOperations:
         )
 
     async def start(
-        self, workspace: Workspace, spec: OperationSpec, *, base_env: dict[str, str]
+        self,
+        workspace: Workspace,
+        spec: OperationSpec,
+        *,
+        base_env: dict[str, str],
+        redact: Collection[str] = (),
     ) -> OperationRef:
         """Accept `spec` once per `(workspace, operation_key)`.
 
         `base_env` is the environment the provider's `execute` would use; the
-        spec's overlay and resolved credentials are laid over it.
+        spec's overlay and resolved credentials are laid over it. `redact`
+        registers credential values the workload may print; they, and every
+        value resolved here, are replaced before the spool stores them.
         """
         if sys.platform != "linux":
             # Ownership, confirmation and cancel all read /proc.
@@ -362,12 +380,20 @@ class LocalOperations:
                         "with a different spec",
                         existing.ref,
                     )
+                # A replay must not claim a registration the spool never had.
+                if existing.policy != redaction_policy(redact):
+                    raise _error(
+                        "conflict",
+                        f"operation_key {spec.operation_key!r} already started "
+                        "with different redaction values",
+                        existing.ref,
+                    )
                 return existing.ref
-            return await self._launch(workspace, spec, key, base_env)
+            return await self._launch(workspace, spec, key, base_env, redact)
 
     def _admit(self, workspace_id: str) -> None:
         if workspace_id in self._closed:
-            raise _error("unknown_operation", f"workspace {workspace_id} is torn down")
+            raise _error("resource_lost", f"workspace {workspace_id} was destroyed")
 
     async def _launch(
         self,
@@ -375,6 +401,7 @@ class LocalOperations:
         spec: OperationSpec,
         key: tuple[str, str],
         base_env: dict[str, str],
+        redact: Collection[str],
     ) -> OperationRef:
         root = workspace.path.resolve()
         cwd = (root / spec.working_directory).resolve()
@@ -384,6 +411,7 @@ class LocalOperations:
                 f"working_directory {spec.working_directory!r} leaves workspace {workspace.id}",
             )
         env = {**base_env, **spec.environment}
+        resolved: list[str] = []
         for binding in spec.credential_bindings:
             if binding.delivery != "env":
                 raise _error(
@@ -396,6 +424,12 @@ class LocalOperations:
                     "credential bindings need a CredentialResolver; none was injected",
                 )
             env[binding.target] = await self._credentials.resolve(binding.ref)
+            resolved.append(env[binding.target])
+        # Refused before launch, not when the spool is built after it.
+        check_redaction((*redact, *resolved))
+        # Teardown may have begun while a resolver held this start; it waits
+        # for this start's key, so nothing it must cancel launches after it.
+        self._admit(workspace.id)
         argv: tuple[str, ...] = spec.argv
         if isinstance(spec.launch_marker, LaunchMarker):
             marker = spec.launch_marker
@@ -448,11 +482,12 @@ class LocalOperations:
             ref=ref,
             spec=spec,
             workspace_id=workspace.id,
-            spool=OperationSpool(retention_bytes=self._retention),
+            spool=OperationSpool(retention_bytes=self._retention, redact=(*redact, *resolved)),
             started_at=_now(),
             process=process,
             token=token,
             born=born,
+            policy=redaction_policy(redact),
             pipe=inode,
         )
         operation.collector = asyncio.create_task(self._collect(operation, output, transport))
@@ -486,6 +521,7 @@ class LocalOperations:
                 with contextlib.suppress(asyncio.CancelledError):
                     await reader
             transport.close()
+        operation.spool.finish()
         # A cancel still confirming decides between cancelled and failed.
         async with operation.stopping:
             self._settle(operation, process.returncode)
@@ -503,7 +539,7 @@ class LocalOperations:
             operation.signal = signal.Signals(-code).name
             code = 128 - code
         operation.exit_code = code
-        if operation.unconfirmed:
+        if operation.unconfirmed or (operation.cancel_requested and not operation.cancel_confirmed):
             operation.state = "failed"
         elif operation.cancel_requested:
             operation.state = "cancelled"
@@ -575,9 +611,10 @@ class LocalOperations:
         A refused group (init, or our own) is never signalled as a group; its
         owned processes are signalled one by one and the refusal is recorded.
         Survivors of KILL mark the operation unconfirmed, so it settles failed.
-        A cancel is requested only under the lock, so the collector never sees
-        a request whose confirmation has not run; a confirmation interrupted
-        before it finished is recorded unconfirmed before the lock is released.
+        A cancel is requested only under the lock and settles cancelled only
+        once a confirmation has run to the end. One interrupted before it
+        finished is only noted: if the workload ends before another cancel
+        confirms, it settles failed; a retried cancel may still confirm it.
         """
         async with operation.stopping:
             if operation.state in TERMINAL_STATES:
@@ -587,9 +624,10 @@ class LocalOperations:
             try:
                 await self._signal_and_confirm(operation, grace_seconds=grace_seconds)
             except BaseException:
-                operation.unconfirmed = True
                 self._note(operation, "cancel confirmation was interrupted before it completed")
                 raise
+            if cancelling:
+                operation.cancel_confirmed = True
 
     async def _signal_and_confirm(self, operation: _Operation, *, grace_seconds: float) -> None:
         pgid = operation.process.pid
