@@ -1324,11 +1324,7 @@ pub(crate) mod hazards {
     /// Every hazard test, in the order libtest would list them.
     fn trials() -> Vec<Trial> {
         vec![
-            Trial::test("hazards::hazard_case", || {
-                hazard_case();
-                Ok(())
-            })
-            .with_ignored_flag(true),
+            hazard("hazard_case", hazard_case).with_ignored_flag(true),
             hazard("a_late_exec_into_a_stopped_container_is_refused", || {
                 on_tokio(async { late_exec_refused(StandIn::new("LH-3")).await })
             }),
@@ -1802,13 +1798,8 @@ pub(crate) mod hazards {
         let done = tempfile::tempdir().unwrap();
         let marker = done.path().join("done");
         let began = std::time::Instant::now();
-        let mut child = std::process::Command::new("setsid")
-            .arg("-w")
-            .arg(std::env::current_exe().unwrap())
-            .args(["--exact", "hazards::hazard_case", "--ignored"])
-            .args(["--nocapture", "--test-threads=1", "-q"])
-            .env(CASE, case)
-            .env(CASE_DONE, &marker)
+        let mut child = case_process(case, &marker)
+            .arg("-q")
             .spawn()
             .expect("setsid(1) is required to bound a hazard case");
         // A spawned child never leads a process group, so setsid(1) does not
@@ -1838,6 +1829,19 @@ pub(crate) mod hazards {
         end
     }
 
+    /// The case process for `case`, in its own session, reporting to `marker`.
+    fn case_process(case: &str, marker: &std::path::Path) -> std::process::Command {
+        let mut process = std::process::Command::new("setsid");
+        process
+            .arg("-w")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "hazards::hazard_case", "--ignored"])
+            .args(["--nocapture", "--test-threads=1"])
+            .env(CASE, case)
+            .env(CASE_DONE, marker);
+        process
+    }
+
     fn kill_session(group: &str) {
         // ESRCH once the session is empty is the expected end.
         let _ = std::process::Command::new("kill")
@@ -1856,10 +1860,11 @@ pub(crate) mod hazards {
     }
 
     /// The entry point `bounded` runs in the case process. Ignored, so a
-    /// plain `cargo test` never runs a case outside its bound.
-    fn hazard_case() {
+    /// plain `cargo test` never runs a case outside its bound. It ends as the
+    /// case did, so a NOT RUN case is NOT RUN in its own process too.
+    fn hazard_case() -> Result<(), NotRun> {
         let Ok(case) = std::env::var(CASE) else {
-            return;
+            return Ok(());
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1878,11 +1883,12 @@ pub(crate) mod hazards {
             "not-run" => Err(NotRun("the not-run proof case".into())),
             hazard => runtime.block_on(run(hazard)),
         };
-        let report = match ran {
+        let report = match &ran {
             Ok(()) => String::new(),
             Err(NotRun(reason)) => format!("{NOT_RUN}{reason}"),
         };
         std::fs::write(std::env::var(CASE_DONE).unwrap(), report).unwrap();
+        ran
     }
 
     /// The stand-in models a stopped container: an operation exec held back
@@ -2146,6 +2152,28 @@ pub(crate) mod hazards {
             (1, 2, 1),
             "passed, NOT RUN, failed"
         );
+        // The case process tallies its own end the same way.
+        let child = |case: &str| {
+            let done = tempfile::tempdir().unwrap();
+            let ran = case_process(case, &done.path().join("done"))
+                .args(["--color", "never"])
+                .output()
+                .unwrap();
+            (ran.status.success(), String::from_utf8(ran.stdout).unwrap())
+        };
+        let (succeeded, out) = child("not-run");
+        assert!(succeeded, "{out}");
+        assert!(
+            out.contains("hazards::hazard_case ... ignored (NOT RUN: the not-run proof case)"),
+            "{out}"
+        );
+        assert!(out.contains(" 0 passed; 0 failed; 1 ignored;"), "{out}");
+        let (succeeded, out) = child("passes");
+        assert!(succeeded, "{out}");
+        assert!(out.contains(" 1 passed; 0 failed; 0 ignored;"), "{out}");
+        let (succeeded, out) = child("fails");
+        assert!(!succeeded, "{out}");
+        assert!(out.contains(" 0 passed; 1 failed; 0 ignored;"), "{out}");
         Ok(())
     }
 }
