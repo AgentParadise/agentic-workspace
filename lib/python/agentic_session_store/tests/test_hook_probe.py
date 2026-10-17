@@ -6,6 +6,7 @@ with the passwd shell and ``-c``, so bash reads ``$BASH_ENV`` and zsh reads
 """
 
 import os
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -23,7 +24,7 @@ def environment(tmp_path: Path) -> dict[str, str]:
     directory = tmp_path / "bin"
     directory.mkdir()
     shim = directory / "python3"
-    shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
     shim.chmod(0o755)
     (directory / "sleep").symlink_to(shutil.which("sleep"))
     return {

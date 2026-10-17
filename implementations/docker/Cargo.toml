@@ -15,3 +15,10 @@ tokio.workspace = true
 agentic-workspace-conformance = { path = "../../crates/workspace-conformance" }
 tempfile.workspace = true
 base64.workspace = true
+libtest-mimic.workspace = true
+
+# The lifecycle hazards report NOT RUN as a runtime skip, which libtest
+# cannot express, so they run under their own harness (#78).
+[[test]]
+name = "hazards"
+harness = false

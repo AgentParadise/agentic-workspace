@@ -2,7 +2,10 @@
 
 import asyncio
 import json
+import os
 import shlex
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -10,22 +13,37 @@ import pytest
 from agentic_session_store.child_journal import ChildCall, ChildJournal
 
 from agentic_isolation.child_journal import JournalReadError, WorkspaceChildJournalReader
+from agentic_isolation.harnesses import ExecFn
 from agentic_isolation.providers.base import ExecuteResult
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("target_harness", [None, "claude"])
-async def test_real_export_roundtrip_recovers_late_binding(tmp_path: Path, target_harness) -> None:
-    path = tmp_path / "retained 'quoted' journal.sqlite"
-    journal = ChildJournal(path)
-    call = ChildCall("invocation", "attempt", "codex", "parent/α", "call", target_harness)
-    registered = journal.register(call)
+def _python_shim(directory: Path, interpreter: str) -> Path:
+    """Write a `python3` in directory that execs interpreter, path taken literally."""
+    directory.mkdir()
+    python = directory / "python3"
+    python.write_text(f'#!/bin/sh\nexec {shlex.quote(interpreter)} "$@"\n')
+    python.chmod(0o700)
+    return python
+
+
+@pytest.fixture
+def workspace_execute(tmp_path: Path) -> ExecFn:
+    """Run reader commands as the workspace image would, on this host.
+
+    The reader's contract is that the image's `python3` carries
+    agentic_session_store. Here that is the interpreter running the tests, put
+    on a PATH of its own, so the result does not depend on whichever `python3`
+    the invoking shell happens to resolve (#71).
+    """
+    binary = _python_shim(tmp_path / "workspace-bin", sys.executable).parent
+    environment = {**os.environ, "PATH": str(binary)}
 
     async def execute(command: str, **kwargs: object) -> ExecuteResult:
         process = await asyncio.create_subprocess_exec(
             *shlex.split(command),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=environment,
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
         return ExecuteResult(
@@ -35,7 +53,32 @@ async def test_real_export_roundtrip_recovers_late_binding(tmp_path: Path, targe
             duration_ms=0,
         )
 
-    reader = WorkspaceChildJournalReader(execute, str(path))
+    return execute
+
+
+def test_python_shim_execs_interpreter_path_without_shell_expansion(tmp_path: Path) -> None:
+    interpreter = tmp_path / "venv $HOME `false` \"q\" 'a'" / "python"
+    interpreter.parent.mkdir()
+    interpreter.write_text('#!/bin/sh\nprintf "%s|" exact "$@"\n')
+    interpreter.chmod(0o700)
+    python = _python_shim(tmp_path / "workspace-bin", str(interpreter))
+
+    result = subprocess.run([python, "-m", "a b"], capture_output=True, text=True, timeout=10)
+
+    assert (result.returncode, result.stdout) == (0, "exact|-m|a b|")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_harness", [None, "claude"])
+async def test_real_export_roundtrip_recovers_late_binding(
+    tmp_path: Path, target_harness, workspace_execute: ExecFn
+) -> None:
+    path = tmp_path / "retained 'quoted' journal.sqlite"
+    journal = ChildJournal(path)
+    call = ChildCall("invocation", "attempt", "codex", "parent/α", "call", target_harness)
+    registered = journal.register(call)
+
+    reader = WorkspaceChildJournalReader(workspace_execute, str(path))
     initial = await reader.page()
     assert initial.changes[0].intent.child_invocation_id == registered.child_invocation_id
     assert initial.changes[0].intent.call.parent_native_id == "parent/α"
@@ -103,23 +146,10 @@ async def test_invalid_page_cannot_advance(
         await WorkspaceChildJournalReader(execute, "/spool/journal.sqlite").page()
 
 
-async def _real_execute(command: str, **kwargs: object) -> ExecuteResult:
-    process = await asyncio.create_subprocess_exec(
-        *shlex.split(command),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
-    return ExecuteResult(
-        exit_code=process.returncode or 0,
-        stdout=stdout.decode(),
-        stderr=stderr.decode(),
-        duration_ms=0,
-    )
-
-
 @pytest.mark.asyncio
-async def test_native_lifecycle_and_conflict_roundtrip(tmp_path: Path) -> None:
+async def test_native_lifecycle_and_conflict_roundtrip(
+    tmp_path: Path, workspace_execute: ExecFn
+) -> None:
     """Schema v3: native launched/completed without exit status, and a
     recorded conflict that leaves the original binding in place."""
     from agentic_session_store.child_journal import ChildBindingConflict, LaunchFailureReason
@@ -135,7 +165,7 @@ async def test_native_lifecycle_and_conflict_roundtrip(tmp_path: Path) -> None:
     with pytest.raises(ChildBindingConflict):
         journal.observe_launch(call, "agent-other")
     page = await WorkspaceChildJournalReader(
-        _real_execute, str(tmp_path / "children.sqlite")
+        workspace_execute, str(tmp_path / "children.sqlite")
     ).page()
     assert [(c.intent.call.tool_call_id, c.intent.status) for c in page.changes] == [
         ("call", "pending"),
