@@ -28,6 +28,7 @@ from typing import Protocol
 import pytest
 
 from agentic_isolation import (
+    E2BWorkspaceProvider,
     SecurityConfig,
     StreamOutcome,
     StreamSession,
@@ -36,7 +37,6 @@ from agentic_isolation import (
     SupportsStreamingExec,
     Workspace,
     WorkspaceConfig,
-    E2BWorkspaceProvider,
     WorkspaceDockerProvider,
     WorkspaceOwnershipError,
     WorkspaceProvider,

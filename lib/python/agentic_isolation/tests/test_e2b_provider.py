@@ -85,9 +85,7 @@ async def test_create_refuses_credential_bindings(provider: E2BWorkspaceProvider
 async def test_stream_merges_in_the_sandbox_and_env_stays_out_of_the_argv(
     provider: E2BWorkspaceProvider, client: FakeE2BClient
 ) -> None:
-    workspace = await provider.create(
-        WorkspaceConfig(provider="e2b", environment={"BASE": "1"})
-    )
+    workspace = await provider.create(WorkspaceConfig(provider="e2b", environment={"BASE": "1"}))
     await provider.start_stream(workspace, ["echo", "a b"], env={"VALUE": "s3cr3t"}, cwd="sub")
 
     _, command, cwd, env = client.started[-1]
@@ -159,9 +157,7 @@ async def test_read_files_matches_patterns_and_returns_exact_bytes(
     client.sandboxes[workspace.id].files.update(
         {"/spool/a/one.jsonl": blob, "/spool/b.txt": b"skip"}
     )
-    client.responder = lambda c: FakeRun(
-        chunks=["./b.txt\0./a/one.jsonl\0"] if "find" in c else []
-    )
+    client.responder = lambda c: FakeRun(chunks=["./b.txt\0./a/one.jsonl\0"] if "find" in c else [])
 
     got = await provider.read_files(workspace, ["*.jsonl"], base_path="/spool")
 

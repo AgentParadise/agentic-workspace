@@ -195,13 +195,9 @@ class E2BWorkspaceProvider:
         if not listing.success:
             raise FileNotFoundError(f"cannot list {base_path} in sandbox {workspace.id}")
         relative = sorted(
-            entry.removeprefix("./")
-            for entry in listing.stdout.rstrip("\n").split("\0")
-            if entry
+            entry.removeprefix("./") for entry in listing.stdout.rstrip("\n").split("\0") if entry
         )
-        matched = [
-            path for path in relative if any(fnmatch.fnmatch(path, p) for p in patterns)
-        ]
+        matched = [path for path in relative if any(fnmatch.fnmatch(path, p) for p in patterns)]
         return [
             (path, await self._client.read_bytes(workspace.id, f"{base_path}/{path}"))
             for path in matched

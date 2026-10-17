@@ -63,6 +63,7 @@ from agentic_isolation.config import (
 from agentic_isolation.providers import (
     AgentName,
     AwaitResult,
+    E2BWorkspaceProvider,
     ExecuteResult,
     HarnessPlugin,
     HarnessTranscript,
@@ -81,7 +82,6 @@ from agentic_isolation.providers import (
     TranscriptExtractionResult,
     TranscriptSource,
     Workspace,
-    E2BWorkspaceProvider,
     WorkspaceDockerProvider,
     WorkspaceLocalProvider,
     WorkspaceNotFoundError,
