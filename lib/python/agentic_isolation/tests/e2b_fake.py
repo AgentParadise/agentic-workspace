@@ -79,6 +79,11 @@ class FakeE2BClient:
         self.command_kill_works = True
         self.pause_refused = False
         self.events: list[str] = []
+        # The user each start, read and write ran as, in call order.
+        self.users: list[str] = []
+        # How many list reads still show a sandbox after its kill (E2B's lag).
+        self.listed_after_kill = 0
+        self._dying: dict[str, tuple[FakeSandbox, int]] = {}
 
     async def create(
         self, *, template: str, metadata: Mapping[str, str], lifetime_seconds: int
@@ -89,9 +94,16 @@ class FakeE2BClient:
         return sandbox_id
 
     async def list(self, metadata: Mapping[str, str]) -> list[SandboxListing]:
+        visible = dict(self.sandboxes)
+        for sandbox_id, (box, reads) in list(self._dying.items()):
+            visible[sandbox_id] = box
+            if reads <= 1:
+                del self._dying[sandbox_id]
+            else:
+                self._dying[sandbox_id] = (box, reads - 1)
         return [
             SandboxListing(sandbox_id, dict(box.metadata))
-            for sandbox_id, box in self.sandboxes.items()
+            for sandbox_id, box in visible.items()
             if all(box.metadata.get(k) == v for k, v in metadata.items())
         ]
 
@@ -99,7 +111,10 @@ class FakeE2BClient:
         self.events.append(f"kill {sandbox_id}")
         if self.kill_is_noop:
             return True
-        return self.sandboxes.pop(sandbox_id, None) is not None
+        box = self.sandboxes.pop(sandbox_id, None)
+        if box is not None and self.listed_after_kill:
+            self._dying[sandbox_id] = (box, self.listed_after_kill)
+        return box is not None
 
     async def pause(self, sandbox_id: str) -> None:
         self.events.append(f"pause {sandbox_id}")
@@ -115,8 +130,10 @@ class FakeE2BClient:
         cwd: str | None,
         env: Mapping[str, str],
         timeout: float | None,
+        user: str,
     ) -> FakeCommand:
         self.started.append((sandbox_id, command, cwd, dict(env)))
+        self.users.append(user)
         pid = len(self.commands) + 1
         made = FakeCommand(pid, self.responder(command), kill_works=self.command_kill_works)
         self.commands[pid] = made
@@ -126,11 +143,13 @@ class FakeE2BClient:
         self.events.append(f"reconnect {sandbox_id} {pid}")
         return FakeCommand(pid, FakeRun(chunks=["again\n"]), kill_works=True)
 
-    async def read_bytes(self, sandbox_id: str, path: str) -> bytes:
+    async def read_bytes(self, sandbox_id: str, path: str, *, user: str) -> bytes:
+        self.users.append(user)
         try:
             return self.sandboxes[sandbox_id].files[path]
         except KeyError as exc:
             raise FileNotFoundError(path) from exc
 
-    async def write_bytes(self, sandbox_id: str, path: str, content: bytes) -> None:
+    async def write_bytes(self, sandbox_id: str, path: str, content: bytes, *, user: str) -> None:
+        self.users.append(user)
         self.sandboxes[sandbox_id].files[path] = content

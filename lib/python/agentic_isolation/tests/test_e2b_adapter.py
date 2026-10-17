@@ -56,6 +56,8 @@ def client() -> FakeE2BClient:
 @pytest.fixture(autouse=True)
 def quick_kill_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(e2b_module, "_KILL_SECONDS", 0.05)
+    monkeypatch.setattr(e2b_module, "_REMOVAL_SECONDS", 0.05)
+    monkeypatch.setattr(e2b_module, "_REMOVAL_POLL_SECONDS", 0.01)
 
 
 async def _hanging_session(
@@ -336,7 +338,7 @@ async def test_start_on_an_unreachable_sandbox_is_a_disconnected_command(
     monkeypatch.setattr(SdkE2BClient, "_sandbox", unreachable)
 
     command = await SdkE2BClient(api_key="unused").start(
-        "sbx-1", "echo hi", cwd=None, env={}, timeout=None
+        "sbx-1", "echo hi", cwd=None, env={}, timeout=None, user="agent"
     )
 
     assert isinstance(command, UnstartedCommand)
@@ -350,8 +352,10 @@ class _ScriptedCommands:
 
     def __init__(self, output: bytes) -> None:
         self.output = output
+        self.users: list[object] = []
 
     async def run(self, command: str, **kwargs: object) -> AsyncCommandHandle:
+        self.users.append(kwargs.get("user"))
         output = b"" if "mkdir" in command else self.output
 
         async def events() -> AsyncGenerator[process_pb.StartResponse, None]:
@@ -399,6 +403,35 @@ async def test_execute_returns_the_output_exactly_as_written(
 
     assert result.stdout == text
     assert [line async for line in session.lines()] == text.splitlines()
+    # The root check at create, execute and the stream: all as the image's user.
+    assert commands.users == ["agent", "agent", "agent"]
+
+
+class _RecordingFiles:
+    """`sandbox.files`: keeps what was written and the user of every call."""
+
+    def __init__(self) -> None:
+        self.stored: dict[str, bytes] = {}
+        self.users: list[object] = []
+
+    async def write(self, path: str, data: bytes, **kwargs: object) -> None:
+        self.users.append(kwargs.get("user"))
+        self.stored[path] = data
+
+    async def read(self, path: str, **kwargs: object) -> bytes:
+        self.users.append(kwargs.get("user"))
+        return self.stored[path]
+
+
+async def test_sdk_file_transfer_runs_as_the_given_user() -> None:
+    files = _RecordingFiles()
+    sdk = SdkE2BClient(api_key="unused")
+    sdk._sandboxes["sbx-1"] = type("Sandbox", (), {"files": files})()  # type: ignore[assignment]
+
+    await sdk.write_bytes("sbx-1", "/spool/out", b"\x00\xff", user="builder")
+
+    assert await sdk.read_bytes("sbx-1", "/spool/out", user="builder") == b"\x00\xff"
+    assert files.users == ["builder", "builder"]
 
 
 class _PausingSandbox:
@@ -452,7 +485,12 @@ async def test_cancelled_pause_backoff_stops_retrying_and_keeps_the_sandbox(
 
     monkeypatch.setattr(asyncio, "sleep", held_sleep)
     pausing = asyncio.ensure_future(sdk.pause("sbx-1"))
-    await backing_off.wait()
+    # Bounded: a pause that gives up before its first backoff (patch 09)
+    # must fail this test, not hang it.
+    reached = asyncio.ensure_future(backing_off.wait())
+    await asyncio.wait({pausing, reached}, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+    reached.cancel()
+    assert backing_off.is_set(), f"the pause never backed off: {pausing}"
 
     pausing.cancel()
 

@@ -8,8 +8,9 @@ must never be compared with each other:
 
 - `verified_oci_digest`: the image digest the caller verified (cosign) before
   asking for the build. The build refuses a reference whose digest differs.
-- `expected_manifest_hash`: the sha256 of the image's `manifest.yaml`
-  (research doc issue C), which a launched workspace's manifest is checked
+- `expected_manifest_hash`: the sha256 of the image's version manifest,
+  `/opt/agentic/version.json` (the file the platform reads; research doc
+  issue C), which a launched workspace's manifest is checked
   against. `manifest_hash` computes it from the file.
 
 CPU and RAM are pinned on the spec because E2B's default RAM is documented
@@ -45,7 +46,7 @@ class E2BTemplateSpec:
     #: `repository@sha256:<64 hex>`. A tag alone is refused.
     image: str
     verified_oci_digest: str
-    #: `sha256:<64 hex>` of the image's manifest.yaml, never an OCI digest.
+    #: `sha256:<64 hex>` of the image's version.json, never an OCI digest.
     expected_manifest_hash: str
     cpu_count: int
     memory_mb: int
@@ -67,7 +68,7 @@ class E2BTemplateSpec:
             raise TemplateSpecError("expected_manifest_hash must be sha256:<64 hex>")
         if self.expected_manifest_hash == self.verified_oci_digest:
             raise TemplateSpecError(
-                "expected_manifest_hash equals the OCI digest; it must hash manifest.yaml"
+                "expected_manifest_hash equals the OCI digest; it must hash version.json"
             )
         if self.cpu_count < 1 or self.memory_mb < 1:
             raise TemplateSpecError("cpu_count and memory_mb must be pinned to positive values")
@@ -83,7 +84,7 @@ class E2BTemplateBuild:
 
 
 def manifest_hash(manifest_path: Path) -> str:
-    """`sha256:<hex>` of a manifest.yaml's exact bytes."""
+    """`sha256:<hex>` of a version manifest's exact bytes."""
     return "sha256:" + hashlib.sha256(manifest_path.read_bytes()).hexdigest()
 
 

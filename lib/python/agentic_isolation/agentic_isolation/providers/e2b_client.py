@@ -15,6 +15,10 @@ behaviour it relies on is cited (accessed 2026-10-17):
 - Background commands, `pid`, and reattaching with `commands.connect(pid)`:
   https://e2b.dev/docs/commands/background
 - File read as bytes and write: https://e2b.dev/docs/filesystem/read-write
+- Commands and file operations run as E2B's `user` unless `user=` names
+  another; any user in the sandbox's /etc/passwd may be named
+  (`e2b/connection_config.py` in e2b==2.52.0: `Username = str`,
+  `default_username = "user"`)
 - `AsyncCommandHandle.kill` sends SIGKILL and `disconnect` stops receiving
   events without killing: the docstrings of the pinned SDK,
   `e2b/sandbox_async/commands/command_handle.py` in e2b==2.52.0. Its `wait`
@@ -123,8 +127,9 @@ class E2BSandboxClient(Protocol):
         cwd: str | None,
         env: Mapping[str, str],
         timeout: float | None,
+        user: str,
     ) -> SandboxCommand:
-        """Start a shell command in the sandbox without waiting for it.
+        """Start a shell command in the sandbox, as `user`, without waiting for it.
 
         A transport that fails before the command starts is not raised: the
         returned command has no output and ends `disconnected`, so a client
@@ -136,12 +141,12 @@ class E2BSandboxClient(Protocol):
         """Reattach to a running command by pid."""
         ...
 
-    async def read_bytes(self, sandbox_id: str, path: str) -> bytes:
-        """The exact bytes of a file. Raises FileNotFoundError when absent."""
+    async def read_bytes(self, sandbox_id: str, path: str, *, user: str) -> bytes:
+        """The exact bytes of a file, read as `user`. Raises FileNotFoundError when absent."""
         ...
 
-    async def write_bytes(self, sandbox_id: str, path: str, content: bytes) -> None:
-        """Write a file, creating parent directories."""
+    async def write_bytes(self, sandbox_id: str, path: str, content: bytes, *, user: str) -> None:
+        """Write a file as `user`, creating parent directories."""
         ...
 
 
@@ -238,6 +243,7 @@ class SdkE2BClient:
         cwd: str | None,
         env: Mapping[str, str],
         timeout: float | None,
+        user: str,
     ) -> SandboxCommand:
         chunks = _ChunkQueue()
         try:
@@ -247,6 +253,7 @@ class SdkE2BClient:
                 background=True,
                 envs=dict(env),
                 cwd=cwd,
+                user=user,
                 on_stdout=chunks.put,
                 # 0 means the SDK does not bound the command; ours is enforced
                 # by `timeout` in the sandbox (see E2BWorkspaceProvider).
@@ -269,18 +276,18 @@ class SdkE2BClient:
             raise E2BTransportError(f"cannot reattach to pid {pid}: {exc}") from exc
         return _SdkCommand(handle, chunks)
 
-    async def read_bytes(self, sandbox_id: str, path: str) -> bytes:
+    async def read_bytes(self, sandbox_id: str, path: str, *, user: str) -> bytes:
         from e2b import FileNotFoundException
 
         sandbox = await self._sandbox(sandbox_id)
         try:
-            return bytes(await sandbox.files.read(path, format="bytes"))
+            return bytes(await sandbox.files.read(path, format="bytes", user=user))
         except FileNotFoundException as exc:
             raise FileNotFoundError(path) from exc
 
-    async def write_bytes(self, sandbox_id: str, path: str, content: bytes) -> None:
+    async def write_bytes(self, sandbox_id: str, path: str, content: bytes, *, user: str) -> None:
         sandbox = await self._sandbox(sandbox_id)
-        await sandbox.files.write(path, content)
+        await sandbox.files.write(path, content, user=user)
 
 
 class _ChunkQueue:

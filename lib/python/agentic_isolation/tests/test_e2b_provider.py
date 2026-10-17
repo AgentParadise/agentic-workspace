@@ -35,6 +35,7 @@ from agentic_isolation.providers import (
     TemplateSpecError,
     manifest_hash,
 )
+from agentic_isolation.providers import e2b as e2b_module
 from tests.e2b_fake import FakeE2BClient, FakeRun
 
 OCI = "sha256:" + "a" * 64
@@ -49,6 +50,12 @@ def client() -> FakeE2BClient:
 @pytest.fixture
 def provider(client: FakeE2BClient) -> E2BWorkspaceProvider:
     return E2BWorkspaceProvider("tmpl-1", client=client)
+
+
+@pytest.fixture(autouse=True)
+def quick_removal_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(e2b_module, "_REMOVAL_SECONDS", 0.05)
+    monkeypatch.setattr(e2b_module, "_REMOVAL_POLL_SECONDS", 0.01)
 
 
 def test_fake_refuses_to_construct_outside_pytest(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -74,6 +81,52 @@ async def test_create_starts_the_template_with_labels_as_metadata(
 
     assert client.events[0] == f"create {workspace.id} tmpl-1"
     assert client.sandboxes[workspace.id].metadata == {"syn.host_id": "h7"}
+
+
+async def test_create_checks_both_roots_and_every_operation_runs_as_the_image_user(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+    await provider.write_file(workspace, "out", b"x")
+    await provider.read_file(workspace, "out")
+    await provider.execute(workspace, "true")
+    await provider.read_files(workspace, ["out"], base_path="/workspace")
+
+    _, setup, cwd, _ = client.started[0]
+    assert (setup, cwd) == (
+        shlex.join(
+            [*e2b_module._MERGED, "sh", "-c", e2b_module._writable_roots(["/workspace", "/spool"])]
+        ),
+        "/",
+    )
+    assert "test -w /workspace && test -w /spool" in setup
+    # create, write, read, execute, and the listing of read_files
+    assert client.users == ["agent"] * 5
+
+
+async def test_run_as_names_the_user_every_operation_runs_as(client: FakeE2BClient) -> None:
+    provider = E2BWorkspaceProvider("tmpl-1", client=client, run_as="builder")
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+    await provider.write_file(workspace, "out", b"x")
+
+    assert client.users == ["builder", "builder"]
+
+
+async def test_create_fails_and_kills_when_a_root_is_not_writable(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    client.responder = lambda command: (
+        FakeRun(
+            chunks=["mkdir: cannot create directory '/spool': Permission denied\n"],
+            exit=CommandExit(end="exited", exit_code=1),
+        )
+        if "test -w" in command
+        else FakeRun()
+    )
+
+    with pytest.raises(RuntimeError, match="not writable by user agent: mkdir: .*/spool"):
+        await provider.create(WorkspaceConfig(provider="e2b"))
+    assert client.sandboxes == {}
 
 
 async def test_create_refuses_credential_bindings(provider: E2BWorkspaceProvider) -> None:
@@ -316,6 +369,19 @@ async def test_a_failed_while_running_hook_destroys_nothing(
 
     assert report.finalization.state == "failed"
     assert workspace.id in client.sandboxes and not client.sandboxes[workspace.id].paused
+
+
+async def test_teardown_waits_for_a_killed_sandbox_to_leave_the_list(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r3"}))
+    client.listed_after_kill = 3  # E2B still lists it for three reads after the kill
+
+    report = await provider.destroy(workspace)
+
+    assert report.finalization.state == "completed"
+    assert client.events.count(f"kill {workspace.id}") == 1, "the kill was retried"
+    assert await provider.list_owned({"run": "r3"}) == []
 
 
 async def test_negative_control_a_noop_kill_fails_cleanup(

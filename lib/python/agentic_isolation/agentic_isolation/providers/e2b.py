@@ -24,9 +24,16 @@ Decisions that differ from Docker, and why:
   is up; if `before_delete` raises, the sandbox is paused, not killed, and the
   report is `retained`. If E2B keeps refusing the pause (HTTP 503), the
   sandbox is left running and still never killed. A teardown reports
-  `completed` only when the sandbox is absent from the E2B list afterwards;
-  a kill that leaves it listed raises `SandboxRemovalError`, which is also
-  the negative control of #1915.
+  `completed` only when the sandbox has left the E2B list; the list is read
+  until it does, for up to `_REMOVAL_SECONDS`, because E2B can still list a
+  sandbox for a moment after the kill returns. A sandbox still listed after
+  that raises `SandboxRemovalError`, which is also the negative control of
+  #1915.
+- Commands and file transfers run as the image's `agent` user, not E2B's
+  default `user`. The template takes the image's ownership, and the image
+  gives `/workspace` and `/spool` to `agent` (as the Docker provider runs);
+  E2B's `user` cannot write them, and making it the owner would need root at
+  every create. Create confirms both roots are writable before returning.
 - Credential bindings, host mounts and `limits.network=False` are refused:
   none has an E2B delivery yet, and silently dropping one would launch a
   workspace without what the caller asked for. The mutable `environment` is
@@ -70,10 +77,16 @@ from agentic_isolation.providers.teardown_report import TeardownReport, Teardown
 
 _PROVIDER = "e2b"
 _WORKSPACE_ROOT = "/workspace"
+_SPOOL_ROOT = "/spool"
+# The user the pinned workspace image owns its roots as (its Dockerfile's USER).
+_RUN_AS = "agent"
 # Runs the argv with stderr on the same pipe as stdout, in one process.
 _MERGED = ("sh", "-c", 'exec "$@" 2>&1', "sh")
 # How long a kill, and the end it causes, may take before it counts as unconfirmed.
 _KILL_SECONDS = 10.0
+# How long a killed sandbox may stay in the E2B list, and how often it is read.
+_REMOVAL_SECONDS = 30.0
+_REMOVAL_POLL_SECONDS = 0.5
 
 
 class SandboxRemovalError(RuntimeError):
@@ -96,16 +109,20 @@ class E2BWorkspaceProvider:
         *,
         client: E2BSandboxClient | None = None,
         lifetime_seconds: int = 3600,
+        run_as: str = _RUN_AS,
     ) -> None:
         """
         Args:
             template: E2B template id or name, built by `build_template`.
             client: The sandbox port; the e2b SDK adapter by default.
             lifetime_seconds: E2B's sandbox timeout, after which E2B kills it.
+            run_as: The sandbox user every command and file transfer runs as;
+                it must be able to write `/workspace` and `/spool`.
         """
         self._template = template
         self._client = client if client is not None else SdkE2BClient()
         self._lifetime_seconds = lifetime_seconds
+        self._run_as = run_as
         self._workspaces: dict[str, Workspace] = {}
         self._retained: dict[str, Workspace] = {}
 
@@ -138,36 +155,47 @@ class E2BWorkspaceProvider:
             _handle=sandbox_id,
         )
         self._workspaces[sandbox_id] = workspace
+        roots = (_WORKSPACE_ROOT, _SPOOL_ROOT)
         try:
-            result = await self.execute(workspace, f"mkdir -p {_WORKSPACE_ROOT}", cwd="/")
+            result = await self.execute(workspace, _writable_roots(roots), cwd="/")
             if not result.success:
-                raise RuntimeError(f"sandbox {sandbox_id} could not create {_WORKSPACE_ROOT}")
+                raise RuntimeError(
+                    f"sandbox {sandbox_id}: {' and '.join(roots)} are not writable by "
+                    f"user {self._run_as}: {result.stdout.strip()}"
+                )
         except BaseException as exc:
             # The caller never gets this workspace, so nobody else can free it.
             self._workspaces.pop(sandbox_id, None)
-            leak = await self._discard(sandbox_id, config.labels)
-            if leak is None:
-                raise
-            if isinstance(exc, Exception):
-                raise SandboxRemovalError(
-                    f"creating sandbox {sandbox_id} failed ({exc!r}) and it is still "
-                    f"allocated: {leak}",
-                    sandbox_id=sandbox_id,
-                ) from exc
-            exc.add_note(f"sandbox {sandbox_id} is still allocated: {leak}")
+            try:
+                await self._remove(sandbox_id, config.labels)
+            except Exception as leak:
+                if isinstance(exc, Exception):
+                    raise SandboxRemovalError(
+                        f"creating sandbox {sandbox_id} failed ({exc!r}) and it is still "
+                        f"allocated: {leak!r}",
+                        sandbox_id=sandbox_id,
+                    ) from exc
+                exc.add_note(f"sandbox {sandbox_id} is still allocated: {leak!r}")
             raise
         return workspace
 
-    async def _discard(self, sandbox_id: str, labels: Mapping[str, str]) -> str | None:
-        """Kill a sandbox and confirm it left the list; why not, when it did not."""
-        try:
-            await self._client.kill(sandbox_id)
-            listed = await self._client.list(labels)
-        except Exception as exc:
-            return f"cleanup raised {exc!r}"
-        if any(entry.sandbox_id == sandbox_id for entry in listed):
-            return "still in the E2B list after kill"
-        return None
+    async def _remove(self, sandbox_id: str, labels: Mapping[str, str]) -> None:
+        """Kill a sandbox and wait until E2B no longer lists it.
+
+        A kill's False (not found) is not trusted either: only the list's
+        absence confirms it. Raises `SandboxRemovalError` when the sandbox is
+        still listed after `_REMOVAL_SECONDS`; transport errors propagate.
+        """
+        await self._client.kill(sandbox_id)
+        deadline = time.monotonic() + _REMOVAL_SECONDS
+        while any(entry.sandbox_id == sandbox_id for entry in await self._client.list(labels)):
+            if time.monotonic() >= deadline:
+                raise SandboxRemovalError(
+                    f"sandbox {sandbox_id} is still in the E2B list {_REMOVAL_SECONDS:g}s "
+                    "after kill; the workspace was kept. Retry teardown by ref.",
+                    sandbox_id=sandbox_id,
+                )
+            await asyncio.sleep(_REMOVAL_POLL_SECONDS)
 
     async def destroy(self, workspace: Workspace) -> TeardownReport:
         return await self.teardown(workspace)
@@ -201,10 +229,12 @@ class E2BWorkspaceProvider:
 
     async def write_file(self, workspace: Workspace, path: str, content: str | bytes) -> None:
         data = content.encode() if isinstance(content, str) else content
-        await self._client.write_bytes(workspace.id, _contained(path), data)
+        await self._client.write_bytes(workspace.id, _contained(path), data, user=self._run_as)
 
     async def read_file(self, workspace: Workspace, path: str) -> str:
-        return (await self._client.read_bytes(workspace.id, _contained(path))).decode()
+        return (
+            await self._client.read_bytes(workspace.id, _contained(path), user=self._run_as)
+        ).decode()
 
     async def file_exists(self, workspace: Workspace, path: str) -> bool:
         result = await self.execute(workspace, shlex.join(["test", "-e", _contained(path)]))
@@ -237,6 +267,7 @@ class E2BWorkspaceProvider:
             cwd=_resolve_cwd(cwd),
             env=merged_env,
             timeout=timeout,
+            user=self._run_as,
         )
         return E2BStreamSession(self._client, workspace.id, command, timeout=timeout)
 
@@ -259,7 +290,12 @@ class E2BWorkspaceProvider:
         )
         matched = [path for path in relative if any(fnmatch.fnmatch(path, p) for p in patterns)]
         return [
-            (path, await self._client.read_bytes(workspace.id, f"{base_path}/{path}"))
+            (
+                path,
+                await self._client.read_bytes(
+                    workspace.id, f"{base_path}/{path}", user=self._run_as
+                ),
+            )
             for path in matched
         ]
 
@@ -338,18 +374,7 @@ class E2BWorkspaceProvider:
                     usage=TeardownUsage(),
                 )
 
-        await self._client.kill(workspace.id)
-        still_listed = [
-            entry
-            for entry in await self._client.list(workspace.config.labels)
-            if entry.sandbox_id == workspace.id
-        ]
-        if still_listed:
-            raise SandboxRemovalError(
-                f"sandbox {workspace.id} is still in the E2B list after kill; "
-                "the workspace was kept. Retry teardown by ref.",
-                sandbox_id=workspace.id,
-            )
+        await self._remove(workspace.id, workspace.config.labels)
         self._workspaces.pop(workspace.id, None)
         self._retained.pop(workspace.id, None)
         return TeardownReport(
@@ -479,6 +504,12 @@ async def _bounded(waiting: asyncio.Future[CommandExit]) -> CommandExit | None:
     """The command's end if it arrives within `_KILL_SECONDS`, else None."""
     done, _ = await asyncio.wait({waiting}, timeout=_KILL_SECONDS)
     return waiting.result() if done else None
+
+
+def _writable_roots(roots: Sequence[str]) -> str:
+    """A command that creates each root if absent and fails unless all are writable."""
+    checks = " && ".join(shlex.join(["test", "-w", root]) for root in roots)
+    return f"{shlex.join(['mkdir', '-p', *roots])} && {checks}"
 
 
 def _contained(path: str) -> str:

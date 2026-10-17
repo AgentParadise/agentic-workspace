@@ -5,8 +5,9 @@ template built by `build_template` from the pinned workspace image, which
 must carry `codex` and its manifest). The private-build test also needs
 E2B_PRIVATE_IMAGE (`ghcr.io/...@sha256:<digest>`), E2B_GHCR_USERNAME,
 E2B_GHCR_TOKEN and E2B_EXPECTED_MANIFEST_HASH; E2B_MANIFEST_PATH names where
-the image carries manifest.yaml (default /opt/agentic/manifest.yaml; the
-test fails if it is absent, it does not assume it). E2B_BUILD_RECEIPT, when
+the image carries its version manifest (default /opt/agentic/version.json, the
+path the platform reads; the test fails if it is absent, it does not assume
+it). E2B_BUILD_RECEIPT, when
 set, is where the build receipt is written as JSON.
 
 Without those inputs each test is reported NOT RUN by
@@ -20,10 +21,12 @@ Run: REQUIRE_E2B_LIVE=1 uv run --locked --all-extras pytest -rA -k e2b \
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
 import shlex
+import time
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -32,6 +35,7 @@ import pytest
 
 from agentic_isolation import E2BWorkspaceProvider, Workspace, WorkspaceConfig
 from agentic_isolation.providers import E2BTemplateSpec, SdkE2BClient, build_template
+from agentic_isolation.providers import e2b as e2b_module
 from agentic_isolation.providers.e2b import SandboxRemovalError
 
 pytestmark = [pytest.mark.e2b_live, pytest.mark.integration]
@@ -113,21 +117,55 @@ def _mount_field(mount_point: str, field: int) -> str:
     )
 
 
-async def test_q5_root_is_read_only_and_workspace_tmpfs_is_writable(
+async def test_q5_e2b_root_is_writable_so_a_read_only_root_is_not_an_e2b_property(
     live: tuple[E2BWorkspaceProvider, Workspace],
 ) -> None:
+    """Q5's answer for E2B: the root filesystem is NOT read-only.
+
+    The first live run (PR #87, 2026-10-17) measured `/` as `rw,relatime`,
+    and the provider has no way to remount it. The Docker provider's
+    read-only root is therefore not a property of E2B workspaces; this test
+    asserts the measured answer so that a change in E2B fails here and sends
+    the research doc back for review, instead of the property being assumed.
+    """
     provider, workspace = live
     options = await provider.execute(workspace, _mount_field("/", 6), cwd="/")
-    assert "ro" in options.stdout.strip().split(","), f"root mount options: {options.stdout}"
-    # EROFS positively, not any failure: EACCES would mean permissions, not a ro root.
-    root = await provider.execute(workspace, "touch /e2b-ro-probe", cwd="/")
-    assert not root.success and "Read-only file system" in root.stdout, root.stdout
+    assert "rw" in options.stdout.strip().split(","), (
+        f"E2B now mounts / as {options.stdout.strip()!r}: Q5's answer changed, revisit it"
+    )
 
-    for writable in ("/tmp", "/workspace"):
-        fstype = await provider.execute(workspace, _mount_field(writable, 7), cwd="/")
-        assert fstype.stdout.strip() == "tmpfs", f"{writable} is {fstype.stdout!r}"
+
+async def test_q5_workspace_and_spool_are_writable_by_the_command_user(
+    live: tuple[E2BWorkspaceProvider, Workspace],
+) -> None:
+    """The roots are the image's directories on the sandbox disk, not tmpfs mounts."""
+    provider, workspace = live
+    user = await provider.execute(workspace, "id -un", cwd="/")
+    assert user.stdout.strip() == "agent", user.stdout
+    for writable in ("/tmp", "/workspace", "/spool"):
         probe = await provider.execute(workspace, f"touch {writable}/q5-probe && echo ok", cwd="/")
         assert probe.success and "ok" in probe.stdout, probe.stdout
+
+
+async def test_a_killed_sandbox_leaves_the_list_within_the_removal_bound(template: str) -> None:
+    """Measures the teardown cause of PR #87: how long E2B lists a killed sandbox."""
+    client = SdkE2BClient()
+    run = {"e2b_live.run": uuid.uuid4().hex}
+    sandbox_id = await client.create(template=template, metadata=run, lifetime_seconds=300)
+    killed = await client.kill(sandbox_id)
+    started = time.monotonic()
+    reads_listed = 0
+    while any(entry.sandbox_id == sandbox_id for entry in await client.list(run)):
+        reads_listed += 1
+        assert time.monotonic() - started < e2b_module._REMOVAL_SECONDS, (
+            f"{sandbox_id} still listed {e2b_module._REMOVAL_SECONDS:g}s after kill"
+        )
+        await asyncio.sleep(e2b_module._REMOVAL_POLL_SECONDS)
+    print(
+        f"kill returned {killed}; {sandbox_id} was still listed on {reads_listed} read(s), "
+        f"for {time.monotonic() - started:.2f}s after the kill"
+    )
+    assert killed
 
 
 async def test_q5_private_ghcr_digest_builds_and_launches(tmp_path: Path) -> None:
@@ -138,7 +176,7 @@ async def test_q5_private_ghcr_digest_builds_and_launches(tmp_path: Path) -> Non
         "E2B_GHCR_TOKEN",
         "E2B_EXPECTED_MANIFEST_HASH",
     )
-    manifest = os.environ.get("E2B_MANIFEST_PATH", "/opt/agentic/manifest.yaml")
+    manifest = os.environ.get("E2B_MANIFEST_PATH", "/opt/agentic/version.json")
     spec = E2BTemplateSpec(
         name=f"agentic-q5-{uuid.uuid4().hex[:8]}",
         image=image,

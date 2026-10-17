@@ -188,8 +188,15 @@ async def make_workspace(
         return workspace
 
     yield make
+    # Destroy every workspace even when one fails, so one error leaks nothing.
+    failures: list[Exception] = []
     for workspace in created:
-        await provider.destroy(workspace)
+        try:
+            await provider.destroy(workspace)
+        except Exception as exc:
+            failures.append(exc)
+    if failures:
+        raise ExceptionGroup("destroying the test's workspaces failed", failures)
     assert await provider.list_owned(run) == [], "workspaces were left in the provider list"
 
 
