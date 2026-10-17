@@ -7,7 +7,9 @@ E2B; tests/integration/test_e2b_live.py does that, and is NOT RUN without a key.
 
 from __future__ import annotations
 
+import asyncio
 import shlex
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -382,6 +384,110 @@ async def test_teardown_waits_for_a_killed_sandbox_to_leave_the_list(
     assert report.finalization.state == "completed"
     assert client.events.count(f"kill {workspace.id}") == 1, "the kill was retried"
     assert await provider.list_owned({"run": "r3"}) == []
+
+
+@pytest.mark.parametrize("list_reply", ["never", "late"])
+async def test_the_removal_bound_covers_the_list_requests_themselves(
+    provider: E2BWorkspaceProvider,
+    client: FakeE2BClient,
+    monkeypatch: pytest.MonkeyPatch,
+    list_reply: str,
+) -> None:
+    workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r4"}))
+
+    async def slow_list(labels: Mapping[str, str]) -> list[object]:
+        if list_reply == "never":
+            await asyncio.Event().wait()
+        await asyncio.sleep(0.3)  # an empty page, but six times past the bound
+        return []
+
+    monkeypatch.setattr(client, "list", slow_list)
+
+    with pytest.raises(SandboxRemovalError, match=workspace.id):
+        await asyncio.wait_for(provider.destroy(workspace), 0.2)
+    assert client.events.count(f"kill {workspace.id}") == 1, "the kill was retried"
+
+
+async def test_cancelling_a_removal_wait_is_not_reported_as_a_removal_failure(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+    listing = asyncio.Event()
+
+    async def stalled_list(labels: Mapping[str, str]) -> list[object]:
+        listing.set()
+        await asyncio.Event().wait()
+        return []
+
+    monkeypatch.setattr(client, "list", stalled_list)
+    removing = asyncio.create_task(provider.destroy(workspace))
+    await asyncio.wait_for(listing.wait(), 1)
+    removing.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(removing, 1)
+
+
+class _FailsOnce(FakeE2BClient):
+    """A fake whose first call to `failing` raises a transport error."""
+
+    def __init__(self, failing: str) -> None:
+        super().__init__()
+        self._failing = failing
+
+    async def kill(self, sandbox_id: str) -> bool:
+        if self._failing == "kill":
+            self._failing = ""
+            raise E2BTransportError("connection reset during kill")
+        return await super().kill(sandbox_id)
+
+    async def list(self, metadata: Mapping[str, str]) -> list[object]:
+        if self._failing == "list":
+            self._failing = ""
+            raise E2BTransportError("connection reset during list")
+        return await super().list(metadata)
+
+
+@pytest.mark.parametrize("failing", ["kill", "list"])
+async def test_the_live_removal_measurement_frees_its_sandbox_when_it_fails(
+    monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    from tests.integration import test_e2b_live as live
+
+    client = _FailsOnce(failing)
+    client.listed_after_kill = 2
+    monkeypatch.setattr(live, "SdkE2BClient", lambda: client)
+
+    with pytest.raises(E2BTransportError, match=f"during {failing}"):
+        await live.test_a_killed_sandbox_leaves_the_list_within_the_removal_bound("tmpl-1")
+    assert client.sandboxes == {} and await client.list({}) == [], "the measurement leaked"
+
+
+async def test_the_live_removal_measurement_names_a_sandbox_it_could_not_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.integration import test_e2b_live as live
+
+    client = _FailsOnce("list")
+    client.kill_is_noop = True
+    monkeypatch.setattr(live, "SdkE2BClient", lambda: client)
+
+    with pytest.raises(E2BTransportError) as failure:
+        await live.test_a_killed_sandbox_leaves_the_list_within_the_removal_bound("tmpl-1")
+    assert any("sbx-1" in note for note in failure.value.__notes__)
+
+
+async def test_the_live_removal_measurement_passes_and_frees_on_a_lagging_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.integration import test_e2b_live as live
+
+    client = FakeE2BClient()
+    client.listed_after_kill = 2
+    monkeypatch.setattr(live, "SdkE2BClient", lambda: client)
+
+    await live.test_a_killed_sandbox_leaves_the_list_within_the_removal_bound("tmpl-1")
+    assert client.events.count("kill sbx-1") == 1 and await client.list({}) == []
 
 
 async def test_negative_control_a_noop_kill_fails_cleanup(

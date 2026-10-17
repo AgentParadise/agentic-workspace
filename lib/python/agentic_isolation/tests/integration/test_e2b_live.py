@@ -148,23 +148,39 @@ async def test_q5_workspace_and_spool_are_writable_by_the_command_user(
 
 
 async def test_a_killed_sandbox_leaves_the_list_within_the_removal_bound(template: str) -> None:
-    """Measures the teardown cause of PR #87: how long E2B lists a killed sandbox."""
+    """Measures the teardown cause of PR #87: how long E2B lists a killed sandbox.
+
+    The sandbox is allocated outside the cleanup fixture, so any failure after
+    the allocation removes it through the provider's own kill-and-confirm path
+    before the failure propagates, and names it if that cannot be confirmed.
+    """
     client = SdkE2BClient()
     run = {"e2b_live.run": uuid.uuid4().hex}
     sandbox_id = await client.create(template=template, metadata=run, lifetime_seconds=300)
-    killed = await client.kill(sandbox_id)
-    started = time.monotonic()
-    reads_listed = 0
-    while any(entry.sandbox_id == sandbox_id for entry in await client.list(run)):
-        reads_listed += 1
-        assert time.monotonic() - started < e2b_module._REMOVAL_SECONDS, (
-            f"{sandbox_id} still listed {e2b_module._REMOVAL_SECONDS:g}s after kill"
+    try:
+        killed = await client.kill(sandbox_id)
+        started = time.monotonic()
+        reads_listed = 0
+        try:
+            async with asyncio.timeout(e2b_module._REMOVAL_SECONDS):
+                while any(entry.sandbox_id == sandbox_id for entry in await client.list(run)):
+                    reads_listed += 1
+                    await asyncio.sleep(e2b_module._REMOVAL_POLL_SECONDS)
+        except TimeoutError:
+            pytest.fail(
+                f"{sandbox_id} not seen gone {e2b_module._REMOVAL_SECONDS:g}s after kill "
+                f"(listed on {reads_listed} read(s))"
+            )
+        print(
+            f"kill returned {killed}; {sandbox_id} was still listed on {reads_listed} read(s), "
+            f"for {time.monotonic() - started:.2f}s after the kill"
         )
-        await asyncio.sleep(e2b_module._REMOVAL_POLL_SECONDS)
-    print(
-        f"kill returned {killed}; {sandbox_id} was still listed on {reads_listed} read(s), "
-        f"for {time.monotonic() - started:.2f}s after the kill"
-    )
+    except BaseException as failure:
+        try:
+            await E2BWorkspaceProvider(template, client=client)._remove(sandbox_id, run)
+        except Exception as leak:
+            failure.add_note(f"cleanup of {sandbox_id} was not confirmed: {leak!r}")
+        raise
     assert killed
 
 

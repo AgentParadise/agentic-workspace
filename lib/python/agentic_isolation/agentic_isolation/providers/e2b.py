@@ -25,10 +25,10 @@ Decisions that differ from Docker, and why:
   report is `retained`. If E2B keeps refusing the pause (HTTP 503), the
   sandbox is left running and still never killed. A teardown reports
   `completed` only when the sandbox has left the E2B list; the list is read
-  until it does, for up to `_REMOVAL_SECONDS`, because E2B can still list a
-  sandbox for a moment after the kill returns. A sandbox still listed after
-  that raises `SandboxRemovalError`, which is also the negative control of
-  #1915.
+  until it does, for up to `_REMOVAL_SECONDS` in total (list requests
+  included), because E2B can still list a sandbox for a moment after the kill
+  returns. A sandbox not seen gone within that bound raises
+  `SandboxRemovalError`, which is also the negative control of #1915.
 - Commands and file transfers run as the image's `agent` user, not E2B's
   default `user`. The template takes the image's ownership, and the image
   gives `/workspace` and `/spool` to `agent` (as the Docker provider runs);
@@ -183,19 +183,24 @@ class E2BWorkspaceProvider:
         """Kill a sandbox and wait until E2B no longer lists it.
 
         A kill's False (not found) is not trusted either: only the list's
-        absence confirms it. Raises `SandboxRemovalError` when the sandbox is
-        still listed after `_REMOVAL_SECONDS`; transport errors propagate.
+        absence confirms it. Raises `SandboxRemovalError` when absence is not
+        observed within `_REMOVAL_SECONDS`, list requests included, since one
+        stalled page can outlast the bound; transport errors propagate.
         """
         await self._client.kill(sandbox_id)
-        deadline = time.monotonic() + _REMOVAL_SECONDS
-        while any(entry.sandbox_id == sandbox_id for entry in await self._client.list(labels)):
-            if time.monotonic() >= deadline:
-                raise SandboxRemovalError(
-                    f"sandbox {sandbox_id} is still in the E2B list {_REMOVAL_SECONDS:g}s "
-                    "after kill; the workspace was kept. Retry teardown by ref.",
-                    sandbox_id=sandbox_id,
-                )
-            await asyncio.sleep(_REMOVAL_POLL_SECONDS)
+        try:
+            async with asyncio.timeout(_REMOVAL_SECONDS):
+                while any(
+                    entry.sandbox_id == sandbox_id for entry in await self._client.list(labels)
+                ):
+                    await asyncio.sleep(_REMOVAL_POLL_SECONDS)
+        except TimeoutError as exc:
+            raise SandboxRemovalError(
+                f"sandbox {sandbox_id} was not seen to leave the E2B list within "
+                f"{_REMOVAL_SECONDS:g}s after kill; the workspace was kept. "
+                "Retry teardown by ref.",
+                sandbox_id=sandbox_id,
+            ) from exc
 
     async def destroy(self, workspace: Workspace) -> TeardownReport:
         return await self.teardown(workspace)

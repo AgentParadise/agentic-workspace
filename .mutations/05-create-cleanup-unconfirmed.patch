@@ -1,16 +1,19 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-@@ -190,11 +190,7 @@
-         deadline = time.monotonic() + _REMOVAL_SECONDS
-         while any(entry.sandbox_id == sandbox_id for entry in await self._client.list(labels)):
-             if time.monotonic() >= deadline:
--                raise SandboxRemovalError(
--                    f"sandbox {sandbox_id} is still in the E2B list {_REMOVAL_SECONDS:g}s "
--                    "after kill; the workspace was kept. Retry teardown by ref.",
--                    sandbox_id=sandbox_id,
--                )
-+                return
-             await asyncio.sleep(_REMOVAL_POLL_SECONDS)
+@@ -194,13 +194,8 @@
+                     entry.sandbox_id == sandbox_id for entry in await self._client.list(labels)
+                 ):
+                     await asyncio.sleep(_REMOVAL_POLL_SECONDS)
+-        except TimeoutError as exc:
+-            raise SandboxRemovalError(
+-                f"sandbox {sandbox_id} was not seen to leave the E2B list within "
+-                f"{_REMOVAL_SECONDS:g}s after kill; the workspace was kept. "
+-                "Retry teardown by ref.",
+-                sandbox_id=sandbox_id,
+-            ) from exc
++        except TimeoutError:
++            return
  
      async def destroy(self, workspace: Workspace) -> TeardownReport:
+         return await self.teardown(workspace)
