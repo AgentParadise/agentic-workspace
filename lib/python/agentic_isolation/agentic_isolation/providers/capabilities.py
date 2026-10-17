@@ -39,11 +39,15 @@ class StreamOutcome:
     - `disconnected`: the stream to the process was lost. The process may
       still be running; nothing about its exit is known, so `exit_code` and
       `signal` are None. `reconnect()` is the way back, where supported.
+      This includes a transport that failed before the process started:
+      a client error is never reported as the sandbox's exit status.
+      `detail` carries the transport's own diagnostic, when it gave one.
     """
 
     end: StreamEnd
     exit_code: int | None = None
     signal: int | None = None
+    detail: str | None = None
 
     @property
     def completed(self) -> bool:
@@ -74,6 +78,8 @@ class StreamSession(Protocol):
         """Stdout and stderr MERGED in the order the process wrote them.
 
         One line per item, without the trailing newline. Iterate once.
+        Lines have no length limit, and a final line without a newline is
+        still delivered.
         """
         ...
 
@@ -82,7 +88,11 @@ class StreamSession(Protocol):
         ...
 
     async def cancel(self) -> None:
-        """Stop the SANDBOX process, not only the local end of the pipe."""
+        """Stop the SANDBOX process, not only the local end of the pipe.
+
+        Works after `disconnected` too: losing the stream does not end the
+        process, so the stop is still attempted and confirmed.
+        """
         ...
 
     async def reconnect(self) -> StreamSession:

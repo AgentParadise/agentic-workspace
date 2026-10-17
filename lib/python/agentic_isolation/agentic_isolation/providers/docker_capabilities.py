@@ -29,9 +29,20 @@ from agentic_isolation.providers.capabilities import (
 WORKSPACE_ID_LABEL = "agentic.workspace.id"
 PROVIDER_LABEL = "agentic.provider"
 
-# Records the sandbox pid, then becomes the command with stderr folded into
-# stdout INSIDE the sandbox, so the merged order is the order of the writes.
-_ANNOUNCE_AND_EXEC = 'echo $$ > "$0"; shift; exec "$@" 2>&1'
+# Runs the command as a child with stderr folded into stdout INSIDE the
+# sandbox, so the merged order is the order of the writes. The child's pid
+# goes to "$0" so a stop reaches it, and its exit status to "$0.rc", so
+# completion is read from the sandbox, never inferred from the docker client.
+_SUPERVISE = (
+    'shift; "$@" 2>&1 & child=$!; echo "$child" > "$0"; '
+    'wait "$child"; rc=$?; echo "$rc" > "$0.rc"; exit "$rc"'
+)
+
+# Bytes per read of the output pipe. Lines are framed here, not by
+# StreamReader.readline, so no line length is too long to deliver.
+_READ_CHUNK = 64 * 1024
+
+_STOP_ALREADY_ENDED = 3
 
 
 async def _docker(*args: str) -> tuple[int, bytes, bytes]:
@@ -43,6 +54,10 @@ async def _docker(*args: str) -> tuple[int, bytes, bytes]:
     )
     out, err = await proc.communicate()
     return proc.returncode if proc.returncode is not None else -1, out, err
+
+
+def _line(raw: bytes | bytearray) -> str:
+    return bytes(raw).decode(errors="replace").rstrip("\r")
 
 
 class DockerStreamSession:
@@ -59,6 +74,12 @@ class DockerStreamSession:
         self._proc = proc
         self._pid_file = pid_file
         self._stopped_by: StreamOutcome | None = None
+        self._sandbox_ended = False
+        # The client's own stderr carries only docker diagnostics: the
+        # sandbox's stderr is already folded into stdout by _SUPERVISE.
+        self._client_errors: asyncio.Task[bytes] | None = (
+            asyncio.ensure_future(proc.stderr.read()) if proc.stderr is not None else None
+        )
         self._timer = (
             asyncio.get_running_loop().call_later(timeout, self._on_timeout)
             if timeout is not None
@@ -82,32 +103,48 @@ class DockerStreamSession:
         argv = ["docker", "exec", "-i", "-w", cwd or "/workspace"]
         for key, value in (env or {}).items():
             argv.extend(["-e", f"{key}={value}"])
-        argv.extend([container, "sh", "-c", _ANNOUNCE_AND_EXEC, pid_file, "--", *sandbox_argv])
+        argv.extend([container, "sh", "-c", _SUPERVISE, pid_file, "--", *sandbox_argv])
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
         )
         return cls(container, proc, pid_file, timeout)
 
     async def lines(self) -> AsyncIterator[str]:
         assert self._proc.stdout is not None  # opened with stdout=PIPE above
-        async for raw in self._proc.stdout:
-            yield raw.decode(errors="replace").rstrip("\r\n")
+        pending = bytearray()
+        while chunk := await self._proc.stdout.read(_READ_CHUNK):
+            *complete, rest = chunk.split(b"\n")
+            for raw in complete:
+                pending.extend(raw)
+                yield _line(pending)
+                pending.clear()
+            pending.extend(rest)
+        if pending:
+            yield _line(pending)
 
     async def outcome(self) -> StreamOutcome:
-        returncode = await self._proc.wait()
+        await self._proc.wait()
         if self._timer is not None:
             self._timer.cancel()
         if self._timeout_task is not None:
             await self._timeout_task
+        client_errors = (
+            (await self._client_errors).decode(errors="replace").strip()
+            if (self._client_errors is not None)
+            else ""
+        )
         if self._stopped_by is not None:
             return self._stopped_by
-        if returncode < 0:
-            # The local docker client died, not the sandbox process.
-            return StreamOutcome(end="disconnected")
-        return StreamOutcome(end="completed", exit_code=returncode)
+        exit_code = await self._sandbox_exit_code()
+        if exit_code is None:
+            # The client ended but the sandbox recorded no exit: whether the
+            # process still runs, or ever started, is unknown.
+            return StreamOutcome(end="disconnected", detail=client_errors or None)
+        self._sandbox_ended = True
+        return StreamOutcome(end="completed", exit_code=exit_code)
 
     async def cancel(self) -> None:
         await self._stop(StreamOutcome(end="completed", signal=signals.SIGKILL))
@@ -118,23 +155,54 @@ class DockerStreamSession:
             f"the process in {self._container} keeps running"
         )
 
+    async def _sandbox_exit_code(self) -> int | None:
+        """The status _SUPERVISE recorded, or None when there is none to read."""
+        try:
+            code, out, _ = await _docker(
+                "exec",
+                self._container,
+                "sh",
+                "-c",
+                'cat "$0.rc" && rm -f "$0" "$0.rc"',
+                self._pid_file,
+            )
+        except OSError:
+            # No docker client to ask: the status is unknown, not absent.
+            return None
+        if code != 0:
+            return None
+        try:
+            return int(out.decode().strip())
+        except ValueError:
+            return None
+
     def _on_timeout(self) -> None:
         self._timeout_task = asyncio.ensure_future(self._stop(StreamOutcome(end="timed_out")))
 
     async def _stop(self, outcome: StreamOutcome) -> None:
-        if self._proc.returncode is not None or self._stopped_by is not None:
+        # Only a known sandbox exit makes this a no-op. A dead docker client
+        # is not one: the sandbox process may still run, so it is stopped.
+        if self._sandbox_ended or self._stopped_by is not None:
             return
         self._stopped_by = outcome
-        # Wait briefly for the announce line; then kill the sandbox process.
-        # `kill` is a shell builtin in minimal images, so it cannot be exec'd.
+        # Wait briefly for the announce line, kill the sandbox process, then
+        # confirm it is gone (a zombie counts as gone). `kill` is a shell
+        # builtin in minimal images, so it cannot be exec'd.
         script = (
-            f'i=0; while [ "$i" -lt 50 ]; do if [ -s "{self._pid_file}" ]; then '
-            f'kill -KILL "$(cat "{self._pid_file}")"; exit $?; fi; '
-            "i=$((i + 1)); sleep 0.1; done; exit 1"
+            'i=0; while [ ! -s "$0" ]; do [ "$i" -ge 50 ] && exit 1; '
+            'i=$((i + 1)); sleep 0.1; done; pid=$(cat "$0"); '
+            'alive() { [ -e "/proc/$pid" ] && ! grep -q ") Z " "/proc/$pid/stat"; }; '
+            f"alive || exit {_STOP_ALREADY_ENDED}; "
+            'kill -KILL "$pid" || exit 1; i=0; '
+            'while alive; do [ "$i" -ge 50 ] && exit 1; i=$((i + 1)); sleep 0.1; done'
         )
-        code, _, err = await _docker("exec", self._container, "sh", "-c", script)
-        if code != 0 and self._proc.returncode is None:
-            self._proc.kill()
+        code, _, err = await _docker("exec", self._container, "sh", "-c", script, self._pid_file)
+        if code == _STOP_ALREADY_ENDED:
+            self._stopped_by = None
+            return
+        if code != 0:
+            if self._proc.returncode is None:
+                self._proc.kill()
             raise RuntimeError(
                 f"could not stop the sandbox process in {self._container}: "
                 f"{err.decode(errors='replace').strip() or f'exit {code}'}"
@@ -161,10 +229,13 @@ async def read_files(
     with tarfile.open(fileobj=io.BytesIO(out), mode="r:") as archive:
         for member in archive:
             relative = member.name.removeprefix("./")
-            if not member.isreg() or not any(fnmatch.fnmatchcase(relative, p) for p in patterns):
+            # A hard link is a regular file under a second name; tar stores
+            # its bytes once, under whichever name it met first.
+            regular = member.isreg() or member.islnk()
+            if not regular or not any(fnmatch.fnmatchcase(relative, p) for p in patterns):
                 continue
             handle = archive.extractfile(member)
-            assert handle is not None  # extractfile returns a handle for regular files
+            assert handle is not None  # extractfile resolves regular files and hard links
             found.append((relative, handle.read()))
     return sorted(found)
 
