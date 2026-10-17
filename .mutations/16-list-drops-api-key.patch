@@ -1,67 +1,8 @@
-diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-index da87ee0..7288734 100644
---- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-+++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-@@ -379,11 +379,12 @@ class E2BStreamSession:
-         done, _ = await asyncio.wait({self._waiting}, timeout=timeout)
-         if not done:
-             if not await _confirmed_kill(self._command):
--                self._waiting.cancel()
-+                await _release(self._waiting)
-                 return StreamOutcome(end="disconnected", detail="timeout kill not confirmed")
-             ended = await _bounded(self._waiting)
-             if ended is not None and ended.end == "exited":
-                 return StreamOutcome(end="timed_out")
-+            await _release(self._waiting)
-             return StreamOutcome(end="disconnected", detail="timeout kill not confirmed")
-         if self._waiting.cancelled():
-             return StreamOutcome(end="disconnected", detail="stopped waiting after cancel")
-@@ -430,7 +431,7 @@ class E2BStreamSession:
-             )
-         self._cancelled = StreamOutcome(end="completed", signal=KILL_SIGNAL)
-         if await _bounded(self._waiting) is None:
--            self._waiting.cancel()
-+            await _release(self._waiting)
- 
-     async def reconnect(self) -> StreamSession:
-         command = await self._client.reconnect(self._sandbox_id, self._command.pid)
-@@ -441,10 +442,18 @@ async def _confirmed_kill(command: SandboxCommand) -> bool:
-     """True only when the kill was acknowledged within `_KILL_SECONDS`."""
-     try:
-         return await asyncio.wait_for(command.kill(), timeout=_KILL_SECONDS)
--    except (TimeoutError, E2BTransportError, OSError):
-+    except Exception:
-+        # Whatever the transport raised (a ConnectError on a reset, an SDK
-+        # exception), the kill was not acknowledged. Cancellation propagates.
-         return False
- 
- 
-+async def _release(waiting: asyncio.Future[CommandExit]) -> None:
-+    """Stop waiting for an end event that is not coming, and let the waiter settle."""
-+    waiting.cancel()
-+    await asyncio.wait({waiting})
-+
-+
- async def _bounded(waiting: asyncio.Future[CommandExit]) -> CommandExit | None:
-     """The command's end if it arrives within `_KILL_SECONDS`, else None."""
-     done, _ = await asyncio.wait({waiting}, timeout=_KILL_SECONDS)
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
-index c389a5c..4319b75 100644
+index 2691778..4319b75 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
-@@ -79,7 +79,10 @@ class SandboxCommand(Protocol):
-         ...
- 
-     async def kill(self) -> bool:
--        """Kill the process in the sandbox with SIGKILL. False when it was already gone."""
-+        """Kill the process in the sandbox with SIGKILL. False when it was already gone.
-+
-+        Raises E2BTransportError when the kill could not be delivered.
-+        """
-         ...
- 
- 
-@@ -192,7 +195,7 @@ class SdkE2BClient:
+@@ -195,7 +195,7 @@ class SdkE2BClient:
          from e2b import AsyncSandbox, SandboxQuery
  
          paginator = AsyncSandbox.list(
@@ -70,17 +11,3 @@ index c389a5c..4319b75 100644
          )
          found: list[SandboxListing] = []
          while paginator.has_next:
-@@ -353,7 +356,12 @@ class _SdkCommand:
-             self._chunks.close()
- 
-     async def kill(self) -> bool:
--        return bool(await self._handle.kill())
-+        try:
-+            return bool(await self._handle.kill())
-+        except Exception as exc:
-+            # ConnectError on a reset, SandboxException from the envd mapping:
-+            # the kill was not acknowledged and the process may still run.
-+            raise E2BTransportError(f"kill of pid {self._handle.pid} failed: {exc!r}") from exc
- 
-     async def disconnect(self) -> None:
-         """Stop receiving the stream without killing the process."""
