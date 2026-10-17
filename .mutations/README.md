@@ -1,8 +1,7 @@
 # Mutation evidence for syntropic137/syntropic137#1911
 
 Each patch re-introduces one bug in non-test source. Every listed test must
-fail with the patch applied. All tests are `docker_conformance` and need a
-real daemon, so dispatch `mutation-evidence.yml` (see docs/mutation-evidence.md).
+fail with the patch applied. The `docker_conformance` tests need a real daemon, so dispatch `mutation-evidence.yml` (see docs/mutation-evidence.md).
 
 | Patch | Bug | Killing test(s) |
 |---|---|---|
@@ -11,13 +10,17 @@ real daemon, so dispatch `mutation-evidence.yml` (see docs/mutation-evidence.md)
 | 03-list-owned-matches-key-not-value.patch | `list_owned` filters on the label key only | `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_list_owned_returns_exactly_the_host_workspaces[docker]` |
 | 04-stream-drops-stderr.patch | the stream loses stderr instead of merging it | `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_stream_merges_stdout_and_stderr_in_write_order[docker]` |
 | 05-timeout-reported-as-completed.patch | a timeout is reported as `completed` | `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_stream_timeout_stops_the_sandbox_process[docker]` |
-| 06-disconnect-reported-as-completed.patch | a lost transport is reported as `completed` | `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_stream_lost_transport_is_disconnected_and_process_lives[docker]` |
+| 06-disconnect-reported-as-completed.patch | a lost transport is reported as `completed` | `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_stream_lost_transport_is_disconnected_and_cancel_still_stops_it[docker]` |
 | 07-stop-kills-only-the-local-pipe.patch | timeout/cancel never kill the sandbox process | `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_stream_timeout_stops_the_sandbox_process[docker]`, `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_cancel_stops_the_sandbox_process[docker]` |
+| 08-lines-inherit-readline-limit.patch | lines go back to StreamReader iteration and its 64 KiB limit | `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_stream_lines_have_no_length_limit`, `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_stream_delivers_lines_of_any_length[docker]` |
+| 09-client-error-exit-reported-as-completion.patch | a docker client error exit is reported as the sandbox's exit | `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_a_docker_client_error_is_disconnected_not_completion`, `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_stream_unreachable_transport_is_never_completion[docker]` |
+| 10-cancel-noop-after-disconnect.patch | cancel does nothing once the docker client has exited | `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_cancel_after_a_disconnect_still_stops_the_sandbox`, `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_stream_lost_transport_is_disconnected_and_cancel_still_stops_it[docker]` |
+| 11-read-files-drops-hard-links.patch | `read_files` drops tar hard-link entries | `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_read_files_returns_every_name_of_a_hard_link`, `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_read_files_returns_every_name_of_a_hard_link[docker-/workspace]`, `lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py::test_read_files_returns_every_name_of_a_hard_link[docker-/spool]` |
 
 Dispatch:
 
 ```
-gh workflow run mutation-evidence.yml --ref main -f pr=85 -f tests="lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py"
+gh workflow run mutation-evidence.yml --ref main -f pr=85 -f tests="lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py lib/python/agentic_isolation/tests/test_remote_capabilities.py"
 ```
 
 Delete `.mutations/` before merge (CI job `mutations-not-merged`).

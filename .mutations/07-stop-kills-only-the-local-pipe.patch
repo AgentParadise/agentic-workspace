@@ -1,17 +1,14 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
-index 7a5d604..c85b8f1 100644
+index 1c7175f..92abe73 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
-@@ -127,11 +127,7 @@ class DockerStreamSession:
-         self._stopped_by = outcome
-         # Wait briefly for the announce line; then kill the sandbox process.
-         # `kill` is a shell builtin in minimal images, so it cannot be exec'd.
+@@ -188,7 +188,8 @@ class DockerStreamSession:
+         # Wait briefly for the announce line, kill the sandbox process, then
+         # confirm it is gone (a zombie counts as gone). `kill` is a shell
+         # builtin in minimal images, so it cannot be exec'd.
 -        script = (
--            f'i=0; while [ "$i" -lt 50 ]; do if [ -s "{self._pid_file}" ]; then '
--            f'kill -KILL "$(cat "{self._pid_file}")"; exit $?; fi; '
--            "i=$((i + 1)); sleep 0.1; done; exit 1"
--        )
-+        script = "true"
-         code, _, err = await _docker("exec", self._container, "sh", "-c", script)
-         if code != 0 and self._proc.returncode is None:
-             self._proc.kill()
++        script = 'true'
++        _unused = (
+             'i=0; while [ ! -s "$0" ]; do [ "$i" -ge 50 ] && exit 1; '
+             'i=$((i + 1)); sleep 0.1; done; pid=$(cat "$0"); '
+             'alive() { [ -e "/proc/$pid" ] && ! grep -q ") Z " "/proc/$pid/stat"; }; '
