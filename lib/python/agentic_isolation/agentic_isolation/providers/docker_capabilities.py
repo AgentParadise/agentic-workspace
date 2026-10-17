@@ -74,7 +74,9 @@ class DockerStreamSession:
         self._proc = proc
         self._pid_file = pid_file
         self._stopped_by: StreamOutcome | None = None
-        self._sandbox_ended = False
+        # The completion read from the sandbox. Reading it consumes the
+        # status file, so it is kept for every later observation.
+        self._completed: StreamOutcome | None = None
         # The client's own stderr carries only docker diagnostics: the
         # sandbox's stderr is already folded into stdout by _SUPERVISE.
         self._client_errors: asyncio.Task[bytes] | None = (
@@ -138,13 +140,15 @@ class DockerStreamSession:
         )
         if self._stopped_by is not None:
             return self._stopped_by
+        if self._completed is not None:
+            return self._completed
         exit_code = await self._sandbox_exit_code()
         if exit_code is None:
             # The client ended but the sandbox recorded no exit: whether the
             # process still runs, or ever started, is unknown.
             return StreamOutcome(end="disconnected", detail=client_errors or None)
-        self._sandbox_ended = True
-        return StreamOutcome(end="completed", exit_code=exit_code)
+        self._completed = StreamOutcome(end="completed", exit_code=exit_code)
+        return self._completed
 
     async def cancel(self) -> None:
         await self._stop(StreamOutcome(end="completed", signal=signals.SIGKILL))
@@ -182,7 +186,7 @@ class DockerStreamSession:
     async def _stop(self, outcome: StreamOutcome) -> None:
         # Only a known sandbox exit makes this a no-op. A dead docker client
         # is not one: the sandbox process may still run, so it is stopped.
-        if self._sandbox_ended or self._stopped_by is not None:
+        if self._completed is not None or self._stopped_by is not None:
             return
         self._stopped_by = outcome
         # Wait briefly for the announce line, kill the sandbox process, then

@@ -165,6 +165,8 @@ async def test_stream_merges_stdout_and_stderr_in_write_order(
 
     assert lines == ["out-1", "err-1", "out-2", "err-2"]
     assert outcome == StreamOutcome(end="completed", exit_code=7)
+    # A known exit stays known: observing it again does not lose it.
+    assert await session.outcome() == outcome
 
 
 async def test_stream_env_reaches_the_command_not_the_argv(

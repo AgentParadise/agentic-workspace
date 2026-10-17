@@ -123,6 +123,35 @@ async def test_a_recorded_sandbox_exit_is_completion(monkeypatch: pytest.MonkeyP
     assert await session.outcome() == StreamOutcome(end="completed", exit_code=1)
 
 
+async def test_a_recorded_sandbox_exit_survives_repeated_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The real supervisor runs locally; only the docker exec hop is replaced,
+    # so the status file is really written, read and removed.
+    async def local_exec(*args: str) -> tuple[int, bytes, bytes]:
+        proc = await asyncio.create_subprocess_exec(
+            *args[2:], stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await proc.communicate()
+        return proc.returncode if proc.returncode is not None else -1, out, err
+
+    monkeypatch.setattr(docker_capabilities, "_docker", local_exec)
+    pid_file = str(tmp_path / "command.pid")
+    proc = await asyncio.create_subprocess_exec(
+        *("sh", "-c", docker_capabilities._SUPERVISE, pid_file, "--"),
+        *("sh", "-c", "echo payload; exit 7"),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    session = DockerStreamSession("local", proc, pid_file, None)
+
+    assert [line async for line in session.lines()] == ["payload"]
+    first = await session.outcome()
+    assert first == StreamOutcome(end="completed", exit_code=7)
+    assert not Path(pid_file + ".rc").exists()
+    assert await session.outcome() == first
+
+
 async def test_cancel_after_a_disconnect_still_stops_the_sandbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
