@@ -1,10 +1,10 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
-index 1c7175f..f645ca7 100644
+index 8866b4f..40c2d03 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
-@@ -139,7 +139,7 @@ class DockerStreamSession:
-         if self._stopped_by is not None:
-             return self._stopped_by
+@@ -143,7 +143,7 @@ class DockerStreamSession:
+         if self._completed is not None:
+             return self._completed
          exit_code = await self._sandbox_exit_code()
 -        if exit_code is None:
 +        if exit_code is None and (self._proc.returncode or 0) < 0:

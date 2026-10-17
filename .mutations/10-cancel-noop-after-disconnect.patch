@@ -1,12 +1,12 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
-index 1c7175f..9f71e1b 100644
+index 8866b4f..5bcd5e6 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
-@@ -182,7 +182,7 @@ class DockerStreamSession:
+@@ -186,7 +186,7 @@ class DockerStreamSession:
      async def _stop(self, outcome: StreamOutcome) -> None:
          # Only a known sandbox exit makes this a no-op. A dead docker client
          # is not one: the sandbox process may still run, so it is stopped.
--        if self._sandbox_ended or self._stopped_by is not None:
+-        if self._completed is not None or self._stopped_by is not None:
 +        if self._proc.returncode is not None or self._stopped_by is not None:
              return
          self._stopped_by = outcome
