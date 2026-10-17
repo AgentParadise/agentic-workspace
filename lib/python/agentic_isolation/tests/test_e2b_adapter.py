@@ -25,6 +25,7 @@ from e2b.api.client.models.listed_sandbox import ListedSandbox
 from e2b.api.client.types import UNSET, Response
 from e2b.envd.process import process_pb
 from e2b.sandbox_async.commands.command_handle import AsyncCommandHandle
+from protobuf import Oneof
 
 from agentic_isolation import WorkspaceConfig
 from agentic_isolation.providers import (
@@ -342,6 +343,62 @@ async def test_start_on_an_unreachable_sandbox_is_a_disconnected_command(
     assert (await command.wait()).end == "disconnected"
     assert [chunk async for chunk in command.output()] == []
     assert await command.kill() is False
+
+
+class _ScriptedCommands:
+    """`sandbox.commands`: every command writes `output`, two bytes per SDK event."""
+
+    def __init__(self, output: bytes) -> None:
+        self.output = output
+
+    async def run(self, command: str, **kwargs: object) -> AsyncCommandHandle:
+        output = b"" if "mkdir" in command else self.output
+
+        async def events() -> AsyncGenerator[process_pb.StartResponse, None]:
+            for start in range(0, len(output), 2):
+                data = process_pb.ProcessEvent.DataEvent(
+                    output=Oneof("stdout", output[start : start + 2])
+                )
+                yield process_pb.StartResponse(
+                    event=process_pb.ProcessEvent(event=Oneof("data", data))
+                )
+            end = process_pb.ProcessEvent.EndEvent(exit_code=0, exited=True)
+            yield process_pb.StartResponse(event=process_pb.ProcessEvent(event=Oneof("end", end)))
+
+        async def kill() -> bool:
+            return True
+
+        on_stdout = kwargs["on_stdout"]
+        assert callable(on_stdout)
+        return AsyncCommandHandle(17, kill, events(), on_stdout=on_stdout)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "first\n", "first", "first\nsecond", "a\u03bb\nsecond \n"],
+    ids=["empty", "terminated", "partial", "partial-second", "split-utf8"],
+)
+async def test_execute_returns_the_output_exactly_as_written(
+    monkeypatch: pytest.MonkeyPatch, text: str
+) -> None:
+    commands = _ScriptedCommands(text.encode())
+
+    async def create(_self: SdkE2BClient, **_kwargs: object) -> str:
+        return "sbx-1"
+
+    async def sandbox(_self: SdkE2BClient, _sandbox_id: str) -> object:
+        return type("Sandbox", (), {"commands": commands})()
+
+    monkeypatch.setattr(SdkE2BClient, "create", create)
+    monkeypatch.setattr(SdkE2BClient, "_sandbox", sandbox)
+    provider = E2BWorkspaceProvider("tpl", client=SdkE2BClient(api_key="unused"))
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+
+    result = await provider.execute(workspace, "printf")
+    session = await provider.start_stream(workspace, ["printf"])
+
+    assert result.stdout == text
+    assert [line async for line in session.lines()] == text.splitlines()
 
 
 class _PausingSandbox:

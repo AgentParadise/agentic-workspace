@@ -10,7 +10,7 @@ Decisions that differ from Docker, and why:
 - Output is merged INSIDE the sandbox (`exec "$@" 2>&1`), so `lines()` is in
   the process's write order by construction rather than by trusting the
   arrival order of two SDK callbacks. `execute` therefore returns the merged
-  text as `stdout` and an empty `stderr`.
+  text, exactly as written, as `stdout` and an empty `stderr`.
 - The command timeout is enforced here: on expiry the sandbox process is
   killed and the outcome is `timed_out` only once the kill is confirmed.
   A kill that is refused, raises, or is not followed by the command's end
@@ -27,9 +27,10 @@ Decisions that differ from Docker, and why:
   `completed` only when the sandbox is absent from the E2B list afterwards;
   a kill that leaves it listed raises `SandboxRemovalError`, which is also
   the negative control of #1915.
-- Credential bindings and host mounts are refused: neither has an E2B
-  delivery yet, and silently dropping one would launch a workspace without
-  what the caller asked for.
+- Credential bindings, host mounts and `limits.network=False` are refused:
+  none has an E2B delivery yet, and silently dropping one would launch a
+  workspace without what the caller asked for. The mutable `environment` is
+  re-checked for credentials before allocation and before every command.
 
 The SDK behaviour this relies on is cited in `e2b_client.py`.
 """
@@ -120,6 +121,9 @@ class E2BWorkspaceProvider:
             )
         if config.mounts:
             raise ValueError("the e2b provider cannot mount host paths into a sandbox")
+        if not config.limits.network:
+            raise ValueError("the e2b provider cannot deny network access to a sandbox yet")
+        config.checked_environment()
         sandbox_id = await self._client.create(
             template=self._template,
             metadata=config.labels,
@@ -178,10 +182,10 @@ class E2BWorkspaceProvider:
         env: dict[str, str] | None = None,
     ) -> ExecuteResult:
         started = time.monotonic()
-        session = await self.start_stream(
+        session = await self._start(
             workspace, ["sh", "-c", command], cwd=cwd, env=env, timeout=timeout
         )
-        lines = [line async for line in session.lines()]
+        output = [text async for text in session.output()]
         outcome = await session.outcome()
         if outcome.disconnected:
             raise E2BTransportError(
@@ -189,7 +193,7 @@ class E2BWorkspaceProvider:
             )
         return ExecuteResult(
             exit_code=outcome.exit_code if outcome.exit_code is not None else -1,
-            stdout="".join(f"{line}\n" for line in lines),
+            stdout="".join(output),
             stderr="",
             duration_ms=(time.monotonic() - started) * 1000,
             timed_out=outcome.timed_out,
@@ -215,7 +219,18 @@ class E2BWorkspaceProvider:
         env: Mapping[str, str] | None = None,
         timeout: float | None = None,
     ) -> StreamSession:
-        merged_env = {**workspace.config.environment, **(env or {})}
+        return await self._start(workspace, sandbox_argv, cwd=cwd, env=env, timeout=timeout)
+
+    async def _start(
+        self,
+        workspace: Workspace,
+        sandbox_argv: Sequence[str],
+        *,
+        cwd: str | None,
+        env: Mapping[str, str] | None,
+        timeout: float | None,
+    ) -> E2BStreamSession:
+        merged_env = {**workspace.config.checked_environment(), **(env or {})}
         command = await self._client.start(
             workspace.id,
             shlex.join([*_MERGED, *sandbox_argv]),
@@ -393,8 +408,8 @@ class E2BStreamSession:
             return StreamOutcome(end="completed", exit_code=ended.exit_code)
         return StreamOutcome(end="disconnected", detail=ended.detail)
 
-    async def lines(self) -> AsyncIterator[str]:
-        pending = ""
+    async def output(self) -> AsyncIterator[str]:
+        """The merged output exactly as the process wrote it, in arrival chunks."""
         chunks = aiter(self._command.output())
         while True:
             chunk = asyncio.ensure_future(anext(chunks))
@@ -404,9 +419,15 @@ class E2BStreamSession:
                 chunk.cancel()
                 break
             try:
-                pending += await chunk
+                text = await chunk
             except StopAsyncIteration:
                 break
+            yield text
+
+    async def lines(self) -> AsyncIterator[str]:
+        pending = ""
+        async for text in self.output():
+            pending += text
             *complete, pending = pending.split("\n")
             for line in complete:
                 yield line

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from agentic_isolation import (
+    ResourceLimits,
     StreamOutcome,
     SupportsFileTransfer,
     SupportsOwnership,
@@ -81,6 +82,47 @@ async def test_create_refuses_credential_bindings(provider: E2BWorkspaceProvider
     )
     with pytest.raises(CredentialPolicyError):
         await provider.create(WorkspaceConfig(provider="e2b", credentials=[binding]))
+
+
+async def test_create_refuses_a_credential_added_to_the_environment_before_allocating(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    config = WorkspaceConfig(provider="e2b")
+    config.environment["GH_TOKEN"] = "not-a-real-token"
+
+    with pytest.raises(ValueError, match="credential"):
+        await provider.create(config)
+
+    assert client.events == []
+    assert client.started == []
+
+
+async def test_commands_refuse_a_credential_added_to_a_live_workspace(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    workspace = await provider.create(WorkspaceConfig(provider="e2b", environment={"BASE": "1"}))
+    started = len(client.started)
+    workspace.config.environment["GH_TOKEN"] = "not-a-real-token"
+
+    with pytest.raises(ValueError, match="credential"):
+        await provider.execute(workspace, "true")
+    with pytest.raises(ValueError, match="credential"):
+        await provider.start_stream(workspace, ["true"])
+
+    assert len(client.started) == started
+    assert all("not-a-real-token" not in env.values() for *_, env in client.started)
+
+
+async def test_create_refuses_network_denial_before_allocating(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    config = WorkspaceConfig(provider="e2b", limits=ResourceLimits(network=False))
+
+    with pytest.raises(ValueError, match="network"):
+        await provider.create(config)
+
+    assert client.events == []
+    assert client.sandboxes == {}
 
 
 async def test_stream_merges_in_the_sandbox_and_env_stays_out_of_the_argv(
