@@ -10,16 +10,23 @@ import pytest
 
 _MARKERS = ("docker_conformance", "e2b_live")
 _outcomes: dict[str, str] = {}
+# A later phase can only make a test's record worse: a teardown or cleanup
+# failure after a passed call is a failure, never PASSED.
+_PRECEDENCE = {"passed": 0, "skipped": 1, "failed": 2}
+
+
+def record(outcomes: dict[str, str], report: pytest.TestReport) -> None:
+    """Fold one phase report into the per-test outcome, worst outcome winning."""
+    if report.outcome == "passed" and report.when != "call":
+        return
+    known = outcomes.get(report.nodeid)
+    if known is None or _PRECEDENCE[report.outcome] > _PRECEDENCE[known]:
+        outcomes[report.nodeid] = report.outcome
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
-    if not any(marker in report.keywords for marker in _MARKERS):
-        return
-    if report.outcome != "passed":
-        # The first non-pass (setup error, call failure, skip) is the outcome.
-        _outcomes.setdefault(report.nodeid, report.outcome)
-    elif report.when == "call":
-        _outcomes.setdefault(report.nodeid, "passed")
+    if any(marker in report.keywords for marker in _MARKERS):
+        record(_outcomes, report)
 
 
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:

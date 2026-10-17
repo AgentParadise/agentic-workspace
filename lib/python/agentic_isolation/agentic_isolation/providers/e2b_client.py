@@ -15,6 +15,12 @@ behaviour it relies on is cited (accessed 2026-10-17):
 - Background commands, `pid`, and reattaching with `commands.connect(pid)`:
   https://e2b.dev/docs/commands/background
 - File read as bytes and write: https://e2b.dev/docs/filesystem/read-write
+- `AsyncCommandHandle.kill` sends SIGKILL and `disconnect` stops receiving
+  events without killing: the docstrings of the pinned SDK,
+  `e2b/sandbox_async/commands/command_handle.py` in e2b==2.52.0. Its `wait`
+  raises the stream's own error (for example `connectrpc.errors.ConnectError`),
+  a plain `Exception` when the stream ends with no end event, and
+  `CancelledError` after `disconnect`; all three are a lost stream here.
 
 None of this has run against a real E2B account; see
 tests/integration/test_e2b_live.py for the gated proof.
@@ -24,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import signal
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -72,8 +79,12 @@ class SandboxCommand(Protocol):
         ...
 
     async def kill(self) -> bool:
-        """Kill the process in the sandbox. False when it was already gone."""
+        """Kill the process in the sandbox with SIGKILL. False when it was already gone."""
         ...
+
+
+# The signal `SandboxCommand.kill` sends (the SDK's kill docstring).
+KILL_SIGNAL = int(signal.SIGKILL)
 
 
 class E2BSandboxClient(Protocol):
@@ -110,7 +121,12 @@ class E2BSandboxClient(Protocol):
         env: Mapping[str, str],
         timeout: float | None,
     ) -> SandboxCommand:
-        """Start a shell command in the sandbox without waiting for it."""
+        """Start a shell command in the sandbox without waiting for it.
+
+        A transport that fails before the command starts is not raised: the
+        returned command has no output and ends `disconnected`, so a client
+        error is never read as the sandbox's exit status.
+        """
         ...
 
     async def reconnect(self, sandbox_id: str, pid: int) -> SandboxCommand:
@@ -220,11 +236,9 @@ class SdkE2BClient:
         env: Mapping[str, str],
         timeout: float | None,
     ) -> SandboxCommand:
-        from e2b import SandboxException
-
-        sandbox = await self._sandbox(sandbox_id)
         chunks = _ChunkQueue()
         try:
+            sandbox = await self._sandbox(sandbox_id)
             handle = await sandbox.commands.run(
                 command,
                 background=True,
@@ -235,8 +249,10 @@ class SdkE2BClient:
                 # by `timeout` in the sandbox (see E2BWorkspaceProvider).
                 timeout=0,
             )
-        except SandboxException as exc:
-            raise E2BTransportError(f"cannot start a command in {sandbox_id}: {exc}") from exc
+        except Exception as exc:
+            # Any failure before a handle exists is the transport's, whatever
+            # its type (SandboxException, ConnectError, an httpx error).
+            return UnstartedCommand(f"cannot start a command in {sandbox_id}: {exc!r}")
         return _SdkCommand(handle, chunks)
 
     async def reconnect(self, sandbox_id: str, pid: int) -> SandboxCommand:
@@ -281,6 +297,27 @@ class _ChunkQueue:
             yield chunk
 
 
+class UnstartedCommand:
+    """A command the transport never started: no output, no pid, a lost stream."""
+
+    def __init__(self, detail: str) -> None:
+        self._detail = detail
+
+    @property
+    def pid(self) -> int:
+        raise E2BTransportError(f"the command never started: {self._detail}")
+
+    async def output(self) -> AsyncIterator[str]:
+        return
+        yield
+
+    async def wait(self) -> CommandExit:
+        return CommandExit(end="disconnected", detail=self._detail)
+
+    async def kill(self) -> bool:
+        return False
+
+
 class _SdkCommand:
     def __init__(self, handle: AsyncCommandHandle, chunks: _ChunkQueue) -> None:
         self._handle = handle
@@ -294,17 +331,30 @@ class _SdkCommand:
         return self._chunks.drain()
 
     async def wait(self) -> CommandExit:
-        from e2b import CommandExitException, SandboxException
+        from e2b import CommandExitException
 
         try:
             result = await self._handle.wait()
             return CommandExit(end="exited", exit_code=result.exit_code)
         except CommandExitException as exc:
             return CommandExit(end="exited", exit_code=exc.exit_code)
-        except (SandboxException, OSError) as exc:
-            return CommandExit(end="disconnected", detail=str(exc))
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            # Not our cancellation: the handle's reader was stopped by
+            # `disconnect`, which leaves the process running.
+            return CommandExit(end="disconnected", detail="command stream disconnected")
+        except Exception as exc:
+            # ConnectError on a reset, a plain Exception on a stream that
+            # ended with no end event: the process's exit is unknown.
+            return CommandExit(end="disconnected", detail=repr(exc))
         finally:
             self._chunks.close()
 
     async def kill(self) -> bool:
         return bool(await self._handle.kill())
+
+    async def disconnect(self) -> None:
+        """Stop receiving the stream without killing the process."""
+        await self._handle.disconnect()

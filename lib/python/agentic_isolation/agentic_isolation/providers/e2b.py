@@ -13,6 +13,11 @@ Decisions that differ from Docker, and why:
   text as `stdout` and an empty `stderr`.
 - The command timeout is enforced here: on expiry the sandbox process is
   killed and the outcome is `timed_out` only once the kill is confirmed.
+  A kill that is refused, raises, or is not followed by the command's end
+  within `_KILL_SECONDS` makes the outcome `disconnected` instead.
+- `cancel` reports `completed` with SIGKILL as the signal only once the kill
+  is acknowledged (the SDK's kill sends SIGKILL); an unconfirmed kill raises
+  `E2BTransportError` rather than claiming the process stopped.
 - Teardown follows decision 7 of the research doc: the workspace directory
   is the sandbox's own disk, so "delete" means "kill the sandbox", and it
   comes LAST. `while_running` and `before_delete` both run while the sandbox
@@ -53,6 +58,8 @@ from agentic_isolation.providers.capabilities import (
     mismatched_labels,
 )
 from agentic_isolation.providers.e2b_client import (
+    KILL_SIGNAL,
+    CommandExit,
     E2BSandboxClient,
     E2BTransportError,
     SandboxCommand,
@@ -64,10 +71,19 @@ _PROVIDER = "e2b"
 _WORKSPACE_ROOT = "/workspace"
 # Runs the argv with stderr on the same pipe as stdout, in one process.
 _MERGED = ("sh", "-c", 'exec "$@" 2>&1', "sh")
+# How long a kill, and the end it causes, may take before it counts as unconfirmed.
+_KILL_SECONDS = 10.0
 
 
 class SandboxRemovalError(RuntimeError):
-    """A sandbox was killed but is still in the E2B list; the workspace was kept."""
+    """A sandbox was killed but is still in the E2B list; the workspace was kept.
+
+    `sandbox_id` names the sandbox so a caller can retry or reclaim it.
+    """
+
+    def __init__(self, message: str, *, sandbox_id: str) -> None:
+        super().__init__(message)
+        self.sandbox_id = sandbox_id
 
 
 class E2BWorkspaceProvider:
@@ -118,12 +134,36 @@ class E2BWorkspaceProvider:
             _handle=sandbox_id,
         )
         self._workspaces[sandbox_id] = workspace
-        result = await self.execute(workspace, f"mkdir -p {_WORKSPACE_ROOT}", cwd="/")
-        if not result.success:
-            await self._client.kill(sandbox_id)
+        try:
+            result = await self.execute(workspace, f"mkdir -p {_WORKSPACE_ROOT}", cwd="/")
+            if not result.success:
+                raise RuntimeError(f"sandbox {sandbox_id} could not create {_WORKSPACE_ROOT}")
+        except BaseException as exc:
+            # The caller never gets this workspace, so nobody else can free it.
             self._workspaces.pop(sandbox_id, None)
-            raise RuntimeError(f"sandbox {sandbox_id} could not create {_WORKSPACE_ROOT}")
+            leak = await self._discard(sandbox_id, config.labels)
+            if leak is None:
+                raise
+            if isinstance(exc, Exception):
+                raise SandboxRemovalError(
+                    f"creating sandbox {sandbox_id} failed ({exc!r}) and it is still "
+                    f"allocated: {leak}",
+                    sandbox_id=sandbox_id,
+                ) from exc
+            exc.add_note(f"sandbox {sandbox_id} is still allocated: {leak}")
+            raise
         return workspace
+
+    async def _discard(self, sandbox_id: str, labels: Mapping[str, str]) -> str | None:
+        """Kill a sandbox and confirm it left the list; why not, when it did not."""
+        try:
+            await self._client.kill(sandbox_id)
+            listed = await self._client.list(labels)
+        except Exception as exc:
+            return f"cleanup raised {exc!r}"
+        if any(entry.sandbox_id == sandbox_id for entry in listed):
+            return "still in the E2B list after kill"
+        return None
 
     async def destroy(self, workspace: Workspace) -> TeardownReport:
         return await self.teardown(workspace)
@@ -292,7 +332,8 @@ class E2BWorkspaceProvider:
         if still_listed:
             raise SandboxRemovalError(
                 f"sandbox {workspace.id} is still in the E2B list after kill; "
-                "the workspace was kept. Retry teardown by ref."
+                "the workspace was kept. Retry teardown by ref.",
+                sandbox_id=workspace.id,
             )
         self._workspaces.pop(workspace.id, None)
         self._retained.pop(workspace.id, None)
@@ -326,6 +367,8 @@ class E2BStreamSession:
         self._client = client
         self._sandbox_id = sandbox_id
         self._command = command
+        self._waiting = asyncio.ensure_future(command.wait())
+        self._cancelled: StreamOutcome | None = None
         self._outcome = asyncio.ensure_future(self._watch(timeout))
 
     @property
@@ -333,23 +376,36 @@ class E2BStreamSession:
         return self._command.pid
 
     async def _watch(self, timeout: float | None) -> StreamOutcome:
-        waiting = asyncio.ensure_future(self._command.wait())
-        done, _ = await asyncio.wait({waiting}, timeout=timeout)
+        done, _ = await asyncio.wait({self._waiting}, timeout=timeout)
         if not done:
-            killed = await self._command.kill()
-            ended = await waiting
-            if killed and ended.end == "exited":
+            if not await _confirmed_kill(self._command):
+                self._waiting.cancel()
+                return StreamOutcome(end="disconnected", detail="timeout kill not confirmed")
+            ended = await _bounded(self._waiting)
+            if ended is not None and ended.end == "exited":
                 return StreamOutcome(end="timed_out")
             return StreamOutcome(end="disconnected", detail="timeout kill not confirmed")
-        ended = waiting.result()
+        if self._waiting.cancelled():
+            return StreamOutcome(end="disconnected", detail="stopped waiting after cancel")
+        ended = self._waiting.result()
         if ended.end == "exited":
             return StreamOutcome(end="completed", exit_code=ended.exit_code)
         return StreamOutcome(end="disconnected", detail=ended.detail)
 
     async def lines(self) -> AsyncIterator[str]:
         pending = ""
-        async for chunk in self._command.output():
-            pending += chunk
+        chunks = aiter(self._command.output())
+        while True:
+            chunk = asyncio.ensure_future(anext(chunks))
+            await asyncio.wait({chunk, self._outcome}, return_when=asyncio.FIRST_COMPLETED)
+            if not chunk.done() and (await self.outcome()).disconnected:
+                # The stream is lost: nothing more is coming, so end locally.
+                chunk.cancel()
+                break
+            try:
+                pending += await chunk
+            except StopAsyncIteration:
+                break
             *complete, pending = pending.split("\n")
             for line in complete:
                 yield line
@@ -357,15 +413,42 @@ class E2BStreamSession:
             yield pending
 
     async def outcome(self) -> StreamOutcome:
+        if self._cancelled is not None:
+            return self._cancelled
         return await asyncio.shield(self._outcome)
 
     async def cancel(self) -> None:
-        await self._command.kill()
-        await self.outcome()
+        """SIGKILL the sandbox process; raise when the kill is not confirmed."""
+        if self._outcome.done() and not self._outcome.result().disconnected:
+            return
+        if not await _confirmed_kill(self._command):
+            if self._outcome.done() and not self._outcome.result().disconnected:
+                return  # it ended on its own before the kill reached it
+            raise E2BTransportError(
+                f"cancel of pid in sandbox {self._sandbox_id} was not confirmed; "
+                "the process may still be running"
+            )
+        self._cancelled = StreamOutcome(end="completed", signal=KILL_SIGNAL)
+        if await _bounded(self._waiting) is None:
+            self._waiting.cancel()
 
     async def reconnect(self) -> StreamSession:
         command = await self._client.reconnect(self._sandbox_id, self._command.pid)
         return E2BStreamSession(self._client, self._sandbox_id, command, timeout=None)
+
+
+async def _confirmed_kill(command: SandboxCommand) -> bool:
+    """True only when the kill was acknowledged within `_KILL_SECONDS`."""
+    try:
+        return await asyncio.wait_for(command.kill(), timeout=_KILL_SECONDS)
+    except (TimeoutError, E2BTransportError, OSError):
+        return False
+
+
+async def _bounded(waiting: asyncio.Future[CommandExit]) -> CommandExit | None:
+    """The command's end if it arrives within `_KILL_SECONDS`, else None."""
+    done, _ = await asyncio.wait({waiting}, timeout=_KILL_SECONDS)
+    return waiting.result() if done else None
 
 
 def _contained(path: str) -> str:

@@ -44,6 +44,7 @@ from agentic_isolation import (
 from agentic_isolation.providers.capabilities import TransferRoot
 from agentic_isolation.providers.docker_capabilities import DockerStreamSession
 from agentic_isolation.providers.e2b import E2BStreamSession
+from agentic_isolation.providers.e2b_client import SdkE2BClient, _SdkCommand
 
 pytestmark = [pytest.mark.docker_conformance, pytest.mark.integration]
 
@@ -68,8 +69,8 @@ class ConformanceHarness:
     workspace_config: Callable[[str, dict[str, str]], WorkspaceConfig]
     # Cut the live transport of a running session, as a dropped connection would.
     interrupt_transport: Callable[[StreamSession], None]
-    # Point new sessions at a transport that cannot be reached.
-    break_transport: Callable[[pytest.MonkeyPatch], None]
+    # Point the provider's new sessions at a transport that cannot be reached.
+    break_transport: Callable[[pytest.MonkeyPatch, ConformanceProvider], None]
 
 
 _DOCKER_IMAGE = "python:3.12-slim"
@@ -93,7 +94,7 @@ def _docker_interrupt(session: StreamSession) -> None:
     session._proc.kill()
 
 
-def _docker_break(monkeypatch: pytest.MonkeyPatch) -> None:
+def _docker_break(monkeypatch: pytest.MonkeyPatch, _provider: ConformanceProvider) -> None:
     monkeypatch.setenv("DOCKER_HOST", f"unix:///nonexistent/{uuid.uuid4().hex}.sock")
 
 
@@ -102,14 +103,22 @@ def _e2b_available() -> bool:
 
 
 def _e2b_interrupt(session: StreamSession) -> None:
-    # Reconnecting from a fresh session is E2B's reattach path; cutting the
-    # SDK's stream from outside is not something the SDK documents, so the
-    # E2B harness does not pretend to. This case is NOT RUN for E2B.
+    # The pinned SDK's `AsyncCommandHandle.disconnect` stops the event stream
+    # without killing the process (its docstring, e2b==2.52.0).
     assert isinstance(session, E2BStreamSession)
-    pytest.skip("NOT RUN for e2b: no documented way to cut a live SDK stream")
+    command = session._command
+    assert isinstance(command, _SdkCommand)
+    asyncio.get_running_loop().create_task(command.disconnect())
 
 
-def _e2b_break(monkeypatch: pytest.MonkeyPatch) -> None:
+def _e2b_break(monkeypatch: pytest.MonkeyPatch, provider: ConformanceProvider) -> None:
+    # The adapter caches each sandbox with its command channel already built,
+    # so the cache is emptied and the reconnect goes to a domain that does
+    # not resolve: the real SDK connect path fails, not a stand-in.
+    assert isinstance(provider, E2BWorkspaceProvider)
+    client = provider._client
+    assert isinstance(client, SdkE2BClient)
+    monkeypatch.setattr(client, "_sandboxes", {})
     monkeypatch.setenv("E2B_DOMAIN", f"nonexistent-{uuid.uuid4().hex}.invalid")
 
 
@@ -275,7 +284,7 @@ async def test_stream_unreachable_transport_is_never_completion(
     workspace = await make_workspace({})
 
     with monkeypatch.context() as patched:
-        harness.break_transport(patched)
+        harness.break_transport(patched, provider)
         session = await provider.start_stream(workspace, ["echo", "should-not-run"])
         lines, outcome = await asyncio.wait_for(_run(session), timeout=30)
 
