@@ -136,7 +136,7 @@ async def test_stream_timeout_stops_the_sandbox_process(
     workspace = await make_workspace({})
     marker = f"/tmp/timed-out-{uuid.uuid4().hex}"
     session = await provider.start_stream(
-        workspace, ["sh", "-c", f"echo started; sleep 4; touch {marker}"], timeout=1
+        workspace, ["sh", "-c", f"echo started; sleep 6; touch {marker}"], timeout=3
     )
 
     lines, outcome = await asyncio.wait_for(_run(session), timeout=30)
