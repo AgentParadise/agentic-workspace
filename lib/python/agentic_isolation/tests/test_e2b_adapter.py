@@ -13,11 +13,16 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from http import HTTPStatus
 
 import pytest
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
-from e2b import AsyncSandbox, ServiceBusyException
+from e2b import AsyncSandbox, SandboxException, SandboxQuery, ServiceBusyException
+from e2b.api.client.api.sandboxes import get_v2_sandboxes
+from e2b.api.client.client import AuthenticatedClient
+from e2b.api.client.models.listed_sandbox import ListedSandbox
+from e2b.api.client.types import UNSET, Response
 from e2b.envd.process import process_pb
 from e2b.sandbox_async.commands.command_handle import AsyncCommandHandle
 
@@ -122,32 +127,66 @@ async def test_timeout_with_a_refused_kill_ends_disconnected(client: FakeE2BClie
     assert lines == ["started"]
 
 
+# The shapes a kill can fail with: the adapter's own error, the SDK's
+# ConnectError on a reset (envd/rpc.py), and an SDK exception.
+_KILL_FAILURES = [
+    E2BTransportError("kill rpc failed"),
+    ConnectError(Code.UNAVAILABLE, "kill reset"),
+    SandboxException("kill refused"),
+]
+
+
+@pytest.mark.parametrize("failure", _KILL_FAILURES, ids=["adapter", "connect", "sdk"])
 async def test_timeout_with_a_raising_kill_ends_disconnected(
-    client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch
+    client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch, failure: Exception
 ) -> None:
-    _, session = await _hanging_session(client, timeout=0.5)
+    _, session = await _hanging_session(client, timeout=0.05)
 
     async def broken() -> bool:
-        raise E2BTransportError("kill rpc failed")
+        raise failure
 
     monkeypatch.setattr(client.commands[session.pid], "kill", broken)
 
-    outcome = await asyncio.wait_for(session.outcome(), timeout=2)
-    assert outcome.disconnected and outcome.exit_code is None
+    outcome = await asyncio.wait_for(session.outcome(), timeout=1)
+    assert outcome == StreamOutcome(end="disconnected", detail="timeout kill not confirmed")
+    assert session._waiting.done()
+
+
+@pytest.mark.parametrize("failure", _KILL_FAILURES, ids=["adapter", "connect", "sdk"])
+async def test_cancel_with_a_raising_kill_raises_and_claims_nothing(
+    client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    _, session = await _hanging_session(client)
+
+    async def broken() -> bool:
+        raise failure
+
+    monkeypatch.setattr(client.commands[session.pid], "kill", broken)
+
+    with pytest.raises(E2BTransportError, match="not confirmed"):
+        await session.cancel()
+
+    assert session._cancelled is None and not session._outcome.done()
+    session._waiting.cancel()
+    await asyncio.gather(session._waiting, session._outcome, return_exceptions=True)
 
 
 async def test_timeout_with_a_kill_but_no_end_ends_disconnected(
     client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, session = await _hanging_session(client, timeout=0.5)
+    _, session = await _hanging_session(client, timeout=0.05)
 
     async def acknowledged_only() -> bool:
         return True  # acknowledged, but the command never reports its end
 
     monkeypatch.setattr(client.commands[session.pid], "kill", acknowledged_only)
 
-    outcome = await asyncio.wait_for(session.outcome(), timeout=2)
-    assert outcome.disconnected and outcome.exit_code is None
+    outcome = await asyncio.wait_for(session.outcome(), timeout=1)
+    lines = await asyncio.wait_for(_collect(session), timeout=1)
+
+    assert outcome == StreamOutcome(end="disconnected", detail="timeout kill not confirmed")
+    assert session._waiting.done(), "the outcome left command.wait running"
+    assert lines == ["started"]
 
 
 async def _collect(session: e2b_module.E2BStreamSession) -> list[str]:
@@ -261,6 +300,21 @@ async def test_sdk_disconnect_is_disconnected_not_a_cancellation() -> None:
     assert (await waiting).end == "disconnected"
 
 
+@pytest.mark.parametrize("failure", _KILL_FAILURES[1:], ids=["connect", "sdk"])
+async def test_sdk_kill_failure_is_a_transport_error_and_unconfirmed(failure: Exception) -> None:
+    async def kill() -> bool:
+        raise failure
+
+    command = e2b_client._SdkCommand(AsyncCommandHandle(17, kill, _endless()), _ChunkQueue())
+    try:
+        with pytest.raises(E2BTransportError, match="kill of pid 17") as raised:
+            await command.kill()
+        assert raised.value.__cause__ is failure
+        assert await e2b_module._confirmed_kill(command) is False
+    finally:
+        await command.disconnect()
+
+
 async def test_cancelling_the_waiter_still_propagates() -> None:
     command = e2b_client._SdkCommand(_handle(_endless()), _ChunkQueue())
     waiting = asyncio.ensure_future(command.wait())
@@ -324,6 +378,104 @@ async def test_pause_retries_a_busy_refusal_a_bounded_number_of_times(
     assert sandbox.calls == min(refusals + 1, 5)
     assert len(slept) == min(refusals, 4)
     assert all(2**i <= s < 2**i + 1 for i, s in enumerate(slept))
+
+
+async def test_cancelled_pause_backoff_stops_retrying_and_keeps_the_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = _PausingSandbox(refusals=5)
+    sdk = SdkE2BClient(api_key="unused")
+    sdk._sandboxes["sbx-1"] = sandbox  # type: ignore[assignment]
+    backing_off = asyncio.Event()
+
+    async def held_sleep(_seconds: float) -> None:
+        if not backing_off.is_set():  # hold the first backoff only
+            backing_off.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(asyncio, "sleep", held_sleep)
+    pausing = asyncio.ensure_future(sdk.pause("sbx-1"))
+    await backing_off.wait()
+
+    pausing.cancel()
+
+    done, _ = await asyncio.wait({pausing}, timeout=1)
+    assert done, "the cancelled pause kept retrying"
+    with pytest.raises(asyncio.CancelledError):
+        pausing.result()
+    assert sandbox.calls == 1
+    cached: object = sdk._sandboxes["sbx-1"]
+    assert cached is sandbox
+
+
+def _listed(sandbox_id: str, state: str, metadata: dict[str, str]) -> ListedSandbox:
+    return ListedSandbox.from_dict(
+        {
+            "templateID": "tpl",
+            "sandboxID": sandbox_id,
+            "clientID": "client",
+            "startedAt": "2026-10-17T00:00:00Z",
+            "endAt": "2026-10-17T01:00:00Z",
+            "cpuCount": 2,
+            "memoryMB": 2048,
+            "diskSizeMB": 1024,
+            "state": state,
+            "envdVersion": "0.2.0",
+            "metadata": metadata,
+        }
+    )
+
+
+@dataclass(frozen=True)
+class _ListRequest:
+    token: str
+    metadata: object
+    state: object
+    next_token: object
+
+
+async def test_list_reads_every_page_in_every_state_and_keeps_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = {"agentic.owner": "run-1", "agentic.role": "workspace"}
+    pages: dict[object, tuple[list[ListedSandbox], dict[str, str]]] = {
+        UNSET: ([_listed("sbx-1", "running", owned)], {"x-next-token": "page-2"}),
+        "page-2": (
+            [_listed("sbx-2", "paused", owned), _listed("sbx-3", "running", owned)],
+            {"x-next-token": "page-3"},
+        ),
+        "page-3": ([_listed("sbx-4", "paused", owned)], {}),
+    }
+    requests: list[_ListRequest] = []
+
+    async def get_page(
+        *, client: AuthenticatedClient, **query: object
+    ) -> Response[list[ListedSandbox]]:
+        requests.append(
+            _ListRequest(client.token, query["metadata"], query["state"], query["next_token"])
+        )
+        items, headers = pages[query["next_token"]]
+        return Response(status_code=HTTPStatus.OK, content=b"", headers=headers, parsed=items)
+
+    monkeypatch.setattr(get_v2_sandboxes, "asyncio_detailed", get_page)
+
+    found = await SdkE2BClient(api_key="e2b_key").list(owned)
+
+    assert [(entry.sandbox_id, entry.metadata) for entry in found] == [
+        ("sbx-1", owned),
+        ("sbx-2", owned),
+        ("sbx-3", owned),
+        ("sbx-4", owned),
+    ]
+    expected_metadata = "agentic.owner=run-1&agentic.role=workspace"
+    # No state filter: the SDK then lists running AND paused sandboxes
+    # (AsyncSandbox.list docstring, e2b 2.52.0).
+    assert requests == [
+        _ListRequest("e2b_key", expected_metadata, UNSET, UNSET),
+        _ListRequest("e2b_key", expected_metadata, UNSET, "page-2"),
+        _ListRequest("e2b_key", expected_metadata, UNSET, "page-3"),
+    ]
+    assert SandboxQuery(metadata=owned).state is None
 
 
 async def test_build_template_forwards_the_spec_and_returns_the_receipt(

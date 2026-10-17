@@ -79,7 +79,10 @@ class SandboxCommand(Protocol):
         ...
 
     async def kill(self) -> bool:
-        """Kill the process in the sandbox with SIGKILL. False when it was already gone."""
+        """Kill the process in the sandbox with SIGKILL. False when it was already gone.
+
+        Raises E2BTransportError when the kill could not be delivered.
+        """
         ...
 
 
@@ -353,7 +356,12 @@ class _SdkCommand:
             self._chunks.close()
 
     async def kill(self) -> bool:
-        return bool(await self._handle.kill())
+        try:
+            return bool(await self._handle.kill())
+        except Exception as exc:
+            # ConnectError on a reset, SandboxException from the envd mapping:
+            # the kill was not acknowledged and the process may still run.
+            raise E2BTransportError(f"kill of pid {self._handle.pid} failed: {exc!r}") from exc
 
     async def disconnect(self) -> None:
         """Stop receiving the stream without killing the process."""

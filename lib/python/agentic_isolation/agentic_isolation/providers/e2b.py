@@ -379,11 +379,12 @@ class E2BStreamSession:
         done, _ = await asyncio.wait({self._waiting}, timeout=timeout)
         if not done:
             if not await _confirmed_kill(self._command):
-                self._waiting.cancel()
+                await _release(self._waiting)
                 return StreamOutcome(end="disconnected", detail="timeout kill not confirmed")
             ended = await _bounded(self._waiting)
             if ended is not None and ended.end == "exited":
                 return StreamOutcome(end="timed_out")
+            await _release(self._waiting)
             return StreamOutcome(end="disconnected", detail="timeout kill not confirmed")
         if self._waiting.cancelled():
             return StreamOutcome(end="disconnected", detail="stopped waiting after cancel")
@@ -430,7 +431,7 @@ class E2BStreamSession:
             )
         self._cancelled = StreamOutcome(end="completed", signal=KILL_SIGNAL)
         if await _bounded(self._waiting) is None:
-            self._waiting.cancel()
+            await _release(self._waiting)
 
     async def reconnect(self) -> StreamSession:
         command = await self._client.reconnect(self._sandbox_id, self._command.pid)
@@ -441,8 +442,16 @@ async def _confirmed_kill(command: SandboxCommand) -> bool:
     """True only when the kill was acknowledged within `_KILL_SECONDS`."""
     try:
         return await asyncio.wait_for(command.kill(), timeout=_KILL_SECONDS)
-    except (TimeoutError, E2BTransportError, OSError):
+    except Exception:
+        # Whatever the transport raised (a ConnectError on a reset, an SDK
+        # exception), the kill was not acknowledged. Cancellation propagates.
         return False
+
+
+async def _release(waiting: asyncio.Future[CommandExit]) -> None:
+    """Stop waiting for an end event that is not coming, and let the waiter settle."""
+    waiting.cancel()
+    await asyncio.wait({waiting})
 
 
 async def _bounded(waiting: asyncio.Future[CommandExit]) -> CommandExit | None:
