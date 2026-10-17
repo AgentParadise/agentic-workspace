@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+index da87ee0..adb3a57 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+@@ -162,7 +162,7 @@ class E2BWorkspaceProvider:
+         except Exception as exc:
+             return f"cleanup raised {exc!r}"
+         if any(entry.sandbox_id == sandbox_id for entry in listed):
+-            return "still in the E2B list after kill"
++            return None
+         return None
+ 
+     async def destroy(self, workspace: Workspace) -> TeardownReport:

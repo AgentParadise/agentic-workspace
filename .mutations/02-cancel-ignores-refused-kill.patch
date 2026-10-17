@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+index da87ee0..7d37ad4 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+@@ -421,7 +421,7 @@ class E2BStreamSession:
+         """SIGKILL the sandbox process; raise when the kill is not confirmed."""
+         if self._outcome.done() and not self._outcome.result().disconnected:
+             return
+-        if not await _confirmed_kill(self._command):
++        if not (await _confirmed_kill(self._command) or True):
+             if self._outcome.done() and not self._outcome.result().disconnected:
+                 return  # it ended on its own before the kill reached it
+             raise E2BTransportError(
