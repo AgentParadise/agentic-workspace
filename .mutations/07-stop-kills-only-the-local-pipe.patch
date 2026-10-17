@@ -1,5 +1,5 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
-index efa3a0d..c85b8f1 100644
+index 7a5d604..c85b8f1 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
 @@ -127,11 +127,7 @@ class DockerStreamSession:
@@ -9,7 +9,7 @@ index efa3a0d..c85b8f1 100644
 -        script = (
 -            f'i=0; while [ "$i" -lt 50 ]; do if [ -s "{self._pid_file}" ]; then '
 -            f'kill -KILL "$(cat "{self._pid_file}")"; exit $?; fi; '
--            'i=$((i + 1)); sleep 0.1; done; exit 1'
+-            "i=$((i + 1)); sleep 0.1; done; exit 1"
 -        )
 +        script = "true"
          code, _, err = await _docker("exec", self._container, "sh", "-c", script)
