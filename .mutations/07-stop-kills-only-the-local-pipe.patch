@@ -1,14 +1,17 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
-index 92d5966..c205465 100644
+index efa3a0d..c85b8f1 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
-@@ -127,8 +127,7 @@ class DockerStreamSession:
+@@ -127,11 +127,7 @@ class DockerStreamSession:
          self._stopped_by = outcome
          # Wait briefly for the announce line; then kill the sandbox process.
-         script = (
--            f'for _ in $(seq 50); do [ -s "{self._pid_file}" ] && '
--            f'exec kill -KILL "$(cat "{self._pid_file}")"; sleep 0.1; done; exit 1'
-+            "true"
-         )
+         # `kill` is a shell builtin in minimal images, so it cannot be exec'd.
+-        script = (
+-            f'i=0; while [ "$i" -lt 50 ]; do if [ -s "{self._pid_file}" ]; then '
+-            f'kill -KILL "$(cat "{self._pid_file}")"; exit $?; fi; '
+-            'i=$((i + 1)); sleep 0.1; done; exit 1'
+-        )
++        script = "true"
          code, _, err = await _docker("exec", self._container, "sh", "-c", script)
          if code != 0 and self._proc.returncode is None:
+             self._proc.kill()
