@@ -34,6 +34,17 @@ from agentic_isolation.providers.base import (
     Workspace,
     WorkspaceProvider,
 )
+from agentic_isolation.providers.capabilities import (
+    OwnedWorkspace,
+    StreamOutcome,
+    StreamReconnectUnsupportedError,
+    StreamSession,
+    SupportsFileTransfer,
+    SupportsOwnership,
+    SupportsStreamingExec,
+    WorkspaceNotFoundError,
+    WorkspaceOwnershipError,
+)
 from agentic_isolation.providers.docker import ContainerRemovalError, WorkspaceDockerProvider
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 from agentic_isolation.providers.teardown_report import (
@@ -72,6 +83,16 @@ __all__ = [
     "TeardownReport",
     "TeardownUsage",
     "SupportsWorkspaceLogs",
+    # Remote-tier capabilities (syntropic137/syntropic137#1911)
+    "SupportsStreamingExec",
+    "StreamSession",
+    "StreamOutcome",
+    "StreamReconnectUnsupportedError",
+    "SupportsFileTransfer",
+    "SupportsOwnership",
+    "OwnedWorkspace",
+    "WorkspaceNotFoundError",
+    "WorkspaceOwnershipError",
     "Workspace",
     "ExecuteResult",
     "InteractiveSession",

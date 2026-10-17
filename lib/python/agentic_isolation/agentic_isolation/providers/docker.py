@@ -23,7 +23,7 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -46,6 +46,7 @@ from agentic_isolation.contract import (
     WorkspaceRef,
 )
 from agentic_isolation.harnesses import ExecFn, TranscriptSource, get_harness
+from agentic_isolation.providers import docker_capabilities
 from agentic_isolation.providers.base import (
     BaseProvider,
     CredentialResolver,
@@ -54,6 +55,14 @@ from agentic_isolation.providers.base import (
     Workspace,
     drain_operation,
     resolve_env_credentials,
+)
+from agentic_isolation.providers.capabilities import (
+    OwnedWorkspace,
+    StreamSession,
+    TransferRoot,
+    WorkspaceNotFoundError,
+    WorkspaceOwnershipError,
+    mismatched_labels,
 )
 from agentic_isolation.providers.contained_files import (
     NotARegularFileError,
@@ -781,6 +790,87 @@ class WorkspaceDockerProvider(BaseProvider):
 
         async for line in self._read_stream_lines(proc, timeout_seconds):
             yield line
+
+    async def start_stream(
+        self,
+        workspace: Workspace,
+        sandbox_argv: Sequence[str],
+        *,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> StreamSession:
+        """SupportsStreamingExec: merged stdout+stderr, with an outcome.
+
+        Additive beside `stream()`, which keeps its behaviour and callers.
+        """
+        container_name = workspace._handle
+        if not container_name:
+            raise RuntimeError("Container not available")
+        return await docker_capabilities.DockerStreamSession.start(
+            container_name, sandbox_argv, cwd=cwd, env=env, timeout=timeout
+        )
+
+    async def read_files(
+        self,
+        workspace: Workspace,
+        patterns: Sequence[str],
+        *,
+        base_path: TransferRoot,
+    ) -> list[tuple[str, bytes]]:
+        """SupportsFileTransfer: exact bytes, from inside the container."""
+        container_name = workspace._handle
+        if not container_name:
+            raise RuntimeError("Container not available")
+        return await docker_capabilities.read_files(container_name, patterns, base_path)
+
+    async def list_owned(self, labels: Mapping[str, str]) -> list[OwnedWorkspace]:
+        """SupportsOwnership: this provider's workspaces carrying all of `labels`."""
+        return await docker_capabilities.list_owned(self.name, labels)
+
+    async def attach(self, workspace_id: str, *, expect_labels: Mapping[str, str]) -> Workspace:
+        """SupportsOwnership: a handle to an existing workspace, labels checked first."""
+        found = await self.list_owned({docker_capabilities.WORKSPACE_ID_LABEL: workspace_id})
+        if not found:
+            raise WorkspaceNotFoundError(f"no docker workspace {workspace_id}")
+        mismatched = mismatched_labels(found[0].labels, expect_labels)
+        if mismatched:
+            raise WorkspaceOwnershipError(workspace_id, mismatched)
+        async with self._lock:
+            cached = self._workspaces.get(workspace_id)
+        if cached is not None:
+            return cached
+        container_name = f"agentic-ws-{workspace_id.removeprefix('ws-')}"
+        source = await self._docker_read(
+            "inspect",
+            "--format",
+            '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}',
+            container_name,
+        )
+        if self._workspace_base_dir:
+            workspace_dir = str(self._workspace_base_dir / workspace_id)
+        else:
+            workspace_dir = (source or "").strip()
+        labels = {
+            key: value
+            for key, value in found[0].labels.items()
+            if key
+            not in (docker_capabilities.WORKSPACE_ID_LABEL, docker_capabilities.PROVIDER_LABEL)
+        }
+        workspace = Workspace(
+            id=workspace_id,
+            provider=self.name,
+            path=Path("/workspace"),
+            config=WorkspaceConfig(provider=self.name, labels=labels),
+            metadata={
+                "container_name": container_name,
+                "workspace_dir": workspace_dir,
+                "attached": True,
+            },
+            _handle=container_name,
+        )
+        async with self._lock:
+            return self._workspaces.setdefault(workspace_id, workspace)
 
     async def write_file(
         self,
