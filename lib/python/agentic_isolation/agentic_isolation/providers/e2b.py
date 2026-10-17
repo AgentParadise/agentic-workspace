@@ -17,8 +17,9 @@ Decisions that differ from Docker, and why:
   is the sandbox's own disk, so "delete" means "kill the sandbox", and it
   comes LAST. `while_running` and `before_delete` both run while the sandbox
   is up; if `before_delete` raises, the sandbox is paused, not killed, and the
-  report is `retained`. A teardown reports `completed` only when the sandbox
-  is absent from the E2B list afterwards; a kill that leaves it listed raises
+  report is `retained`. If E2B keeps refusing the pause (HTTP 503), the
+  sandbox is left running and still never killed. A teardown reports
+  `completed` only when the sandbox is absent from the E2B list afterwards; a kill that leaves it listed raises
   `SandboxRemovalError`, which is also the negative control of #1915.
 - Credential bindings and host mounts are refused: neither has an E2B
   delivery yet, and silently dropping one would launch a workspace without
@@ -51,6 +52,7 @@ from agentic_isolation.providers.capabilities import (
 )
 from agentic_isolation.providers.e2b_client import (
     E2BSandboxClient,
+    E2BTransportError,
     SandboxCommand,
     SdkE2BClient,
     shell_join,
@@ -141,7 +143,9 @@ class E2BWorkspaceProvider:
         lines = [line async for line in session.lines()]
         outcome = await session.outcome()
         if outcome.disconnected:
-            raise ConnectionError(f"lost the command stream in sandbox {workspace.id}")
+            raise E2BTransportError(
+                f"lost the command stream in sandbox {workspace.id}: {outcome.detail}"
+            )
         return ExecuteResult(
             exit_code=outcome.exit_code if outcome.exit_code is not None else -1,
             stdout="".join(f"{line}\n" for line in lines),
@@ -256,14 +260,23 @@ class E2BWorkspaceProvider:
             try:
                 await before_delete()
             except Exception as exc:
-                await self._client.pause(workspace.id)
+                error = _hook_failed("before_delete", exc).error
+                try:
+                    await self._client.pause(workspace.id)
+                except E2BTransportError as pause_exc:
+                    # Kept running rather than killed: still retained.
+                    error = OperationError(
+                        kind="internal",
+                        message=f"{error.message}; pause refused, sandbox left running: "
+                        f"{pause_exc}",
+                    )
                 self._workspaces.pop(workspace.id, None)
                 self._retained[workspace.id] = workspace
                 return TeardownReport(
                     finalization=FinalizationOutcome(
                         state="retained",
                         stage="before_delete",
-                        error=_hook_failed("before_delete", exc).error,
+                        error=error,
                         retained=ref,
                     ),
                     usage=TeardownUsage(),

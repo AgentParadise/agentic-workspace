@@ -92,7 +92,11 @@ class E2BSandboxClient(Protocol):
         ...
 
     async def pause(self, sandbox_id: str) -> None:
-        """Pause a sandbox, keeping its disk and memory."""
+        """Pause a sandbox, keeping its disk and memory.
+
+        Raises E2BTransportError when the pause is still refused after the
+        adapter's retries; the sandbox is then still running.
+        """
         ...
 
     async def start(
@@ -118,6 +122,9 @@ class E2BSandboxClient(Protocol):
     async def write_bytes(self, sandbox_id: str, path: str, content: bytes) -> None:
         """Write a file, creating parent directories."""
         ...
+
+
+_PAUSE_ATTEMPTS = 5
 
 
 class SdkE2BClient:
@@ -182,9 +189,28 @@ class SdkE2BClient:
         return bool(await AsyncSandbox.kill(sandbox_id, api_key=self._api_key))
 
     async def pause(self, sandbox_id: str) -> None:
+        import asyncio
+        import random
+
+        from e2b import ServiceBusyException
+
         sandbox = await self._sandbox(sandbox_id)
-        await sandbox.pause()
-        self._sandboxes.pop(sandbox_id, None)
+        # A 503 means a previous snapshot is still finishing and the sandbox
+        # keeps running (persistence docs). Pausing twice is harmless, so the
+        # pause is retried a bounded number of times with jittered backoff.
+        for attempt in range(_PAUSE_ATTEMPTS):
+            try:
+                await sandbox.pause()
+            except ServiceBusyException as exc:
+                if attempt == _PAUSE_ATTEMPTS - 1:
+                    raise E2BTransportError(
+                        f"E2B refused to pause sandbox {sandbox_id} {_PAUSE_ATTEMPTS} "
+                        "times; it is still running"
+                    ) from exc
+                await asyncio.sleep(2**attempt + random.uniform(0, 1))
+            else:
+                self._sandboxes.pop(sandbox_id, None)
+                return
 
     async def start(
         self,

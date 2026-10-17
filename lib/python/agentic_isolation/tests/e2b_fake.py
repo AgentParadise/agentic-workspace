@@ -11,7 +11,11 @@ import os
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 
-from agentic_isolation.providers.e2b_client import CommandExit, SandboxListing
+from agentic_isolation.providers.e2b_client import (
+    CommandExit,
+    E2BTransportError,
+    SandboxListing,
+)
 
 
 @dataclass
@@ -73,7 +77,7 @@ class FakeE2BClient:
         self.responder = responder or (lambda _command: FakeRun())
         self.kill_is_noop = False
         self.command_kill_works = True
-        self.pause_calls: list[str] = []
+        self.pause_refused = False
         self.events: list[str] = []
 
     async def create(
@@ -99,6 +103,8 @@ class FakeE2BClient:
 
     async def pause(self, sandbox_id: str) -> None:
         self.events.append(f"pause {sandbox_id}")
+        if self.pause_refused:
+            raise E2BTransportError(f"pause of {sandbox_id} refused")
         self.sandboxes[sandbox_id].paused = True
 
     async def start(

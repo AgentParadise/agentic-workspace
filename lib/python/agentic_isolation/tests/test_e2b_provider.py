@@ -28,6 +28,7 @@ from agentic_isolation.contract import CredentialBinding, CredentialRef, Workspa
 from agentic_isolation.providers import (
     CommandExit,
     E2BTemplateSpec,
+    E2BTransportError,
     E2BWorkspaceProvider,
     SandboxRemovalError,
     TemplateSpecError,
@@ -232,6 +233,33 @@ async def test_a_failed_archive_pauses_instead_of_killing_and_retries_by_ref(
 
     assert retry.finalization.state == "completed"
     assert workspace.id not in client.sandboxes
+
+
+async def test_a_refused_pause_leaves_the_sandbox_running_and_never_kills_it(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+    client.pause_refused = True
+
+    async def failing() -> None:
+        raise OSError("upload refused")
+
+    report = await provider.teardown(workspace, before_delete=failing)
+
+    assert report.finalization.state == "retained"
+    assert "pause refused" in report.finalization.error.message
+    assert workspace.id in client.sandboxes
+    assert f"kill {workspace.id}" not in client.events
+
+
+async def test_a_lost_stream_fails_execute_with_a_transport_error(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+    client.responder = lambda _c: FakeRun(exit=CommandExit(end="disconnected", detail="reset"))
+
+    with pytest.raises(E2BTransportError, match="reset"):
+        await provider.execute(workspace, "true")
 
 
 async def test_a_failed_while_running_hook_destroys_nothing(
