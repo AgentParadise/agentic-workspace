@@ -56,7 +56,9 @@ def client() -> FakeE2BClient:
 @pytest.fixture(autouse=True)
 def quick_kill_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(e2b_module, "_KILL_SECONDS", 0.05)
-    monkeypatch.setattr(e2b_module, "_REMOVAL_SECONDS", 0.05)
+    # As in test_e2b_provider: a generous removal budget for success paths,
+    # the short one only where expiry is the expected outcome.
+    monkeypatch.setattr(e2b_module, "_REMOVAL_SECONDS", 5.0)
     monkeypatch.setattr(e2b_module, "_REMOVAL_POLL_SECONDS", 0.01)
 
 
@@ -243,8 +245,9 @@ async def test_cancelled_initialisation_kills_the_sandbox(client: FakeE2BClient)
 
 
 async def test_failed_cleanup_after_failed_initialisation_names_the_sandbox(
-    client: FakeE2BClient,
+    client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(e2b_module, "_REMOVAL_SECONDS", 0.05)
     client.responder = lambda _command: FakeRun(exit=CommandExit(end="exited", exit_code=1))
     client.kill_is_noop = True
     provider = E2BWorkspaceProvider("tpl", client=client)

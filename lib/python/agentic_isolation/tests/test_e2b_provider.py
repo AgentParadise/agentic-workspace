@@ -55,9 +55,17 @@ def provider(client: FakeE2BClient) -> E2BWorkspaceProvider:
 
 
 @pytest.fixture(autouse=True)
-def quick_removal_bound(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(e2b_module, "_REMOVAL_SECONDS", 0.05)
+def quick_removal_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Polls fast, but leaves a successful lag observation a budget that a
+    # loaded runner cannot exhaust; tests that expect expiry ask for
+    # `short_removal_bound`.
+    monkeypatch.setattr(e2b_module, "_REMOVAL_SECONDS", 5.0)
     monkeypatch.setattr(e2b_module, "_REMOVAL_POLL_SECONDS", 0.01)
+
+
+@pytest.fixture
+def short_removal_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(e2b_module, "_REMOVAL_SECONDS", 0.05)
 
 
 def test_fake_refuses_to_construct_outside_pytest(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -387,6 +395,7 @@ async def test_teardown_waits_for_a_killed_sandbox_to_leave_the_list(
 
 
 @pytest.mark.parametrize("list_reply", ["never", "late"])
+@pytest.mark.usefixtures("short_removal_bound")
 async def test_the_removal_bound_covers_the_list_requests_themselves(
     provider: E2BWorkspaceProvider,
     client: FakeE2BClient,
@@ -463,6 +472,7 @@ async def test_the_live_removal_measurement_frees_its_sandbox_when_it_fails(
     assert client.sandboxes == {} and await client.list({}) == [], "the measurement leaked"
 
 
+@pytest.mark.usefixtures("short_removal_bound")
 async def test_the_live_removal_measurement_names_a_sandbox_it_could_not_free(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -490,6 +500,7 @@ async def test_the_live_removal_measurement_passes_and_frees_on_a_lagging_list(
     assert client.events.count("kill sbx-1") == 1 and await client.list({}) == []
 
 
+@pytest.mark.usefixtures("short_removal_bound")
 async def test_negative_control_a_noop_kill_fails_cleanup(
     provider: E2BWorkspaceProvider, client: FakeE2BClient
 ) -> None:
