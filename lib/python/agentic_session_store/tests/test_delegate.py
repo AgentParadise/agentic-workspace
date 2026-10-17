@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -33,7 +34,7 @@ def environment(tmp_path):
     # syn-delegate probes that the delegate's capture hooks reach their guard
     # with this PATH, so the recorder's interpreter must be on it.
     python = binary / "python3"
-    python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
     python.chmod(0o700)
     (binary / "sleep").symlink_to(shutil.which("sleep"))
     return {
@@ -125,8 +126,6 @@ def test_real_process_identity_and_status_survive_restart(environment, exit_code
 
 
 def test_shell_success_cannot_hide_delegate_failure(environment):
-    import shlex
-
     _fake(environment, "raise SystemExit(13)\n")
     result = subprocess.run(
         ["/bin/sh", "-c", shlex.join(_command()) + " || true"],
