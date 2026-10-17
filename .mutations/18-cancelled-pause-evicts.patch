@@ -1,0 +1,17 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+index 2691778..7160ddb 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+@@ -225,7 +225,11 @@ class SdkE2BClient:
+                         f"E2B refused to pause sandbox {sandbox_id} {_PAUSE_ATTEMPTS} "
+                         "times; it is still running"
+                     ) from exc
+-                await asyncio.sleep(2**attempt + random.uniform(0, 1))
++                try:
++                    await asyncio.sleep(2**attempt + random.uniform(0, 1))
++                except asyncio.CancelledError:
++                    self._sandboxes.pop(sandbox_id, None)
++                    raise
+             else:
+                 self._sandboxes.pop(sandbox_id, None)
+                 return

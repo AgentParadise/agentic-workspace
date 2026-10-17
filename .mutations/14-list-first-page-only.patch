@@ -1,0 +1,12 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+index 2691778..3bcfa29 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+@@ -201,6 +201,7 @@ class SdkE2BClient:
+         while paginator.has_next:
+             for info in await paginator.next_items():
+                 found.append(SandboxListing(info.sandbox_id, dict(info.metadata)))
++            break
+         return found
+ 
+     async def kill(self, sandbox_id: str) -> bool:

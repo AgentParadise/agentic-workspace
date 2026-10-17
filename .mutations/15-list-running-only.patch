@@ -1,0 +1,17 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+index 2691778..c669dc7 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+@@ -192,10 +192,10 @@ class SdkE2BClient:
+         return sandbox.sandbox_id
+ 
+     async def list(self, metadata: Mapping[str, str]) -> list[SandboxListing]:
+-        from e2b import AsyncSandbox, SandboxQuery
++        from e2b import AsyncSandbox, SandboxQuery, SandboxState
+ 
+         paginator = AsyncSandbox.list(
+-            query=SandboxQuery(metadata=dict(metadata)), api_key=self._api_key
++            query=SandboxQuery(metadata=dict(metadata), state=[SandboxState.RUNNING]), api_key=self._api_key
+         )
+         found: list[SandboxListing] = []
+         while paginator.has_next:

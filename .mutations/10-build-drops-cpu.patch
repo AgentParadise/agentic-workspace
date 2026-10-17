@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_template.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_template.py
+index f6840a1..0c5dbdf 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_template.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_template.py
+@@ -103,7 +103,7 @@ async def build_template(
+     info = await AsyncTemplate.build(
+         template,
+         spec.name,
+-        cpu_count=spec.cpu_count,
++        cpu_count=None,
+         memory_mb=spec.memory_mb,
+         api_key=api_key,
+     )
