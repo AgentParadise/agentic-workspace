@@ -9,11 +9,11 @@ Remove this directory before merge (`mutations-not-merged`).
 | 02-cancel-ignores-refused-kill | R2 | test_refused_cancel_raises_and_claims_nothing |
 | 03-timeout-awaits-unbounded | R4 | test_timeout_with_a_kill_but_no_end_ends_disconnected |
 | 04-create-no-cleanup | R5 | test_failed_initialisation_kills_the_sandbox[*], test_cancelled_initialisation_kills_the_sandbox, test_failed_cleanup_after_failed_initialisation_names_the_sandbox |
-| 05-create-cleanup-unconfirmed | R5 | test_failed_cleanup_after_failed_initialisation_names_the_sandbox |
+| 05-create-cleanup-unconfirmed | R5 | test_failed_cleanup_after_failed_initialisation_names_the_sandbox (patch now targets `_remove`, shared by create cleanup and teardown) |
 | 06-wait-narrow-except | R3 | test_sdk_stream_failure_is_disconnected[reset,truncated] |
 | 07-disconnect-is-cancel | R3 | test_sdk_disconnect_is_disconnected_not_a_cancellation |
 | 08-start-raises | R3 | test_start_on_an_unreachable_sandbox_is_a_disconnected_command |
-| 09-pause-one-attempt | R8 | test_pause_retries_a_busy_refusal_a_bounded_number_of_times[4,5] |
+| 09-pause-one-attempt | R8 | test_pause_retries_a_busy_refusal_a_bounded_number_of_times[4,5], test_cancelled_pause_backoff_stops_retrying_and_keeps_the_sandbox (bounded to 1s; it hung before PR #87 live round 1) |
 | 10-build-drops-cpu | R8 | test_build_template_forwards_the_spec_and_returns_the_receipt |
 | 11-confirmed-kill-narrow-except | R4 (round 2) | test_timeout_with_a_raising_kill_ends_disconnected[connect,sdk], test_cancel_with_a_raising_kill_raises_and_claims_nothing[connect,sdk] |
 | 12-sdk-kill-forwards-errors | R4 (round 2) | test_sdk_kill_failure_is_a_transport_error_and_unconfirmed[connect,sdk] |

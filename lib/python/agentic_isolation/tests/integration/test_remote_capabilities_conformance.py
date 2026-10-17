@@ -195,8 +195,10 @@ async def make_workspace(
             await provider.destroy(workspace)
         except Exception as exc:
             failures.append(exc)
+    for other in failures[1:]:
+        failures[0].add_note(f"destroying another workspace also failed: {other!r}")
     if failures:
-        raise ExceptionGroup("destroying the test's workspaces failed", failures)
+        raise failures[0]
     assert await provider.list_owned(run) == [], "workspaces were left in the provider list"
 
 
