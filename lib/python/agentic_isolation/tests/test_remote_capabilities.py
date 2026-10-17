@@ -6,6 +6,7 @@ tests/integration/test_remote_capabilities_conformance.py.
 
 import asyncio
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -172,6 +173,87 @@ async def test_cancel_after_a_disconnect_still_stops_the_sandbox(
 
     assert [request[:2] for request in requests] == [("exec", "unused")]
     assert "kill -KILL" in requests[0][-2]
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "oserror"])
+async def test_a_failed_stop_publishes_nothing_and_can_be_retried(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    requests: list[tuple[str, ...]] = []
+
+    async def unavailable(*args: str) -> tuple[int, bytes, bytes]:
+        requests.append(args)
+        if failure == "oserror":
+            raise OSError("docker client missing")
+        return 1, b"", b"transport unavailable"
+
+    monkeypatch.setattr(docker_capabilities, "_docker", unavailable)
+    session = await _session_over("import time; time.sleep(60)")
+    session._proc.kill()
+    assert (await session.outcome()).disconnected
+    requests.clear()
+
+    with pytest.raises((RuntimeError, OSError)):
+        await session.cancel()
+    assert (await session.outcome()).disconnected
+    requests.clear()
+    with pytest.raises((RuntimeError, OSError)):
+        await session.cancel()
+
+    assert [request[:2] for request in requests] == [("exec", "unused")]
+    assert "kill -KILL" in requests[0][-2]
+
+
+async def test_concurrent_stops_share_one_confirmed_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stops: list[tuple[str, ...]] = []
+
+    async def stopped(*args: str) -> tuple[int, bytes, bytes]:
+        stops.append(args)
+        await asyncio.sleep(0.05)
+        session._proc.kill()  # the sandbox kill ends the docker client
+        return 0, b"", b""
+
+    monkeypatch.setattr(docker_capabilities, "_docker", stopped)
+    session = await _session_over("import time; time.sleep(60)")
+
+    await asyncio.gather(session.cancel(), session.cancel())
+
+    assert len(stops) == 1
+    assert await session.outcome() == StreamOutcome(end="completed", signal=signal.SIGKILL)
+
+
+async def test_concurrent_observers_agree_on_a_recorded_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # As above, the real supervisor writes the status file; requests are
+    # serviced one at a time, as one docker daemon would.
+    serviced = asyncio.Lock()
+
+    async def local_exec(*args: str) -> tuple[int, bytes, bytes]:
+        async with serviced:
+            proc = await asyncio.create_subprocess_exec(
+                *args[2:], stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await proc.communicate()
+        return proc.returncode if proc.returncode is not None else -1, out, err
+
+    monkeypatch.setattr(docker_capabilities, "_docker", local_exec)
+    pid_file = str(tmp_path / "command.pid")
+    proc = await asyncio.create_subprocess_exec(
+        *("sh", "-c", docker_capabilities._SUPERVISE, pid_file, "--"),
+        *("sh", "-c", "exit 7"),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    session = DockerStreamSession("local", proc, pid_file, None)
+    assert [line async for line in session.lines()] == []
+
+    observed = await asyncio.gather(session.outcome(), session.outcome())
+
+    for outcome in observed:
+        assert outcome == StreamOutcome(end="completed", exit_code=7)
 
 
 async def test_read_files_returns_every_name_of_a_hard_link(

@@ -73,6 +73,9 @@ class DockerStreamSession:
         self._container = container
         self._proc = proc
         self._pid_file = pid_file
+        # Serialises stops and status reads, so a stop is published only once
+        # confirmed and one observer cannot consume another's evidence.
+        self._lock = asyncio.Lock()
         self._stopped_by: StreamOutcome | None = None
         # The completion read from the sandbox. Reading it consumes the
         # status file, so it is kept for every later observation.
@@ -138,17 +141,18 @@ class DockerStreamSession:
             if (self._client_errors is not None)
             else ""
         )
-        if self._stopped_by is not None:
-            return self._stopped_by
-        if self._completed is not None:
+        async with self._lock:
+            if self._stopped_by is not None:
+                return self._stopped_by
+            if self._completed is not None:
+                return self._completed
+            exit_code = await self._sandbox_exit_code()
+            if exit_code is None:
+                # The client ended but the sandbox recorded no exit: whether the
+                # process still runs, or ever started, is unknown.
+                return StreamOutcome(end="disconnected", detail=client_errors or None)
+            self._completed = StreamOutcome(end="completed", exit_code=exit_code)
             return self._completed
-        exit_code = await self._sandbox_exit_code()
-        if exit_code is None:
-            # The client ended but the sandbox recorded no exit: whether the
-            # process still runs, or ever started, is unknown.
-            return StreamOutcome(end="disconnected", detail=client_errors or None)
-        self._completed = StreamOutcome(end="completed", exit_code=exit_code)
-        return self._completed
 
     async def cancel(self) -> None:
         await self._stop(StreamOutcome(end="completed", signal=signals.SIGKILL))
@@ -184,11 +188,18 @@ class DockerStreamSession:
         self._timeout_task = asyncio.ensure_future(self._stop(StreamOutcome(end="timed_out")))
 
     async def _stop(self, outcome: StreamOutcome) -> None:
-        # Only a known sandbox exit makes this a no-op. A dead docker client
-        # is not one: the sandbox process may still run, so it is stopped.
+        async with self._lock:
+            await self._stop_locked(outcome)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._proc.wait(), timeout=10)
+        if self._proc.returncode is None:
+            self._proc.kill()
+
+    async def _stop_locked(self, outcome: StreamOutcome) -> None:
+        # Only a known sandbox exit or a confirmed stop makes this a no-op. A
+        # dead docker client is not one: the sandbox process may still run.
         if self._completed is not None or self._stopped_by is not None:
             return
-        self._stopped_by = outcome
         # Wait briefly for the announce line, kill the sandbox process, then
         # confirm it is gone (a zombie counts as gone). `kill` is a shell
         # builtin in minimal images, so it cannot be exec'd.
@@ -202,19 +213,17 @@ class DockerStreamSession:
         )
         code, _, err = await _docker("exec", self._container, "sh", "-c", script, self._pid_file)
         if code == _STOP_ALREADY_ENDED:
-            self._stopped_by = None
             return
         if code != 0:
+            # Nothing is published: the outcome stays unknown and a later
+            # stop tries again.
             if self._proc.returncode is None:
                 self._proc.kill()
             raise RuntimeError(
                 f"could not stop the sandbox process in {self._container}: "
                 f"{err.decode(errors='replace').strip() or f'exit {code}'}"
             )
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self._proc.wait(), timeout=10)
-        if self._proc.returncode is None:
-            self._proc.kill()
+        self._stopped_by = outcome
 
 
 async def read_files(
