@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+index c389a5c..2e48e24 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+@@ -345,7 +345,7 @@ class _SdkCommand:
+             # Not our cancellation: the handle's reader was stopped by
+             # `disconnect`, which leaves the process running.
+             return CommandExit(end="disconnected", detail="command stream disconnected")
+-        except Exception as exc:
++        except OSError as exc:
+             # ConnectError on a reset, a plain Exception on a stream that
+             # ended with no end event: the process's exit is unknown.
+             return CommandExit(end="disconnected", detail=repr(exc))

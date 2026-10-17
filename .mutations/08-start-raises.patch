@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+index c389a5c..dd00968 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+@@ -252,7 +252,7 @@ class SdkE2BClient:
+         except Exception as exc:
+             # Any failure before a handle exists is the transport's, whatever
+             # its type (SandboxException, ConnectError, an httpx error).
+-            return UnstartedCommand(f"cannot start a command in {sandbox_id}: {exc!r}")
++            raise E2BTransportError(str(exc)) from exc
+         return _SdkCommand(handle, chunks)
+ 
+     async def reconnect(self, sandbox_id: str, pid: int) -> SandboxCommand:

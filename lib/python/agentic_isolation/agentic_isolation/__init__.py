@@ -63,6 +63,7 @@ from agentic_isolation.config import (
 from agentic_isolation.providers import (
     AgentName,
     AwaitResult,
+    E2BWorkspaceProvider,
     ExecuteResult,
     HarnessPlugin,
     HarnessTranscript,
@@ -153,6 +154,7 @@ __all__ = [
     "AwaitResult",
     "WorkspaceLocalProvider",
     "WorkspaceDockerProvider",
+    "E2BWorkspaceProvider",
     # Harness contract (see agentic_isolation.harnesses, issue #792)
     "AgentName",
     "HarnessPlugin",
