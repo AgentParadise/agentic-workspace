@@ -130,7 +130,7 @@ class DockerStreamSession:
         script = (
             f'i=0; while [ "$i" -lt 50 ]; do if [ -s "{self._pid_file}" ]; then '
             f'kill -KILL "$(cat "{self._pid_file}")"; exit $?; fi; '
-            'i=$((i + 1)); sleep 0.1; done; exit 1'
+            "i=$((i + 1)); sleep 0.1; done; exit 1"
         )
         code, _, err = await _docker("exec", self._container, "sh", "-c", script)
         if code != 0 and self._proc.returncode is None:
