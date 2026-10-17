@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+index 92d5966..aab1783 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+@@ -31,7 +31,7 @@ PROVIDER_LABEL = "agentic.provider"
+ 
+ # Records the sandbox pid, then becomes the command with stderr folded into
+ # stdout INSIDE the sandbox, so the merged order is the order of the writes.
+-_ANNOUNCE_AND_EXEC = 'echo $$ > "$0"; shift; exec "$@" 2>&1'
++_ANNOUNCE_AND_EXEC = 'echo $$ > "$0"; shift; exec "$@" 2>/dev/null'
+ 
+ 
+ async def _docker(*args: str) -> tuple[int, bytes, bytes]:

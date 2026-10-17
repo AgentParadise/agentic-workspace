@@ -1,0 +1,14 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+index 92d5966..c205465 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+@@ -127,8 +127,7 @@ class DockerStreamSession:
+         self._stopped_by = outcome
+         # Wait briefly for the announce line; then kill the sandbox process.
+         script = (
+-            f'for _ in $(seq 50); do [ -s "{self._pid_file}" ] && '
+-            f'exec kill -KILL "$(cat "{self._pid_file}")"; sleep 0.1; done; exit 1'
++            "true"
+         )
+         code, _, err = await _docker("exec", self._container, "sh", "-c", script)
+         if code != 0 and self._proc.returncode is None:

@@ -1,0 +1,14 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+index 92d5966..2482481 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+@@ -104,9 +104,6 @@ class DockerStreamSession:
+             await self._timeout_task
+         if self._stopped_by is not None:
+             return self._stopped_by
+-        if returncode < 0:
+-            # The local docker client died, not the sandbox process.
+-            return StreamOutcome(end="disconnected")
+         return StreamOutcome(end="completed", exit_code=returncode)
+ 
+     async def cancel(self) -> None:

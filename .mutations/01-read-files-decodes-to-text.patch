@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+index 92d5966..7b83aaf 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+@@ -163,7 +163,7 @@ async def read_files(
+                 continue
+             handle = archive.extractfile(member)
+             assert handle is not None  # extractfile returns a handle for regular files
+-            found.append((relative, handle.read()))
++            found.append((relative, handle.read().decode(errors="replace").encode()))
+     return sorted(found)
+ 
+ 
