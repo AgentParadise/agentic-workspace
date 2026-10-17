@@ -454,6 +454,13 @@ class WorkspaceDockerProvider(BaseProvider):
             ]
         )
         for key, value in config.labels.items():
+            # The internal labels are the workspace's identity: attach
+            # authorises by them, so a caller may not overwrite them.
+            if key in (
+                docker_capabilities.WORKSPACE_ID_LABEL,
+                docker_capabilities.PROVIDER_LABEL,
+            ):
+                raise ValueError(f"Docker label {key!r} is reserved for the provider")
             # Validate label values to prevent command injection
             label_value = str(value)
             if "\n" in label_value or "\r" in label_value:
@@ -830,17 +837,27 @@ class WorkspaceDockerProvider(BaseProvider):
 
     async def attach(self, workspace_id: str, *, expect_labels: Mapping[str, str]) -> Workspace:
         """SupportsOwnership: a handle to an existing workspace, labels checked first."""
-        found = await self.list_owned({docker_capabilities.WORKSPACE_ID_LABEL: workspace_id})
+        found = await docker_capabilities.find_containers(
+            self.name, {docker_capabilities.WORKSPACE_ID_LABEL: workspace_id}
+        )
         if not found:
             raise WorkspaceNotFoundError(f"no docker workspace {workspace_id}")
-        mismatched = mismatched_labels(found[0].labels, expect_labels)
+        # The labels checked must be those of the container returned, so an
+        # id that names more than one container cannot be attached at all.
+        if len(found) > 1:
+            raise WorkspaceOwnershipError(workspace_id, [docker_capabilities.WORKSPACE_ID_LABEL])
+        container_name, found_labels = found[0]
+        mismatched = mismatched_labels(found_labels, expect_labels)
         if mismatched:
             raise WorkspaceOwnershipError(workspace_id, mismatched)
         async with self._lock:
             cached = self._workspaces.get(workspace_id)
         if cached is not None:
+            if cached._handle != container_name:
+                raise WorkspaceOwnershipError(
+                    workspace_id, [docker_capabilities.WORKSPACE_ID_LABEL]
+                )
             return cached
-        container_name = f"agentic-ws-{workspace_id.removeprefix('ws-')}"
         source = await self._docker_read(
             "inspect",
             "--format",
@@ -853,7 +870,7 @@ class WorkspaceDockerProvider(BaseProvider):
             workspace_dir = (source or "").strip()
         labels = {
             key: value
-            for key, value in found[0].labels.items()
+            for key, value in found_labels.items()
             if key
             not in (docker_capabilities.WORKSPACE_ID_LABEL, docker_capabilities.PROVIDER_LABEL)
         }

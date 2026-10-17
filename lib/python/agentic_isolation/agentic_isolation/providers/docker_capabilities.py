@@ -253,34 +253,48 @@ async def read_files(
     return sorted(found)
 
 
-async def inspect_labels(container_ids: Sequence[str]) -> list[dict[str, str]]:
-    """The labels of each container, in order."""
+async def inspect_containers(container_ids: Sequence[str]) -> list[tuple[str, dict[str, str]]]:
+    """The name and labels of each container, in order."""
     if not container_ids:
         return []
-    code, out, err = await _docker("inspect", "--format", "{{json .Config.Labels}}", *container_ids)
+    code, out, err = await _docker(
+        "inspect",
+        "--format",
+        '{"name": {{json .Name}}, "labels": {{json .Config.Labels}}}',
+        *container_ids,
+    )
     if code != 0:
         raise RuntimeError(f"docker inspect failed: {err.decode(errors='replace').strip()}")
-    labels: list[dict[str, str]] = []
+    containers: list[tuple[str, dict[str, str]]] = []
     for line in out.decode().splitlines():
         parsed: object = json.loads(line)
-        if parsed is None:
-            parsed = {}
-        if not isinstance(parsed, dict):
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("name"), str):
+            raise RuntimeError(f"docker inspect returned an unexpected container: {line}")
+        labels: object = parsed.get("labels") or {}
+        if not isinstance(labels, dict):
             raise RuntimeError(f"docker inspect returned labels that are not an object: {line}")
-        labels.append({str(k): str(v) for k, v in parsed.items()})
-    return labels
+        name = parsed["name"].removeprefix("/")
+        containers.append((name, {str(k): str(v) for k, v in labels.items()}))
+    return containers
 
 
-async def list_owned(provider_name: str, labels: Mapping[str, str]) -> list[OwnedWorkspace]:
-    """Every workspace container of this provider carrying all of `labels`."""
+async def find_containers(
+    provider_name: str, labels: Mapping[str, str]
+) -> list[tuple[str, dict[str, str]]]:
+    """The name and labels of every container of this provider carrying all of `labels`."""
     filters = [f"--filter=label={PROVIDER_LABEL}={provider_name}"]
     filters.extend(f"--filter=label={key}={value}" for key, value in labels.items())
     code, out, err = await _docker("ps", "-a", "-q", "--no-trunc", *filters)
     if code != 0:
         raise RuntimeError(f"docker ps failed: {err.decode(errors='replace').strip()}")
+    return await inspect_containers(out.decode().split())
+
+
+async def list_owned(provider_name: str, labels: Mapping[str, str]) -> list[OwnedWorkspace]:
+    """Every workspace container of this provider carrying all of `labels`."""
     owned = [
         OwnedWorkspace(workspace_id=found[WORKSPACE_ID_LABEL], labels=found)
-        for found in await inspect_labels(out.decode().split())
+        for _, found in await find_containers(provider_name, labels)
         if WORKSPACE_ID_LABEL in found
     ]
     return sorted(owned, key=lambda workspace: workspace.workspace_id)

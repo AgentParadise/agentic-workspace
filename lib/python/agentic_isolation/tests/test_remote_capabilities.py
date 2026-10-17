@@ -5,19 +5,24 @@ tests/integration/test_remote_capabilities_conformance.py.
 """
 
 import asyncio
+import json
 import os
 import signal
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
 
 from agentic_isolation import (
+    SecurityConfig,
     StreamOutcome,
     SupportsFileTransfer,
     SupportsOwnership,
     SupportsStreamingExec,
+    Workspace,
+    WorkspaceConfig,
     WorkspaceDockerProvider,
     WorkspaceLocalProvider,
     WorkspaceOwnershipError,
@@ -274,3 +279,114 @@ async def test_read_files_returns_every_name_of_a_hard_link(
         assert await docker_capabilities.read_files("unused", [name], "/workspace") == [
             (name, bytes(range(256)))
         ]
+
+
+def _victim() -> Workspace:
+    return Workspace(
+        id="ws-victim",
+        provider="docker",
+        path=Path("/workspace"),
+        config=WorkspaceConfig(provider="docker", labels={"syn.host_id": "victim"}),
+        metadata={},
+        _handle="agentic-ws-victim",
+    )
+
+
+def _containers_transport(
+    containers: list[tuple[str, dict[str, str]]],
+) -> Callable[..., Awaitable[tuple[int, bytes, bytes]]]:
+    async def transport(*args: str) -> tuple[int, bytes, bytes]:
+        if args[0] == "ps":
+            return 0, "".join(f"{name}-id\n" for name, _ in containers).encode(), b""
+        assert args[0] == "inspect"
+        lines = [json.dumps({"name": f"/{name}", "labels": labels}) for name, labels in containers]
+        return 0, ("\n".join(lines) + "\n").encode(), b""
+
+    return transport
+
+
+def test_the_producer_refuses_to_overwrite_the_internal_labels(tmp_path: Path) -> None:
+    provider = WorkspaceDockerProvider(security=SecurityConfig.development())
+    for key in (docker_capabilities.WORKSPACE_ID_LABEL, docker_capabilities.PROVIDER_LABEL):
+        with pytest.raises(ValueError, match="reserved"):
+            provider._build_run_command(
+                container_name="agentic-ws-other",
+                workspace_id="ws-other",
+                workspace_dir=tmp_path,
+                image="unused",
+                config=WorkspaceConfig(provider="docker", labels={key: "ws-victim"}),
+                security=SecurityConfig.development(),
+            )
+
+
+@pytest.mark.parametrize("cache_hit", [True, False])
+async def test_attach_refuses_an_id_that_names_two_containers(
+    monkeypatch: pytest.MonkeyPatch, cache_hit: bool
+) -> None:
+    provider = WorkspaceDockerProvider(security=SecurityConfig.development())
+    victim = _victim()
+    if cache_hit:
+        provider._workspaces[victim.id] = victim
+    identity = {"agentic.workspace.id": victim.id, "agentic.provider": "docker"}
+    # The newer duplicate is listed first, carrying the caller's claim.
+    monkeypatch.setattr(
+        docker_capabilities,
+        "_docker",
+        _containers_transport(
+            [
+                ("agentic-ws-other", {**identity, "syn.host_id": "other"}),
+                ("agentic-ws-victim", {**identity, "syn.host_id": "victim"}),
+            ]
+        ),
+    )
+
+    with pytest.raises(WorkspaceOwnershipError) as refused:
+        await provider.attach(victim.id, expect_labels={"syn.host_id": "other"})
+    assert refused.value.mismatched == ("agentic.workspace.id",)
+
+
+async def test_attach_refuses_a_cached_handle_that_is_not_the_checked_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = WorkspaceDockerProvider(security=SecurityConfig.development())
+    victim = _victim()
+    provider._workspaces[victim.id] = victim
+    monkeypatch.setattr(
+        docker_capabilities,
+        "_docker",
+        _containers_transport(
+            [
+                (
+                    "agentic-ws-other",
+                    {"agentic.workspace.id": victim.id, "syn.host_id": "other"},
+                )
+            ]
+        ),
+    )
+
+    with pytest.raises(WorkspaceOwnershipError):
+        await provider.attach(victim.id, expect_labels={"syn.host_id": "other"})
+
+
+async def test_attach_returns_the_container_whose_labels_it_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = WorkspaceDockerProvider(security=SecurityConfig.development())
+    monkeypatch.setattr(
+        docker_capabilities,
+        "_docker",
+        _containers_transport(
+            [("renamed-container", {"agentic.workspace.id": "ws-victim", "syn.host_id": "h"})]
+        ),
+    )
+
+    async def mount_source(*args: str) -> str:
+        assert args[-1] == "renamed-container"
+        return "/host/ws-victim"
+
+    monkeypatch.setattr(provider, "_docker_read", mount_source)
+
+    attached = await provider.attach("ws-victim", expect_labels={"syn.host_id": "h"})
+
+    assert attached._handle == "renamed-container"
+    assert attached.config.labels == {"syn.host_id": "h"}
