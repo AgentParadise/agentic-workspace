@@ -20,6 +20,10 @@ fail with the patch applied. The `docker_conformance` tests need a real daemon, 
 | 13-failed-stop-published-as-completion.patch | a stop is published before the sandbox confirms it, so a failed stop reads as completion and is never retried | `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_a_failed_stop_publishes_nothing_and_can_be_retried[nonzero]`, `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_a_failed_stop_publishes_nothing_and_can_be_retried[oserror]` |
 | 14-concurrent-observers-race-the-status-read.patch | concurrent `outcome()` calls race the destructive status read and one reports `disconnected` | `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_concurrent_observers_agree_on_a_recorded_exit` |
 | 15-concurrent-stops-each-reach-the-sandbox.patch | concurrent stops do not share one confirmed stop | `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_concurrent_stops_share_one_confirmed_stop` |
+| 16-attach-accepts-a-duplicate-id.patch | `attach` authorises one of several containers sharing an id | `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_attach_refuses_an_id_that_names_two_containers[False]` |
+| 17-attach-returns-a-cached-handle-unchecked.patch | `attach` returns a cached handle that is not the container it checked | `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_attach_refuses_a_cached_handle_that_is_not_the_checked_container` |
+| 18-caller-labels-overwrite-the-workspace-id.patch | a caller label may overwrite `agentic.workspace.id` | `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_the_producer_refuses_to_overwrite_the_internal_labels` |
+| 19-attach-derives-the-handle-from-the-id.patch | `attach` derives its handle from the id, not from the container it checked | `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_attach_returns_the_container_whose_labels_it_checked`, `lib/python/agentic_isolation/tests/test_remote_capabilities.py::test_attach_refuses_a_cached_handle_that_is_not_the_checked_container` |
 
 Dispatch:
 

@@ -1,10 +1,10 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
-index 92d5966..321f265 100644
+index b32f31e..b70681c 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
-@@ -188,7 +188,7 @@ async def inspect_labels(container_ids: Sequence[str]) -> list[dict[str, str]]:
- async def list_owned(provider_name: str, labels: Mapping[str, str]) -> list[OwnedWorkspace]:
-     """Every workspace container of this provider carrying all of `labels`."""
+@@ -283,7 +283,7 @@ async def find_containers(
+ ) -> list[tuple[str, dict[str, str]]]:
+     """The name and labels of every container of this provider carrying all of `labels`."""
      filters = [f"--filter=label={PROVIDER_LABEL}={provider_name}"]
 -    filters.extend(f"--filter=label={key}={value}" for key, value in labels.items())
 +    filters.extend(f"--filter=label={key}" for key in labels)

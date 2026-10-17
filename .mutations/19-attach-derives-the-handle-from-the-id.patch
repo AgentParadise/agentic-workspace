@@ -1,0 +1,14 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
+index 424e109..e6ec736 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
+@@ -846,7 +846,8 @@ class WorkspaceDockerProvider(BaseProvider):
+         # id that names more than one container cannot be attached at all.
+         if len(found) > 1:
+             raise WorkspaceOwnershipError(workspace_id, [docker_capabilities.WORKSPACE_ID_LABEL])
+-        container_name, found_labels = found[0]
++        _, found_labels = found[0]
++        container_name = f"agentic-ws-{workspace_id.removeprefix('ws-')}"
+         mismatched = mismatched_labels(found_labels, expect_labels)
+         if mismatched:
+             raise WorkspaceOwnershipError(workspace_id, mismatched)

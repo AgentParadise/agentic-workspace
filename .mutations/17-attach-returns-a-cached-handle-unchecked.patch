@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
+index 424e109..1e74dfa 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
+@@ -853,7 +853,7 @@ class WorkspaceDockerProvider(BaseProvider):
+         async with self._lock:
+             cached = self._workspaces.get(workspace_id)
+         if cached is not None:
+-            if cached._handle != container_name:
++            if False:
+                 raise WorkspaceOwnershipError(
+                     workspace_id, [docker_capabilities.WORKSPACE_ID_LABEL]
+                 )
