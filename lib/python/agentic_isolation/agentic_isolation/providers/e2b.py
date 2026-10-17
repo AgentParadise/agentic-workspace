@@ -19,8 +19,9 @@ Decisions that differ from Docker, and why:
   is up; if `before_delete` raises, the sandbox is paused, not killed, and the
   report is `retained`. If E2B keeps refusing the pause (HTTP 503), the
   sandbox is left running and still never killed. A teardown reports
-  `completed` only when the sandbox is absent from the E2B list afterwards; a kill that leaves it listed raises
-  `SandboxRemovalError`, which is also the negative control of #1915.
+  `completed` only when the sandbox is absent from the E2B list afterwards;
+  a kill that leaves it listed raises `SandboxRemovalError`, which is also
+  the negative control of #1915.
 - Credential bindings and host mounts are refused: neither has an E2B
   delivery yet, and silently dropping one would launch a workspace without
   what the caller asked for.
@@ -33,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import posixpath
+import shlex
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
@@ -55,7 +57,6 @@ from agentic_isolation.providers.e2b_client import (
     E2BTransportError,
     SandboxCommand,
     SdkE2BClient,
-    shell_join,
 )
 from agentic_isolation.providers.teardown_report import TeardownReport, TeardownUsage
 
@@ -162,7 +163,7 @@ class E2BWorkspaceProvider:
         return (await self._client.read_bytes(workspace.id, _contained(path))).decode()
 
     async def file_exists(self, workspace: Workspace, path: str) -> bool:
-        result = await self.execute(workspace, shell_join(["test", "-e", _contained(path)]))
+        result = await self.execute(workspace, shlex.join(["test", "-e", _contained(path)]))
         return result.success
 
     async def start_stream(
@@ -177,7 +178,7 @@ class E2BWorkspaceProvider:
         merged_env = {**workspace.config.environment, **(env or {})}
         command = await self._client.start(
             workspace.id,
-            shell_join([*_MERGED, *sandbox_argv]),
+            shlex.join([*_MERGED, *sandbox_argv]),
             cwd=_resolve_cwd(cwd),
             env=merged_env,
             timeout=timeout,
@@ -193,7 +194,7 @@ class E2BWorkspaceProvider:
     ) -> list[tuple[str, bytes]]:
         listing = await self.execute(
             workspace,
-            shell_join(["find", ".", "-type", "f", "-print0"]),
+            shlex.join(["find", ".", "-type", "f", "-print0"]),
             cwd=base_path,
         )
         if not listing.success:

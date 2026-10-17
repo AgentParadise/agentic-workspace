@@ -22,7 +22,9 @@ tests/integration/test_e2b_live.py for the gated proof.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping, Sequence
+import asyncio
+import random
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -189,9 +191,6 @@ class SdkE2BClient:
         return bool(await AsyncSandbox.kill(sandbox_id, api_key=self._api_key))
 
     async def pause(self, sandbox_id: str) -> None:
-        import asyncio
-        import random
-
         from e2b import ServiceBusyException
 
         sandbox = await self._sandbox(sandbox_id)
@@ -269,8 +268,6 @@ class _ChunkQueue:
     """Stdout chunks from an SDK callback, closed with None when the command ends."""
 
     def __init__(self) -> None:
-        import asyncio
-
         self._queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     def put(self, chunk: str) -> None:
@@ -311,10 +308,3 @@ class _SdkCommand:
 
     async def kill(self) -> bool:
         return bool(await self._handle.kill())
-
-
-def shell_join(argv: Sequence[str]) -> str:
-    """Quote an argv as one POSIX shell command line."""
-    import shlex
-
-    return shlex.join(argv)
