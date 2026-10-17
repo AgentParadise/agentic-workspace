@@ -17,7 +17,7 @@ real daemon, so dispatch `mutation-evidence.yml` (see docs/mutation-evidence.md)
 Dispatch:
 
 ```
-gh workflow run mutation-evidence.yml --ref main -f pr=<PR> -f tests="lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py"
+gh workflow run mutation-evidence.yml --ref main -f pr=85 -f tests="lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conformance.py"
 ```
 
 Delete `.mutations/` before merge (CI job `mutations-not-merged`).
