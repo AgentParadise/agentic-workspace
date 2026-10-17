@@ -126,9 +126,11 @@ class DockerStreamSession:
             return
         self._stopped_by = outcome
         # Wait briefly for the announce line; then kill the sandbox process.
+        # `kill` is a shell builtin in minimal images, so it cannot be exec'd.
         script = (
-            f'for _ in $(seq 50); do [ -s "{self._pid_file}" ] && '
-            f'exec kill -KILL "$(cat "{self._pid_file}")"; sleep 0.1; done; exit 1'
+            f'i=0; while [ "$i" -lt 50 ]; do if [ -s "{self._pid_file}" ]; then '
+            f'kill -KILL "$(cat "{self._pid_file}")"; exit $?; fi; '
+            'i=$((i + 1)); sleep 0.1; done; exit 1'
         )
         code, _, err = await _docker("exec", self._container, "sh", "-c", script)
         if code != 0 and self._proc.returncode is None:
