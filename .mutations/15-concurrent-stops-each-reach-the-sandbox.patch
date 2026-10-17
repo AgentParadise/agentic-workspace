@@ -1,0 +1,14 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+index e118757..3d265cd 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+@@ -188,8 +188,7 @@ class DockerStreamSession:
+         self._timeout_task = asyncio.ensure_future(self._stop(StreamOutcome(end="timed_out")))
+ 
+     async def _stop(self, outcome: StreamOutcome) -> None:
+-        async with self._lock:
+-            await self._stop_locked(outcome)
++        await self._stop_locked(outcome)
+         with contextlib.suppress(asyncio.TimeoutError):
+             await asyncio.wait_for(self._proc.wait(), timeout=10)
+         if self._proc.returncode is None:

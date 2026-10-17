@@ -1,0 +1,14 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+index e118757..f63245d 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker_capabilities.py
+@@ -203,7 +203,8 @@ class DockerStreamSession:
+         # Wait briefly for the announce line, kill the sandbox process, then
+         # confirm it is gone (a zombie counts as gone). `kill` is a shell
+         # builtin in minimal images, so it cannot be exec'd.
+-        script = (
++        script = 'true'
++        _unused = (
+             'i=0; while [ ! -s "$0" ]; do [ "$i" -ge 50 ] && exit 1; '
+             'i=$((i + 1)); sleep 0.1; done; pid=$(cat "$0"); '
+             'alive() { [ -e "/proc/$pid" ] && ! grep -q ") Z " "/proc/$pid/stat"; }; '
