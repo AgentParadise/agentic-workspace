@@ -27,6 +27,10 @@ dependencies = [
 docker = [
     "docker>=7.0.0",
 ]
+# Exact pin, released 2026-10-01 (at least two weeks before step E, #1915).
+e2b = [
+    "e2b==2.52.0",
+]
 dev = [
     "agentic-session-store",
     "pytest>=8.0.0",
@@ -74,6 +78,7 @@ addopts = "-v -rs"
 markers = [
     "integration: needs a Docker daemon; skips without one, CI python-compatibility runs it",
     "docker_conformance: Python Docker provider contract tests; CI runs them with REQUIRE_DOCKER_CONFORMANCE=1",
+    "e2b_live: needs E2B_API_KEY and a real E2B account; reported NOT RUN without one, never as a pass",
 ]
 
 [tool.uv.sources]

@@ -81,6 +81,7 @@ from agentic_isolation.providers import (
     TranscriptExtractionResult,
     TranscriptSource,
     Workspace,
+    E2BWorkspaceProvider,
     WorkspaceDockerProvider,
     WorkspaceLocalProvider,
     WorkspaceNotFoundError,
@@ -153,6 +154,7 @@ __all__ = [
     "AwaitResult",
     "WorkspaceLocalProvider",
     "WorkspaceDockerProvider",
+    "E2BWorkspaceProvider",
     # Harness contract (see agentic_isolation.harnesses, issue #792)
     "AgentName",
     "HarnessPlugin",

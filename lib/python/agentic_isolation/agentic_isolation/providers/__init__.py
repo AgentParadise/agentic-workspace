@@ -6,7 +6,7 @@ Available providers:
 - InteractiveTmuxProvider: Docker containers running interactive claude/codex/
   gemini CLIs in tmux panes (productionized from EXP-01..EXP-04; adapter
   added per the EXP-05 codex cross-review M2 finding)
-- WorkspaceE2BProvider: E2B cloud sandboxes (future)
+- E2BWorkspaceProvider: E2B cloud sandboxes (syntropic137/syntropic137#1915)
 """
 
 from typing import TYPE_CHECKING, Any
@@ -46,6 +46,26 @@ from agentic_isolation.providers.capabilities import (
     WorkspaceOwnershipError,
 )
 from agentic_isolation.providers.docker import ContainerRemovalError, WorkspaceDockerProvider
+from agentic_isolation.providers.e2b import (
+    E2BStreamSession,
+    E2BWorkspaceProvider,
+    SandboxRemovalError,
+)
+from agentic_isolation.providers.e2b_client import (
+    CommandExit,
+    E2BSandboxClient,
+    E2BTransportError,
+    SandboxCommand,
+    SandboxListing,
+    SdkE2BClient,
+)
+from agentic_isolation.providers.e2b_template import (
+    E2BTemplateBuild,
+    E2BTemplateSpec,
+    TemplateSpecError,
+    build_template,
+    manifest_hash,
+)
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 from agentic_isolation.providers.teardown_report import (
     DeleteFallback,
@@ -106,6 +126,21 @@ __all__ = [
     "WorkspaceDockerProvider",
     "ContainerRemovalError",
     "InteractiveTmuxProvider",
+    # E2B (syntropic137/syntropic137#1915)
+    "E2BWorkspaceProvider",
+    "E2BStreamSession",
+    "SandboxRemovalError",
+    "E2BSandboxClient",
+    "SandboxCommand",
+    "SandboxListing",
+    "CommandExit",
+    "E2BTransportError",
+    "SdkE2BClient",
+    "E2BTemplateSpec",
+    "E2BTemplateBuild",
+    "TemplateSpecError",
+    "build_template",
+    "manifest_hash",
     # Harness contract (see agentic_isolation.harnesses, issue #792)
     "AgentName",
     "HarnessPlugin",
