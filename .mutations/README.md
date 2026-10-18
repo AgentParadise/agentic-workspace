@@ -1,6 +1,7 @@
 # Mutation patches for PR #87 (syntropic137/syntropic137#1915, verify rounds 1 and 2)
 
-Every patch is killed by `lib/python/agentic_isolation/tests/test_e2b_adapter.py`.
+Patches 01-18 are killed by `lib/python/agentic_isolation/tests/test_e2b_adapter.py`;
+19-20 by `tests/test_e2b_provider.py` in the same package.
 Remove this directory before merge (`mutations-not-merged`).
 
 | Patch | Finding | Killing test(s) |
@@ -23,6 +24,8 @@ Remove this directory before merge (`mutations-not-merged`).
 | 16-list-drops-api-key | R8 (round 2) | test_list_reads_every_page_in_every_state_and_keeps_metadata |
 | 17-pause-swallows-cancel | R8 (round 2) | test_cancelled_pause_backoff_stops_retrying_and_keeps_the_sandbox |
 | 18-cancelled-pause-evicts | R8 (round 2) | test_cancelled_pause_backoff_stops_retrying_and_keeps_the_sandbox |
+| 19-attach-reads-the-list | live run 2 (list lags create) | test_attach_finds_a_sandbox_the_list_does_not_show_yet (in test_e2b_provider.py) |
+| 20-remove-trusts-unseen-absence | live run 2 (list lags create) | test_teardown_of_a_sandbox_not_yet_listed_waits_to_see_it_leave, test_a_sandbox_never_listed_is_killed_by_id_and_its_removal_is_unconfirmed, test_negative_control_a_noop_kill_fails_cleanup_while_the_list_lags_create (in test_e2b_provider.py) |
 
 The R7 reporter fix lives in `tests/integration/conftest.py`, which the runner
 REFUSES to mutate (test-shaped code); its mutation was run locally only.

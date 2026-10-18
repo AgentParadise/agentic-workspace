@@ -1,0 +1,14 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+index 1c119cf..c2891da 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+@@ -340,7 +340,8 @@ class E2BWorkspaceProvider:
+ 
+     async def attach(self, workspace_id: str, *, expect_labels: Mapping[str, str]) -> Workspace:
+         # By id, not from the list: the list can omit a sandbox just created.
+-        found = await self._client.lookup(workspace_id)
++        listed = [e for e in await self._client.list({}) if e.sandbox_id == workspace_id]
++        found = listed[0] if listed else None
+         if found is None:
+             raise WorkspaceNotFoundError(workspace_id)
+         labels = dict(found.metadata)
