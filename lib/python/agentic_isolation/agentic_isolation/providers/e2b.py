@@ -29,6 +29,10 @@ Decisions that differ from Docker, and why:
   included), because E2B can still list a sandbox for a moment after the kill
   returns. A sandbox not seen gone within that bound raises
   `SandboxRemovalError`, which is also the negative control of #1915.
+  The list also lags a create, so absence only proves removal for a sandbox
+  the list has shown: the kill waits, within the same bound, until the
+  sandbox is listed, and a sandbox E2B no longer knows by id needs no list
+  confirmation. `attach` reads the sandbox by id for the same reason.
 - Commands and file transfers run as the image's `agent` user, not E2B's
   default `user`. The template takes the image's ownership, and the image
   gives `/workspace` and `/spool` to `agent` (as the Docker provider runs);
@@ -182,17 +186,35 @@ class E2BWorkspaceProvider:
     async def _remove(self, sandbox_id: str, labels: Mapping[str, str]) -> None:
         """Kill a sandbox and wait until E2B no longer lists it.
 
+        E2B's list can omit a sandbox for a moment after its create, so
+        absence there proves removal only once the list has shown it: the
+        sandbox is waited for in the list before the kill. One that E2B no
+        longer knows by id is already gone and is killed without confirmation.
         A kill's False (not found) is not trusted either: only the list's
-        absence confirms it. Raises `SandboxRemovalError` when absence is not
-        observed within `_REMOVAL_SECONDS`, list requests included, since one
-        stalled page can outlast the bound; transport errors propagate.
+        absence confirms it. Raises `SandboxRemovalError` when presence or
+        absence is not observed within `_REMOVAL_SECONDS` each, list requests
+        included, since one stalled page can outlast the bound; transport
+        errors propagate.
         """
+        try:
+            async with asyncio.timeout(_REMOVAL_SECONDS):
+                while not await self._listed(sandbox_id, labels):
+                    if await self._client.lookup(sandbox_id) is None:
+                        await self._client.kill(sandbox_id)
+                        return
+                    await asyncio.sleep(_REMOVAL_POLL_SECONDS)
+        except TimeoutError as exc:
+            await self._client.kill(sandbox_id)
+            raise SandboxRemovalError(
+                f"sandbox {sandbox_id} was not seen in the E2B list within "
+                f"{_REMOVAL_SECONDS:g}s, so its kill cannot be confirmed by the list; "
+                "the workspace was kept. Retry teardown by ref.",
+                sandbox_id=sandbox_id,
+            ) from exc
         await self._client.kill(sandbox_id)
         try:
             async with asyncio.timeout(_REMOVAL_SECONDS):
-                while any(
-                    entry.sandbox_id == sandbox_id for entry in await self._client.list(labels)
-                ):
+                while await self._listed(sandbox_id, labels):
                     await asyncio.sleep(_REMOVAL_POLL_SECONDS)
         except TimeoutError as exc:
             raise SandboxRemovalError(
@@ -201,6 +223,9 @@ class E2BWorkspaceProvider:
                 "Retry teardown by ref.",
                 sandbox_id=sandbox_id,
             ) from exc
+
+    async def _listed(self, sandbox_id: str, labels: Mapping[str, str]) -> bool:
+        return any(entry.sandbox_id == sandbox_id for entry in await self._client.list(labels))
 
     async def destroy(self, workspace: Workspace) -> TeardownReport:
         return await self.teardown(workspace)
@@ -314,10 +339,11 @@ class E2BWorkspaceProvider:
         ]
 
     async def attach(self, workspace_id: str, *, expect_labels: Mapping[str, str]) -> Workspace:
-        found = [entry for entry in await self._client.list({}) if entry.sandbox_id == workspace_id]
-        if not found:
+        # By id, not from the list: the list can omit a sandbox just created.
+        found = await self._client.lookup(workspace_id)
+        if found is None:
             raise WorkspaceNotFoundError(workspace_id)
-        labels = dict(found[0].metadata)
+        labels = dict(found.metadata)
         mismatched = mismatched_labels(labels, expect_labels)
         if mismatched:
             raise WorkspaceOwnershipError(workspace_id, mismatched)

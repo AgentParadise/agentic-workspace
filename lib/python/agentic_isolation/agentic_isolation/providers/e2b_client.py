@@ -9,6 +9,11 @@ behaviour it relies on is cited (accessed 2026-10-17):
 
 - Metadata on create and list filtering by it:
   https://e2b.dev/docs/sandbox/metadata and https://e2b.dev/docs/sandbox/list
+- `list` and `get_info` read different endpoints: the list paginates
+  `GET /v2/sandboxes` and `get_info` reads `GET /sandboxes/{id}`, raising
+  `SandboxNotFoundException` on a 404 (`e2b/sandbox_async/sandbox_api.py` and
+  `paginator.py` in e2b==2.52.0). The client filters nothing out of either, so
+  a sandbox the list does not show yet is the list endpoint's lag.
 - `kill` returns False when the sandbox was not found, and `pause`/`connect`
   resume: https://e2b.dev/docs/sandbox/persistence (a pause can be refused
   with HTTP 503, `ServiceBusyException`, while the sandbox keeps running)
@@ -105,6 +110,13 @@ class E2BSandboxClient(Protocol):
 
     async def list(self, metadata: Mapping[str, str]) -> list[SandboxListing]:
         """Running and paused sandboxes carrying ALL of `metadata`."""
+        ...
+
+    async def lookup(self, sandbox_id: str) -> SandboxListing | None:
+        """One running or paused sandbox by id, None when E2B does not know it.
+
+        Unlike `list`, this does not lag a create.
+        """
         ...
 
     async def kill(self, sandbox_id: str) -> bool:
@@ -207,6 +219,15 @@ class SdkE2BClient:
             for info in await paginator.next_items():
                 found.append(SandboxListing(info.sandbox_id, dict(info.metadata)))
         return found
+
+    async def lookup(self, sandbox_id: str) -> SandboxListing | None:
+        from e2b import AsyncSandbox, SandboxNotFoundException
+
+        try:
+            info = await AsyncSandbox.get_info(sandbox_id, api_key=self._api_key)
+        except SandboxNotFoundException:
+            return None
+        return SandboxListing(info.sandbox_id, dict(info.metadata))
 
     async def kill(self, sandbox_id: str) -> bool:
         from e2b import AsyncSandbox

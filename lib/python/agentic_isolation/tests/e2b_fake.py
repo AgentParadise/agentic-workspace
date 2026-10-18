@@ -84,12 +84,18 @@ class FakeE2BClient:
         # How many list reads still show a sandbox after its kill (E2B's lag).
         self.listed_after_kill = 0
         self._dying: dict[str, tuple[FakeSandbox, int]] = {}
+        # How many list reads omit a sandbox after its create (E2B's lag);
+        # `lookup` by id never lags.
+        self.unlisted_after_create = 0
+        self._unlisted: dict[str, int] = {}
 
     async def create(
         self, *, template: str, metadata: Mapping[str, str], lifetime_seconds: int
     ) -> str:
         sandbox_id = f"sbx-{len(self.sandboxes) + 1}"
         self.sandboxes[sandbox_id] = FakeSandbox(metadata=dict(metadata))
+        if self.unlisted_after_create:
+            self._unlisted[sandbox_id] = self.unlisted_after_create
         self.events.append(f"create {sandbox_id} {template}")
         return sandbox_id
 
@@ -101,11 +107,21 @@ class FakeE2BClient:
                 del self._dying[sandbox_id]
             else:
                 self._dying[sandbox_id] = (box, reads - 1)
+        for sandbox_id, reads in list(self._unlisted.items()):
+            visible.pop(sandbox_id, None)
+            if reads <= 1:
+                del self._unlisted[sandbox_id]
+            else:
+                self._unlisted[sandbox_id] = reads - 1
         return [
             SandboxListing(sandbox_id, dict(box.metadata))
             for sandbox_id, box in visible.items()
             if all(box.metadata.get(k) == v for k, v in metadata.items())
         ]
+
+    async def lookup(self, sandbox_id: str) -> SandboxListing | None:
+        box = self.sandboxes.get(sandbox_id)
+        return None if box is None else SandboxListing(sandbox_id, dict(box.metadata))
 
     async def kill(self, sandbox_id: str) -> bool:
         self.events.append(f"kill {sandbox_id}")

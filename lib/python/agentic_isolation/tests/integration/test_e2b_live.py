@@ -68,23 +68,57 @@ async def live(template: str) -> AsyncIterator[tuple[E2BWorkspaceProvider, Works
         assert await provider.list_owned(run) == []
 
 
-class _NoopKillClient(SdkE2BClient):
+class _NoopKill:
+    """The SDK client with a kill that claims success and does nothing."""
+
+    def __init__(self, client: SdkE2BClient) -> None:
+        self._client = client
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._client, name)
+
     async def kill(self, sandbox_id: str) -> bool:
         return True
+
+
+async def _await_listed(client: SdkE2BClient, run: dict[str, str], sandbox_id: str) -> float:
+    """Seconds until `sandbox_id` is in the E2B list; fails past the removal bound.
+
+    E2B's list can omit a sandbox for a moment after its create, and absence
+    from it proves a removal only for a sandbox it has shown.
+    """
+    started = time.monotonic()
+    reads = 0
+    try:
+        async with asyncio.timeout(e2b_module._REMOVAL_SECONDS):
+            while not any(entry.sandbox_id == sandbox_id for entry in await client.list(run)):
+                reads += 1
+                await asyncio.sleep(e2b_module._REMOVAL_POLL_SECONDS)
+    except TimeoutError:
+        pytest.fail(
+            f"{sandbox_id} not listed {e2b_module._REMOVAL_SECONDS:g}s after create "
+            f"(missing on {reads} read(s))"
+        )
+    elapsed = time.monotonic() - started
+    print(f"{sandbox_id} was missing from the list on {reads} read(s), {elapsed:.2f}s after create")
+    return elapsed
 
 
 async def test_negative_control_noop_kill_leaves_a_sandbox_and_fails_cleanup(
     template: str,
 ) -> None:
     run = {"e2b_live.run": uuid.uuid4().hex}
-    broken = E2BWorkspaceProvider(template, client=_NoopKillClient())
+    client = SdkE2BClient()
+    broken = E2BWorkspaceProvider(template, client=_NoopKill(client))  # type: ignore[arg-type]
     workspace = await broken.create(WorkspaceConfig(provider="e2b", labels=run))
     try:
+        # Without this, a sandbox not yet listed would pass as removed.
+        await _await_listed(client, run, workspace.id)
         with pytest.raises(SandboxRemovalError):
             await broken.destroy(workspace)
         assert [o.workspace_id for o in await broken.list_owned(run)] == [workspace.id]
     finally:
-        await E2BWorkspaceProvider(template).destroy(workspace)
+        await E2BWorkspaceProvider(template, client=client).destroy(workspace)
 
 
 # The same policy the Docker codex test uses (test_codex_sandbox_seccomp.py).
@@ -158,6 +192,8 @@ async def test_a_killed_sandbox_leaves_the_list_within_the_removal_bound(templat
     run = {"e2b_live.run": uuid.uuid4().hex}
     sandbox_id = await client.create(template=template, metadata=run, lifetime_seconds=300)
     try:
+        # Absence after the kill means nothing for a sandbox the list never showed.
+        await _await_listed(client, run, sandbox_id)
         killed = await client.kill(sandbox_id)
         started = time.monotonic()
         reads_listed = 0

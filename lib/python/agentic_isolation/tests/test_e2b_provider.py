@@ -298,6 +298,22 @@ async def test_list_owned_and_attach_check_labels(
         await fresh.attach("sbx-missing", expect_labels={})
 
 
+async def test_attach_finds_a_sandbox_the_list_does_not_show_yet(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    client.unlisted_after_create = 1000  # E2B's list lags the create throughout
+    mine = await provider.create(WorkspaceConfig(provider="e2b", labels={"syn.host_id": "h1"}))
+
+    fresh = E2BWorkspaceProvider("tmpl-1", client=client)
+    attached = await fresh.attach(mine.id, expect_labels={"syn.host_id": "h1"})
+    assert attached.id == mine.id
+    assert attached.config.labels == {"syn.host_id": "h1"}
+    with pytest.raises(WorkspaceOwnershipError):
+        await E2BWorkspaceProvider("tmpl-1", client=client).attach(
+            mine.id, expect_labels={"syn.host_id": "h2"}
+        )
+
+
 async def test_teardown_runs_both_hooks_before_the_kill(
     provider: E2BWorkspaceProvider, client: FakeE2BClient
 ) -> None:
@@ -392,6 +408,45 @@ async def test_teardown_waits_for_a_killed_sandbox_to_leave_the_list(
     assert report.finalization.state == "completed"
     assert client.events.count(f"kill {workspace.id}") == 1, "the kill was retried"
     assert await provider.list_owned({"run": "r3"}) == []
+
+
+async def test_teardown_of_a_sandbox_not_yet_listed_waits_to_see_it_leave(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    client.unlisted_after_create = 1
+    client.listed_after_kill = 3
+    workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r5"}))
+
+    report = await provider.destroy(workspace)
+
+    assert report.finalization.state == "completed"
+    assert client.events.count(f"kill {workspace.id}") == 1
+    assert await provider.list_owned({"run": "r5"}) == []
+
+
+async def test_teardown_of_a_sandbox_e2b_no_longer_knows_completes_without_the_list(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r6"}))
+    del client.sandboxes[workspace.id]  # expired or killed elsewhere
+
+    report = await provider.destroy(workspace)
+
+    assert report.finalization.state == "completed"
+    assert client.events.count(f"kill {workspace.id}") == 1
+
+
+@pytest.mark.usefixtures("short_removal_bound")
+async def test_a_sandbox_never_listed_is_killed_by_id_and_its_removal_is_unconfirmed(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    client.unlisted_after_create = 1_000_000
+    workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r7"}))
+
+    with pytest.raises(SandboxRemovalError, match=workspace.id):
+        await provider.destroy(workspace)
+    assert client.events.count(f"kill {workspace.id}") == 1
+    assert workspace.id not in client.sandboxes
 
 
 @pytest.mark.parametrize("list_reply", ["never", "late"])
@@ -510,6 +565,46 @@ async def test_negative_control_a_noop_kill_fails_cleanup(
     with pytest.raises(SandboxRemovalError):
         await provider.destroy(workspace)
     assert await provider.list_owned({"run": "r1"})
+
+
+@pytest.mark.usefixtures("short_removal_bound")
+async def test_negative_control_a_noop_kill_fails_cleanup_while_the_list_lags_create(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    client.unlisted_after_create = 3
+    workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r8"}))
+    client.kill_is_noop = True
+
+    with pytest.raises(SandboxRemovalError):
+        await provider.destroy(workspace)
+    assert await provider.list_owned({"run": "r8"})
+
+
+@pytest.mark.usefixtures("short_removal_bound")
+async def test_the_live_negative_control_holds_while_the_list_lags_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.integration import test_e2b_live as live
+
+    client = FakeE2BClient()
+    client.unlisted_after_create = 3
+    monkeypatch.setattr(live, "SdkE2BClient", lambda: client)
+
+    await live.test_negative_control_noop_kill_leaves_a_sandbox_and_fails_cleanup("tmpl-1")
+    assert client.sandboxes == {}, "the negative control leaked its sandbox"
+
+
+@pytest.mark.usefixtures("short_removal_bound")
+async def test_the_live_wait_for_listing_fails_when_the_sandbox_never_appears() -> None:
+    from tests.integration import test_e2b_live as live
+
+    client = FakeE2BClient()
+    client.unlisted_after_create = 1_000_000
+    run = {"run": "r9"}
+    sandbox_id = await client.create(template="tmpl-1", metadata=run, lifetime_seconds=60)
+
+    with pytest.raises(pytest.fail.Exception, match="not listed"):
+        await live._await_listed(client, run, sandbox_id)  # type: ignore[arg-type]
 
 
 def test_template_spec_records_a_pinned_verified_sized_build(tmp_path: Path) -> None:
