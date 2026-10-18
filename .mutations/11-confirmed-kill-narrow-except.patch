@@ -1,8 +1,8 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-index 7288734..863aa2e 100644
+index 5a81c8a..1702d7f 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-@@ -442,7 +442,7 @@ async def _confirmed_kill(command: SandboxCommand) -> bool:
+@@ -530,7 +530,7 @@ async def _confirmed_kill(command: SandboxCommand) -> bool:
      """True only when the kill was acknowledged within `_KILL_SECONDS`."""
      try:
          return await asyncio.wait_for(command.kill(), timeout=_KILL_SECONDS)

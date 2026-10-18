@@ -1,0 +1,21 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+index 5a81c8a..1b26010 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+@@ -212,16 +212,6 @@ class E2BWorkspaceProvider:
+                 "its removal is unconfirmed. Retry teardown by ref.",
+                 sandbox_id=sandbox_id,
+             ) from exc
+-        except Exception as observation:
+-            # Not seeing the sandbox must not stop its kill: the kill is its
+-            # own endpoint and may still work.
+-            try:
+-                await self._client.kill(sandbox_id)
+-            except Exception as kill_error:
+-                observation.add_note(f"the kill of {sandbox_id} by id also failed: {kill_error!r}")
+-            else:
+-                observation.add_note(f"{sandbox_id} was killed by id; its removal is unconfirmed")
+-            raise
+         await self._client.kill(sandbox_id)
+         try:
+             async with asyncio.timeout(_REMOVAL_SECONDS):

@@ -1,8 +1,8 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-index 7288734..fcd89e9 100644
+index 5a81c8a..b5046da 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-@@ -381,7 +381,7 @@ class E2BStreamSession:
+@@ -463,7 +463,7 @@ class E2BStreamSession:
              if not await _confirmed_kill(self._command):
                  await _release(self._waiting)
                  return StreamOutcome(end="disconnected", detail="timeout kill not confirmed")

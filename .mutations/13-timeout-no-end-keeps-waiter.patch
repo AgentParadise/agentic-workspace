@@ -1,8 +1,8 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-index 7288734..72780b2 100644
+index 5a81c8a..8ec37a3 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-@@ -384,7 +384,6 @@ class E2BStreamSession:
+@@ -466,7 +466,6 @@ class E2BStreamSession:
              ended = await _bounded(self._waiting)
              if ended is not None and ended.end == "exited":
                  return StreamOutcome(end="timed_out")

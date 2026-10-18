@@ -1,8 +1,8 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-index 1c119cf..59d2dd1 100644
+index 5a81c8a..b2ae2cb 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-@@ -216,13 +216,8 @@ class E2BWorkspaceProvider:
+@@ -227,13 +227,8 @@ class E2BWorkspaceProvider:
              async with asyncio.timeout(_REMOVAL_SECONDS):
                  while await self._listed(sandbox_id, labels):
                      await asyncio.sleep(_REMOVAL_POLL_SECONDS)
