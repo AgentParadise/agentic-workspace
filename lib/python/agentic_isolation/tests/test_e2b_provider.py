@@ -449,6 +449,67 @@ async def test_a_sandbox_never_listed_is_killed_by_id_and_its_removal_is_unconfi
     assert workspace.id not in client.sandboxes
 
 
+@pytest.mark.parametrize("failing", ["list", "lookup"])
+async def test_a_failed_read_before_the_kill_still_kills_by_id(
+    provider: E2BWorkspaceProvider,
+    client: FakeE2BClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: str,
+) -> None:
+    if failing == "lookup":
+        client.unlisted_after_create = 1_000_000  # so the id is looked up
+    workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r9"}))
+
+    async def unavailable(*args: object) -> object:
+        raise E2BTransportError(f"{failing} endpoint unavailable")
+
+    monkeypatch.setattr(client, failing, unavailable)
+
+    with pytest.raises(E2BTransportError, match=f"{failing} endpoint") as failure:
+        await provider.destroy(workspace)
+    assert client.events.count(f"kill {workspace.id}") == 1, "the read failure skipped the kill"
+    assert workspace.id not in client.sandboxes
+    notes = getattr(failure.value, "__notes__", [])
+    assert any("removal is unconfirmed" in note for note in notes)
+
+
+async def test_a_failed_kill_after_a_failed_read_keeps_both_errors(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+
+    async def unavailable(*args: object) -> object:
+        raise E2BTransportError("list endpoint unavailable")
+
+    async def refused(sandbox_id: str) -> bool:
+        raise E2BTransportError("kill endpoint unavailable")
+
+    monkeypatch.setattr(client, "list", unavailable)
+    monkeypatch.setattr(client, "kill", refused)
+
+    with pytest.raises(E2BTransportError, match="list endpoint") as failure:
+        await provider.destroy(workspace)
+    notes = getattr(failure.value, "__notes__", [])
+    assert any("kill endpoint unavailable" in note for note in notes)
+    assert workspace.id in client.sandboxes
+
+
+async def test_a_failed_create_still_kills_when_the_list_fails(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client.responder = lambda command: FakeRun(exit=CommandExit(end="exited", exit_code=1))
+
+    async def unavailable(*args: object) -> object:
+        raise E2BTransportError("list endpoint unavailable")
+
+    monkeypatch.setattr(client, "list", unavailable)
+
+    with pytest.raises(SandboxRemovalError, match="still allocated.*list endpoint"):
+        await provider.create(WorkspaceConfig(provider="e2b"))
+    assert client.events.count("kill sbx-1") == 1, "the failed create skipped the kill"
+    assert client.sandboxes == {}
+
+
 @pytest.mark.parametrize("list_reply", ["never", "late"])
 @pytest.mark.usefixtures("short_removal_bound")
 async def test_the_removal_bound_covers_the_list_requests_themselves(

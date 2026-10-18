@@ -25,14 +25,15 @@ Decisions that differ from Docker, and why:
   report is `retained`. If E2B keeps refusing the pause (HTTP 503), the
   sandbox is left running and still never killed. A teardown reports
   `completed` only when the sandbox has left the E2B list; the list is read
-  until it does, for up to `_REMOVAL_SECONDS` in total (list requests
+  until it does, for up to `_REMOVAL_SECONDS` after the kill (list requests
   included), because E2B can still list a sandbox for a moment after the kill
   returns. A sandbox not seen gone within that bound raises
   `SandboxRemovalError`, which is also the negative control of #1915.
   The list also lags a create, so absence only proves removal for a sandbox
-  the list has shown: the kill waits, within the same bound, until the
-  sandbox is listed, and a sandbox E2B no longer knows by id needs no list
-  confirmation. `attach` reads the sandbox by id for the same reason.
+  the list has shown: the kill waits, for up to another `_REMOVAL_SECONDS`,
+  until the sandbox is listed (a failed read there still sends the kill),
+  and a sandbox E2B no longer knows by id needs no list confirmation.
+  `attach` reads the sandbox by id for the same reason.
 - Commands and file transfers run as the image's `agent` user, not E2B's
   default `user`. The template takes the image's ownership, and the image
   gives `/workspace` and `/spool` to `agent` (as the Docker provider runs);
@@ -194,7 +195,7 @@ class E2BWorkspaceProvider:
         absence confirms it. Raises `SandboxRemovalError` when presence or
         absence is not observed within `_REMOVAL_SECONDS` each, list requests
         included, since one stalled page can outlast the bound; transport
-        errors propagate.
+        errors propagate, and one raised before the kill still sends it.
         """
         try:
             async with asyncio.timeout(_REMOVAL_SECONDS):
@@ -208,9 +209,19 @@ class E2BWorkspaceProvider:
             raise SandboxRemovalError(
                 f"sandbox {sandbox_id} was not seen in the E2B list within "
                 f"{_REMOVAL_SECONDS:g}s, so its kill cannot be confirmed by the list; "
-                "the workspace was kept. Retry teardown by ref.",
+                "its removal is unconfirmed. Retry teardown by ref.",
                 sandbox_id=sandbox_id,
             ) from exc
+        except Exception as observation:
+            # Not seeing the sandbox must not stop its kill: the kill is its
+            # own endpoint and may still work.
+            try:
+                await self._client.kill(sandbox_id)
+            except Exception as kill_error:
+                observation.add_note(f"the kill of {sandbox_id} by id also failed: {kill_error!r}")
+            else:
+                observation.add_note(f"{sandbox_id} was killed by id; its removal is unconfirmed")
+            raise
         await self._client.kill(sandbox_id)
         try:
             async with asyncio.timeout(_REMOVAL_SECONDS):
