@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+index dea214e..e3e4110 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+@@ -207,7 +207,7 @@ class E2BWorkspaceProvider:
+         await self._client.kill(sandbox_id)
+         try:
+             async with asyncio.timeout(_REMOVAL_SECONDS):
+-                while await self._client.lookup(sandbox_id) is not None:
++                while any(e.sandbox_id == sandbox_id for e in await self._client.list({})):
+                     await asyncio.sleep(_POLL_SECONDS)
+         except TimeoutError as exc:
+             raise SandboxRemovalError(

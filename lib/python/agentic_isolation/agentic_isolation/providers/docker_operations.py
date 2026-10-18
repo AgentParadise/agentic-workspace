@@ -448,7 +448,9 @@ class DockerOperations:
             ref=ref,
             spec=spec,
             container=container,
-            spool=OperationSpool(retention_bytes=self._retention, redact=(*redact, *resolved)),
+            spool=OperationSpool(
+                retention_bytes=self._retention, redact=(*redact, *resolved)
+            ),
             started_at=_now(),
             key=key,
             channels=(bytearray(), bytearray()) if separate_channels else None,

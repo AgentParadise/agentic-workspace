@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+index dea214e..100e298 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+@@ -334,7 +334,7 @@ class E2BWorkspaceProvider:
+                 while True:
+                     listed = await self._client.list(labels)
+                     shown = {entry.sandbox_id for entry in listed}
+-                    if held <= shown and not shown & self._removed:
++                    if not shown & self._removed:
+                         break
+                     await asyncio.sleep(_POLL_SECONDS)
+         except TimeoutError as exc:
