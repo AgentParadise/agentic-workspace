@@ -33,6 +33,7 @@ from agentic_isolation.providers import (
     E2BTemplateSpec,
     E2BTransportError,
     E2BWorkspaceProvider,
+    SandboxListing,
     SandboxRemovalError,
     TemplateSpecError,
     manifest_hash,
@@ -60,12 +61,19 @@ def quick_removal_poll(monkeypatch: pytest.MonkeyPatch) -> None:
     # loaded runner cannot exhaust; tests that expect expiry ask for
     # `short_removal_bound`.
     monkeypatch.setattr(e2b_module, "_REMOVAL_SECONDS", 5.0)
-    monkeypatch.setattr(e2b_module, "_REMOVAL_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(e2b_module, "_LISTING_SECONDS", 5.0)
+    monkeypatch.setattr(e2b_module, "_POLL_SECONDS", 0.01)
 
 
 @pytest.fixture
 def short_removal_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(e2b_module, "_REMOVAL_SECONDS", 0.05)
+    monkeypatch.setattr(e2b_module, "_LISTING_SECONDS", 0.05)
+
+
+@pytest.fixture
+def short_listing_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(e2b_module, "_LISTING_SECONDS", 0.05)
 
 
 def test_fake_refuses_to_construct_outside_pytest(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -397,34 +405,98 @@ async def test_a_failed_while_running_hook_destroys_nothing(
     assert workspace.id in client.sandboxes and not client.sandboxes[workspace.id].paused
 
 
-async def test_teardown_waits_for_a_killed_sandbox_to_leave_the_list(
+async def test_teardown_confirms_removal_by_id_not_by_the_list(
     provider: E2BWorkspaceProvider, client: FakeE2BClient
 ) -> None:
+    client.unlisted_after_create = 1_000_000  # the list never shows it
+    client.found_after_kill = 3  # get_info still finds it for three lookups
     workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r3"}))
-    client.listed_after_kill = 3  # E2B still lists it for three reads after the kill
 
     report = await provider.destroy(workspace)
 
     assert report.finalization.state == "completed"
     assert client.events.count(f"kill {workspace.id}") == 1, "the kill was retried"
-    assert await provider.list_owned({"run": "r3"}) == []
+    assert client.list_reads == 0, "removal was read from the list"
+    assert await client.lookup(workspace.id) is None
 
 
-async def test_teardown_of_a_sandbox_not_yet_listed_waits_to_see_it_leave(
+async def test_list_owned_waits_for_a_killed_sandbox_to_leave_the_list(
     provider: E2BWorkspaceProvider, client: FakeE2BClient
 ) -> None:
-    client.unlisted_after_create = 1
-    client.listed_after_kill = 3
     workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r5"}))
+    client.listed_after_kill = 3  # E2B still lists it for three reads after the kill
 
-    report = await provider.destroy(workspace)
+    await provider.destroy(workspace)
 
-    assert report.finalization.state == "completed"
-    assert client.events.count(f"kill {workspace.id}") == 1
     assert await provider.list_owned({"run": "r5"}) == []
+    assert client.list_reads == 4
 
 
-async def test_teardown_of_a_sandbox_e2b_no_longer_knows_completes_without_the_list(
+async def test_list_owned_waits_for_a_just_created_sandbox_to_be_listed(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    client.unlisted_after_create = 3
+    mine = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r6"}))
+
+    owned = await provider.list_owned({"run": "r6"})
+
+    assert [o.workspace_id for o in owned] == [mine.id]
+    assert client.list_reads == 4
+
+
+async def test_list_owned_lags_both_ways_on_a_non_monotonic_list(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    client.unlisted_after_create = 2
+    client.found_after_kill = 2
+    gone = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r7"}))
+    kept = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r7"}))
+    client.listed_after_kill = 4
+    client.dropped_list_reads = {1}  # one read shows nothing at all
+
+    await provider.destroy(gone)
+    owned = await provider.list_owned({"run": "r7"})
+
+    assert [o.workspace_id for o in owned] == [kept.id]
+
+
+async def test_list_owned_does_not_wait_for_sandboxes_it_never_held(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    await client.create(template="tmpl-1", metadata={"run": "r8"}, lifetime_seconds=60)
+    client.unlisted_after_create = 1_000_000
+    await client.create(template="tmpl-1", metadata={"run": "r8"}, lifetime_seconds=60)
+
+    assert [o.workspace_id for o in await provider.list_owned({"run": "r8"})] == ["sbx-1"]
+    assert client.list_reads == 1
+
+
+@pytest.mark.usefixtures("short_listing_bound")
+async def test_list_owned_reports_an_unsettled_list_unchanged_past_the_bound(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    client.unlisted_after_create = 1_000_000
+    await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r9"}))
+
+    assert await asyncio.wait_for(provider.list_owned({"run": "r9"}), 1) == []
+    assert client.list_reads > 1
+
+
+@pytest.mark.usefixtures("short_listing_bound")
+async def test_list_owned_raises_when_the_list_never_answers(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def stalled_list(labels: Mapping[str, str]) -> list[object]:
+        await asyncio.Event().wait()
+        return []
+
+    monkeypatch.setattr(client, "list", stalled_list)
+
+    with pytest.raises(E2BTransportError, match="did not answer"):
+        await asyncio.wait_for(provider.list_owned({}), 1)
+
+
+async def test_teardown_of_a_sandbox_e2b_no_longer_knows_completes(
     provider: E2BWorkspaceProvider, client: FakeE2BClient
 ) -> None:
     workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r6"}))
@@ -436,97 +508,72 @@ async def test_teardown_of_a_sandbox_e2b_no_longer_knows_completes_without_the_l
     assert client.events.count(f"kill {workspace.id}") == 1
 
 
-@pytest.mark.usefixtures("short_removal_bound")
-async def test_a_sandbox_never_listed_is_killed_by_id_and_its_removal_is_unconfirmed(
-    provider: E2BWorkspaceProvider, client: FakeE2BClient
+async def test_a_failed_lookup_after_the_kill_leaves_the_removal_unconfirmed(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    client.unlisted_after_create = 1_000_000
-    workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r7"}))
-
-    with pytest.raises(SandboxRemovalError, match=workspace.id):
-        await provider.destroy(workspace)
-    assert client.events.count(f"kill {workspace.id}") == 1
-    assert workspace.id not in client.sandboxes
-
-
-@pytest.mark.parametrize("failing", ["list", "lookup"])
-async def test_a_failed_read_before_the_kill_still_kills_by_id(
-    provider: E2BWorkspaceProvider,
-    client: FakeE2BClient,
-    monkeypatch: pytest.MonkeyPatch,
-    failing: str,
-) -> None:
-    if failing == "lookup":
-        client.unlisted_after_create = 1_000_000  # so the id is looked up
     workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r9"}))
 
     async def unavailable(*args: object) -> object:
-        raise E2BTransportError(f"{failing} endpoint unavailable")
+        raise E2BTransportError("lookup endpoint unavailable")
 
-    monkeypatch.setattr(client, failing, unavailable)
+    monkeypatch.setattr(client, "lookup", unavailable)
 
-    with pytest.raises(E2BTransportError, match=f"{failing} endpoint") as failure:
+    with pytest.raises(E2BTransportError, match="lookup endpoint") as failure:
         await provider.destroy(workspace)
-    assert client.events.count(f"kill {workspace.id}") == 1, "the read failure skipped the kill"
-    assert workspace.id not in client.sandboxes
+    assert client.events.count(f"kill {workspace.id}") == 1
     notes = getattr(failure.value, "__notes__", [])
     assert any("removal is unconfirmed" in note for note in notes)
+    assert workspace.id in provider._workspaces, "an unconfirmed removal dropped the workspace"
 
 
-async def test_a_failed_kill_after_a_failed_read_keeps_both_errors(
+async def test_a_failed_kill_is_raised_and_keeps_the_workspace(
     provider: E2BWorkspaceProvider, client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = await provider.create(WorkspaceConfig(provider="e2b"))
 
-    async def unavailable(*args: object) -> object:
-        raise E2BTransportError("list endpoint unavailable")
-
     async def refused(sandbox_id: str) -> bool:
         raise E2BTransportError("kill endpoint unavailable")
 
-    monkeypatch.setattr(client, "list", unavailable)
     monkeypatch.setattr(client, "kill", refused)
 
-    with pytest.raises(E2BTransportError, match="list endpoint") as failure:
+    with pytest.raises(E2BTransportError, match="kill endpoint"):
         await provider.destroy(workspace)
-    notes = getattr(failure.value, "__notes__", [])
-    assert any("kill endpoint unavailable" in note for note in notes)
-    assert workspace.id in client.sandboxes
+    assert workspace.id in client.sandboxes and workspace.id in provider._workspaces
 
 
-async def test_a_failed_create_still_kills_when_the_list_fails(
+async def test_a_failed_create_still_kills_when_the_lookup_fails(
     provider: E2BWorkspaceProvider, client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client.responder = lambda command: FakeRun(exit=CommandExit(end="exited", exit_code=1))
 
     async def unavailable(*args: object) -> object:
-        raise E2BTransportError("list endpoint unavailable")
+        raise E2BTransportError("lookup endpoint unavailable")
 
-    monkeypatch.setattr(client, "list", unavailable)
+    monkeypatch.setattr(client, "lookup", unavailable)
 
-    with pytest.raises(SandboxRemovalError, match="still allocated.*list endpoint"):
+    with pytest.raises(SandboxRemovalError, match="still allocated.*lookup endpoint"):
         await provider.create(WorkspaceConfig(provider="e2b"))
     assert client.events.count("kill sbx-1") == 1, "the failed create skipped the kill"
     assert client.sandboxes == {}
 
 
-@pytest.mark.parametrize("list_reply", ["never", "late"])
+@pytest.mark.parametrize("lookup_reply", ["never", "late"])
 @pytest.mark.usefixtures("short_removal_bound")
-async def test_the_removal_bound_covers_the_list_requests_themselves(
+async def test_the_removal_bound_covers_the_lookups_themselves(
     provider: E2BWorkspaceProvider,
     client: FakeE2BClient,
     monkeypatch: pytest.MonkeyPatch,
-    list_reply: str,
+    lookup_reply: str,
 ) -> None:
     workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r4"}))
 
-    async def slow_list(labels: Mapping[str, str]) -> list[object]:
-        if list_reply == "never":
+    async def slow_lookup(sandbox_id: str) -> None:
+        if lookup_reply == "never":
             await asyncio.Event().wait()
-        await asyncio.sleep(0.3)  # an empty page, but six times past the bound
-        return []
+        await asyncio.sleep(0.3)  # not found, but six times past the bound
+        return None
 
-    monkeypatch.setattr(client, "list", slow_list)
+    monkeypatch.setattr(client, "lookup", slow_lookup)
 
     with pytest.raises(SandboxRemovalError, match=workspace.id):
         await asyncio.wait_for(provider.destroy(workspace), 0.2)
@@ -537,16 +584,15 @@ async def test_cancelling_a_removal_wait_is_not_reported_as_a_removal_failure(
     provider: E2BWorkspaceProvider, client: FakeE2BClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = await provider.create(WorkspaceConfig(provider="e2b"))
-    listing = asyncio.Event()
+    looking = asyncio.Event()
 
-    async def stalled_list(labels: Mapping[str, str]) -> list[object]:
-        listing.set()
+    async def stalled_lookup(sandbox_id: str) -> None:
+        looking.set()
         await asyncio.Event().wait()
-        return []
 
-    monkeypatch.setattr(client, "list", stalled_list)
+    monkeypatch.setattr(client, "lookup", stalled_lookup)
     removing = asyncio.create_task(provider.destroy(workspace))
-    await asyncio.wait_for(listing.wait(), 1)
+    await asyncio.wait_for(looking.wait(), 1)
     removing.cancel()
 
     with pytest.raises(asyncio.CancelledError):
@@ -566,26 +612,26 @@ class _FailsOnce(FakeE2BClient):
             raise E2BTransportError("connection reset during kill")
         return await super().kill(sandbox_id)
 
-    async def list(self, metadata: Mapping[str, str]) -> list[object]:
-        if self._failing == "list":
+    async def lookup(self, sandbox_id: str) -> SandboxListing | None:
+        if self._failing == "lookup":
             self._failing = ""
-            raise E2BTransportError("connection reset during list")
-        return await super().list(metadata)
+            raise E2BTransportError("connection reset during lookup")
+        return await super().lookup(sandbox_id)
 
 
-@pytest.mark.parametrize("failing", ["kill", "list"])
+@pytest.mark.parametrize("failing", ["kill", "lookup"])
 async def test_the_live_removal_measurement_frees_its_sandbox_when_it_fails(
     monkeypatch: pytest.MonkeyPatch, failing: str
 ) -> None:
     from tests.integration import test_e2b_live as live
 
     client = _FailsOnce(failing)
-    client.listed_after_kill = 2
+    client.found_after_kill = 2
     monkeypatch.setattr(live, "SdkE2BClient", lambda: client)
 
     with pytest.raises(E2BTransportError, match=f"during {failing}"):
-        await live.test_a_killed_sandbox_leaves_the_list_within_the_removal_bound("tmpl-1")
-    assert client.sandboxes == {} and await client.list({}) == [], "the measurement leaked"
+        await live.test_a_killed_sandbox_is_gone_by_id_within_the_removal_bound("tmpl-1")
+    assert client.sandboxes == {} and await client.lookup("sbx-1") is None, "it leaked"
 
 
 @pytest.mark.usefixtures("short_removal_bound")
@@ -594,12 +640,12 @@ async def test_the_live_removal_measurement_names_a_sandbox_it_could_not_free(
 ) -> None:
     from tests.integration import test_e2b_live as live
 
-    client = _FailsOnce("list")
+    client = FakeE2BClient()
     client.kill_is_noop = True
     monkeypatch.setattr(live, "SdkE2BClient", lambda: client)
 
-    with pytest.raises(E2BTransportError) as failure:
-        await live.test_a_killed_sandbox_leaves_the_list_within_the_removal_bound("tmpl-1")
+    with pytest.raises(pytest.fail.Exception, match="still known by id") as failure:
+        await live.test_a_killed_sandbox_is_gone_by_id_within_the_removal_bound("tmpl-1")
     assert any("sbx-1" in note for note in failure.value.__notes__)
 
 
@@ -609,10 +655,12 @@ async def test_the_live_removal_measurement_passes_and_frees_on_a_lagging_list(
     from tests.integration import test_e2b_live as live
 
     client = FakeE2BClient()
+    client.unlisted_after_create = 2
     client.listed_after_kill = 2
+    client.found_after_kill = 2
     monkeypatch.setattr(live, "SdkE2BClient", lambda: client)
 
-    await live.test_a_killed_sandbox_leaves_the_list_within_the_removal_bound("tmpl-1")
+    await live.test_a_killed_sandbox_is_gone_by_id_within_the_removal_bound("tmpl-1")
     assert client.events.count("kill sbx-1") == 1 and await client.list({}) == []
 
 
@@ -625,20 +673,24 @@ async def test_negative_control_a_noop_kill_fails_cleanup(
 
     with pytest.raises(SandboxRemovalError):
         await provider.destroy(workspace)
-    assert await provider.list_owned({"run": "r1"})
+    assert [o.workspace_id for o in await provider.list_owned({"run": "r1"})] == [workspace.id]
 
 
 @pytest.mark.usefixtures("short_removal_bound")
-async def test_negative_control_a_noop_kill_fails_cleanup_while_the_list_lags_create(
+async def test_negative_control_a_noop_kill_fails_cleanup_on_a_list_that_lags_both_ways(
     provider: E2BWorkspaceProvider, client: FakeE2BClient
 ) -> None:
+    # Every read after the kill omits the sandbox, as a lagging or
+    # non-monotonic list can: absence there must not pass for removal.
     client.unlisted_after_create = 3
     workspace = await provider.create(WorkspaceConfig(provider="e2b", labels={"run": "r8"}))
+    client.listed_after_kill = 3
     client.kill_is_noop = True
+    client.dropped_list_reads = set(range(1, 1_000))
 
-    with pytest.raises(SandboxRemovalError):
+    with pytest.raises(SandboxRemovalError, match=workspace.id):
         await provider.destroy(workspace)
-    assert await provider.list_owned({"run": "r8"})
+    assert workspace.id in provider._workspaces, "a failed removal dropped the workspace"
 
 
 @pytest.mark.usefixtures("short_removal_bound")

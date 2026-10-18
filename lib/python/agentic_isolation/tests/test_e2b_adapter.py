@@ -59,7 +59,8 @@ def quick_kill_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     # As in test_e2b_provider: a generous removal budget for success paths,
     # the short one only where expiry is the expected outcome.
     monkeypatch.setattr(e2b_module, "_REMOVAL_SECONDS", 5.0)
-    monkeypatch.setattr(e2b_module, "_REMOVAL_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(e2b_module, "_LISTING_SECONDS", 5.0)
+    monkeypatch.setattr(e2b_module, "_POLL_SECONDS", 0.01)
 
 
 async def _hanging_session(

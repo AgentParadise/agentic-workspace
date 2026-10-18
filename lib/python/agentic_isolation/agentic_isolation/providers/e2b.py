@@ -24,16 +24,22 @@ Decisions that differ from Docker, and why:
   is up; if `before_delete` raises, the sandbox is paused, not killed, and the
   report is `retained`. If E2B keeps refusing the pause (HTTP 503), the
   sandbox is left running and still never killed. A teardown reports
-  `completed` only when the sandbox has left the E2B list; the list is read
-  until it does, for up to `_REMOVAL_SECONDS` after the kill (list requests
-  included), because E2B can still list a sandbox for a moment after the kill
-  returns. A sandbox not seen gone within that bound raises
-  `SandboxRemovalError`, which is also the negative control of #1915.
-  The list also lags a create, so absence only proves removal for a sandbox
-  the list has shown: the kill waits, for up to another `_REMOVAL_SECONDS`,
-  until the sandbox is listed (a failed read there still sends the kill),
-  and a sandbox E2B no longer knows by id needs no list confirmation.
-  `attach` reads the sandbox by id for the same reason.
+  `completed` only once E2B no longer knows the sandbox by id (`lookup`, the
+  SDK's `get_info`, is None), polled for up to `_REMOVAL_SECONDS` after the
+  kill, lookups included. A sandbox still known by id past that bound raises
+  `SandboxRemovalError`, which is also the negative control of #1915. The
+  kill's own True is not evidence (the SDK returns it without a request in
+  debug mode), and neither is the list: E2B's list is eventually consistent
+  in both directions and not monotonic, so one read without the id proves
+  nothing.
+- `list_owned` reports E2B's list once that list agrees with what this
+  provider knows: every matching sandbox it holds is listed and none it
+  confirmed removed is. It reads for up to `_LISTING_SECONDS` (live run 3
+  saw a create missing for two reads and killed sandboxes listed for under a
+  minute); past that bound it returns the last read unchanged, so a listing
+  that never settles reaches the caller instead of being hidden. Sandboxes
+  this provider never held are not waited for. `attach` reads the sandbox by
+  id for the same reason.
 - Commands and file transfers run as the image's `agent` user, not E2B's
   default `user`. The template takes the image's ownership, and the image
   gives `/workspace` and `/spool` to `agent` (as the Docker provider runs);
@@ -76,6 +82,7 @@ from agentic_isolation.providers.e2b_client import (
     E2BSandboxClient,
     E2BTransportError,
     SandboxCommand,
+    SandboxListing,
     SdkE2BClient,
 )
 from agentic_isolation.providers.teardown_report import TeardownReport, TeardownUsage
@@ -89,13 +96,16 @@ _RUN_AS = "agent"
 _MERGED = ("sh", "-c", 'exec "$@" 2>&1', "sh")
 # How long a kill, and the end it causes, may take before it counts as unconfirmed.
 _KILL_SECONDS = 10.0
-# How long a killed sandbox may stay in the E2B list, and how often it is read.
+# How long E2B may still know a killed sandbox by id.
 _REMOVAL_SECONDS = 30.0
-_REMOVAL_POLL_SECONDS = 0.5
+# How long the E2B list may disagree with the sandboxes this provider holds or removed.
+_LISTING_SECONDS = 30.0
+# How often either is read again.
+_POLL_SECONDS = 0.5
 
 
 class SandboxRemovalError(RuntimeError):
-    """A sandbox was killed but is still in the E2B list; the workspace was kept.
+    """A sandbox was killed but E2B still knows it by id; the workspace was kept.
 
     `sandbox_id` names the sandbox so a caller can retry or reclaim it.
     """
@@ -130,6 +140,8 @@ class E2BWorkspaceProvider:
         self._run_as = run_as
         self._workspaces: dict[str, Workspace] = {}
         self._retained: dict[str, Workspace] = {}
+        # Sandboxes E2B was seen not to know by id after this provider killed them.
+        self._removed: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -172,7 +184,7 @@ class E2BWorkspaceProvider:
             # The caller never gets this workspace, so nobody else can free it.
             self._workspaces.pop(sandbox_id, None)
             try:
-                await self._remove(sandbox_id, config.labels)
+                await self._remove(sandbox_id)
             except Exception as leak:
                 if isinstance(exc, Exception):
                     raise SandboxRemovalError(
@@ -184,59 +196,29 @@ class E2BWorkspaceProvider:
             raise
         return workspace
 
-    async def _remove(self, sandbox_id: str, labels: Mapping[str, str]) -> None:
-        """Kill a sandbox and wait until E2B no longer lists it.
+    async def _remove(self, sandbox_id: str) -> None:
+        """Kill a sandbox and wait until E2B no longer knows it by id.
 
-        E2B's list can omit a sandbox for a moment after its create, so
-        absence there proves removal only once the list has shown it: the
-        sandbox is waited for in the list before the kill. One that E2B no
-        longer knows by id is already gone and is killed without confirmation.
-        A kill's False (not found) is not trusted either: only the list's
-        absence confirms it. Raises `SandboxRemovalError` when presence or
-        absence is not observed within `_REMOVAL_SECONDS` each, list requests
-        included, since one stalled page can outlast the bound; transport
-        errors propagate, and one raised before the kill still sends it.
+        Raises `SandboxRemovalError` when `lookup` still finds it
+        `_REMOVAL_SECONDS` after the kill, lookups included, since one stalled
+        request can outlast the bound. Transport errors propagate; one raised
+        by a lookup after the kill says the removal is unconfirmed.
         """
-        try:
-            async with asyncio.timeout(_REMOVAL_SECONDS):
-                while not await self._listed(sandbox_id, labels):
-                    if await self._client.lookup(sandbox_id) is None:
-                        await self._client.kill(sandbox_id)
-                        return
-                    await asyncio.sleep(_REMOVAL_POLL_SECONDS)
-        except TimeoutError as exc:
-            await self._client.kill(sandbox_id)
-            raise SandboxRemovalError(
-                f"sandbox {sandbox_id} was not seen in the E2B list within "
-                f"{_REMOVAL_SECONDS:g}s, so its kill cannot be confirmed by the list; "
-                "its removal is unconfirmed. Retry teardown by ref.",
-                sandbox_id=sandbox_id,
-            ) from exc
-        except Exception as observation:
-            # Not seeing the sandbox must not stop its kill: the kill is its
-            # own endpoint and may still work.
-            try:
-                await self._client.kill(sandbox_id)
-            except Exception as kill_error:
-                observation.add_note(f"the kill of {sandbox_id} by id also failed: {kill_error!r}")
-            else:
-                observation.add_note(f"{sandbox_id} was killed by id; its removal is unconfirmed")
-            raise
         await self._client.kill(sandbox_id)
         try:
             async with asyncio.timeout(_REMOVAL_SECONDS):
-                while await self._listed(sandbox_id, labels):
-                    await asyncio.sleep(_REMOVAL_POLL_SECONDS)
+                while await self._client.lookup(sandbox_id) is not None:
+                    await asyncio.sleep(_POLL_SECONDS)
         except TimeoutError as exc:
             raise SandboxRemovalError(
-                f"sandbox {sandbox_id} was not seen to leave the E2B list within "
-                f"{_REMOVAL_SECONDS:g}s after kill; the workspace was kept. "
-                "Retry teardown by ref.",
+                f"sandbox {sandbox_id} was still known to E2B by id {_REMOVAL_SECONDS:g}s "
+                "after kill; the workspace was kept. Retry teardown by ref.",
                 sandbox_id=sandbox_id,
             ) from exc
-
-    async def _listed(self, sandbox_id: str, labels: Mapping[str, str]) -> bool:
-        return any(entry.sandbox_id == sandbox_id for entry in await self._client.list(labels))
+        except Exception as observation:
+            observation.add_note(f"{sandbox_id} was killed by id; its removal is unconfirmed")
+            raise
+        self._removed.add(sandbox_id)
 
     async def destroy(self, workspace: Workspace) -> TeardownReport:
         return await self.teardown(workspace)
@@ -341,7 +323,26 @@ class E2BWorkspaceProvider:
         ]
 
     async def list_owned(self, labels: Mapping[str, str]) -> list[OwnedWorkspace]:
-        listed = await self._client.list(labels)
+        held = {
+            sandbox_id
+            for sandbox_id, workspace in {**self._workspaces, **self._retained}.items()
+            if not mismatched_labels(workspace.config.labels, labels)
+        }
+        listed: list[SandboxListing] | None = None
+        try:
+            async with asyncio.timeout(_LISTING_SECONDS):
+                while True:
+                    listed = await self._client.list(labels)
+                    shown = {entry.sandbox_id for entry in listed}
+                    if held <= shown and not shown & self._removed:
+                        break
+                    await asyncio.sleep(_POLL_SECONDS)
+        except TimeoutError as exc:
+            if listed is None:
+                raise E2BTransportError(
+                    f"the E2B list did not answer within {_LISTING_SECONDS:g}s"
+                ) from exc
+            # Unsettled past the bound: the last read is reported as E2B gave it.
         # The server filters too; this keeps the contract if it ever does not.
         return [
             OwnedWorkspace(workspace_id=entry.sandbox_id, labels=dict(entry.metadata))
@@ -416,7 +417,7 @@ class E2BWorkspaceProvider:
                     usage=TeardownUsage(),
                 )
 
-        await self._remove(workspace.id, workspace.config.labels)
+        await self._remove(workspace.id)
         self._workspaces.pop(workspace.id, None)
         self._retained.pop(workspace.id, None)
         return TeardownReport(

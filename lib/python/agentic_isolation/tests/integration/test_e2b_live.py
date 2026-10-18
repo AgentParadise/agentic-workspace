@@ -65,6 +65,7 @@ async def live(template: str) -> AsyncIterator[tuple[E2BWorkspaceProvider, Works
         yield provider, workspace
     finally:
         await provider.destroy(workspace)
+        # Bounded: list_owned waits out a list still showing what destroy removed.
         assert await provider.list_owned(run) == []
 
 
@@ -84,8 +85,7 @@ class _NoopKill:
 async def _await_listed(client: SdkE2BClient, run: dict[str, str], sandbox_id: str) -> float:
     """Seconds until `sandbox_id` is in the E2B list; fails past the removal bound.
 
-    E2B's list can omit a sandbox for a moment after its create, and absence
-    from it proves a removal only for a sandbox it has shown.
+    E2B's list can omit a sandbox for a moment after its create; this measures it.
     """
     started = time.monotonic()
     reads = 0
@@ -93,7 +93,7 @@ async def _await_listed(client: SdkE2BClient, run: dict[str, str], sandbox_id: s
         async with asyncio.timeout(e2b_module._REMOVAL_SECONDS):
             while not any(entry.sandbox_id == sandbox_id for entry in await client.list(run)):
                 reads += 1
-                await asyncio.sleep(e2b_module._REMOVAL_POLL_SECONDS)
+                await asyncio.sleep(e2b_module._POLL_SECONDS)
     except TimeoutError:
         pytest.fail(
             f"{sandbox_id} not listed {e2b_module._REMOVAL_SECONDS:g}s after create "
@@ -112,10 +112,10 @@ async def test_negative_control_noop_kill_leaves_a_sandbox_and_fails_cleanup(
     broken = E2BWorkspaceProvider(template, client=_NoopKill(client))  # type: ignore[arg-type]
     workspace = await broken.create(WorkspaceConfig(provider="e2b", labels=run))
     try:
-        # Without this, a sandbox not yet listed would pass as removed.
-        await _await_listed(client, run, workspace.id)
         with pytest.raises(SandboxRemovalError):
             await broken.destroy(workspace)
+        assert await client.lookup(workspace.id) is not None
+        # Bounded: list_owned waits for a sandbox it holds to be listed.
         assert [o.workspace_id for o in await broken.list_owned(run)] == [workspace.id]
     finally:
         await E2BWorkspaceProvider(template, client=client).destroy(workspace)
@@ -181,43 +181,53 @@ async def test_q5_workspace_and_spool_are_writable_by_the_command_user(
         assert probe.success and "ok" in probe.stdout, probe.stdout
 
 
-async def test_a_killed_sandbox_leaves_the_list_within_the_removal_bound(template: str) -> None:
-    """Measures the teardown cause of PR #87: how long E2B lists a killed sandbox.
+async def test_a_killed_sandbox_is_gone_by_id_within_the_removal_bound(template: str) -> None:
+    """Measures the teardown cause of PR #87: how long E2B knows and lists a killed sandbox.
 
-    The sandbox is allocated outside the cleanup fixture, so any failure after
-    the allocation removes it through the provider's own kill-and-confirm path
-    before the failure propagates, and names it if that cannot be confirmed.
+    Removal is confirmed by id (`get_info` not found). The list is then read
+    `_LIST_SAMPLES` times and each read printed, because a list that is not
+    monotonic shows up only across reads. The sandbox is allocated outside the
+    cleanup fixture, so any failure after the allocation removes it through the
+    provider's own kill-and-confirm path, and names it if that cannot be confirmed.
     """
     client = SdkE2BClient()
     run = {"e2b_live.run": uuid.uuid4().hex}
     sandbox_id = await client.create(template=template, metadata=run, lifetime_seconds=300)
     try:
-        # Absence after the kill means nothing for a sandbox the list never showed.
         await _await_listed(client, run, sandbox_id)
         killed = await client.kill(sandbox_id)
         started = time.monotonic()
-        reads_listed = 0
+        lookups = 0
         try:
             async with asyncio.timeout(e2b_module._REMOVAL_SECONDS):
-                while any(entry.sandbox_id == sandbox_id for entry in await client.list(run)):
-                    reads_listed += 1
-                    await asyncio.sleep(e2b_module._REMOVAL_POLL_SECONDS)
+                while await client.lookup(sandbox_id) is not None:
+                    lookups += 1
+                    await asyncio.sleep(e2b_module._POLL_SECONDS)
         except TimeoutError:
             pytest.fail(
-                f"{sandbox_id} not seen gone {e2b_module._REMOVAL_SECONDS:g}s after kill "
-                f"(listed on {reads_listed} read(s))"
+                f"{sandbox_id} still known by id {e2b_module._REMOVAL_SECONDS:g}s after kill "
+                f"(found on {lookups} lookup(s))"
             )
+        gone = time.monotonic() - started
+        listed = []
+        for _ in range(_LIST_SAMPLES):
+            listed.append(any(e.sandbox_id == sandbox_id for e in await client.list(run)))
+            await asyncio.sleep(e2b_module._POLL_SECONDS)
         print(
-            f"kill returned {killed}; {sandbox_id} was still listed on {reads_listed} read(s), "
-            f"for {time.monotonic() - started:.2f}s after the kill"
+            f"kill returned {killed}; {sandbox_id} was found by id on {lookups} lookup(s), "
+            f"gone {gone:.2f}s after the kill; then listed per read: {listed}"
         )
     except BaseException as failure:
         try:
-            await E2BWorkspaceProvider(template, client=client)._remove(sandbox_id, run)
+            await E2BWorkspaceProvider(template, client=client)._remove(sandbox_id)
         except Exception as leak:
             failure.add_note(f"cleanup of {sandbox_id} was not confirmed: {leak!r}")
         raise
     assert killed
+
+
+# List reads printed after a confirmed removal, to show whether the list is monotonic.
+_LIST_SAMPLES = 10
 
 
 async def test_q5_private_ghcr_digest_builds_and_launches(tmp_path: Path) -> None:
@@ -253,6 +263,7 @@ async def test_q5_private_ghcr_digest_builds_and_launches(tmp_path: Path) -> Non
         assert "sha256:" + hashed.stdout.split()[0] == expected
     finally:
         await provider.destroy(workspace)
+        # Bounded: list_owned waits out a list still showing what destroy removed.
         assert await provider.list_owned(run) == []
 
 
@@ -284,4 +295,5 @@ async def test_pause_and_resume_keep_the_spool(template: str) -> None:
         assert got == [("probe", b"kept")]
     finally:
         await provider.destroy(workspace)
+        # Bounded: list_owned waits out a list still showing what destroy removed.
         assert await provider.list_owned(run) == []

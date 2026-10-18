@@ -296,9 +296,7 @@ async def test_docker_refuses_a_marker_overlapping_value_before_launch(
     ops = _ops(docker_env)
     values = _REFUSED["value-contains-marker"]
     with pytest.raises(OperationFailure) as refused:
-        await ops.start(
-            _workspace(), _spec("printf prefixinvented-tokensuffix"), redact=values
-        )
+        await ops.start(_workspace(), _spec("printf prefixinvented-tokensuffix"), redact=values)
     _assert_refused_naming_no_value(refused.value, values)
     assert ops._operations == {}
 

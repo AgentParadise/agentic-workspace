@@ -13,7 +13,12 @@ behaviour it relies on is cited (accessed 2026-10-17):
   `GET /v2/sandboxes` and `get_info` reads `GET /sandboxes/{id}`, raising
   `SandboxNotFoundException` on a 404 (`e2b/sandbox_async/sandbox_api.py` and
   `paginator.py` in e2b==2.52.0). The client filters nothing out of either, so
-  a sandbox the list does not show yet is the list endpoint's lag.
+  a sandbox the list does not show yet, or still shows after its kill, is the
+  list endpoint's lag. `get_info` (`lookup` here) is the per-id existence
+  check the provider confirms a removal with: it sends a request and maps 404
+  to not-found. `kill`'s bool is not one: `_cls_kill` returns True without a
+  request when `config.debug` is set, and True on any 2xx; `connect` resumes a
+  paused sandbox, so reading with it has a side effect.
 - `kill` returns False when the sandbox was not found, and `pause`/`connect`
   resume: https://e2b.dev/docs/sandbox/persistence (a pause can be refused
   with HTTP 503, `ServiceBusyException`, while the sandbox keeps running)

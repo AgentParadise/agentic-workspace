@@ -88,6 +88,13 @@ class FakeE2BClient:
         # `lookup` by id never lags.
         self.unlisted_after_create = 0
         self._unlisted: dict[str, int] = {}
+        # List reads, counted from 1, that omit every sandbox: E2B's list is
+        # not monotonic, so an id can be absent on one read and back on the next.
+        self.dropped_list_reads: set[int] = set()
+        self.list_reads = 0
+        # How many lookups still find a sandbox after its kill.
+        self.found_after_kill = 0
+        self._fading: dict[str, tuple[FakeSandbox, int]] = {}
 
     async def create(
         self, *, template: str, metadata: Mapping[str, str], lifetime_seconds: int
@@ -100,6 +107,7 @@ class FakeE2BClient:
         return sandbox_id
 
     async def list(self, metadata: Mapping[str, str]) -> list[SandboxListing]:
+        self.list_reads += 1
         visible = dict(self.sandboxes)
         for sandbox_id, (box, reads) in list(self._dying.items()):
             visible[sandbox_id] = box
@@ -113,6 +121,8 @@ class FakeE2BClient:
                 del self._unlisted[sandbox_id]
             else:
                 self._unlisted[sandbox_id] = reads - 1
+        if self.list_reads in self.dropped_list_reads:
+            return []
         return [
             SandboxListing(sandbox_id, dict(box.metadata))
             for sandbox_id, box in visible.items()
@@ -121,6 +131,12 @@ class FakeE2BClient:
 
     async def lookup(self, sandbox_id: str) -> SandboxListing | None:
         box = self.sandboxes.get(sandbox_id)
+        if box is None and sandbox_id in self._fading:
+            box, reads = self._fading[sandbox_id]
+            if reads <= 1:
+                del self._fading[sandbox_id]
+            else:
+                self._fading[sandbox_id] = (box, reads - 1)
         return None if box is None else SandboxListing(sandbox_id, dict(box.metadata))
 
     async def kill(self, sandbox_id: str) -> bool:
@@ -130,6 +146,8 @@ class FakeE2BClient:
         box = self.sandboxes.pop(sandbox_id, None)
         if box is not None and self.listed_after_kill:
             self._dying[sandbox_id] = (box, self.listed_after_kill)
+        if box is not None and self.found_after_kill:
+            self._fading[sandbox_id] = (box, self.found_after_kill)
         return box is not None
 
     async def pause(self, sandbox_id: str) -> None:
