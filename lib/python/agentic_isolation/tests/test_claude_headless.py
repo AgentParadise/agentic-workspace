@@ -17,6 +17,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -54,7 +55,7 @@ def _auth_status(
 
 @dataclass
 class _FakeClaude:
-    """Stands in for `subprocess.run` under `ClaudeHeadless`: records each call, never runs `claude`.
+    """Stands in for `subprocess.run` under `ClaudeHeadless`: records calls, never runs `claude`.
 
     `claude auth status` is answered from `auth_stdout` and recorded in `auth_calls`;
     every other call is an answer, recorded in `calls`. `envs` holds each call's `env`.
@@ -405,7 +406,7 @@ class _MessagesHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         self.server.authorizations.append(self.headers.get("authorization"))
-        events = [
+        events: list[dict[str, Any]] = [
             {
                 "type": "message_start",
                 "message": {
