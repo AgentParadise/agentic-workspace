@@ -131,7 +131,6 @@ def test_runs_the_cli_headless_with_the_exact_model() -> None:
     assert argv == [
         "claude",
         "-p",
-        "the prompt",
         "--model",
         MODEL,
         "--system-prompt",
@@ -145,8 +144,20 @@ def test_runs_the_cli_headless_with_the_exact_model() -> None:
         "--no-session-persistence",
         "--setting-sources",
         "user",
+        "--",
+        "the prompt",
     ]
     assert "--bare" not in argv
+
+
+@pytest.mark.parametrize("prompt", ["--help", "-h", "--version", "--model", "-", "--"])
+def test_a_flag_shaped_prompt_is_passed_after_the_end_of_options(prompt: str) -> None:
+    """Without the ``--`` the CLI parses a prompt like ``--help`` as its own option."""
+    fake = _FakeClaude(stdout=_envelope("ok"))
+    _client(fake).complete(model=MODEL, system="s", prompt=prompt)
+    [(argv, _, _)] = fake.calls
+    assert argv[-2:] == ["--", prompt]
+    assert argv.index("--") == len(argv) - 2
 
 
 @pytest.mark.parametrize("model", ["sonnet", "opus", "fable", "default", "sonnet[1m]"])
@@ -392,7 +403,7 @@ def test_the_real_cli_still_takes_every_flag_the_argv_uses() -> None:
         check=True,
     )
     flags = ClaudeHeadless(effort="medium").argv(model=MODEL, system="s", prompt="p")
-    for flag in (a for a in flags if a.startswith("-")):
+    for flag in (a for a in flags if a.startswith("-") and a != "--"):
         assert re.search(rf"(^|[\s,]){re.escape(flag)}\b", done.stdout), flag
     assert "low, medium, high, xhigh, max" in done.stdout
 
@@ -404,6 +415,7 @@ class _MessagesEndpoint(http.server.ThreadingHTTPServer):
     def __init__(self) -> None:
         super().__init__(("127.0.0.1", 0), _MessagesHandler)
         self.authorizations: list[str | None] = []
+        self.requests: list[dict[str, Any]] = []
 
 
 class _MessagesHandler(http.server.BaseHTTPRequestHandler):
@@ -412,6 +424,7 @@ class _MessagesHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         self.server.authorizations.append(self.headers.get("authorization"))
+        self.server.requests.append(body)
         events: list[dict[str, Any]] = [
             {
                 "type": "message_start",
@@ -504,6 +517,49 @@ def test_no_settings_file_routes_the_real_cli_off_the_oauth_token(
             assert client.complete(model=MODEL, system="s", prompt="p") == "ok"
             assert endpoint.authorizations
             assert set(endpoint.authorizations) == {"Bearer synthetic-oauth"}
+    finally:
+        endpoint.shutdown()
+        endpoint.server_close()
+
+
+def _texts(content: str | list[dict[str, Any]]) -> list[str]:
+    if isinstance(content, str):
+        return [content]
+    return [block["text"] for block in content if block["type"] == "text"]
+
+
+@_needs_claude
+@pytest.mark.parametrize(
+    "prompt", ["an ordinary prompt", "--help", "-h", "--version", "--unknown-option"]
+)
+def test_the_real_cli_sends_a_flag_shaped_prompt_as_the_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, prompt: str
+) -> None:
+    """The real CLI, against a local endpoint with synthetic credentials: every request
+    carries the caller's exact model and prompt, which is never read as a CLI option."""
+    for name in list(os.environ):
+        if name.startswith(("ANTHROPIC_", "CLAUDE_CODE_", "CLAUDE_CONFIG_DIR")):
+            monkeypatch.delenv(name)
+    home, project = tmp_path / "home", tmp_path / "project"
+    (home / ".claude").mkdir(parents=True)
+    project.mkdir()
+    endpoint = _MessagesEndpoint()
+    threading.Thread(target=endpoint.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-oauth")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{endpoint.server_port}")
+        monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        monkeypatch.chdir(project)
+        client = ClaudeHeadless(effort="medium", timeout_s=60.0)
+        assert client.complete(model=MODEL, system="--help", prompt=prompt) == "ok"
+        assert endpoint.requests
+        for request in endpoint.requests:
+            assert request["model"] == MODEL
+            assert "--help" in "".join(_texts(request.get("system", [])))
+            user = [m["content"] for m in request["messages"] if m["role"] == "user"]
+            assert prompt in [text for content in user for text in _texts(content)]
     finally:
         endpoint.shutdown()
         endpoint.server_close()

@@ -151,7 +151,6 @@ class ClaudeHeadless:
         return [
             self.executable,
             "-p",
-            prompt,
             "--model",
             model,
             "--system-prompt",
@@ -165,6 +164,8 @@ class ClaudeHeadless:
             "--no-session-persistence",
             "--setting-sources",
             CLAUDE_SETTING_SOURCES,
+            "--",
+            prompt,
         ]
 
     def check_auth(self) -> None:
