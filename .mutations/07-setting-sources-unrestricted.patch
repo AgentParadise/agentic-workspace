@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+index 8b07edf..1a197c8 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+@@ -163,8 +163,6 @@ class ClaudeHeadless:
+             "--tools",
+             "",
+             "--no-session-persistence",
+-            "--setting-sources",
+-            CLAUDE_SETTING_SOURCES,
+         ]
+ 
+     def check_auth(self) -> None:

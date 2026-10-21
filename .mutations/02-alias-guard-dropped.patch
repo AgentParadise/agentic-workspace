@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+index 8b07edf..5b03916 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+@@ -143,7 +143,7 @@ class ClaudeHeadless:
+     executable: str = "claude"
+ 
+     def argv(self, *, model: str, system: str, prompt: str) -> list[str]:
+-        if not model.startswith("claude-"):
++        if False:
+             raise ClaudeHeadlessModelError(
+                 f"claude -p needs an exact model id such as 'claude-sonnet-5-5', not "
+                 f"{model!r}: the CLI resolves an alias to whatever model is latest"

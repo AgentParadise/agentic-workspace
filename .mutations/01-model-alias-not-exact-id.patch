@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+index 8b07edf..e5d3ae8 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+@@ -153,7 +153,7 @@ class ClaudeHeadless:
+             "-p",
+             prompt,
+             "--model",
+-            model,
++            model.split("-")[1],
+             "--system-prompt",
+             system,
+             "--effort",

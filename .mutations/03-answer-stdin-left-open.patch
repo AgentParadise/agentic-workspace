@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+index 8b07edf..42a0abc 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+@@ -179,7 +179,7 @@ class ClaudeHeadless:
+         try:
+             done = self.run(
+                 argv,
+-                stdin=subprocess.DEVNULL,
++                stdin=None,  # type: ignore[arg-type]
+                 capture_output=True,
+                 text=True,
+                 timeout=self.timeout_s,

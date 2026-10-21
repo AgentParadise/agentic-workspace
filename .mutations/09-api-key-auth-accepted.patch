@@ -1,0 +1,12 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+index 8b07edf..ad1deae 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+@@ -241,7 +241,6 @@ class ClaudeHeadless:
+             returncode != 0
+             or not status.logged_in
+             or status.api_provider != "firstParty"
+-            or status.auth_method not in CLAUDE_OAUTH_METHODS
+             or status.api_key_source is not None
+         ):
+             raise ClaudeHeadlessNotOAuthError(

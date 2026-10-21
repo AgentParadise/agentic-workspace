@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+index 8b07edf..a09abbd 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+@@ -251,7 +251,7 @@ class ClaudeHeadless:
+                 "run `claude auth login`, and remove any apiKeyHelper or key from its settings"
+             )
+         if status.auth_method == "oauth_token":
+-            self._require_oauth_token_source(env)
++            pass
+ 
+     def _require_oauth_token_source(self, env: Mapping[str, str]) -> None:
+         """Raise unless an `oauth_token` status comes from `CLAUDE_OAUTH_TOKEN_ENV`.

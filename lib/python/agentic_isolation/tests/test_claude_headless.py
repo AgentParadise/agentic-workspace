@@ -281,6 +281,11 @@ def test_a_settings_bearer_token_cannot_pass_for_oauth(
             "authMethod=api_key",
         ),
         (
+            _FakeClaude(auth_stdout=_auth_status("api_key")),
+            "ClaudeHeadlessNotOAuthError",
+            "authMethod=api_key apiProvider",
+        ),
+        (
             _FakeClaude(auth_stdout=_auth_status("api_key_helper", key_source="apiKeyHelper")),
             "ClaudeHeadlessNotOAuthError",
             "apiKeySource=apiKeyHelper",
@@ -314,6 +319,7 @@ def test_a_settings_bearer_token_cannot_pass_for_oauth(
     ],
     ids=[
         "api-key",
+        "non-oauth-method-without-key-source",
         "api-key-helper",
         "oauth-but-key-source",
         "bedrock",

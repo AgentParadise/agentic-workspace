@@ -1,0 +1,12 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+index 8b07edf..5758996 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+@@ -27,7 +27,6 @@ ClaudeEffort = Literal["low", "medium", "high", "xhigh", "max"]
+ """`claude --effort <level>` values (`claude --help`, CLI 2.1.293)."""
+ 
+ CLAUDE_CREDENTIAL_ENV = (
+-    "ANTHROPIC_API_KEY",
+     "ANTHROPIC_AUTH_TOKEN",
+     "CLAUDE_CODE_USE_BEDROCK",
+     "CLAUDE_CODE_USE_VERTEX",
