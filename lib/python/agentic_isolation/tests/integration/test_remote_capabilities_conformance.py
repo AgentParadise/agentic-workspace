@@ -28,6 +28,7 @@ from typing import Protocol
 import pytest
 
 from agentic_isolation import (
+    E2BWorkspaceProvider,
     SecurityConfig,
     StreamOutcome,
     StreamSession,
@@ -42,6 +43,8 @@ from agentic_isolation import (
 )
 from agentic_isolation.providers.capabilities import TransferRoot
 from agentic_isolation.providers.docker_capabilities import DockerStreamSession
+from agentic_isolation.providers.e2b import E2BStreamSession
+from agentic_isolation.providers.e2b_client import SdkE2BClient, _SdkCommand
 
 pytestmark = [pytest.mark.docker_conformance, pytest.mark.integration]
 
@@ -66,8 +69,8 @@ class ConformanceHarness:
     workspace_config: Callable[[str, dict[str, str]], WorkspaceConfig]
     # Cut the live transport of a running session, as a dropped connection would.
     interrupt_transport: Callable[[StreamSession], None]
-    # Point new sessions at a transport that cannot be reached.
-    break_transport: Callable[[pytest.MonkeyPatch], None]
+    # Point the provider's new sessions at a transport that cannot be reached.
+    break_transport: Callable[[pytest.MonkeyPatch, ConformanceProvider], None]
 
 
 _DOCKER_IMAGE = "python:3.12-slim"
@@ -91,8 +94,32 @@ def _docker_interrupt(session: StreamSession) -> None:
     session._proc.kill()
 
 
-def _docker_break(monkeypatch: pytest.MonkeyPatch) -> None:
+def _docker_break(monkeypatch: pytest.MonkeyPatch, _provider: ConformanceProvider) -> None:
     monkeypatch.setenv("DOCKER_HOST", f"unix:///nonexistent/{uuid.uuid4().hex}.sock")
+
+
+def _e2b_available() -> bool:
+    return bool(os.environ.get("E2B_API_KEY")) and bool(os.environ.get("E2B_TEMPLATE"))
+
+
+def _e2b_interrupt(session: StreamSession) -> None:
+    # The pinned SDK's `AsyncCommandHandle.disconnect` stops the event stream
+    # without killing the process (its docstring, e2b==2.52.0).
+    assert isinstance(session, E2BStreamSession)
+    command = session._command
+    assert isinstance(command, _SdkCommand)
+    asyncio.get_running_loop().create_task(command.disconnect())
+
+
+def _e2b_break(monkeypatch: pytest.MonkeyPatch, provider: ConformanceProvider) -> None:
+    # The adapter caches each sandbox with its command channel already built,
+    # so the cache is emptied and the reconnect goes to a domain that does
+    # not resolve: the real SDK connect path fails, not a stand-in.
+    assert isinstance(provider, E2BWorkspaceProvider)
+    client = provider._client
+    assert isinstance(client, SdkE2BClient)
+    monkeypatch.setattr(client, "_sandboxes", {})
+    monkeypatch.setenv("E2B_DOMAIN", f"nonexistent-{uuid.uuid4().hex}.invalid")
 
 
 _HARNESSES: dict[str, ConformanceHarness] = {
@@ -105,6 +132,17 @@ _HARNESSES: dict[str, ConformanceHarness] = {
         ),
         interrupt_transport=_docker_interrupt,
         break_transport=_docker_break,
+    ),
+    # syntropic137/syntropic137#1915. Needs E2B_API_KEY and E2B_TEMPLATE (a
+    # template built by `build_template`). Without them every case reports
+    # "NOT RUN", and REQUIRE_E2B_LIVE=1 turns that into a failure.
+    "e2b": ConformanceHarness(
+        available=_e2b_available,
+        required=lambda: os.environ.get("REQUIRE_E2B_LIVE") == "1",
+        new_provider=lambda: E2BWorkspaceProvider(os.environ["E2B_TEMPLATE"]),
+        workspace_config=lambda name, labels: WorkspaceConfig(provider=name, labels=labels),
+        interrupt_transport=_e2b_interrupt,
+        break_transport=_e2b_break,
     ),
 }
 
@@ -120,7 +158,7 @@ def harness(request: pytest.FixtureRequest) -> ConformanceHarness:
             pytest.fail(
                 f"{request.param} conformance is required here but its backend is not available"
             )
-        pytest.skip(f"{request.param} backend not available")
+        pytest.skip(f"NOT RUN: {request.param} backend not available")
     return chosen
 
 
@@ -138,15 +176,30 @@ async def make_workspace(
     harness: ConformanceHarness, provider: ConformanceProvider
 ) -> AsyncIterator[MakeWorkspace]:
     created: list[Workspace] = []
+    # Every workspace this test makes carries the run label, so cleanup can
+    # be checked against the provider's own list (#1915: nothing left behind).
+    run = {"conformance.run": uuid.uuid4().hex}
 
     async def make(labels: dict[str, str]) -> Workspace:
-        workspace = await provider.create(harness.workspace_config(provider.name, labels))
+        workspace = await provider.create(
+            harness.workspace_config(provider.name, {**labels, **run})
+        )
         created.append(workspace)
         return workspace
 
     yield make
+    # Destroy every workspace even when one fails, so one error leaks nothing.
+    failures: list[Exception] = []
     for workspace in created:
-        await provider.destroy(workspace)
+        try:
+            await provider.destroy(workspace)
+        except Exception as exc:
+            failures.append(exc)
+    for other in failures[1:]:
+        failures[0].add_note(f"destroying another workspace also failed: {other!r}")
+    if failures:
+        raise failures[0]
+    assert await provider.list_owned(run) == [], "workspaces were left in the provider list"
 
 
 async def _run(session: StreamSession) -> tuple[list[str], StreamOutcome]:
@@ -240,7 +293,7 @@ async def test_stream_unreachable_transport_is_never_completion(
     workspace = await make_workspace({})
 
     with monkeypatch.context() as patched:
-        harness.break_transport(patched)
+        harness.break_transport(patched, provider)
         session = await provider.start_stream(workspace, ["echo", "should-not-run"])
         lines, outcome = await asyncio.wait_for(_run(session), timeout=30)
 
