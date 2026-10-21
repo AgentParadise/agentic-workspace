@@ -1,7 +1,8 @@
 """Claude harness package. See issue #792.
 
 Bundles the transcript extraction know-how for the `claude` harness
-(Claude Code CLI). See `agentic_isolation.harnesses` for the shared
+(Claude Code CLI), and `ClaudeHeadless`, a one-shot `claude -p` answer on
+the CLI's OAuth login. See `agentic_isolation.harnesses` for the shared
 contract (`HarnessPlugin`, `TranscriptSource`, `ExecFn`) this package
 conforms to.
 """
@@ -11,6 +12,7 @@ from __future__ import annotations
 from agentic_isolation.harnesses import AgentName, ExecFn, TranscriptSource, register_harness
 from agentic_isolation.harnesses.claude.conversation import ClaudeConversationReader
 from agentic_isolation.harnesses.claude.evidence import ClaudeNativeEvidenceReader
+from agentic_isolation.harnesses.claude.headless import ClaudeHeadless, ClaudeHeadlessError
 from agentic_isolation.harnesses.claude.transcripts import ClaudeTranscriptSource
 
 
@@ -37,4 +39,4 @@ class ClaudeHarness:
 
 register_harness(ClaudeHarness())
 
-__all__ = ["ClaudeHarness"]
+__all__ = ["ClaudeHarness", "ClaudeHeadless", "ClaudeHeadlessError"]
