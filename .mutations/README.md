@@ -18,5 +18,7 @@ Named test file: `lib/python/agentic_isolation/tests/test_claude_headless.py`.
 | 10-model-alias-not-exact-id-after-end-of-options | same attack as 01, written when the prompt moved after `--` | `test_runs_the_cli_headless_with_the_exact_model` |
 | 11-setting-sources-unrestricted-after-end-of-options | same attack as 07, written when the prompt moved after `--` | `test_runs_the_cli_headless_with_the_exact_model`, real-CLI `test_no_settings_file_routes_the_real_cli_off_the_oauth_token[project,local]` |
 | 12-prompt-before-end-of-options | the `--` is dropped, so a prompt such as `--help` is parsed as a CLI option | `test_runs_the_cli_headless_with_the_exact_model`, `test_a_flag_shaped_prompt_is_passed_after_the_end_of_options`, real-CLI `test_the_real_cli_sends_a_flag_shaped_prompt_as_the_prompt` |
+| 13-custom-headers-from-settings-sent | `--settings` no longer empties ANTHROPIC_CUSTOM_HEADERS, so a user settings ``env`` header replaces the OAuth bearer or adds `x-api-key` | `test_runs_the_cli_headless_with_the_exact_model`, real-CLI `test_no_custom_header_carries_another_credential_from_the_real_cli[user-*]` |
+| 14-custom-headers-inherited | ANTHROPIC_CUSTOM_HEADERS from the parent reaches the CLI | `test_no_credential_in_the_parent_environment_reaches_the_cli` |
 
 Do not delete before the trusted mutation-evidence run posts PASS for the head SHA (PC-204).

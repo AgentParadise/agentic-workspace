@@ -1,0 +1,12 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+index 0ea3f44..04f5744 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+@@ -33,7 +33,6 @@ CLAUDE_CREDENTIAL_ENV = (
+     "CLAUDE_CODE_USE_BEDROCK",
+     "CLAUDE_CODE_USE_VERTEX",
+     "CLAUDE_CODE_USE_FOUNDRY",
+-    "ANTHROPIC_CUSTOM_HEADERS",
+ )
+ """Variables that would put a call on a key, a bearer token or a cloud provider, ahead
+ of the OAuth login (`claude -p` prefers an API key whenever one is set), or add an

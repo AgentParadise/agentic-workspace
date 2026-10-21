@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+index 0ea3f44..fe2cbde 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/headless.py
+@@ -167,8 +167,6 @@ class ClaudeHeadless:
+             self.effort,
+             "--output-format",
+             "json",
+-            "--settings",
+-            CLAUDE_FLAG_SETTINGS,
+             "--tools",
+             "",
+             "--no-session-persistence",

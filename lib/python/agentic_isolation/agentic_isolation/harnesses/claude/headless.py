@@ -12,6 +12,7 @@ fields of `claude auth status --json` before raising it.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from collections.abc import Mapping
@@ -32,10 +33,11 @@ CLAUDE_CREDENTIAL_ENV = (
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_CUSTOM_HEADERS",
 )
 """Variables that would put a call on a key, a bearer token or a cloud provider, ahead
-of the OAuth login (`claude -p` prefers an API key whenever one is set). Never passed
-to the CLI."""
+of the OAuth login (`claude -p` prefers an API key whenever one is set), or add an
+``Authorization`` or ``x-api-key`` header beside it. Never passed to the CLI."""
 
 CLAUDE_OAUTH_METHODS = frozenset({"claude.ai", "oauth_token"})
 """`authMethod` values of `claude auth status` that can be the OAuth login. `claude.ai`
@@ -50,6 +52,11 @@ CLAUDE_SETTING_SOURCES = "user"
 user settings but not project or local ones, which `claude -p` loads by default from
 its working directory: a project's ``env`` ANTHROPIC_AUTH_TOKEN would reach the answer
 unseen by the OAuth check. Managed settings apply to both regardless."""
+
+CLAUDE_FLAG_SETTINGS = json.dumps({"env": {"ANTHROPIC_CUSTOM_HEADERS": ""}})
+"""`claude -p --settings` for an answer, which outrank user settings. `claude auth status`
+does not report custom headers, so a user settings ``env`` ANTHROPIC_CUSTOM_HEADERS could
+replace the OAuth bearer or add an API key unseen by the check: the answer sends none."""
 
 CLAUDE_HEADLESS_TIMEOUT_S = 300.0
 """Default per-call ceiling on one CLI run, after which the call is an error."""
@@ -130,7 +137,8 @@ class ClaudeHeadless:
     OAuth method (`CLAUDE_OAUTH_METHODS`) and no API key source. That catches what the
     environment alone cannot, such as an ``apiKeyHelper`` or ``env`` key in a settings
     file. The answer loads only the settings that status reads (`CLAUDE_SETTING_SOURCES`),
-    so no settings file can change the credential after the check. Never add ``--bare``,
+    and sends no custom headers (`CLAUDE_FLAG_SETTINGS`), so no settings file can change
+    the credential after the check. Never add ``--bare``,
     which skips that login for an API key. Each call is one non-interactive session with
     stdin closed, tools disabled, nothing persisted, the exact model id given and
     `effort`. The reply is the ``result`` of the JSON envelope. Every way that yields no
@@ -159,6 +167,8 @@ class ClaudeHeadless:
             self.effort,
             "--output-format",
             "json",
+            "--settings",
+            CLAUDE_FLAG_SETTINGS,
             "--tools",
             "",
             "--no-session-persistence",
@@ -288,6 +298,7 @@ def _child_env() -> dict[str, str]:
 __all__ = [
     "CLAUDE_CLI_VERSION",
     "CLAUDE_CREDENTIAL_ENV",
+    "CLAUDE_FLAG_SETTINGS",
     "CLAUDE_HEADLESS_TIMEOUT_S",
     "CLAUDE_OAUTH_METHODS",
     "CLAUDE_OAUTH_TOKEN_ENV",

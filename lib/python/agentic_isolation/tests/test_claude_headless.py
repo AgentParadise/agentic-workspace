@@ -139,6 +139,8 @@ def test_runs_the_cli_headless_with_the_exact_model() -> None:
         "high",
         "--output-format",
         "json",
+        "--settings",
+        '{"env": {"ANTHROPIC_CUSTOM_HEADERS": ""}}',
         "--tools",
         "",
         "--no-session-persistence",
@@ -181,20 +183,22 @@ def test_no_credential_in_the_parent_environment_reaches_the_cli(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`claude -p` prefers an exported key to the OAuth login, so the child never sees one."""
-    for name in CLAUDE_CREDENTIAL_ENV:
+    credentials = {
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "ANTHROPIC_CUSTOM_HEADERS",
+    }
+    for name in credentials | set(CLAUDE_CREDENTIAL_ENV):
         monkeypatch.setenv(name, "synthetic-not-a-credential")
     monkeypatch.setenv("HOME", "/home/u")
     fake = _FakeClaude(stdout=_envelope("ok"))
     _client(fake).complete(model=MODEL, system="s", prompt="p")
     assert len(fake.envs) == 2 and len(fake.auth_calls) == 1 and len(fake.calls) == 1
     for env in fake.envs:
-        assert not set(env) & {
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_USE_VERTEX",
-            "CLAUDE_CODE_USE_FOUNDRY",
-        }
+        assert not set(env) & credentials
         # The rest of the environment, the OAuth login's included, is kept.
         assert env["HOME"] == "/home/u" and env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-oauth"
 
@@ -415,6 +419,7 @@ class _MessagesEndpoint(http.server.ThreadingHTTPServer):
     def __init__(self) -> None:
         super().__init__(("127.0.0.1", 0), _MessagesHandler)
         self.authorizations: list[str | None] = []
+        self.credentials: list[dict[str, str]] = []
         self.requests: list[dict[str, Any]] = []
 
 
@@ -424,6 +429,13 @@ class _MessagesHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         self.server.authorizations.append(self.headers.get("authorization"))
+        self.server.credentials.append(
+            {
+                k.lower(): v
+                for k, v in self.headers.items()
+                if k.lower() in ("authorization", "x-api-key", "proxy-authorization")
+            }
+        )
         self.server.requests.append(body)
         events: list[dict[str, Any]] = [
             {
@@ -517,6 +529,62 @@ def test_no_settings_file_routes_the_real_cli_off_the_oauth_token(
             assert client.complete(model=MODEL, system="s", prompt="p") == "ok"
             assert endpoint.authorizations
             assert set(endpoint.authorizations) == {"Bearer synthetic-oauth"}
+    finally:
+        endpoint.shutdown()
+        endpoint.server_close()
+
+
+@_needs_claude
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Authorization: Bearer synthetic-other-token",
+        "authorization: Bearer synthetic-other-token",
+        "x-api-key: synthetic-api-key",
+        "X-Api-Key: synthetic-api-key",
+    ],
+)
+@pytest.mark.parametrize(
+    "source",
+    [
+        "parent",
+        "home/.claude/settings.json",
+        "project/.claude/settings.json",
+        "project/.claude/settings.local.json",
+    ],
+    ids=["parent", "user", "project", "local"],
+)
+def test_no_custom_header_carries_another_credential_from_the_real_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, header: str, source: str
+) -> None:
+    """The real CLI, against a local endpoint with synthetic credentials: an
+    ANTHROPIC_CUSTOM_HEADERS from the parent or any settings ``env`` never replaces the
+    OAuth bearer or adds a key. `claude auth status` does not report custom headers, so
+    only what the answer is run with can close this."""
+    for name in list(os.environ):
+        if name.startswith(("ANTHROPIC_", "CLAUDE_CODE_", "CLAUDE_CONFIG_DIR")):
+            monkeypatch.delenv(name)
+    home, project = tmp_path / "home", tmp_path / "project"
+    (home / ".claude").mkdir(parents=True)
+    (project / ".claude").mkdir(parents=True)
+    if source == "parent":
+        monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", header)
+    else:
+        (tmp_path / source).write_text(json.dumps({"env": {"ANTHROPIC_CUSTOM_HEADERS": header}}))
+    endpoint = _MessagesEndpoint()
+    threading.Thread(target=endpoint.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-oauth")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{endpoint.server_port}")
+        monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        monkeypatch.chdir(project)
+        client = ClaudeHeadless(effort="medium", timeout_s=60.0)
+        assert client.complete(model=MODEL, system="s", prompt="p") == "ok"
+        assert endpoint.credentials
+        for credential in endpoint.credentials:
+            assert credential == {"authorization": "Bearer synthetic-oauth"}
     finally:
         endpoint.shutdown()
         endpoint.server_close()
