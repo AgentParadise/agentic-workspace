@@ -5,8 +5,9 @@ f, g, h, i, j, k, m, unknown ref, run_to_completion), driven only through the
 `SupportsOperations` surface of each provider. Docker runs through the stand-in
 `docker` of `test_docker_operations`; its Docker-only checks (client argv,
 daemon presence, namespaces) stay there. E2B runs over `FakeE2BClient` in its
-executing mode, whose every behaviour is cited from the SDK in `e2b_fake.py`. Local-only checks (the W-6.2 opt-in
-guard, the pgid guard, escaped descendants, destroy) follow the suite.
+executing mode, whose every behaviour is cited from the SDK in `e2b_fake.py`.
+Local-only checks (the W-6.2 opt-in guard, the pgid guard, escaped
+descendants, destroy) follow the suite.
 
 Cancel tests spawn process groups: run locally as `setsid -w uv run pytest`.
 Each test is bounded by `asyncio.timeout` instead of a pytest-timeout plugin.
