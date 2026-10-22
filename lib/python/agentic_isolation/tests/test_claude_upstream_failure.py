@@ -147,6 +147,76 @@ def test_syntropic137_labels_with_a_status_are_placed(
     assert classify_upstream_failure(reason, observed_at=_SEEN) == UpstreamFailure(kind)
 
 
+@pytest.mark.parametrize(
+    ("reason", "kind"),
+    [
+        # Syntropic137's `_extract_error_reason` when the API message equals the label.
+        ("API overloaded", UpstreamFailureKind.CAPACITY),
+        ("Rate limited", UpstreamFailureKind.RATE_LIMITED),
+        ("Authentication failed", UpstreamFailureKind.AUTH),
+        ("Permission denied", UpstreamFailureKind.AUTH),
+        # ... and when the API message differs from it.
+        ("API overloaded: Overloaded", UpstreamFailureKind.CAPACITY),
+        (
+            "Rate limited: Number of requests has exceeded your limit",
+            UpstreamFailureKind.RATE_LIMITED,
+        ),
+        ("Authentication failed: invalid x-api-key", UpstreamFailureKind.AUTH),
+        ("Permission denied: access denied", UpstreamFailureKind.AUTH),
+    ],
+)
+def test_syntropic137_labels_without_a_status_are_placed(
+    reason: str, kind: UpstreamFailureKind
+) -> None:
+    assert classify_upstream_failure(reason, observed_at=_SEEN) == UpstreamFailure(kind)
+
+
+def test_quota_after_the_rate_limited_label_is_quota_not_rate_limited() -> None:
+    # The weekly-limit sentence as a rate_limit_error's message, after
+    # Syntropic137's `_extract_error_reason` has replaced the body with its label.
+    reason = "Rate limited: You've hit your weekly limit · resets Oct 23, 3pm (UTC)"
+    assert classify_upstream_failure(reason, observed_at=_SEEN) == UpstreamFailure(
+        UpstreamFailureKind.QUOTA, datetime(2026, 10, 23, 15, tzinfo=UTC)
+    )
+
+
+@pytest.mark.parametrize(
+    ("error_type", "kind"),
+    [
+        ("overloaded_error", UpstreamFailureKind.CAPACITY),
+        ("rate_limit_error", UpstreamFailureKind.RATE_LIMITED),
+        ("authentication_error", UpstreamFailureKind.AUTH),
+        ("permission_error", UpstreamFailureKind.AUTH),
+    ],
+)
+def test_bare_structured_error_is_placed_by_its_type(
+    error_type: str, kind: UpstreamFailureKind
+) -> None:
+    # No HTTP status anywhere and a message no label matches: only `error.type` places it.
+    reason = json.dumps(
+        {"type": "error", "error": {"type": error_type, "message": "upstream said no"}}
+    )
+    assert classify_upstream_failure(reason, observed_at=_SEEN) == UpstreamFailure(kind)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "Invalid request: prompt is too long",
+        "API internal error",
+        "Resource not found (HTTP 404)",
+        "The agent wrote: Rate limited",
+        "Rate limitedness: unclear",
+        "rate limited",
+        '{"type":"error","error":{"type":"api_error","message":"Internal server error"}}',
+    ],
+)
+def test_other_labels_and_quoted_labels_are_unknown(reason: str) -> None:
+    assert classify_upstream_failure(reason, observed_at=_SEEN) == UpstreamFailure(
+        UpstreamFailureKind.UNKNOWN
+    )
+
+
 def test_naive_observed_at_is_refused() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         classify_upstream_failure("Connection refused", observed_at=datetime(2026, 10, 13))

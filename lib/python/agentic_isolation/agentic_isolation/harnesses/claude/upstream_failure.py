@@ -3,20 +3,27 @@
 Input is the text of the CLI's ``is_error`` ``result`` event, as the CLI
 wrote it: plain prose such as the quota sentence, or an API error such as
 ``API Error: 529 {"type":"error","error":{"type":"overloaded_error",...}}``.
-Syntropic137's shortened label for the same fault (``API overloaded (HTTP
-529)``) is also understood through its HTTP status, but only the raw text
-keeps a quota sentence the API sent inside a 429 body, so pass the raw text.
+Syntropic137's reason for the same fault (``_extract_error_reason``) is also
+understood: its label for the error type, alone (``API overloaded``), with
+the status (``API overloaded (HTTP 529)``), or with the API's own message
+(``Authentication failed: invalid x-api-key``). That reason drops the
+message whenever a status is present, so only the raw text keeps a quota
+sentence the API sent inside an ``API Error: 429`` body; pass the raw text
+when there is one.
 
 Recognised, most specific first:
 
-1. The weekly-limit sentence, alone or as an API error's message. Seen live
+1. The weekly-limit sentence, alone or as an API error's message (in a JSON
+   body, or after Syntropic137's label: ``Rate limited: You've hit ...``). Seen live
    twice: ``You've hit your weekly limit · resets Oct 15, 8am (UTC)``. QUOTA,
    with the reset placed in time (see `_reset_after`). Claude's other
    allowances (the 5-hour session limit, per-model weekly limits) have no
    recorded text yet, so they read as UNKNOWN rather than as a guessed
    spelling. Add each here with a fixture once it is seen.
 2. The API error ``error.type`` in an embedded JSON body.
-3. The HTTP status, from ``API Error: <status>`` or ``(HTTP <status>)``.
+3. Syntropic137's label for the error type, as the whole reason or before
+   ``(HTTP <status>)`` or ``: <message>``.
+4. The HTTP status, from ``API Error: <status>`` or ``(HTTP <status>)``.
 
 Anything else non-blank is UNKNOWN.
 """
@@ -47,6 +54,22 @@ _HTTP_STATUSES: dict[str, UpstreamFailureKind] = {
     "401": _KIND.AUTH,
     "403": _KIND.AUTH,
 }
+
+#: Syntropic137's label for each of those error types (``API_ERROR_LABELS`` in
+#: its EventStreamProcessor), which its reason carries in place of the body.
+_LABELS: dict[str, UpstreamFailureKind] = {
+    "API overloaded": _KIND.CAPACITY,
+    "Rate limited": _KIND.RATE_LIMITED,
+    "Authentication failed": _KIND.AUTH,
+    "Permission denied": _KIND.AUTH,
+}
+
+#: A label as the whole reason, optionally followed by the status or by the
+#: API's message. Anchored at both ends, so a label quoted inside other text
+#: is not read as one.
+_LABELLED = re.compile(
+    r"\A(?P<label>[A-Z][A-Za-z ]*?)(?: \(HTTP \d{3}\))?(?:: (?P<message>.*))?\Z", re.DOTALL
+)
 
 _HTTP_STATUS = re.compile(r"API Error: (\d{3})\b|\(HTTP (\d{3})\)")
 
@@ -79,11 +102,18 @@ def classify_upstream_failure(
     if not text:
         return None
     error = _api_error(text)
-    message = error.get("message") if error else None
-    for sentence in (text, message):
+    labelled = _LABELLED.match(text)
+    label = labelled["label"] if labelled and labelled["label"] in _LABELS else None
+    for sentence in (
+        text,
+        error.get("message") if error else None,
+        labelled["message"] if label and labelled else None,
+    ):
         if isinstance(sentence, str) and _WEEKLY_LIMIT.match(sentence.strip()):
             return UpstreamFailure(_KIND.QUOTA, _reset_after(sentence, observed_at))
     kind = _ERROR_TYPES.get(str(error.get("type"))) if error else None
+    if kind is None and label is not None:
+        kind = _LABELS[label]
     if kind is None:
         status = _HTTP_STATUS.search(text)
         kind = _HTTP_STATUSES.get(status.group(1) or status.group(2)) if status else None
