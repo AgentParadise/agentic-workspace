@@ -34,9 +34,24 @@ from agentic_isolation.providers.e2b_client import (
     E2BTransportError,
     SandboxListing,
 )
+from agentic_isolation.providers.e2b_operations import OWNER_VARIABLE
 
 # A sandbox root at the start of a path: not `/workspaces`, not `a/workspace`.
 _SANDBOX_ROOT = re.compile(r"(?<![\w./-])(/workspace|/spool)(?![\w.-])")
+
+
+def _kill_sandbox_processes(process: asyncio.subprocess.Process, owners: tuple[str, ...]) -> None:
+    """SIGKILL what a command of a killed sandbox left running on this host.
+
+    Its session, and anything carrying its owner token: the stand-in for the
+    VM going, which takes every process with it.
+    """
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
+    for environ in Path("/proc").glob("[0-9]*/environ"):
+        with contextlib.suppress(OSError):
+            if any(owner.encode() in environ.read_bytes().split(b"\0") for owner in owners):
+                os.kill(int(environ.parent.name), signal.SIGKILL)
 
 
 @dataclass
@@ -69,7 +84,7 @@ class FakeCommand:
 
     async def wait(self) -> CommandExit:
         await self._finished.wait()
-        if self.killed:
+        if self.killed and self._run.exit.end == "exited":
             return CommandExit(end="exited", exit_code=137)
         return self._run.exit
 
@@ -79,6 +94,11 @@ class FakeCommand:
         self.killed = True
         self._finished.set()
         return True
+
+    def lose(self) -> None:
+        """The sandbox died under it: the stream ends with no end event."""
+        self._run.exit = CommandExit(end="disconnected", detail="sandbox killed")
+        self._finished.set()
 
 
 class ExecutedCommand:
@@ -143,6 +163,10 @@ class FakeE2BClient:
         # The stdin each start was given, in call order.
         self.stdins: list[bytes | None] = []
         self.executed: list[ExecutedCommand] = []
+        self._command_sandbox: dict[int, str] = {}
+        self._executed_sandbox: list[tuple[asyncio.subprocess.Process, str]] = []
+        # Owner tokens (`OWNER_VARIABLE`) each executed command carried, by pid.
+        self.executed_tokens: dict[int, tuple[str, ...]] = {}
         self.kill_is_noop = False
         self.command_kill_works = True
         self.pause_refused = False
@@ -212,6 +236,13 @@ class FakeE2BClient:
         if self.kill_is_noop:
             return True
         box = self.sandboxes.pop(sandbox_id, None)
+        # The sandbox's VM goes, and every process in it.
+        for pid, owner in self._command_sandbox.items():
+            if owner == sandbox_id:
+                self.commands[pid].lose()
+        for process, owner in self._executed_sandbox:
+            if owner == sandbox_id:
+                _kill_sandbox_processes(process, self.executed_tokens.get(process.pid, ()))
         if box is not None and self.listed_after_kill:
             self._dying[sandbox_id] = (box, self.listed_after_kill)
         if box is not None and self.found_after_kill:
@@ -239,10 +270,16 @@ class FakeE2BClient:
         self.users.append(user)
         self.stdins.append(stdin)
         if self.executing_root is not None:
-            return await self._execute(command, cwd=cwd, env=env, stdin=stdin)
+            made_here = await self._execute(command, cwd=cwd, env=env, stdin=stdin)
+            self._executed_sandbox.append((made_here._process, sandbox_id))
+            self.executed_tokens[made_here.pid] = tuple(
+                f"{name}={value}" for name, value in env.items() if name == OWNER_VARIABLE
+            )
+            return made_here
         pid = len(self.commands) + 1
         made = FakeCommand(pid, self.responder(command), kill_works=self.command_kill_works)
         self.commands[pid] = made
+        self._command_sandbox[pid] = sandbox_id
         return made
 
     async def _execute(

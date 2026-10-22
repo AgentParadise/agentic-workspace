@@ -29,8 +29,11 @@ Differences from Docker, and why:
   (`AsyncCommandHandle`'s incremental decoder in e2b==2.52.0), so bytes that
   are not UTF-8 arrive replaced. The descriptor therefore publishes
   `continuity_detected`, not `exact`.
-- There is no container to stop when a group will not die: an unconfirmed
-  termination raises `provider_unavailable` and the operation settles
+- A descendant that leaves the group is found by `OWNER_VARIABLE` in its
+  environ, as `LocalOperations` does, where Docker walks parent links.
+- Where Docker stops the container when the operation will not die, this
+  kills the sandbox (`metadata["cancel_escalation"]`). A kill that fails or
+  is not confirmed raises `provider_unavailable` and the operation settles
   `failed`, with the reason in `metadata["cancel_signal_failure"]`.
 - Records live as long as the workspace; `forget_workspace` drops them at
   teardown. There is no reattach, as for Docker.
@@ -41,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import posixpath
+import secrets as secrets_module
 import shlex
 import signal
 from collections.abc import Collection
@@ -82,18 +86,28 @@ _OUTER = (
 # Line one is the group's pid, then the marker line if one was given, then the
 # workload replaces this shell.
 _INNER = 'echo "$$"; [ -n "$1" ] && printf "%s\\n" "$1"; shift; exec "$@"'
-# TERM group $1, wait up to $2 tenths of a second for every non-zombie member
-# to go, then KILL and wait up to 2s. Exits 0 only once none is left, 2 for a
-# group it refuses to signal. Builtins and /proc only: slim images ship no `ps`.
+# Every process started for an operation inherits this variable, set to the
+# operation's token, so a descendant that leaves the group (`setsid`) or loses
+# its parent is still found by its own /proc environ.
+OWNER_VARIABLE = "AGENTIC_E2B_OPERATION"
+# Members of operation $2 (group $1): every non-zombie in the group, and every
+# process whose environ carries `$OWNER_VARIABLE=$2`. TERM each of them, wait
+# up to $3 tenths of a second for all to go, then KILL and wait up to 2s. Exits
+# 0 only once none is left, 1 listing the survivors, 2 for a group it refuses
+# to signal. /proc, `cat` and `grep` only: slim images ship no `ps`.
 _TERMINATE = (
-    'group=$1; grace=$2; [ "$group" -gt 1 ] 2>/dev/null || exit 2; '
-    "alive() { for s in /proc/[0-9]*/stat; do "
+    'group=$1; owner=$2; grace=$3; [ "$group" -gt 1 ] 2>/dev/null || exit 2; '
+    "members() { for s in /proc/[0-9]*/stat; do "
     'st=$(cat "$s" 2>/dev/null) || continue; set -- ${st##*) }; '
-    '[ "$1" != Z ] && [ "$3" = "$group" ] && return 0; done; return 1; }; '
-    'settle() { n=$1; while alive; do [ "$n" -le 0 ] && return 1; '
+    '[ "$1" != Z ] && [ "$3" = "$group" ] && { p=${s#/proc/}; echo "${p%/stat}"; }; done; '
+    'for e in $(grep -lzxF "$owner" /proc/[0-9]*/environ 2>/dev/null); do '
+    'p=${e#/proc/}; echo "${p%/environ}"; done; }; '
+    'signal() { for p in $(members); do kill -s "$1" "$p" 2>/dev/null; done; '
+    'kill -s "$1" -- "-$group" 2>/dev/null; }; '
+    'settle() { n=$1; while [ -n "$(members)" ]; do [ "$n" -le 0 ] && return 1; '
     "sleep 0.1; n=$((n-1)); done; return 0; }; "
-    'kill -s TERM -- "-$group" 2>/dev/null; settle "$grace" && exit 0; '
-    'kill -s KILL -- "-$group" 2>/dev/null; settle 20'
+    'signal TERM; settle "$grace" && exit 0; '
+    "signal KILL; settle 20 && exit 0; echo survivors $(members); exit 1"
 )
 # How long a termination command, or a command's end after one, may take.
 _CONTROL_SECONDS = 30.0
@@ -117,6 +131,8 @@ class _Operation:
     sandbox_id: str
     spool: OperationSpool
     started_at: str
+    # `OWNER_VARIABLE`'s value for this operation, unguessable by other workloads.
+    token: str = field(default_factory=lambda: secrets_module.token_hex(16))
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     leader_known: asyncio.Event = field(default_factory=asyncio.Event)
     # The session leader's pid, which is the operation's process group.
@@ -132,6 +148,9 @@ class _Operation:
     # Held by a termination and by settlement, so a cancel decides its outcome first.
     stopping: asyncio.Lock = field(default_factory=asyncio.Lock)
     signal_failure: str | None = None
+    # The group would not die, so the sandbox was killed; `stop_failed` if that failed too.
+    escalated: bool = False
+    stop_failed: bool = False
     collector: asyncio.Task[None] | None = None
 
     def note(self, failure: str) -> None:
@@ -269,7 +288,12 @@ class E2BOperations:
             workspace.id,
             shlex.join(["sh", "-c", _OUTER, "aw-operation", _INNER, *spec.argv]),
             cwd=posixpath.normpath(posixpath.join("/workspace", spec.working_directory)),
-            env={**workspace.config.checked_environment(), **spec.environment, **secrets},
+            env={
+                **workspace.config.checked_environment(),
+                **spec.environment,
+                **secrets,
+                OWNER_VARIABLE: operation.token,
+            },
             timeout=None,
             user=self._run_as,
             stdin=f"{argv0}\n{line}\n".encode(),
@@ -297,7 +321,7 @@ class E2BOperations:
                 operation.timed_out = True
                 async with operation.stopping:
                     try:
-                        await self._terminate(operation, grace_seconds=1.0)
+                        await self._stop(operation, grace_seconds=1.0)
                     except OperationFailure as e:
                         operation.note(e.error.message)
                 done, _ = await asyncio.wait({waiting}, timeout=_CONTROL_SECONDS)
@@ -371,6 +395,10 @@ class E2BOperations:
     async def status(self, ref: OperationRef) -> OperationStatus:
         operation = self._lookup(ref)
         metadata = dict(operation.spec.metadata)
+        if operation.escalated:
+            metadata["cancel_escalation"] = (
+                "sandbox_kill_failed" if operation.stop_failed else "sandbox_killed"
+            )
         if operation.signal_failure is not None:
             metadata["cancel_signal_failure"] = operation.signal_failure
         if operation.state not in TERMINAL_STATES:
@@ -423,7 +451,7 @@ class E2BOperations:
                     return await self.status(ref)
                 operation.cancel_requested = True
                 try:
-                    await self._terminate(operation, grace_seconds=grace_seconds)
+                    await self._stop(operation, grace_seconds=grace_seconds)
                 except OperationFailure as e:
                     operation.note(e.error.message)
                     raise
@@ -434,6 +462,43 @@ class E2BOperations:
             if operation.collector is not None:
                 await operation.collector
         return await self.status(ref)
+
+    async def _stop(self, operation: _Operation, *, grace_seconds: float) -> None:
+        """Terminate the operation in the sandbox; failing that, kill the sandbox.
+
+        As Docker stops the container when its group will not die, the
+        escalation ends every process of the workspace. A kill that fails, or
+        a sandbox still found after it, raises provider_unavailable: the
+        operation may still be running.
+        """
+        try:
+            await self._terminate(operation, grace_seconds=grace_seconds)
+            return
+        except OperationFailure as e:
+            operation.note(e.error.message)
+        operation.escalated = True
+        try:
+            await self._client.kill(operation.sandbox_id)
+            deadline = asyncio.get_running_loop().time() + _CONTROL_SECONDS
+            while await self._client.lookup(operation.sandbox_id) is not None:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise _error(
+                        "provider_unavailable",
+                        f"sandbox {operation.sandbox_id} was killed but is still found "
+                        f"{_CONTROL_SECONDS:g}s later; its termination is unconfirmed",
+                        operation.ref,
+                    )
+                await asyncio.sleep(0.1)
+        except OperationFailure:
+            operation.stop_failed = True
+            raise
+        except Exception as e:
+            operation.stop_failed = True
+            raise _error(
+                "provider_unavailable",
+                f"killing sandbox {operation.sandbox_id} failed: {e!r}",
+                operation.ref,
+            ) from e
 
     async def _terminate(self, operation: _Operation, *, grace_seconds: float) -> None:
         """TERM the group, KILL after the grace, and confirm none is left, in the sandbox.
@@ -451,7 +516,17 @@ class E2BOperations:
         tenths = max(0, round(grace_seconds * 10))
         command = await self._client.start(
             operation.sandbox_id,
-            shlex.join(["sh", "-c", _TERMINATE, "aw-terminate", str(operation.group), str(tenths)]),
+            shlex.join(
+                [
+                    "sh",
+                    "-c",
+                    _TERMINATE,
+                    "aw-terminate",
+                    str(operation.group),
+                    f"{OWNER_VARIABLE}={operation.token}",
+                    str(tenths),
+                ]
+            ),
             cwd="/",
             env={},
             timeout=None,
