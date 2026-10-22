@@ -7,10 +7,13 @@ By default a started command is scripted (`FakeRun`). With `executing_root`
 it really runs, as a local `sh -c` in a new session, so the operation
 conformance suite can check real pids and files. Each behaviour of
 `ExecutedCommand` is what the pinned SDK does (e2b==2.52.0):
-`/workspace` is the sandbox's own disk, mapped here to `executing_root`;
+`/workspace` and `/spool` are the sandbox's own disk, mapped here to
+`executing_root` and a `-spool` sibling of it, in `cwd` and in the command
+alike, so nothing runs against the host's root;
 `envs` are added to the sandbox's environment; `stdin` is written then closed
 (`send_stdin`, `close_stdin`); stdout is decoded as UTF-8 with replacement by
-an incremental decoder (`AsyncCommandHandle`); `kill` is SIGKILL to the one
+an incremental decoder (`AsyncCommandHandle`), and the stream ends only after
+`wait` returns, as `_SdkCommand` closes its queue in `wait`; `kill` is SIGKILL to the one
 pid and nothing else (its docstring), so descendants survive it.
 """
 
@@ -20,6 +23,7 @@ import asyncio
 import codecs
 import contextlib
 import os
+import re
 import signal
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
@@ -30,6 +34,9 @@ from agentic_isolation.providers.e2b_client import (
     E2BTransportError,
     SandboxListing,
 )
+
+# A sandbox root at the start of a path: not `/workspaces`, not `a/workspace`.
+_SANDBOX_ROOT = re.compile(r"(?<![\w./-])(/workspace|/spool)(?![\w.-])")
 
 
 @dataclass
@@ -79,6 +86,7 @@ class ExecutedCommand:
 
     def __init__(self, process: asyncio.subprocess.Process) -> None:
         self._process = process
+        self._waited = asyncio.Event()
 
     @property
     def pid(self) -> int:
@@ -92,9 +100,14 @@ class ExecutedCommand:
                 yield text
         if tail := decoder.decode(b"", final=True):
             yield tail
+        # The adapter's stream ends only once `wait` has seen the end event.
+        await self._waited.wait()
 
     async def wait(self) -> CommandExit:
-        code = await self._process.wait()
+        try:
+            code = await self._process.wait()
+        finally:
+            self._waited.set()
         # envd reports a signal death the way a shell does.
         return CommandExit(end="exited", exit_code=code if code >= 0 else 128 - code)
 
@@ -236,14 +249,11 @@ class FakeE2BClient:
         self, command: str, *, cwd: str | None, env: Mapping[str, str], stdin: bytes | None
     ) -> ExecutedCommand:
         assert self.executing_root is not None
-        local = Path(cwd or "/workspace")
-        if local.is_relative_to("/workspace"):
-            local = self.executing_root / local.relative_to("/workspace")
         process = await asyncio.create_subprocess_exec(
             "sh",
             "-c",
-            command,
-            cwd=local,
+            self.sandbox_paths(command),
+            cwd=self.sandbox_paths(cwd or "/workspace"),
             env={**os.environ, **env},
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
@@ -257,6 +267,25 @@ class FakeE2BClient:
         made = ExecutedCommand(process)
         self.executed.append(made)
         return made
+
+    def sandbox_paths(self, text: str) -> str:
+        """`text` with each sandbox root (`/workspace`, `/spool`) moved under the test's root."""
+        assert self.executing_root is not None
+        roots = {"/workspace": self.executing_root, "/spool": self.spool_root}
+        # Host paths the test passed in (its tmp dir may sit under /workspace) stay as given.
+        hosted = tuple(str(root) for root in roots.values())
+
+        def move(match: re.Match[str]) -> str:
+            if text.startswith(hosted, match.start()):
+                return match.group(1)
+            return str(roots[match.group(1)])
+
+        return _SANDBOX_ROOT.sub(move, text)
+
+    @property
+    def spool_root(self) -> Path:
+        assert self.executing_root is not None
+        return self.executing_root.with_name(f"{self.executing_root.name}-spool")
 
     async def reconnect(self, sandbox_id: str, pid: int) -> FakeCommand:
         self.events.append(f"reconnect {sandbox_id} {pid}")

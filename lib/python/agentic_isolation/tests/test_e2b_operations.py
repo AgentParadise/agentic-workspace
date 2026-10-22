@@ -94,3 +94,18 @@ async def test_teardown_forgets_the_workspaces_operations(tmp_path: Path) -> Non
     with pytest.raises(OperationFailure) as caught:
         await provider.status(ref)
     assert caught.value.error.kind == "unknown_operation"
+
+
+async def test_the_executing_double_keeps_sandbox_roots_off_the_host(tmp_path: Path) -> None:
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    client = FakeE2BClient(executing_root=root)
+    provider = E2BWorkspaceProvider("t", client=client)
+    workspace = await provider.create(WorkspaceConfig())
+    result = await provider.execute(
+        workspace, "touch /spool/probe /workspace/probe && echo /workspaces", cwd="/"
+    )
+    assert result.success, result.stdout
+    assert (client.spool_root / "probe").is_file()
+    assert (root / "probe").is_file()
+    assert result.stdout.strip() == "/workspaces"

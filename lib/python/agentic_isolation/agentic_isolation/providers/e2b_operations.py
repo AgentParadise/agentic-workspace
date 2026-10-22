@@ -457,13 +457,27 @@ class E2BOperations:
             timeout=None,
             user=self._run_as,
         )
+        chunks: list[str] = []
+
+        async def drain() -> None:
+            async for text in command.output():
+                chunks.append(text)
+
+        # Drained alongside `wait`, never before it: the SDK adapter ends its
+        # output only once `wait` has seen the command end.
+        reader = asyncio.create_task(drain())
         try:
             async with asyncio.timeout(_CONTROL_SECONDS + grace_seconds):
-                output = "".join([text async for text in command.output()])
                 ended = await command.wait()
+                await reader
         except TimeoutError:
             ended = CommandExit(end="disconnected", detail="termination did not answer")
-            output = ""
+        finally:
+            if not reader.done():
+                reader.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reader
+        output = "".join(chunks)
         if ended.end != "exited" or ended.exit_code != 0:
             raise _error(
                 "provider_unavailable",
