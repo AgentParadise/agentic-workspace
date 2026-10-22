@@ -255,16 +255,16 @@ async def test_h_foreign_generation_cursor_is_unknown_operation(make: Factory) -
 
 
 async def test_i_every_serialised_page_fits_max_page_bytes(make: Factory) -> None:
-    ops, workspace, _ = await make(page=700)
+    ops, workspace, root = await make(page=700)
     async with _bounded():
-        ref = await ops.start(workspace, _spec("head -c 20000 /dev/urandom"))
+        ref = await ops.start(
+            workspace, _spec(f"head -c 20000 /dev/urandom | tee {root / 'sent.bin'}")
+        )
         pages = await _pages(ops, ref, max_bytes=100_000)
     assert len(pages) > 10
     assert all(len(p.encode()) <= 700 for p in pages)
-    # Only a provider publishing `exact` integrity keeps non-UTF-8 bytes; E2B's
-    # SDK decodes its stream with replacement (see e2b_operations.py).
-    if ops.describe().observation.integrity == "exact":
-        assert len(_data(pages)) == 20000
+    assert len(_data(pages)) == 20000
+    assert _data(pages) == (root / "sent.bin").read_bytes()
 
 
 async def test_j_late_read_drains_the_rest_and_only_then_completes(make: Factory) -> None:

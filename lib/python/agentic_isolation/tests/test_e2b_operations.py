@@ -152,7 +152,8 @@ def _unkillable(command: str) -> FakeRun:
     if "aw-terminate" in command:
         return FakeRun(chunks=["survivors 4321\n"], exit=CommandExit(end="exited", exit_code=1))
     if "aw-operation" in command:
-        return FakeRun(chunks=["4321\n"], hang=True)
+        # The wrapper's pid line, hex-encoded as the sandbox sends it.
+        return FakeRun(chunks=[b"4321\n".hex() + "\n"], hang=True)
     return FakeRun()
 
 
@@ -187,3 +188,22 @@ async def test_a_sandbox_that_survives_its_kill_fails_the_cancel(
     status = await provider.status(ref)
     assert status.metadata["cancel_escalation"] == "sandbox_kill_failed"
     assert status.state not in ("cancelled", "succeeded")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"first", b"\xff\xfe\x00\xc3", b"euro \xe2\x82", b"\xe2\x82\xac" * 30000],
+    ids=["ascii", "invalid-utf8", "incomplete-utf8-tail", "multibyte-across-reads"],
+)
+async def test_without_redaction_every_output_byte_is_observed_unchanged(
+    tmp_path: Path, raw: bytes
+) -> None:
+    """The double decodes stdout as the SDK does (UTF-8, replacement), so a
+    byte that is not UTF-8 survives only if the sandbox side encodes it."""
+    (tmp_path / "raw.bin").write_bytes(raw)
+    provider = E2BWorkspaceProvider("t", client=FakeE2BClient(executing_root=tmp_path))
+    workspace = await provider.create(WorkspaceConfig())
+    async with asyncio.timeout(30):
+        status, output = await run_to_completion(provider, workspace, _spec("cat raw.bin"))
+    assert status.state == "succeeded"
+    assert output == raw

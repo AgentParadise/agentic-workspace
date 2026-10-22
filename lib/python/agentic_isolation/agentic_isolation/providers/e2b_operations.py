@@ -26,9 +26,9 @@ Differences from Docker, and why:
 - stderr is merged into stdout inside the sandbox, as `E2BWorkspaceProvider`
   already does, so the stream is in write order.
 - The SDK decodes the stream as UTF-8 with replacement
-  (`AsyncCommandHandle`'s incremental decoder in e2b==2.52.0), so bytes that
-  are not UTF-8 arrive replaced. The descriptor therefore publishes
-  `continuity_detected`, not `exact`.
+  (`AsyncCommandHandle`'s incremental decoder in e2b==2.52.0), so the
+  sandbox sends the output as hex lines (`_ENCODE`) and the bytes are
+  restored here, before the spool sees them.
 - A descendant that leaves the group is found by `OWNER_VARIABLE` in its
   environ, as `LocalOperations` does, where Docker walks parent links.
 - Where Docker stops the container when the operation will not die, this
@@ -79,9 +79,25 @@ _PROVIDER = "e2b"
 # Reads the marker's argv0 and line from stdin, then runs the inner wrapper as
 # a background job (not a group leader, so `setsid` execs in place and its pid
 # is the new group). `wait` returns the workload's status, 128+n for a signal.
+#
+# Everything the inner wrapper and the workload print goes through `_ENCODE`,
+# and the workload's status comes back on fd 4, never through that pipe. The
+# encoder drops `OWNER_VARIABLE`, so a cancel never kills it before the
+# workload's last output is sent.
 _OUTER = (
-    "exec 2>&1; IFS= read -r argv0; IFS= read -r line; inner=$1; shift; "
-    'setsid sh -c "$inner" "$argv0" "$line" "$@" & wait "$!"'
+    "exec 2>&1 3>&1; IFS= read -r argv0; IFS= read -r line; inner=$1; encode=$2; shift 2; "
+    'status=$( { { setsid sh -c "$inner" "$argv0" "$line" "$@" 2>&1 3>&- 4>&- & wait "$!"; '
+    'echo "$?" >&4; } | env -u AGENTIC_E2B_OPERATION sh -c "$encode" >&3; } 4>&1 ); '
+    'exit "$status"'
+)
+# Each read of the workload's output, as one line of lowercase hex. The SDK
+# decodes stdout as UTF-8 with replacement (`AsyncCommandHandle` in
+# e2b==2.52.0), which would rewrite any other byte; hex survives it exactly.
+# `dd` without `iflag=fullblock` returns what one read gave, so a chunk is
+# sent as soon as the workload writes it.
+_ENCODE = (
+    "while chunk=$(dd bs=65536 count=1 2>/dev/null | od -An -v -tx1 | tr -d ' \\n') "
+    '&& [ -n "$chunk" ]; do printf "%s\\n" "$chunk"; done'
 )
 # Line one is the group's pid, then the marker line if one was given, then the
 # workload replaces this shell.
@@ -159,6 +175,18 @@ class _Operation:
         )
 
 
+def _decode(line: str) -> bytes:
+    """One `_ENCODE` line as the bytes the workload wrote.
+
+    A line that is not hex was printed by the wrapper's shell before the
+    encoder ran (a failed `setsid`, say), and is kept as printed.
+    """
+    try:
+        return bytes.fromhex(line)
+    except ValueError:
+        return f"{line}\n".encode()
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -205,7 +233,7 @@ class E2BOperations:
             observation=ObservationDescriptor(
                 retention_bytes=self._retention,
                 max_page_bytes=self._max_page,
-                integrity="continuity_detected",
+                integrity="exact",
             ),
             interactive=False,
             environment_kinds=("e2b-template",),
@@ -286,7 +314,7 @@ class E2BOperations:
         )
         command = await self._client.start(
             workspace.id,
-            shlex.join(["sh", "-c", _OUTER, "aw-operation", _INNER, *spec.argv]),
+            shlex.join(["sh", "-c", _OUTER, "aw-operation", _INNER, _ENCODE, *spec.argv]),
             cwd=posixpath.normpath(posixpath.join("/workspace", spec.working_directory)),
             env={
                 **workspace.config.checked_environment(),
@@ -343,32 +371,40 @@ class E2BOperations:
             self._settle(operation, ended)
 
     async def _read(self, operation: _Operation, command: SandboxCommand) -> None:
-        pending = ""
+        text = ""
+        pending = b""
         try:
-            async for text in command.output():
-                if operation.leader_known.is_set():
-                    self._record(operation, text)
-                    continue
-                pending += text
-                header, newline, rest = pending.partition("\n")
-                if not newline:
-                    continue
-                if header.isdecimal():
-                    operation.group = int(header)
-                else:
-                    # Not the wrapper's line (it failed before exec); keep it.
-                    rest = pending
-                operation.leader_known.set()
-                if rest:
-                    self._record(operation, rest)
-            if pending and not operation.leader_known.is_set():
-                self._record(operation, pending)
+            async for chunk in command.output():
+                text += chunk
+                *lines, text = text.split("\n")
+                for line in lines:
+                    data = _decode(line)
+                    if operation.leader_known.is_set():
+                        self._record(operation, data)
+                        continue
+                    pending += data
+                    header, newline, rest = pending.partition(b"\n")
+                    if not newline:
+                        continue
+                    if header.isdigit():
+                        operation.group = int(header)
+                    else:
+                        # Not the wrapper's line (it failed before exec); keep it.
+                        rest = pending
+                    operation.leader_known.set()
+                    pending = b""
+                    if rest:
+                        self._record(operation, rest)
+            # Only a wrapper that failed before encoding ends without a newline.
+            tail = pending + text.encode()
+            if tail:
+                self._record(operation, tail)
         finally:
             operation.leader_known.set()
 
     @staticmethod
-    def _record(operation: _Operation, text: str) -> None:
-        operation.spool.append(text.encode())
+    def _record(operation: _Operation, data: bytes) -> None:
+        operation.spool.append(data)
         operation.changed.set()
 
     @staticmethod
