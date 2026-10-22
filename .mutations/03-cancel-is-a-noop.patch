@@ -1,12 +1,11 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
-index a65a696..f8ea109 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
-@@ -423,7 +423,7 @@ class E2BOperations:
+@@ -499,7 +499,7 @@
                      return await self.status(ref)
                  operation.cancel_requested = True
                  try:
--                    await self._terminate(operation, grace_seconds=grace_seconds)
+-                    await self._stop(operation, grace_seconds=grace_seconds)
 +                    pass
                  except OperationFailure as e:
                      operation.note(e.error.message)

@@ -30,7 +30,8 @@ Differences from Docker, and why:
   sandbox sends the output as hex lines (`_ENCODE`) and the bytes are
   restored here, before the spool sees them.
 - A descendant that leaves the group is found by `OWNER_VARIABLE` in its
-  environ, as `LocalOperations` does, where Docker walks parent links.
+  environ, as `LocalOperations` does, and by its parent links, as Docker
+  does, remembered by pid and start time once seen (`_TERMINATE`).
 - Where Docker stops the container when the operation will not die, this
   kills the sandbox (`metadata["cancel_escalation"]`). A kill that fails or
   is not confirmed raises `provider_unavailable` and the operation settles
@@ -106,24 +107,35 @@ _INNER = 'echo "$$"; [ -n "$1" ] && printf "%s\\n" "$1"; shift; exec "$@"'
 # operation's token, so a descendant that leaves the group (`setsid`) or loses
 # its parent is still found by its own /proc environ.
 OWNER_VARIABLE = "AGENTIC_E2B_OPERATION"
-# Members of operation $2 (group $1): every non-zombie in the group, and every
-# process whose environ carries `$OWNER_VARIABLE=$2`. TERM each of them, wait
-# up to $3 tenths of a second for all to go, then KILL and wait up to 2s. Exits
-# 0 only once none is left, 1 listing the survivors, 2 for a group it refuses
-# to signal. /proc, `cat` and `grep` only: slim images ship no `ps`.
+# Members of operation $2 (group $1): every non-zombie in the group and its
+# descendants (by parent pid, to a fixed point), every process whose environ
+# carries `$OWNER_VARIABLE=$2`, and every process already seen as a member in
+# this command, by pid and start time. So a descendant that cleared its
+# environment, left the group and was orphaned by the first signal is still
+# found, and a reused pid is not. Parent links are followed from the group
+# only: the wrapper outside it carries the token too, and its other child is
+# the encoder, which must outlive the workload. TERM each member, wait up to
+# $3 tenths of a second for all to go, then KILL and wait up to 2s. Exits 0
+# only once none is left, 1 listing the survivors, 2 for a group it refuses to
+# signal. /proc, `cat` and `grep` only: slim images ship no `ps`. `members`
+# sets `$m` rather than printing it, so `$known` outlives each scan.
 _TERMINATE = (
-    'group=$1; owner=$2; grace=$3; [ "$group" -gt 1 ] 2>/dev/null || exit 2; '
-    "members() { for s in /proc/[0-9]*/stat; do "
-    'st=$(cat "$s" 2>/dev/null) || continue; set -- ${st##*) }; '
-    '[ "$1" != Z ] && [ "$3" = "$group" ] && { p=${s#/proc/}; echo "${p%/stat}"; }; done; '
+    'group=$1; owner=$2; grace=$3; [ "$group" -gt 1 ] 2>/dev/null || exit 2; known=" "; '
+    "members() { procs=; for s in /proc/[0-9]*/stat; do "
+    'st=$(cat "$s" 2>/dev/null) || continue; p=${s#/proc/}; set -- ${st##*) }; '
+    '[ "$1" != Z ] && procs="$procs ${p%/stat},$2,$3,${20}"; done; '
+    'd=" "; grow=1; while [ $grow = 1 ]; do grow=0; for r in $procs; do '
+    'IFS=,; set -- $r; unset IFS; case "$d" in *" $1 "*) continue;; esac; '
+    'case "$d|$known" in *" $2 "*\\|*|*" $1:$4 "*) ;; *) [ "$3" = "$group" ] || continue;; esac; '
+    'd="$d$1 "; known="$known$1:$4 "; grow=1; done; done; m=$d; '
     'for e in $(grep -lzxF "$owner" /proc/[0-9]*/environ 2>/dev/null); do '
-    'p=${e#/proc/}; echo "${p%/environ}"; done; }; '
-    'signal() { for p in $(members); do kill -s "$1" "$p" 2>/dev/null; done; '
+    'p=${e#/proc/}; p=${p%/environ}; case "$m" in *" $p "*) ;; *) m="$m$p ";; esac; done; }; '
+    'signal() { members; for p in $m; do kill -s "$1" "$p" 2>/dev/null; done; '
     'kill -s "$1" -- "-$group" 2>/dev/null; }; '
-    'settle() { n=$1; while [ -n "$(members)" ]; do [ "$n" -le 0 ] && return 1; '
+    'settle() { n=$1; while members; [ -n "${m# }" ]; do [ "$n" -le 0 ] && return 1; '
     "sleep 0.1; n=$((n-1)); done; return 0; }; "
     'signal TERM; settle "$grace" && exit 0; '
-    "signal KILL; settle 20 && exit 0; echo survivors $(members); exit 1"
+    "signal KILL; settle 20 && exit 0; members; echo survivors $m; exit 1"
 )
 # How long a termination command, or a command's end after one, may take.
 _CONTROL_SECONDS = 30.0

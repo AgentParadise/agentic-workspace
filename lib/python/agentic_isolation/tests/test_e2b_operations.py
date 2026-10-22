@@ -123,11 +123,21 @@ def _alive(pid: int) -> bool:
         return False
 
 
-async def test_cancel_stops_a_descendant_that_left_the_group(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "launcher",
+    [
+        pytest.param("setsid", id="inherited-environment"),
+        # No owner variable left to find it by: only its parent link is.
+        pytest.param("env -i PATH=/usr/bin:/bin setsid", id="clean-environment"),
+    ],
+)
+async def test_cancel_stops_a_descendant_that_left_the_group(
+    tmp_path: Path, launcher: str
+) -> None:
     provider = E2BWorkspaceProvider("t", client=FakeE2BClient(executing_root=tmp_path))
     workspace = await provider.create(WorkspaceConfig())
     script = (
-        "setsid sh -c 'echo $$ > escaped.pid; exec sleep 300' >/dev/null 2>&1 & "
+        f"{launcher} sh -c 'echo $$ > escaped.pid; exec sleep 300' >/dev/null 2>&1 & "
         "while :; do sleep 1; done"
     )
     escaped: int | None = None
