@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/upstream_failure.py b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/upstream_failure.py
+index 5dfa7c8..b499264 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/upstream_failure.py
++++ b/lib/python/agentic_isolation/agentic_isolation/harnesses/claude/upstream_failure.py
+@@ -80,7 +80,7 @@ def classify_upstream_failure(
+         return None
+     error = _api_error(text)
+     message = error.get("message") if error else None
+-    for sentence in (text, message):
++    for sentence in (text,):
+         if isinstance(sentence, str) and _WEEKLY_LIMIT.match(sentence.strip()):
+             return UpstreamFailure(_KIND.QUOTA, _reset_after(sentence, observed_at))
+     kind = _ERROR_TYPES.get(str(error.get("type"))) if error else None
