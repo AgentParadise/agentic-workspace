@@ -2,14 +2,28 @@
 
 It refuses to construct outside a pytest run, so it can never stand in for
 the SDK adapter in a real process.
+
+By default a started command is scripted (`FakeRun`). With `executing_root`
+it really runs, as a local `sh -c` in a new session, so the operation
+conformance suite can check real pids and files. Each behaviour of
+`ExecutedCommand` is what the pinned SDK does (e2b==2.52.0):
+`/workspace` is the sandbox's own disk, mapped here to `executing_root`;
+`envs` are added to the sandbox's environment; `stdin` is written then closed
+(`send_stdin`, `close_stdin`); stdout is decoded as UTF-8 with replacement by
+an incremental decoder (`AsyncCommandHandle`); `kill` is SIGKILL to the one
+pid and nothing else (its docstring), so descendants survive it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import codecs
+import contextlib
 import os
+import signal
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from agentic_isolation.providers.e2b_client import (
     CommandExit,
@@ -60,6 +74,38 @@ class FakeCommand:
         return True
 
 
+class ExecutedCommand:
+    """A command really running as a local process; see the module docstring."""
+
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self._process = process
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    async def output(self) -> AsyncIterator[str]:
+        assert self._process.stdout is not None
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        while chunk := await self._process.stdout.read(65536):
+            if text := decoder.decode(chunk):
+                yield text
+        if tail := decoder.decode(b"", final=True):
+            yield tail
+
+    async def wait(self) -> CommandExit:
+        code = await self._process.wait()
+        # envd reports a signal death the way a shell does.
+        return CommandExit(end="exited", exit_code=code if code >= 0 else 128 - code)
+
+    async def kill(self) -> bool:
+        if self._process.returncode is not None:
+            return False
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(self._process.pid, signal.SIGKILL)
+        return True
+
+
 @dataclass
 class FakeSandbox:
     metadata: dict[str, str]
@@ -68,13 +114,22 @@ class FakeSandbox:
 
 
 class FakeE2BClient:
-    def __init__(self, *, responder: Callable[[str], FakeRun] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        responder: Callable[[str], FakeRun] | None = None,
+        executing_root: Path | None = None,
+    ) -> None:
         if "PYTEST_CURRENT_TEST" not in os.environ:
             raise RuntimeError("FakeE2BClient is a test double; it refuses to run outside pytest")
         self.sandboxes: dict[str, FakeSandbox] = {}
         self.started: list[tuple[str, str, str | None, dict[str, str]]] = []
         self.commands: dict[int, FakeCommand] = {}
         self.responder = responder or (lambda _command: FakeRun())
+        self.executing_root = executing_root
+        # The stdin each start was given, in call order.
+        self.stdins: list[bytes | None] = []
+        self.executed: list[ExecutedCommand] = []
         self.kill_is_noop = False
         self.command_kill_works = True
         self.pause_refused = False
@@ -165,12 +220,42 @@ class FakeE2BClient:
         env: Mapping[str, str],
         timeout: float | None,
         user: str,
-    ) -> FakeCommand:
+        stdin: bytes | None = None,
+    ) -> FakeCommand | ExecutedCommand:
         self.started.append((sandbox_id, command, cwd, dict(env)))
         self.users.append(user)
+        self.stdins.append(stdin)
+        if self.executing_root is not None:
+            return await self._execute(command, cwd=cwd, env=env, stdin=stdin)
         pid = len(self.commands) + 1
         made = FakeCommand(pid, self.responder(command), kill_works=self.command_kill_works)
         self.commands[pid] = made
+        return made
+
+    async def _execute(
+        self, command: str, *, cwd: str | None, env: Mapping[str, str], stdin: bytes | None
+    ) -> ExecutedCommand:
+        assert self.executing_root is not None
+        local = Path(cwd or "/workspace")
+        if local.is_relative_to("/workspace"):
+            local = self.executing_root / local.relative_to("/workspace")
+        process = await asyncio.create_subprocess_exec(
+            "sh",
+            "-c",
+            command,
+            cwd=local,
+            env={**os.environ, **env},
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        if process.stdin is not None:
+            process.stdin.write(stdin or b"")
+            await process.stdin.drain()
+            process.stdin.close()
+        made = ExecutedCommand(process)
+        self.executed.append(made)
         return made
 
     async def reconnect(self, sandbox_id: str, pid: int) -> FakeCommand:
