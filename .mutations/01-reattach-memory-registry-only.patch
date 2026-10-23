@@ -1,0 +1,12 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+index 8ab10ea..b93f3d8 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+@@ -506,6 +506,7 @@ class E2BOperations:
+                     "unknown_operation", f"{ref.operation_id} is not owned by this token", ref
+                 )
+             return
++        raise _error("unknown_operation", f"no operation {ref.operation_id} in this provider", ref)
+         probe = await self._probe(ref, token)
+         self._reattached[ref.operation_id] = _Reattached(
+             ref=ref,

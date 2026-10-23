@@ -1,0 +1,12 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+index 7a2fc00..1e05164 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
+@@ -371,7 +371,6 @@ class E2BWorkspaceProvider:
+ 
+     async def pause(self, workspace: Workspace) -> None:
+         """Pause the sandbox. Raises E2BTransportError when E2B refuses; it still runs."""
+-        await self._client.pause(workspace.id)
+ 
+     async def resume(self, workspace: Workspace) -> None:
+         """Resume the sandbox. Raises E2BTransportError when E2B cannot."""
