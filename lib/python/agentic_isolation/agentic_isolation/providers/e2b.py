@@ -400,15 +400,18 @@ class E2BWorkspaceProvider:
         """The decoded output of `script`, failing past `cap` bytes or `timeout` seconds.
 
         E2B kills the command at `timeout`; the host stops waiting then too,
-        since a killed command's stream may never end.
+        since a killed command's stream may never end. The host deadline
+        covers the start as well: sending the paths blocks once the sandbox
+        stops reading them, as it does when a read blocks on a FIFO.
         """
-        session = await self._start(
-            workspace, ["sh", "-c", script], cwd="/", env=None, timeout=timeout, stdin=stdin
-        )
+        session: E2BStreamSession | None = None
         encoded: list[str] = []
         size = 0
         try:
             async with asyncio.timeout(timeout):
+                session = await self._start(
+                    workspace, ["sh", "-c", script], cwd="/", env=None, timeout=timeout, stdin=stdin
+                )
                 async for text in session.output():
                     # base64 is ASCII, so this is the encoded length; anything else
                     # the stream carries is counted by its UTF-8 bytes all the same.
@@ -422,10 +425,12 @@ class E2BWorkspaceProvider:
             expired = ReadFilesTimeoutError(
                 f"read in sandbox {workspace.id} did not finish within {timeout:g}s"
             )
-            try:
-                await asyncio.wait_for(session.cancel(), timeout=_KILL_SECONDS)
-            except Exception as leak:
-                expired.add_note(f"the kill of the timed-out command is unconfirmed: {leak!r}")
+            # Before a session exists the adapter has already killed whatever it started.
+            if session is not None:
+                try:
+                    await asyncio.wait_for(session.cancel(), timeout=_KILL_SECONDS)
+                except Exception as leak:
+                    expired.add_note(f"the kill of the timed-out command is unconfirmed: {leak!r}")
             raise expired from exc
         if outcome.end == "timed_out":
             raise ReadFilesTimeoutError(

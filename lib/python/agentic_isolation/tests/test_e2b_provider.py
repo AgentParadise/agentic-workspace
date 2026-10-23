@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import os
 import shlex
+import signal
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -319,6 +320,47 @@ async def test_read_files_times_out_on_a_file_swapped_for_a_fifo_after_its_check
     finally:
         with contextlib.suppress(OSError):
             os.close(os.open(client.spool_root / "f", os.O_WRONLY | os.O_NONBLOCK))
+
+
+async def test_read_files_times_out_while_the_paths_are_still_being_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # As above, but with far more path bytes than one xargs batch and a pipe
+    # buffer hold: the first batch blocks on the FIFO, xargs stops reading,
+    # and sending the rest of the paths blocks before any output exists.
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    client = FakeE2BClient(executing_root=root)
+    client.spool_root.mkdir(parents=True)
+    names = [f"{i:04}".ljust(250, "x") for i in range(2000)]
+    for name in names:
+        (client.spool_root / name).write_bytes(b"x")
+    old = 'elif ! command exec 3<"./$p"; then'
+    new = 'elif ! { rm -f -- "./$p" && mkfifo -- "./$p" && command exec 3<"./$p"; }; then'
+    assert old in file_transfer._READER
+    monkeypatch.setattr(file_transfer, "_READER", file_transfer._READER.replace(old, new))
+    provider = E2BWorkspaceProvider("tmpl-1", client=client)
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+
+    try:
+        with pytest.raises(ReadFilesTimeoutError, match="within 0.5s"):
+            await asyncio.wait_for(
+                provider.read_files(
+                    workspace, ["*"], base_path="/spool", limits=ReadLimits(timeout_seconds=0.5)
+                ),
+                20,
+            )
+        assert len(client.stdins[-1] or b"") == 2000 * 251
+        assert (client.spool_root / names[0]).is_fifo()
+        # The command expired while its stdin was being written, and was killed.
+        reader = client.executed[-1]._process
+        assert await asyncio.wait_for(reader.wait(), 20) < 0
+    finally:
+        for process in (made._process for made in client.executed):
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                await asyncio.wait_for(process.wait(), 20)
 
 
 async def test_read_files_reports_a_sandbox_that_answers_outside_the_contract(

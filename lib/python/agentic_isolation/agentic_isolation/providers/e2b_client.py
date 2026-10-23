@@ -177,6 +177,8 @@ class E2BSandboxClient(Protocol):
 
 
 _PAUSE_ATTEMPTS = 5
+# How long the kill of a command whose stdin could not be written may take.
+_STDIN_KILL_SECONDS = 10.0
 
 
 class SdkE2BClient:
@@ -304,10 +306,14 @@ class SdkE2BClient:
             try:
                 await sandbox.commands.send_stdin(handle.pid, stdin)
                 await sandbox.commands.close_stdin(handle.pid)
-            except Exception as exc:
+            except BaseException as exc:
                 # The command would wait on stdin forever: kill it, report it lost.
+                # A cancelled caller (its deadline passed while the sandbox was
+                # not reading) gets the same bounded kill, then its cancellation.
                 with contextlib.suppress(Exception):
-                    await handle.kill()
+                    await asyncio.wait_for(handle.kill(), timeout=_STDIN_KILL_SECONDS)
+                if not isinstance(exc, Exception):
+                    raise
                 return UnstartedCommand(f"cannot write stdin of pid {handle.pid}: {exc!r}")
         return _SdkCommand(handle, chunks)
 
