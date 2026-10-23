@@ -58,7 +58,8 @@ The SDK behaviour this relies on is cited in `e2b_client.py`.
 from __future__ import annotations
 
 import asyncio
-import fnmatch
+import base64
+import binascii
 import posixpath
 import shlex
 import time
@@ -82,6 +83,7 @@ from agentic_isolation.providers.capabilities import (
     OwnedWorkspace,
     StreamOutcome,
     StreamSession,
+    TRANSFER_ROOTS,
     TransferRoot,
     WorkspaceNotFoundError,
     WorkspaceOwnershipError,
@@ -97,6 +99,18 @@ from agentic_isolation.providers.e2b_client import (
     SdkE2BClient,
 )
 from agentic_isolation.providers.e2b_operations import E2BOperations
+from agentic_isolation.providers.file_transfer import (
+    ReadFilesError,
+    ReadFilesResult,
+    ReadLimits,
+    archive_cap,
+    archive_script,
+    archive_stdin,
+    collect,
+    listing_cap,
+    listing_script,
+    plan_reads,
+)
 from agentic_isolation.providers.teardown_report import TeardownReport, TeardownUsage
 
 _PROVIDER = "e2b"
@@ -308,6 +322,7 @@ class E2BWorkspaceProvider:
         cwd: str | None,
         env: Mapping[str, str] | None,
         timeout: float | None,
+        stdin: bytes | None = None,
     ) -> E2BStreamSession:
         merged_env = {**workspace.config.checked_environment(), **(env or {})}
         command = await self._client.start(
@@ -317,6 +332,7 @@ class E2BWorkspaceProvider:
             env=merged_env,
             timeout=timeout,
             user=self._run_as,
+            stdin=stdin,
         )
         return E2BStreamSession(self._client, workspace.id, command, timeout=timeout)
 
@@ -352,27 +368,50 @@ class E2BWorkspaceProvider:
         patterns: Sequence[str],
         *,
         base_path: TransferRoot,
-    ) -> list[tuple[str, bytes]]:
-        listing = await self.execute(
+        limits: ReadLimits = ReadLimits(),
+    ) -> ReadFilesResult:
+        if base_path not in TRANSFER_ROOTS:
+            raise ValueError(f"base_path must be one of {', '.join(TRANSFER_ROOTS)}")
+        # Bytes cross the command stream as base64, which is text-safe; the
+        # files API is not used because it follows symlinks.
+        listing = await self._sandbox_bytes(
+            workspace, listing_script(base_path, limits, base64=True), b"", listing_cap(limits)
+        )
+        plan = plan_reads(listing, patterns, limits, base_path)
+        if not plan.reads:
+            return collect(b"", plan, limits, base_path)
+        archive = await self._sandbox_bytes(
             workspace,
-            shlex.join(["find", ".", "-type", "f", "-print0"]),
-            cwd=base_path,
+            archive_script(base_path, base64=True),
+            archive_stdin(plan),
+            archive_cap(plan, limits),
         )
-        if not listing.success:
-            raise FileNotFoundError(f"cannot list {base_path} in sandbox {workspace.id}")
-        relative = sorted(
-            entry.removeprefix("./") for entry in listing.stdout.rstrip("\n").split("\0") if entry
+        return collect(archive, plan, limits, base_path)
+
+    async def _sandbox_bytes(
+        self, workspace: Workspace, script: str, stdin: bytes, cap: int
+    ) -> bytes:
+        session = await self._start(
+            workspace, ["sh", "-c", script], cwd="/", env=None, timeout=None, stdin=stdin
         )
-        matched = [path for path in relative if any(fnmatch.fnmatch(path, p) for p in patterns)]
-        return [
-            (
-                path,
-                await self._client.read_bytes(
-                    workspace.id, f"{base_path}/{path}", user=self._run_as
-                ),
+        encoded: list[str] = []
+        size = 0
+        async for text in session.output():
+            size += len(text)
+            if size > 4 * (cap // 3 + 1):
+                await session.cancel()
+                raise ReadFilesError(f"sandbox {workspace.id} sent more than {cap} bytes")
+            encoded.append(text)
+        outcome = await session.outcome()
+        if not outcome.completed or outcome.exit_code != 0:
+            raise ReadFilesError(
+                f"read in sandbox {workspace.id} ended {outcome.end} "
+                f"(exit {outcome.exit_code}): {outcome.detail or ''}".rstrip(": ")
             )
-            for path in matched
-        ]
+        try:
+            return base64.b64decode("".join(encoded).strip(), validate=True)
+        except binascii.Error as exc:
+            raise ReadFilesError(f"sandbox {workspace.id} sent output that is not base64") from exc
 
     async def list_owned(self, labels: Mapping[str, str]) -> list[OwnedWorkspace]:
         held = {

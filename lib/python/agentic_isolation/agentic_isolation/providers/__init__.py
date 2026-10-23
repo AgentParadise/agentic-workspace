@@ -45,6 +45,12 @@ from agentic_isolation.providers.capabilities import (
     WorkspaceNotFoundError,
     WorkspaceOwnershipError,
 )
+from agentic_isolation.providers.file_transfer import (
+    FileRefusal,
+    ReadFilesError,
+    ReadFilesResult,
+    ReadLimits,
+)
 from agentic_isolation.providers.docker import ContainerRemovalError, WorkspaceDockerProvider
 from agentic_isolation.providers.e2b import (
     E2BStreamSession,
@@ -109,6 +115,10 @@ __all__ = [
     "StreamOutcome",
     "StreamReconnectUnsupportedError",
     "SupportsFileTransfer",
+    "ReadLimits",
+    "ReadFilesResult",
+    "FileRefusal",
+    "ReadFilesError",
     "SupportsOwnership",
     "OwnedWorkspace",
     "WorkspaceNotFoundError",

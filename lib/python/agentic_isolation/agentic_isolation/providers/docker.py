@@ -64,6 +64,7 @@ from agentic_isolation.providers.capabilities import (
     WorkspaceOwnershipError,
     mismatched_labels,
 )
+from agentic_isolation.providers.file_transfer import ReadFilesResult, ReadLimits
 from agentic_isolation.providers.contained_files import (
     NotARegularFileError,
     _open_contained,
@@ -824,12 +825,13 @@ class WorkspaceDockerProvider(BaseProvider):
         patterns: Sequence[str],
         *,
         base_path: TransferRoot,
-    ) -> list[tuple[str, bytes]]:
+        limits: ReadLimits = ReadLimits(),
+    ) -> ReadFilesResult:
         """SupportsFileTransfer: exact bytes, from inside the container."""
         container_name = workspace._handle
         if not container_name:
             raise RuntimeError("Container not available")
-        return await docker_capabilities.read_files(container_name, patterns, base_path)
+        return await docker_capabilities.read_files(container_name, patterns, base_path, limits)
 
     async def list_owned(self, labels: Mapping[str, str]) -> list[OwnedWorkspace]:
         """SupportsOwnership: this provider's workspaces carrying all of `labels`."""

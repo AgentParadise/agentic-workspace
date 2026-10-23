@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fnmatch
-import io
 import json
+import shlex
 import signal as signals
-import tarfile
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 
@@ -24,6 +22,18 @@ from agentic_isolation.providers.capabilities import (
     StreamReconnectUnsupportedError,
     StreamSession,
     TransferRoot,
+)
+from agentic_isolation.providers.file_transfer import (
+    ReadFilesError,
+    ReadFilesResult,
+    ReadLimits,
+    archive_cap,
+    archive_script,
+    archive_stdin,
+    collect,
+    listing_cap,
+    listing_script,
+    plan_reads,
 )
 
 WORKSPACE_ID_LABEL = "agentic.workspace.id"
@@ -226,31 +236,52 @@ class DockerStreamSession:
         self._stopped_by = outcome
 
 
+async def _docker_bounded(args: Sequence[str], stdin: bytes, cap: int) -> bytes:
+    """Stdout of `docker exec`, refused past `cap` bytes so a sandbox cannot flood the host."""
+    proc = await asyncio.create_subprocess_exec(
+        "docker",
+        *args,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    proc.stdin.write(stdin)
+    proc.stdin.close()
+    out = bytearray()
+    while chunk := await proc.stdout.read(_READ_CHUNK):
+        out += chunk
+        if len(out) > cap:
+            proc.kill()
+            await proc.wait()
+            raise ReadFilesError(f"the sandbox sent more than {cap} bytes for: {shlex.join(args)}")
+    err = await proc.stderr.read()
+    code = await proc.wait()
+    if code != 0:
+        raise ReadFilesError(
+            f"{shlex.join(args[:2])} failed: {err.decode(errors='replace').strip() or f'exit {code}'}"
+        )
+    return bytes(out)
+
+
 async def read_files(
-    container: str, patterns: Sequence[str], base_path: TransferRoot
-) -> list[tuple[str, bytes]]:
-    """Read matching regular files under `base_path` as a tar from the sandbox."""
+    container: str, patterns: Sequence[str], base_path: TransferRoot, limits: ReadLimits
+) -> ReadFilesResult:
+    """List, then archive only what the listing allows, from inside the sandbox."""
     if base_path not in TRANSFER_ROOTS:
         raise ValueError(f"base_path must be one of {', '.join(TRANSFER_ROOTS)}")
-    code, out, err = await _docker("exec", container, "tar", "-cf", "-", "-C", base_path, ".")
-    if code != 0:
-        raise RuntimeError(
-            f"could not read {base_path} from {container}: "
-            f"{err.decode(errors='replace').strip() or f'tar exited {code}'}"
-        )
-    found: list[tuple[str, bytes]] = []
-    with tarfile.open(fileobj=io.BytesIO(out), mode="r:") as archive:
-        for member in archive:
-            relative = member.name.removeprefix("./")
-            # A hard link is a regular file under a second name; tar stores
-            # its bytes once, under whichever name it met first.
-            regular = member.isreg() or member.islnk()
-            if not regular or not any(fnmatch.fnmatchcase(relative, p) for p in patterns):
-                continue
-            handle = archive.extractfile(member)
-            assert handle is not None  # extractfile resolves regular files and hard links
-            found.append((relative, handle.read()))
-    return sorted(found)
+    listing = await _docker_bounded(
+        ["exec", container, "sh", "-c", listing_script(base_path, limits)], b"", listing_cap(limits)
+    )
+    plan = plan_reads(listing, patterns, limits, base_path)
+    if not plan.reads:
+        return collect(b"", plan, limits, base_path)
+    archive = await _docker_bounded(
+        ["exec", "-i", container, "sh", "-c", archive_script(base_path)],
+        archive_stdin(plan),
+        archive_cap(plan, limits),
+    )
+    return collect(archive, plan, limits, base_path)
 
 
 async def inspect_containers(container_ids: Sequence[str]) -> list[tuple[str, dict[str, str]]]:
