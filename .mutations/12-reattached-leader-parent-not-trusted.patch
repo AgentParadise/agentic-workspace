@@ -1,0 +1,14 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+index e11f9bf..e3caa2a 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+@@ -179,8 +179,7 @@ _TERMINATE = (
+     'if [ "$mode" = verify ]; then [ "$group" -gt 1 ] 2>/dev/null '
+     '&& lead=$(cat "/proc/$group/stat" 2>/dev/null) && set -- ${lead##*) } '
+     '&& [ "$1" != Z ] && [ "$3" = "$group" ] '
+-    '&& { grep -qzxF "$owner" "/proc/$group/environ" || grep -qzxF "$owner" "/proc/$2/environ"; } '
+-    "2>/dev/null || group=-; "
++    '&& grep -qzxF "$owner" "/proc/$group/environ" 2>/dev/null || group=-; '
+     'elif ! [ "$group" -gt 1 ] 2>/dev/null; then exit 2; fi; known=" "; '
+     'stopped() { echo "$word" > "$state/stopped" 2>/dev/null; exit 0; }; '
+     "members() { procs=; for s in /proc/[0-9]*/stat; do "

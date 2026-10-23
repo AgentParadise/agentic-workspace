@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+index e11f9bf..a50f928 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+@@ -640,7 +640,7 @@ class E2BOperations:
+             return OperationStatus.model_validate({**common, "state": "running"})
+         if probe.stopped is not None:
+             state = probe.stopped
+-        elif probe.exit_code is not None:
++        elif False:  # a recorded exit is ignored on reattach
+             exit_code = probe.exit_code
+             if exit_code > 128 and exit_code - 128 < signal.NSIG:
+                 signal_name = signal.Signals(exit_code - 128).name

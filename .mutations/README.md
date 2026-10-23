@@ -43,3 +43,21 @@ selection is still the one file above, now 14 node ids, none parametrised.
 
 Locally, over the e2b-double at the fix commit: 07 failed 2 tests, 08 1,
 09 1, 10 2, 11 1. As above, that is not mutation evidence.
+
+## Added by the second fix round (B3, B4)
+
+B3: a fresh-instance cancel confirmed a stop while a workload leader that
+had cleared `AGENTIC_E2B_OPERATION` was still alive. The fix also trusts the
+recorded group when the leader's parent (the marked wrapper) carries the
+marker. B4: the ordinary-completion test had no mutation naming it. The
+selection is still the one file above, now 15 node ids, none parametrised.
+The isolation test now copies the attacker's own directory, so 08's kill no
+longer depends on glob order.
+
+| Patch | Bug | Killing tests |
+|---|---|---|
+| `12-reattached-leader-parent-not-trusted.patch` | the recorded group is trusted only if its leader still carries the marker, so a leader that cleared its environment survives a confirmed cancel | `test_fresh_cancel_kills_a_leader_that_cleared_its_environment` |
+| `13-reattached-exit-status-ignored.patch` | a fresh instance ignores the recorded exit status, so a completed operation reads `lost` | `test_a_completed_operation_keeps_its_exit_status_after_reattach`, `test_fresh_instance_reads_running_then_the_exit_status` |
+
+Locally, over the e2b-double at the commit that added them: 08 failed 1
+test, 12 1, 13 2. As above, that is not mutation evidence.
