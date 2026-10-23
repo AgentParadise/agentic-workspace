@@ -1,0 +1,15 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
+index 059d443..08f0db3 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
+@@ -184,9 +184,7 @@ for p; do
+     exit 1
+   else
+     x=$(readlink /proc/self/fd/3; echo .); x=${x%.}; x=${x%?}
+-    if [ "$x" != "$ROOT/$p" ]; then
+-      emit r "$x"
+-    elif [ ! -f /proc/self/fd/3 ]; then
++    if [ ! -f /proc/self/fd/3 ]; then
+       emit s ""
+     elif [ "$(stat -L -c %h /proc/self/fd/3)" != 1 ]; then
+       emit h ""

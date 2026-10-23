@@ -1,22 +1,22 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
-index a1b638a..55a2f88 100644
+index 059d443..de29760 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
-@@ -245,7 +245,7 @@ def collect(archive: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str)
-     With nothing planned, no archive was taken and `archive` is ignored.
+@@ -316,7 +316,7 @@ def collect(stream: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str) -
+     `stream` is ignored.
      """
      if not plan.reads:
 -        return ReadFilesResult(files=(), refused=_by_path(plan.refused))
 +        return ReadFilesResult(files=(), refused=())
-     expected = {path for path, _ in plan.reads}
      files: list[tuple[str, bytes]] = []
      refused = list(plan.refused)
-@@ -277,7 +277,7 @@ def collect(archive: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str)
-         raise ReadFilesError(f"the sandbox archive is not a readable tar: {exc}") from exc
-     if expected:
-         raise ReadFilesError(f"the sandbox archive is missing {', '.join(sorted(expected))}")
+     total = 0
+@@ -344,7 +344,7 @@ def collect(stream: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str) -
+             raise ReadFilesError(f"the sandbox read {path!r} as unknown kind {kind!r}")
+     if at != len(stream):
+         raise ReadFilesError("the sandbox sent records past the planned reads")
 -    return ReadFilesResult(files=tuple(sorted(files)), refused=_by_path(refused))
 +    return ReadFilesResult(files=tuple(sorted(files)), refused=())
  
  
- def _by_path(refused: Sequence[FileRefusal]) -> tuple[FileRefusal, ...]:
+ def _next_record(stream: bytes, at: int, path: str) -> tuple[bytes, bytes, int]:

@@ -1,25 +1,36 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
-index a1b638a..45a7126 100644
+index 059d443..91edf50 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
-@@ -153,6 +153,7 @@ def archive_script(base_path: str, *, base64: bool = False) -> str:
-             "--no-recursion",
-             "--null",
-             "--verbatim-files-from",
-+            "--dereference",
-             "-cf",
-             "-",
-             "-T",
-@@ -221,8 +222,10 @@ def plan_reads(
+@@ -176,7 +176,7 @@ _READER = r"""
+ t=$1; shift; used=0
+ emit() { printf '%s %s\0%s\0%s' "$1" "${#2}" "$p" "$2"; }
+ for p; do
+-  if [ -L "./$p" ]; then
++  if [ -L "./$p" ] && case $(readlink -- "./$p") in /*|..*) false ;; esac; then
+     x=$(readlink -- "./$p"; echo .); x=${x%.}; emit l "${x%?}"
+   elif [ ! -f "./$p" ]; then
+     emit s ""
+@@ -184,7 +184,7 @@ for p; do
+     exit 1
+   else
+     x=$(readlink /proc/self/fd/3; echo .); x=${x%.}; x=${x%?}
+-    if [ "$x" != "$ROOT/$p" ]; then
++    if [ "$x" != "$ROOT/$p" ] && case $x in "$ROOT"/*) true ;; *) false ;; esac; then
+       emit r "$x"
+     elif [ ! -f /proc/self/fd/3 ]; then
+       emit s ""
+@@ -270,11 +270,11 @@ def plan_reads(
              continue
-         if kind == "l":
+         if kind == "d" or not _matches(path, patterns):
+             continue
+-        if kind == "l":
++        if kind == "l" and not _escapes(path, raw_target.decode(), base_path):
              target = raw_target.decode("utf-8", "surrogateescape")
--            escaping = _escapes(path, target, base_path)
--            refused.append(FileRefusal(path, "escaping_symlink" if escaping else "symlink"))
-+            if _escapes(path, target, base_path):
-+                reads.append((path, nbytes))
-+            else:
-+                refused.append(FileRefusal(path, "symlink"))
-         elif kind != "f":
+             escaping = _escapes(path, target, base_path)
+             refused.append(FileRefusal(path, "escaping_symlink" if escaping else "symlink"))
+-        elif kind != "f":
++        elif kind not in ("f", "l"):
              refused.append(FileRefusal(path, "special_file"))
          elif nlink > 1:
+             refused.append(FileRefusal(path, "hard_link"))
