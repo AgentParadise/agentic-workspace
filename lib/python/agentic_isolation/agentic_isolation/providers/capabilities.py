@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
+from agentic_isolation.contract import OperationRef
 from agentic_isolation.providers.base import Workspace
 from agentic_isolation.providers.file_transfer import (
     DEFAULT_READ_LIMITS,
@@ -206,3 +207,44 @@ class SupportsOwnership(Protocol):
 def mismatched_labels(actual: Mapping[str, str], expected: Mapping[str, str]) -> list[str]:
     """The keys of `expected` that `actual` lacks or holds a different value for."""
     return sorted(key for key, value in expected.items() if actual.get(key) != value)
+
+
+@runtime_checkable
+class SupportsOperationReattach(Protocol):
+    """Optional capability: answer for an operation another instance started.
+
+    For a provider whose operations outlive the process that started them.
+    The caller persists the ref and the opaque token from `reattach_token`;
+    after `reattach`, `SupportsOperations.status` and `cancel` work for that
+    ref as they do for one started here. A provider whose operations die with
+    their process (Docker) does not implement this.
+    """
+
+    def reattach_token(self, ref: OperationRef) -> str:
+        """The secret proving ownership of `ref`, from the instance holding it.
+
+        Raises OperationFailure `unknown_operation` for a ref it does not hold.
+        """
+        ...
+
+    async def reattach(self, ref: OperationRef, token: str) -> None:
+        """Take over status and cancel for `ref`, checking `token` owns it.
+
+        Raises OperationFailure `unknown_operation` when the operation is not
+        found or `token` does not own it, and `provider_unavailable` when the
+        provider cannot read its state.
+        """
+        ...
+
+
+@runtime_checkable
+class SupportsWorkspaceSuspend(Protocol):
+    """Optional capability: pause a workspace, keeping its disk and memory, and resume it."""
+
+    async def pause(self, workspace: Workspace) -> None:
+        """Suspend every process of `workspace`. Raises when it may still be running."""
+        ...
+
+    async def resume(self, workspace: Workspace) -> None:
+        """Run a paused `workspace` again; a running one is left as it is."""
+        ...

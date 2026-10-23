@@ -141,6 +141,13 @@ class E2BSandboxClient(Protocol):
         """
         ...
 
+    async def resume(self, sandbox_id: str) -> None:
+        """Resume a paused sandbox; a running one is left running.
+
+        Raises E2BTransportError when E2B cannot resume it.
+        """
+        ...
+
     async def start(
         self,
         sandbox_id: str,
@@ -271,6 +278,12 @@ class SdkE2BClient:
             else:
                 self._sandboxes.pop(sandbox_id, None)
                 return
+
+    async def resume(self, sandbox_id: str) -> None:
+        # `AsyncSandbox.connect` resumes a paused sandbox (e2b==2.52.0); the
+        # cached handle is dropped first so the connect really happens.
+        self._sandboxes.pop(sandbox_id, None)
+        await self._sandbox(sandbox_id)
 
     async def start(
         self,
