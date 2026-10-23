@@ -363,6 +363,20 @@ class E2BWorkspaceProvider:
     async def cancel(self, ref: OperationRef, *, grace_seconds: float) -> OperationStatus:
         return await self._operations.cancel(ref, grace_seconds=grace_seconds)
 
+    def reattach_token(self, ref: OperationRef) -> str:
+        return self._operations.reattach_token(ref)
+
+    async def reattach(self, ref: OperationRef, token: str) -> None:
+        await self._operations.reattach(ref, token)
+
+    async def pause(self, workspace: Workspace) -> None:
+        """Pause the sandbox. Raises E2BTransportError when E2B refuses; it still runs."""
+        await self._client.pause(workspace.id)
+
+    async def resume(self, workspace: Workspace) -> None:
+        """Resume the sandbox. Raises E2BTransportError when E2B cannot."""
+        await self._client.resume(workspace.id)
+
     async def read_files(
         self,
         workspace: Workspace,

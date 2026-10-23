@@ -40,8 +40,10 @@ from agentic_isolation.providers.capabilities import (
     StreamReconnectUnsupportedError,
     StreamSession,
     SupportsFileTransfer,
+    SupportsOperationReattach,
     SupportsOwnership,
     SupportsStreamingExec,
+    SupportsWorkspaceSuspend,
     WorkspaceNotFoundError,
     WorkspaceOwnershipError,
 )
@@ -112,6 +114,7 @@ __all__ = [
     "SupportsWorkspaceLogs",
     # Remote-tier capabilities (syntropic137/syntropic137#1911)
     "SupportsStreamingExec",
+    "SupportsWorkspaceSuspend",
     "StreamSession",
     "StreamOutcome",
     "StreamReconnectUnsupportedError",
@@ -121,6 +124,7 @@ __all__ = [
     "FileRefusal",
     "ReadFilesError",
     "ReadFilesTimeoutError",
+    "SupportsOperationReattach",
     "SupportsOwnership",
     "OwnedWorkspace",
     "WorkspaceNotFoundError",

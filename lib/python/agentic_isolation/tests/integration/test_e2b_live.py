@@ -380,3 +380,40 @@ async def test_live_cancel_stops_the_whole_group_in_the_sandbox(template: str) -
         assert alive.stdout.strip() == ""
     finally:
         await provider.destroy(workspace)
+
+
+async def test_a_fresh_provider_reattaches_cancels_and_pause_resume_keeps_the_sandbox(
+    live: tuple[E2BWorkspaceProvider, Workspace],
+) -> None:
+    """#103: status and cancel from a second provider given only the ref and token."""
+    from agentic_isolation.contract import OperationRef, OperationSpec
+
+    provider, workspace = live
+    spec = OperationSpec.model_validate(
+        {
+            "execution_id": "e2b-live-reattach",
+            "operation_key": uuid.uuid4().hex,
+            "argv": ("sh", "-c", "exec sleep 600"),
+            "working_directory": ".",
+            "environment": {},
+            "credential_bindings": (),
+            "timeout_seconds": 900,
+            "metadata": {},
+        }
+    )
+    ref = await provider.start(workspace, spec)
+    token = provider.reattach_token(ref)
+    await asyncio.sleep(2)
+
+    fresh = E2BWorkspaceProvider(provider._template)
+    persisted = OperationRef.model_validate_json(ref.model_dump_json())
+    with pytest.raises(Exception, match="not owned"):
+        await fresh.reattach(persisted, "0" * 32)
+    await fresh.reattach(persisted, token)
+    assert (await fresh.status(persisted)).state == "running"
+    assert (await fresh.cancel(persisted, grace_seconds=2)).state == "cancelled"
+
+    await fresh.pause(workspace)
+    await fresh.resume(workspace)
+    marker = await provider.execute(workspace, "echo resumed")
+    assert "resumed" in marker.stdout
