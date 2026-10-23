@@ -230,13 +230,13 @@ class _Reattached:
 class _Probe:
     """One read of a reattach directory and of /proc."""
 
-    owner: str
     execution_id: str
     started_at: str
     group: int | None
     exit_code: int | None
     ended_at: str | None
-    stopped: str
+    # What a confirmed termination wrote, if one did.
+    stopped: Literal["cancelled", "timed_out"] | None
     alive: bool
 
 
@@ -550,15 +550,22 @@ class E2BOperations:
             execution_id = bytes.fromhex(fields.get("execution", "")).decode()
         except ValueError:
             execution_id = ""
-        group, code = fields.get("group", ""), fields.get("exit", "")
+        group, code, stopped = (
+            fields.get("group", ""),
+            fields.get("exit", ""),
+            fields.get("stopped"),
+        )
         return _Probe(
-            owner=fields["owner"],
             execution_id=execution_id or ref.operation_id,
             started_at=fields.get("started", ""),
             group=int(group) if group.isdigit() else None,
             exit_code=int(code) if code.isdigit() else None,
             ended_at=fields.get("ended") or None,
-            stopped=fields.get("stopped", ""),
+            stopped="cancelled"
+            if stopped == "cancelled"
+            else "timed_out"
+            if stopped == "timed_out"
+            else None,
             alive=fields.get("alive") == "1",
         )
 
@@ -582,8 +589,8 @@ class E2BOperations:
         exit_code: int | None = None
         signal_name: str | None = None
         state: OperationState
-        if probe.stopped in ("cancelled", "timed_out"):
-            state = "cancelled" if probe.stopped == "cancelled" else "timed_out"
+        if probe.stopped is not None:
+            state = probe.stopped
         elif probe.exit_code is not None:
             exit_code = probe.exit_code
             if exit_code > 128 and exit_code - 128 < signal.NSIG:
