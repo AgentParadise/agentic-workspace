@@ -175,6 +175,28 @@ async def test_a_writer_left_by_an_exited_leader_is_running_until_cancel_kills_i
             os.kill(writer, signal.SIGKILL)
 
 
+async def test_fresh_cancel_kills_a_leader_that_cleared_its_environment(
+    tmp_path: Path,
+) -> None:
+    pidfile = tmp_path / "ws" / "leader"
+    # The leader drops the marker; only the wrapper that started it keeps it.
+    client, first, _, ref, token = await _started(
+        tmp_path,
+        f"exec env -u {OWNER_VARIABLE} sh -c 'echo $$ > {pidfile}; exec sleep 60'",
+    )
+    leader = await _pid(pidfile)
+    fresh = _fresh(client)
+    await fresh.reattach(ref, token)
+    try:
+        assert (await fresh.status(ref)).state == "running"
+        cancelled = await fresh.cancel(ref, grace_seconds=0)
+        assert not _alive(leader), "a confirmed cancel left the workload's leader alive"
+        assert cancelled.state == "cancelled"
+    finally:
+        if _alive(leader):
+            os.kill(leader, signal.SIGKILL)
+
+
 async def test_a_completed_operation_keeps_its_exit_status_after_reattach(
     tmp_path: Path,
 ) -> None:
@@ -213,13 +235,13 @@ async def test_a_workload_cannot_aim_its_token_at_another_operation(tmp_path: Pa
     victim_pid = await _pid(victim_pidfile)
     victim_group = (tmp_path / "ws-ops" / victim.operation_id / "group").read_text().strip()
     forged_id = f"{workspace.id}-op-{'a' * 16}"
-    # Run AS THE WORKLOAD: copy every reattach directory it can read to a
-    # new id, and point every group it can write, its own included, at B.
+    # Run AS THE WORKLOAD: copy its own reattach directory (its group is its
+    # `$$`) to a new id, and point every group it can write, its own included, at B.
     attacker_script = (
         f"forged=/tmp/agentic-operations/{forged_id}; "
         "for d in /tmp/agentic-operations/*-op-*; do "
         '[ -e "$d/group" ] || continue; '
-        '[ -e "$forged" ] || cp -r "$d" "$forged"; '
+        '[ "$(cat "$d/group")" = $$ ] && cp -r "$d" "$forged"; '
         f'echo {victim_group} > "$d/group"; done; '
         f'echo {victim_group} > "$forged/group"; '
         "touch /workspace/forged; exec sleep 60"
@@ -232,6 +254,10 @@ async def test_a_workload_cannot_aim_its_token_at_another_operation(tmp_path: Pa
             break
         await asyncio.sleep(0.05)
     assert (root / "forged").exists()
+    # The copy is A's own: refused below only because the digest binds the id.
+    assert (tmp_path / "ws-ops" / forged_id / "owner").read_text() == (
+        tmp_path / "ws-ops" / attacker.operation_id / "owner"
+    ).read_text()
     fresh = _fresh(client)
     try:
         with pytest.raises(OperationFailure) as refused:

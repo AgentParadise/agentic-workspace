@@ -167,9 +167,10 @@ OWNER_VARIABLE = "AGENTIC_E2B_OPERATION"
 # $3 tenths of a second for all to go, then KILL and wait up to 2s. Exits 0
 # only once none is left, 1 listing the survivors, 2 for a group it refuses to
 # signal. With $6 `verify` (a group read from the workload's directory), the
-# group is used only if its leader is alive, leads it and carries `$2`;
-# otherwise it is `-` and only processes carrying `$2` (and those already
-# seen) are members. On exit 0 it writes $5 (`cancelled` or `timed_out`) to `stopped` in
+# group is used only if its leader is alive, leads it and carries `$2`, or
+# its parent does (the wrapper's subshell that started it, so a leader that
+# cleared its environment is still trusted); otherwise it is `-` and only
+# processes carrying `$2` (and those already seen) are members. On exit 0 it writes $5 (`cancelled` or `timed_out`) to `stopped` in
 # the reattach directory $4, so a fresh instance reads why the group is gone.
 # /proc, `cat` and `grep` only: slim images ship no `ps`. `members`
 # sets `$m` rather than printing it, so `$known` outlives each scan.
@@ -178,7 +179,8 @@ _TERMINATE = (
     'if [ "$mode" = verify ]; then [ "$group" -gt 1 ] 2>/dev/null '
     '&& lead=$(cat "/proc/$group/stat" 2>/dev/null) && set -- ${lead##*) } '
     '&& [ "$1" != Z ] && [ "$3" = "$group" ] '
-    '&& grep -qzxF "$owner" "/proc/$group/environ" 2>/dev/null || group=-; '
+    '&& { grep -qzxF "$owner" "/proc/$group/environ" || grep -qzxF "$owner" "/proc/$2/environ"; } '
+    "2>/dev/null || group=-; "
     'elif ! [ "$group" -gt 1 ] 2>/dev/null; then exit 2; fi; known=" "; '
     'stopped() { echo "$word" > "$state/stopped" 2>/dev/null; exit 0; }; '
     "members() { procs=; for s in /proc/[0-9]*/stat; do "
@@ -201,14 +203,17 @@ _TERMINATE = (
 STATE_ROOT = "/tmp/agentic-operations"
 # Prints the reattach directory $1 as `name=value` lines, then `alive=1` when
 # some process carries `$OWNER_VARIABLE=$2`: the wrapper until the workload's
-# status is written, and every descendant that kept its environment. Exits 3
-# when there is no such directory.
+# status is written, and every descendant that kept its environment. /proc is
+# read first: the wrapper writes the status before it exits, so `alive=0`
+# means any status is already in the files. Exits 3 when there is no such
+# directory.
 _PROBE = (
     'd=$1; [ -r "$d/owner" ] || exit 3; '
+    'if grep -qzxF "$2" /proc/[0-9]*/environ 2>/dev/null; '
+    "then alive=1; else alive=0; fi; "
     "for f in owner execution started group exit ended stopped; do "
     'v=$(head -n 1 "$d/$f" 2>/dev/null); printf "%s=%s\n" "$f" "$v"; done; '
-    'if grep -qzxF "$2" /proc/[0-9]*/environ 2>/dev/null; '
-    "then echo alive=1; else echo alive=0; fi"
+    'echo "alive=$alive"'
 )
 # How long a termination command, or a command's end after one, may take.
 _CONTROL_SECONDS = 30.0
