@@ -14,6 +14,7 @@ from agentic_isolation.harnesses.claude.conversation import ClaudeConversationRe
 from agentic_isolation.harnesses.claude.evidence import ClaudeNativeEvidenceReader
 from agentic_isolation.harnesses.claude.headless import ClaudeHeadless, ClaudeHeadlessError
 from agentic_isolation.harnesses.claude.transcripts import ClaudeTranscriptSource
+from agentic_isolation.harnesses.claude.upstream_failure import classify_upstream_failure
 
 
 class ClaudeHarness:
@@ -39,4 +40,9 @@ class ClaudeHarness:
 
 register_harness(ClaudeHarness())
 
-__all__ = ["ClaudeHarness", "ClaudeHeadless", "ClaudeHeadlessError"]
+__all__ = [
+    "ClaudeHarness",
+    "ClaudeHeadless",
+    "ClaudeHeadlessError",
+    "classify_upstream_failure",
+]
