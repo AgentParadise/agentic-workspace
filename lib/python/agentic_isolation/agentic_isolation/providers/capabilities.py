@@ -155,7 +155,8 @@ class SupportsFileTransfer(Protocol):
         device, FIFO or socket, or past a limit is returned as a
         `FileRefusal`, never skipped. Omitting `limits` gets the finite
         `DEFAULT_READ_LIMITS`. Raises `ReadFilesError` when the sandbox's
-        walk or archive fails or breaks the contract.
+        walk or archive fails or breaks the contract, and its subclass
+        `ReadFilesTimeoutError` when either outlasts `limits.timeout_seconds`.
         """
         ...
 

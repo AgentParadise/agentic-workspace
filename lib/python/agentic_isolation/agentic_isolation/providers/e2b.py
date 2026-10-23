@@ -102,6 +102,7 @@ from agentic_isolation.providers.file_transfer import (
     DEFAULT_READ_LIMITS,
     ReadFilesError,
     ReadFilesResult,
+    ReadFilesTimeoutError,
     ReadLimits,
     collect,
     listing_cap,
@@ -375,7 +376,11 @@ class E2BWorkspaceProvider:
         # Bytes cross the command stream as base64, which is text-safe; the
         # files API is not used because it follows symlinks.
         listing = await self._sandbox_bytes(
-            workspace, listing_script(base_path, limits, base64=True), b"", listing_cap(limits)
+            workspace,
+            listing_script(base_path, limits, base64=True),
+            b"",
+            listing_cap(limits),
+            limits.timeout_seconds,
         )
         plan = plan_reads(listing, patterns, limits, base_path)
         if not plan.reads:
@@ -385,26 +390,47 @@ class E2BWorkspaceProvider:
             read_script(base_path, limits, base64=True),
             read_stdin(plan),
             read_cap(plan, limits),
+            limits.timeout_seconds,
         )
         return collect(read, plan, limits, base_path)
 
     async def _sandbox_bytes(
-        self, workspace: Workspace, script: str, stdin: bytes, cap: int
+        self, workspace: Workspace, script: str, stdin: bytes, cap: int, timeout: float
     ) -> bytes:
+        """The decoded output of `script`, failing past `cap` bytes or `timeout` seconds.
+
+        E2B kills the command at `timeout`; the host stops waiting then too,
+        since a killed command's stream may never end.
+        """
         session = await self._start(
-            workspace, ["sh", "-c", script], cwd="/", env=None, timeout=None, stdin=stdin
+            workspace, ["sh", "-c", script], cwd="/", env=None, timeout=timeout, stdin=stdin
         )
         encoded: list[str] = []
         size = 0
-        async for text in session.output():
-            # base64 is ASCII, so this is the encoded length; anything else
-            # the stream carries is counted by its UTF-8 bytes all the same.
-            size += len(text.encode("utf-8", "surrogateescape"))
-            if size > 4 * (cap // 3 + 1):
-                await session.cancel()
-                raise ReadFilesError(f"sandbox {workspace.id} sent more than {cap} bytes")
-            encoded.append(text)
-        outcome = await session.outcome()
+        try:
+            async with asyncio.timeout(timeout):
+                async for text in session.output():
+                    # base64 is ASCII, so this is the encoded length; anything else
+                    # the stream carries is counted by its UTF-8 bytes all the same.
+                    size += len(text.encode("utf-8", "surrogateescape"))
+                    if size > 4 * (cap // 3 + 1):
+                        await session.cancel()
+                        raise ReadFilesError(f"sandbox {workspace.id} sent more than {cap} bytes")
+                    encoded.append(text)
+                outcome = await session.outcome()
+        except TimeoutError as exc:
+            expired = ReadFilesTimeoutError(
+                f"read in sandbox {workspace.id} did not finish within {timeout:g}s"
+            )
+            try:
+                await asyncio.wait_for(session.cancel(), timeout=_KILL_SECONDS)
+            except Exception as leak:
+                expired.add_note(f"the kill of the timed-out command is unconfirmed: {leak!r}")
+            raise expired from exc
+        if outcome.end == "timed_out":
+            raise ReadFilesTimeoutError(
+                f"read in sandbox {workspace.id} did not finish within {timeout:g}s"
+            )
         if not outcome.completed or outcome.exit_code != 0:
             raise ReadFilesError(
                 f"read in sandbox {workspace.id} ended {outcome.end} "

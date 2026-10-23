@@ -70,6 +70,7 @@ from agentic_isolation.providers.file_transfer import (
     FileRefusal,
     ReadFilesError,
     ReadFilesResult,
+    ReadFilesTimeoutError,
     ReadLimits,
 )
 from agentic_isolation.providers.local import WorkspaceLocalProvider
@@ -119,6 +120,7 @@ __all__ = [
     "ReadFilesResult",
     "FileRefusal",
     "ReadFilesError",
+    "ReadFilesTimeoutError",
     "SupportsOwnership",
     "OwnedWorkspace",
     "WorkspaceNotFoundError",

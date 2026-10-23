@@ -134,8 +134,10 @@ class ExecutedCommand:
     async def kill(self) -> bool:
         if self._process.returncode is not None:
             return False
+        # Its whole group, so a child blocked in the sandbox does not hold
+        # the output open past the kill.
         with contextlib.suppress(ProcessLookupError):
-            os.kill(self._process.pid, signal.SIGKILL)
+            os.killpg(self._process.pid, signal.SIGKILL)
         return True
 
 

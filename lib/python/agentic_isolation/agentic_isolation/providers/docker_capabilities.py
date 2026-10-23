@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import shlex
 import signal as signals
 import uuid
@@ -26,6 +27,7 @@ from agentic_isolation.providers.capabilities import (
 from agentic_isolation.providers.file_transfer import (
     ReadFilesError,
     ReadFilesResult,
+    ReadFilesTimeoutError,
     ReadLimits,
     collect,
     listing_cap,
@@ -51,6 +53,12 @@ _SUPERVISE = (
 # Bytes per read of the output pipe. Lines are framed here, not by
 # StreamReader.readline, so no line length is too long to deliver.
 _READ_CHUNK = 64 * 1024
+
+# Bytes of a read's stderr kept for its error message; the rest is drained
+# and dropped, so a sandbox flooding stderr can neither stall nor fill the host.
+_STDERR_KEPT = 64 * 1024
+# How long a killed docker client may take to exit.
+_REAP_SECONDS = 5.0
 
 _STOP_ALREADY_ENDED = 3
 
@@ -236,31 +244,65 @@ class DockerStreamSession:
         self._stopped_by = outcome
 
 
-async def _docker_bounded(args: Sequence[str], stdin: bytes, cap: int) -> bytes:
-    """Stdout of `docker exec`, refused past `cap` bytes so a sandbox cannot flood the host."""
+async def _docker_bounded(args: Sequence[str], stdin: bytes, cap: int, timeout: float) -> bytes:
+    """Stdout of `docker exec`, refused past `cap` bytes so a sandbox cannot flood the host.
+
+    Stdout and stderr are drained together, so neither pipe can fill and
+    stall the other, and the whole exchange ends within `timeout` seconds
+    or raises `ReadFilesTimeoutError`. The caller bounds the sandbox side
+    too; this kills only the docker client.
+    """
     proc = await asyncio.create_subprocess_exec(
         "docker",
         *args,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    stdout, stderr = proc.stdout, proc.stderr
     proc.stdin.write(stdin)
     proc.stdin.close()
     out = bytearray()
-    while chunk := await proc.stdout.read(_READ_CHUNK):
-        out += chunk
-        if len(out) > cap:
-            proc.kill()
-            await proc.wait()
-            raise ReadFilesError(f"the sandbox sent more than {cap} bytes for: {shlex.join(args)}")
-    err = await proc.stderr.read()
-    code = await proc.wait()
+    err = bytearray()
+
+    async def read_out() -> None:
+        while chunk := await stdout.read(_READ_CHUNK):
+            out.extend(chunk)
+            if len(out) > cap:
+                raise ReadFilesError(
+                    f"the sandbox sent more than {cap} bytes for: {shlex.join(args)}"
+                )
+
+    async def read_err() -> None:
+        while chunk := await stderr.read(_READ_CHUNK):
+            err.extend(chunk[: max(0, _STDERR_KEPT - len(err))])
+
+    try:
+        async with asyncio.timeout(timeout):
+            await asyncio.gather(read_out(), read_err())
+            code = await proc.wait()
+    except BaseException as exc:
+        # The client's whole group, so nothing it started holds the pipes open.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signals.SIGKILL)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=_REAP_SECONDS)
+        if isinstance(exc, TimeoutError):
+            raise ReadFilesTimeoutError(
+                f"{shlex.join(args[:2])} did not finish within {timeout:g}s"
+            ) from exc
+        raise
     if code != 0:
         detail = err.decode(errors="replace").strip() or f"exit {code}"
         raise ReadFilesError(f"{shlex.join(args[:2])} failed: {detail}")
     return bytes(out)
+
+
+def _deadline(limits: ReadLimits) -> list[str]:
+    """Kill the sandbox side once the host stops waiting, since killing the client does not."""
+    return ["timeout", "-s", "KILL", f"{limits.timeout_seconds + _REAP_SECONDS:g}"]
 
 
 async def read_files(
@@ -270,15 +312,19 @@ async def read_files(
     if base_path not in TRANSFER_ROOTS:
         raise ValueError(f"base_path must be one of {', '.join(TRANSFER_ROOTS)}")
     listing = await _docker_bounded(
-        ["exec", container, "sh", "-c", listing_script(base_path, limits)], b"", listing_cap(limits)
+        ["exec", container, *_deadline(limits), "sh", "-c", listing_script(base_path, limits)],
+        b"",
+        listing_cap(limits),
+        limits.timeout_seconds,
     )
     plan = plan_reads(listing, patterns, limits, base_path)
     if not plan.reads:
         return collect(b"", plan, limits, base_path)
     read = await _docker_bounded(
-        ["exec", "-i", container, "sh", "-c", read_script(base_path, limits)],
+        ["exec", "-i", container, *_deadline(limits), "sh", "-c", read_script(base_path, limits)],
         read_stdin(plan),
         read_cap(plan, limits),
+        limits.timeout_seconds,
     )
     return collect(read, plan, limits, base_path)
 

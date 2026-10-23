@@ -17,9 +17,11 @@ are bounded by the limits: the walk stops once `max_entries + 1` records are
 out (plus one pipe buffer), and at most `max_file_bytes + 1` bytes of one
 file are held at a time.
 
-The sandbox needs /proc and GNU find, xargs, head and stat, as the Docker and
-E2B base images have. A file replaced by a FIFO between the reader's type
-check and its open can block that read; it cannot return the FIFO's bytes.
+The sandbox needs /proc and GNU find, xargs, head, stat and timeout, as the
+Docker and E2B base images have. A file replaced by a FIFO between the
+reader's type check and its open can block that read; it cannot return the
+FIFO's bytes, and the call ends with `ReadFilesTimeoutError` once
+`timeout_seconds` pass.
 """
 
 from __future__ import annotations
@@ -53,18 +55,30 @@ class ReadLimits:
       they match, since listing them is the cost.
     - `max_depth`: path components of an entry; `a/b.txt` is depth 2. The
       walk does not descend below it.
+    - `timeout_seconds`: how long each of the walk and the read may take
+      before the call fails with `ReadFilesTimeoutError`.
     """
 
     max_total_bytes: int = 64 * 1024 * 1024
     max_file_bytes: int = 16 * 1024 * 1024
     max_entries: int = 10_000
     max_depth: int = 32
+    timeout_seconds: float = 120.0
 
     def __post_init__(self) -> None:
         for name in ("max_total_bytes", "max_file_bytes", "max_entries", "max_depth"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"ReadLimits.{name} must be a positive int, got {value!r}")
+        seconds = self.timeout_seconds
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, int | float)
+            or not 0 < seconds < float("inf")
+        ):
+            raise ValueError(
+                f"ReadLimits.timeout_seconds must be a positive finite number, got {seconds!r}"
+            )
 
 
 # What a caller that passes no limits gets: finite, never unlimited.
@@ -98,6 +112,13 @@ class ReadFilesResult:
 
 class ReadFilesError(RuntimeError):
     """The sandbox's walk or archive failed, or answered outside the contract."""
+
+
+class ReadFilesTimeoutError(ReadFilesError):
+    """The sandbox's walk or read did not finish within `ReadLimits.timeout_seconds`.
+
+    Nothing read before the deadline is returned.
+    """
 
 
 @dataclass(frozen=True)

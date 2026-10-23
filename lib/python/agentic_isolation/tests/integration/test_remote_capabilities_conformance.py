@@ -450,19 +450,21 @@ def _after_the_listing(
     if isinstance(provider, E2BWorkspaceProvider):
         sandbox_bytes = provider._sandbox_bytes
 
-        async def hooked_e2b(ws: Workspace, script: str, stdin: bytes, cap: int) -> bytes:
+        async def hooked_e2b(
+            ws: Workspace, script: str, stdin: bytes, cap: int, timeout: float
+        ) -> bytes:
             if stdin:
                 await plant()
-            return await sandbox_bytes(ws, script, stdin, cap)
+            return await sandbox_bytes(ws, script, stdin, cap, timeout)
 
         monkeypatch.setattr(provider, "_sandbox_bytes", hooked_e2b)
     else:
         docker_bounded = docker_capabilities._docker_bounded
 
-        async def hooked_docker(args: list[str], stdin: bytes, cap: int) -> bytes:
+        async def hooked_docker(args: list[str], stdin: bytes, cap: int, timeout: float) -> bytes:
             if stdin:
                 await plant()
-            return await docker_bounded(args, stdin, cap)
+            return await docker_bounded(args, stdin, cap, timeout)
 
         monkeypatch.setattr(docker_capabilities, "_docker_bounded", hooked_docker)
     return fired

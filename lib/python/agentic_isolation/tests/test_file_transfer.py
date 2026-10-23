@@ -63,6 +63,12 @@ def test_limits_must_be_positive_ints(value: object) -> None:
         ReadLimits(max_entries=value)  # type: ignore[arg-type]  # the bad value is the test
 
 
+@pytest.mark.parametrize("value", [0, -1, True, float("inf"), float("nan"), None])
+def test_the_timeout_must_be_positive_and_finite(value: object) -> None:
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        ReadLimits(timeout_seconds=value)  # type: ignore[arg-type]  # the bad value is the test
+
+
 def test_the_plan_looks_at_no_more_records_than_the_entry_limit_allows() -> None:
     listing = b"".join(_record("f", f"f{n}") for n in range(5))
 

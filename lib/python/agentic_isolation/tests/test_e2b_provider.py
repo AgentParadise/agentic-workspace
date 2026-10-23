@@ -8,6 +8,8 @@ E2B; tests/integration/test_e2b_live.py does that, and is NOT RUN without a key.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
 import shlex
 from collections.abc import Mapping
 from pathlib import Path
@@ -17,6 +19,7 @@ import pytest
 from agentic_isolation import (
     ReadFilesError,
     ReadFilesResult,
+    ReadFilesTimeoutError,
     ReadLimits,
     ResourceLimits,
     StreamOutcome,
@@ -285,6 +288,37 @@ async def test_read_files_matches_patterns_and_returns_exact_bytes(tmp_path: Pat
     assert got == ReadFilesResult(files=(("a/one.jsonl", blob),), refused=())
     assert len(client.started) == 3  # create's root check, the listing, the read
     assert client.stdins[-1] == b"a/one.jsonl\0"
+
+
+async def test_read_files_times_out_on_a_file_swapped_for_a_fifo_after_its_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The reader with the name swapped for a FIFO between its type check and
+    # its open, so the read blocks with no output until the deadline.
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    client = FakeE2BClient(executing_root=root)
+    client.spool_root.mkdir(parents=True)
+    (client.spool_root / "f").write_bytes(b"x")
+    old = 'elif ! command exec 3<"./$p"; then'
+    new = 'elif ! { rm -f -- "./$p" && mkfifo -- "./$p" && command exec 3<"./$p"; }; then'
+    assert old in file_transfer._READER
+    monkeypatch.setattr(file_transfer, "_READER", file_transfer._READER.replace(old, new))
+    provider = E2BWorkspaceProvider("tmpl-1", client=client)
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+
+    try:
+        with pytest.raises(ReadFilesTimeoutError, match="within 0.5s"):
+            await asyncio.wait_for(
+                provider.read_files(
+                    workspace, ["f"], base_path="/spool", limits=ReadLimits(timeout_seconds=0.5)
+                ),
+                20,
+            )
+        assert (client.spool_root / "f").is_fifo()
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(os.open(client.spool_root / "f", os.O_WRONLY | os.O_NONBLOCK))
 
 
 async def test_read_files_reports_a_sandbox_that_answers_outside_the_contract(
