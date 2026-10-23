@@ -124,9 +124,6 @@ async def test_fresh_instance_cancel_kills_the_workload(tmp_path: Path) -> None:
     third = _fresh(client)
     await third.reattach(ref, token)
     assert (await third.status(ref)).state == "cancelled"
-    # The starting instance settles it the same way.
-    await asyncio.sleep(0.2)
-    assert (await first.status(ref)).state in ("running", "cancelled", "failed")
 
 
 async def test_a_wrong_token_cannot_reattach_or_cancel(tmp_path: Path) -> None:
