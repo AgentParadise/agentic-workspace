@@ -1,0 +1,25 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
+index a1b638a..45a7126 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
+@@ -153,6 +153,7 @@ def archive_script(base_path: str, *, base64: bool = False) -> str:
+             "--no-recursion",
+             "--null",
+             "--verbatim-files-from",
++            "--dereference",
+             "-cf",
+             "-",
+             "-T",
+@@ -221,8 +222,10 @@ def plan_reads(
+             continue
+         if kind == "l":
+             target = raw_target.decode("utf-8", "surrogateescape")
+-            escaping = _escapes(path, target, base_path)
+-            refused.append(FileRefusal(path, "escaping_symlink" if escaping else "symlink"))
++            if _escapes(path, target, base_path):
++                reads.append((path, nbytes))
++            else:
++                refused.append(FileRefusal(path, "symlink"))
+         elif kind != "f":
+             refused.append(FileRefusal(path, "special_file"))
+         elif nlink > 1:

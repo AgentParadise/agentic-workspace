@@ -1,0 +1,22 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
+index a1b638a..a9f9d31 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
+@@ -227,8 +227,6 @@ def plan_reads(
+             refused.append(FileRefusal(path, "special_file"))
+         elif nlink > 1:
+             refused.append(FileRefusal(path, "hard_link"))
+-        elif nbytes > limits.max_file_bytes:
+-            refused.append(FileRefusal(path, "file_too_large"))
+         elif total + nbytes > limits.max_total_bytes:
+             refused.append(FileRefusal(path, "total_bytes_exceeded"))
+         else:
+@@ -264,8 +262,6 @@ def collect(archive: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str)
+                     refused.append(FileRefusal(path, "escaping_symlink" if escaping else "symlink"))
+                 elif not member.isreg():
+                     refused.append(FileRefusal(path, "special_file"))
+-                elif member.size > limits.max_file_bytes:
+-                    refused.append(FileRefusal(path, "file_too_large"))
+                 elif total + member.size > limits.max_total_bytes:
+                     refused.append(FileRefusal(path, "total_bytes_exceeded"))
+                 else:

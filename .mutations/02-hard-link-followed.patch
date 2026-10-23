@@ -1,0 +1,28 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
+index a1b638a..b356f82 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
+@@ -225,8 +225,6 @@ def plan_reads(
+             refused.append(FileRefusal(path, "escaping_symlink" if escaping else "symlink"))
+         elif kind != "f":
+             refused.append(FileRefusal(path, "special_file"))
+-        elif nlink > 1:
+-            refused.append(FileRefusal(path, "hard_link"))
+         elif nbytes > limits.max_file_bytes:
+             refused.append(FileRefusal(path, "file_too_large"))
+         elif total + nbytes > limits.max_total_bytes:
+@@ -257,12 +255,10 @@ def collect(archive: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str)
+                 if path not in expected:
+                     raise ReadFilesError(f"the sandbox archive holds an unrequested entry {path!r}")
+                 expected.remove(path)
+-                if member.islnk():
+-                    refused.append(FileRefusal(path, "hard_link"))
+-                elif member.issym():
++                if member.issym():
+                     escaping = _escapes(path, member.linkname, base_path)
+                     refused.append(FileRefusal(path, "escaping_symlink" if escaping else "symlink"))
+-                elif not member.isreg():
++                elif not (member.isreg() or member.islnk()):
+                     refused.append(FileRefusal(path, "special_file"))
+                 elif member.size > limits.max_file_bytes:
+                     refused.append(FileRefusal(path, "file_too_large"))
