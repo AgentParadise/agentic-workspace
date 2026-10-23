@@ -292,7 +292,7 @@ async def test_pause_and_resume_keep_the_spool(template: str) -> None:
 
         got = await provider.read_files(workspace, ["probe"], base_path="/spool")
         assert await _state(workspace.id) == "running"
-        assert got == [("probe", b"kept")]
+        assert got.files == (("probe", b"kept"),) and got.refused == ()
     finally:
         await provider.destroy(workspace)
         # Bounded: list_owned waits out a list still showing what destroy removed.
