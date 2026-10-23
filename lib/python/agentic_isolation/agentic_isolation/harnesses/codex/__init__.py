@@ -30,6 +30,7 @@ from agentic_isolation.harnesses import AgentName, ExecFn, TranscriptSource, reg
 from agentic_isolation.harnesses.codex.conversation import CodexConversationReader
 from agentic_isolation.harnesses.codex.evidence import CodexNativeEvidenceReader
 from agentic_isolation.harnesses.codex.transcripts import CodexTranscriptSource
+from agentic_isolation.harnesses.codex.upstream_failure import classify_upstream_failure
 
 
 class CodexHarness:
@@ -55,4 +56,4 @@ class CodexHarness:
 
 register_harness(CodexHarness())
 
-__all__ = ["CodexHarness"]
+__all__ = ["CodexHarness", "classify_upstream_failure"]

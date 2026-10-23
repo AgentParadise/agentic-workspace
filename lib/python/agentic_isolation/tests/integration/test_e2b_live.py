@@ -297,3 +297,86 @@ async def test_pause_and_resume_keep_the_spool(template: str) -> None:
         await provider.destroy(workspace)
         # Bounded: list_owned waits out a list still showing what destroy removed.
         assert await provider.list_owned(run) == []
+
+
+async def test_live_operation_scrubs_a_binding_and_reports_the_real_exit_code(
+    template: str,
+) -> None:
+    """#95 against real E2B: credential env, launch marker on stdin, true exit code."""
+    from agentic_isolation.contract import (
+        CredentialBinding,
+        CredentialRef,
+        LaunchMarker,
+        OperationSpec,
+    )
+    from agentic_isolation.providers.base import run_to_completion
+
+    class Vault:
+        async def resolve(self, ref: CredentialRef) -> str:
+            return "s3cr3t-live-e2b"
+
+    provider = E2BWorkspaceProvider(template, credentials=Vault())
+    workspace = await provider.create(
+        WorkspaceConfig(provider="e2b", labels={"e2b_live.run": uuid.uuid4().hex})
+    )
+    try:
+        spec = OperationSpec.model_validate(
+            {
+                "execution_id": "exec-live",
+                "operation_key": "live-1",
+                "argv": ("sh", "-c", 'echo "token=$TOKEN"; echo 0 > exit_code; exit 7'),
+                "working_directory": ".",
+                "environment": {},
+                "credential_bindings": (
+                    CredentialBinding(
+                        ref=CredentialRef(name="t", scope="repo"), delivery="env", target="TOKEN"
+                    ),
+                ),
+                "launch_marker": LaunchMarker(argv0="aw-live", line="AW_LAUNCH live"),
+                "timeout_seconds": 60,
+                "metadata": {},
+            }
+        )
+        status, output = await run_to_completion(provider, workspace, spec)
+        assert (status.state, status.exit_code) == ("failed", 7)
+        assert output == b"AW_LAUNCH live\ntoken=[REDACTED]\n"
+    finally:
+        await provider.destroy(workspace)
+
+
+async def test_live_cancel_stops_the_whole_group_in_the_sandbox(template: str) -> None:
+    """#95 against real E2B: a TERM-trapping child and a grandchild die with cancel."""
+    from agentic_isolation.contract import OperationSpec
+
+    provider = E2BWorkspaceProvider(template)
+    workspace = await provider.create(
+        WorkspaceConfig(provider="e2b", labels={"e2b_live.run": uuid.uuid4().hex})
+    )
+    script = (
+        "(sh -c 'echo $$ >> pids; exec sleep 300' &); "
+        "sh -c 'trap \"\" TERM; echo $$ >> pids; exec sleep 300' >/dev/null 2>&1 & "
+        "echo $$ >> pids; exec sleep 300"
+    )
+    try:
+        spec = OperationSpec.model_validate(
+            {
+                "execution_id": "exec-live",
+                "operation_key": "live-cancel",
+                "argv": ("sh", "-c", script),
+                "working_directory": ".",
+                "environment": {},
+                "credential_bindings": (),
+                "timeout_seconds": 120,
+                "metadata": {},
+            }
+        )
+        ref = await provider.start(workspace, spec)
+        while len((await provider.execute(workspace, "cat pids 2>/dev/null")).stdout.split()) < 3:
+            await asyncio.sleep(0.5)
+        assert (await provider.cancel(ref, grace_seconds=1.0)).state == "cancelled"
+        alive = await provider.execute(
+            workspace, 'for p in $(cat pids); do kill -0 "$p" 2>/dev/null && echo "$p"; done'
+        )
+        assert alive.stdout.strip() == ""
+    finally:
+        await provider.destroy(workspace)

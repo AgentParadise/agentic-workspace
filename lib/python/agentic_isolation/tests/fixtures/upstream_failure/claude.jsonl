@@ -1,0 +1,8 @@
+{"type":"result","subtype":"success","is_error":true,"session_id":"quota-oct-23","result":"You've hit your weekly limit · resets Oct 23, 3pm (UTC)"}
+{"type":"result","subtype":"success","is_error":true,"session_id":"quota-oct-15","result":"You've hit your weekly limit · resets Oct 15, 8am (UTC)"}
+{"type":"result","subtype":"success","is_error":true,"session_id":"overloaded","result":"API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"},\"request_id\":\"req_0001\"}"}
+{"type":"result","subtype":"success","is_error":true,"session_id":"rate-limited","result":"API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed the rate limit for your organization.\"},\"request_id\":\"req_0002\"}"}
+{"type":"result","subtype":"success","is_error":true,"session_id":"unauthenticated","result":"API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_0003\"}"}
+{"type":"result","subtype":"success","is_error":true,"session_id":"forbidden","result":"API Error: 403 {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Your API key does not have permission to use the specified resource.\"},\"request_id\":\"req_0004\"}"}
+{"type":"result","subtype":"success","is_error":true,"session_id":"unplaced","result":"Connection refused"}
+{"type":"result","subtype":"success","is_error":false,"session_id":"clean","result":""}

@@ -45,7 +45,9 @@ Decisions that differ from Docker, and why:
   gives `/workspace` and `/spool` to `agent` (as the Docker provider runs);
   E2B's `user` cannot write them, and making it the owner would need root at
   every create. Create confirms both roots are writable before returning.
-- Credential bindings, host mounts and `limits.network=False` are refused:
+- `SupportsOperations` is delegated to `E2BOperations` (#95), which has
+  Docker's `OperationSpec` semantics; see `e2b_operations.py`.
+- Workspace-level credential bindings, host mounts and `limits.network=False` are refused:
   none has an E2B delivery yet, and silently dropping one would launch a
   workspace without what the caller asked for. The mutable `environment` is
   re-checked for credentials before allocation and before every command.
@@ -60,13 +62,22 @@ import fnmatch
 import posixpath
 import shlex
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Literal
 
 from agentic_isolation.config import CredentialPolicyError, WorkspaceConfig
-from agentic_isolation.contract import FinalizationOutcome, OperationError, WorkspaceRef
-from agentic_isolation.providers.base import ExecuteResult, Workspace
+from agentic_isolation.contract import (
+    FinalizationOutcome,
+    ObservationPage,
+    OperationError,
+    OperationRef,
+    OperationSpec,
+    OperationStatus,
+    ProviderDescriptor,
+    WorkspaceRef,
+)
+from agentic_isolation.providers.base import CredentialResolver, ExecuteResult, Workspace
 from agentic_isolation.providers.capabilities import (
     OwnedWorkspace,
     StreamOutcome,
@@ -85,6 +96,7 @@ from agentic_isolation.providers.e2b_client import (
     SandboxListing,
     SdkE2BClient,
 )
+from agentic_isolation.providers.e2b_operations import E2BOperations
 from agentic_isolation.providers.teardown_report import TeardownReport, TeardownUsage
 
 _PROVIDER = "e2b"
@@ -125,6 +137,9 @@ class E2BWorkspaceProvider:
         client: E2BSandboxClient | None = None,
         lifetime_seconds: int = 3600,
         run_as: str = _RUN_AS,
+        credentials: CredentialResolver | None = None,
+        retention_bytes: int = 1 << 24,
+        max_page_bytes: int = 1 << 16,
     ) -> None:
         """
         Args:
@@ -133,6 +148,10 @@ class E2BWorkspaceProvider:
             lifetime_seconds: E2B's sandbox timeout, after which E2B kills it.
             run_as: The sandbox user every command and file transfer runs as;
                 it must be able to write `/workspace` and `/spool`.
+            credentials: Resolves an operation's `credential_bindings`; a
+                binding without one is refused as `rejected_policy`.
+            retention_bytes: Output each operation keeps for `observe`.
+            max_page_bytes: The largest serialised page `observe` returns.
         """
         self._template = template
         self._client = client if client is not None else SdkE2BClient()
@@ -142,6 +161,13 @@ class E2BWorkspaceProvider:
         self._retained: dict[str, Workspace] = {}
         # Sandboxes E2B was seen not to know by id after this provider killed them.
         self._removed: set[str] = set()
+        self._operations = E2BOperations(
+            self._client,
+            run_as=run_as,
+            credentials=credentials,
+            retention_bytes=retention_bytes,
+            max_page_bytes=max_page_bytes,
+        )
 
     @property
     def name(self) -> str:
@@ -294,6 +320,32 @@ class E2BWorkspaceProvider:
         )
         return E2BStreamSession(self._client, workspace.id, command, timeout=timeout)
 
+    def describe(self) -> ProviderDescriptor:
+        return self._operations.describe()
+
+    async def start(
+        self, workspace: Workspace, spec: OperationSpec, *, redact: Collection[str] = ()
+    ) -> OperationRef:
+        return await self._operations.start(workspace, spec, redact=redact)
+
+    async def status(self, ref: OperationRef) -> OperationStatus:
+        return await self._operations.status(ref)
+
+    async def observe(
+        self,
+        ref: OperationRef,
+        *,
+        cursor: str | None,
+        max_bytes: int,
+        wait_seconds: float = 0,
+    ) -> ObservationPage:
+        return await self._operations.observe(
+            ref, cursor=cursor, max_bytes=max_bytes, wait_seconds=wait_seconds
+        )
+
+    async def cancel(self, ref: OperationRef, *, grace_seconds: float) -> OperationStatus:
+        return await self._operations.cancel(ref, grace_seconds=grace_seconds)
+
     async def read_files(
         self,
         workspace: Workspace,
@@ -420,6 +472,7 @@ class E2BWorkspaceProvider:
         await self._remove(workspace.id)
         self._workspaces.pop(workspace.id, None)
         self._retained.pop(workspace.id, None)
+        self._operations.forget_workspace(workspace.id)
         return TeardownReport(
             finalization=FinalizationOutcome(state="completed"), usage=TeardownUsage()
         )

@@ -2,20 +2,56 @@
 
 It refuses to construct outside a pytest run, so it can never stand in for
 the SDK adapter in a real process.
+
+By default a started command is scripted (`FakeRun`). With `executing_root`
+it really runs, as a local `sh -c` in a new session, so the operation
+conformance suite can check real pids and files. Each behaviour of
+`ExecutedCommand` is what the pinned SDK does (e2b==2.52.0):
+`/workspace` and `/spool` are the sandbox's own disk, mapped here to
+`executing_root` and a `-spool` sibling of it, in `cwd` and in the command
+alike, so nothing runs against the host's root;
+`envs` are added to the sandbox's environment; `stdin` is written then closed
+(`send_stdin`, `close_stdin`); stdout is decoded as UTF-8 with replacement by
+an incremental decoder (`AsyncCommandHandle`), and the stream ends only after
+`wait` returns, as `_SdkCommand` closes its queue in `wait`; `kill` is SIGKILL to the one
+pid and nothing else (its docstring), so descendants survive it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import codecs
+import contextlib
 import os
+import re
+import signal
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from agentic_isolation.providers.e2b_client import (
     CommandExit,
     E2BTransportError,
     SandboxListing,
 )
+from agentic_isolation.providers.e2b_operations import OWNER_VARIABLE
+
+# A sandbox root at the start of a path: not `/workspaces`, not `a/workspace`.
+_SANDBOX_ROOT = re.compile(r"(?<![\w./-])(/workspace|/spool)(?![\w.-])")
+
+
+def _kill_sandbox_processes(process: asyncio.subprocess.Process, owners: tuple[str, ...]) -> None:
+    """SIGKILL what a command of a killed sandbox left running on this host.
+
+    Its session, and anything carrying its owner token: the stand-in for the
+    VM going, which takes every process with it.
+    """
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
+    for environ in Path("/proc").glob("[0-9]*/environ"):
+        with contextlib.suppress(OSError):
+            if any(owner.encode() in environ.read_bytes().split(b"\0") for owner in owners):
+                os.kill(int(environ.parent.name), signal.SIGKILL)
 
 
 @dataclass
@@ -48,7 +84,7 @@ class FakeCommand:
 
     async def wait(self) -> CommandExit:
         await self._finished.wait()
-        if self.killed:
+        if self.killed and self._run.exit.end == "exited":
             return CommandExit(end="exited", exit_code=137)
         return self._run.exit
 
@@ -57,6 +93,49 @@ class FakeCommand:
             return False
         self.killed = True
         self._finished.set()
+        return True
+
+    def lose(self) -> None:
+        """The sandbox died under it: the stream ends with no end event."""
+        self._run.exit = CommandExit(end="disconnected", detail="sandbox killed")
+        self._finished.set()
+
+
+class ExecutedCommand:
+    """A command really running as a local process; see the module docstring."""
+
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self._process = process
+        self._waited = asyncio.Event()
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    async def output(self) -> AsyncIterator[str]:
+        assert self._process.stdout is not None
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        while chunk := await self._process.stdout.read(65536):
+            if text := decoder.decode(chunk):
+                yield text
+        if tail := decoder.decode(b"", final=True):
+            yield tail
+        # The adapter's stream ends only once `wait` has seen the end event.
+        await self._waited.wait()
+
+    async def wait(self) -> CommandExit:
+        try:
+            code = await self._process.wait()
+        finally:
+            self._waited.set()
+        # envd reports a signal death the way a shell does.
+        return CommandExit(end="exited", exit_code=code if code >= 0 else 128 - code)
+
+    async def kill(self) -> bool:
+        if self._process.returncode is not None:
+            return False
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(self._process.pid, signal.SIGKILL)
         return True
 
 
@@ -68,13 +147,26 @@ class FakeSandbox:
 
 
 class FakeE2BClient:
-    def __init__(self, *, responder: Callable[[str], FakeRun] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        responder: Callable[[str], FakeRun] | None = None,
+        executing_root: Path | None = None,
+    ) -> None:
         if "PYTEST_CURRENT_TEST" not in os.environ:
             raise RuntimeError("FakeE2BClient is a test double; it refuses to run outside pytest")
         self.sandboxes: dict[str, FakeSandbox] = {}
         self.started: list[tuple[str, str, str | None, dict[str, str]]] = []
         self.commands: dict[int, FakeCommand] = {}
         self.responder = responder or (lambda _command: FakeRun())
+        self.executing_root = executing_root
+        # The stdin each start was given, in call order.
+        self.stdins: list[bytes | None] = []
+        self.executed: list[ExecutedCommand] = []
+        self._command_sandbox: dict[int, str] = {}
+        self._executed_sandbox: list[tuple[asyncio.subprocess.Process, str]] = []
+        # Owner tokens (`OWNER_VARIABLE`) each executed command carried, by pid.
+        self.executed_tokens: dict[int, tuple[str, ...]] = {}
         self.kill_is_noop = False
         self.command_kill_works = True
         self.pause_refused = False
@@ -144,6 +236,13 @@ class FakeE2BClient:
         if self.kill_is_noop:
             return True
         box = self.sandboxes.pop(sandbox_id, None)
+        # The sandbox's VM goes, and every process in it.
+        for pid, owner in self._command_sandbox.items():
+            if owner == sandbox_id:
+                self.commands[pid].lose()
+        for process, owner in self._executed_sandbox:
+            if owner == sandbox_id:
+                _kill_sandbox_processes(process, self.executed_tokens.get(process.pid, ()))
         if box is not None and self.listed_after_kill:
             self._dying[sandbox_id] = (box, self.listed_after_kill)
         if box is not None and self.found_after_kill:
@@ -165,13 +264,65 @@ class FakeE2BClient:
         env: Mapping[str, str],
         timeout: float | None,
         user: str,
-    ) -> FakeCommand:
+        stdin: bytes | None = None,
+    ) -> FakeCommand | ExecutedCommand:
         self.started.append((sandbox_id, command, cwd, dict(env)))
         self.users.append(user)
+        self.stdins.append(stdin)
+        if self.executing_root is not None:
+            made_here = await self._execute(command, cwd=cwd, env=env, stdin=stdin)
+            self._executed_sandbox.append((made_here._process, sandbox_id))
+            self.executed_tokens[made_here.pid] = tuple(
+                f"{name}={value}" for name, value in env.items() if name == OWNER_VARIABLE
+            )
+            return made_here
         pid = len(self.commands) + 1
         made = FakeCommand(pid, self.responder(command), kill_works=self.command_kill_works)
         self.commands[pid] = made
+        self._command_sandbox[pid] = sandbox_id
         return made
+
+    async def _execute(
+        self, command: str, *, cwd: str | None, env: Mapping[str, str], stdin: bytes | None
+    ) -> ExecutedCommand:
+        assert self.executing_root is not None
+        process = await asyncio.create_subprocess_exec(
+            "sh",
+            "-c",
+            self.sandbox_paths(command),
+            cwd=self.sandbox_paths(cwd or "/workspace"),
+            env={**os.environ, **env},
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        if process.stdin is not None:
+            process.stdin.write(stdin or b"")
+            await process.stdin.drain()
+            process.stdin.close()
+        made = ExecutedCommand(process)
+        self.executed.append(made)
+        return made
+
+    def sandbox_paths(self, text: str) -> str:
+        """`text` with each sandbox root (`/workspace`, `/spool`) moved under the test's root."""
+        assert self.executing_root is not None
+        roots = {"/workspace": self.executing_root, "/spool": self.spool_root}
+        # Host paths the test passed in (its tmp dir may sit under /workspace) stay as given.
+        hosted = tuple(str(root) for root in roots.values())
+
+        def move(match: re.Match[str]) -> str:
+            if text.startswith(hosted, match.start()):
+                return match.group(1)
+            return str(roots[match.group(1)])
+
+        return _SANDBOX_ROOT.sub(move, text)
+
+    @property
+    def spool_root(self) -> Path:
+        assert self.executing_root is not None
+        return self.executing_root.with_name(f"{self.executing_root.name}-spool")
 
     async def reconnect(self, sandbox_id: str, pid: int) -> FakeCommand:
         self.events.append(f"reconnect {sandbox_id} {pid}")

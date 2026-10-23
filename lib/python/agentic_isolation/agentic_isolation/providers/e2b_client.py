@@ -24,6 +24,10 @@ behaviour it relies on is cited (accessed 2026-10-17):
   with HTTP 503, `ServiceBusyException`, while the sandbox keeps running)
 - Background commands, `pid`, and reattaching with `commands.connect(pid)`:
   https://e2b.dev/docs/commands/background
+- `commands.run(stdin=True)`, `send_stdin(pid, data)` and `close_stdin(pid)`
+  (EOF; needs a recent envd), and stdout decoded as UTF-8 with replacement by
+  an incremental decoder: `e2b/sandbox_async/commands/command.py` and
+  `command_handle.py` in e2b==2.52.0
 - File read as bytes and write: https://e2b.dev/docs/filesystem/read-write
 - Commands and file operations run as E2B's `user` unless `user=` names
   another; any user in the sandbox's /etc/passwd may be named
@@ -43,6 +47,7 @@ tests/integration/test_e2b_live.py for the gated proof.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import random
 import signal
 from collections.abc import AsyncIterator, Mapping
@@ -145,8 +150,12 @@ class E2BSandboxClient(Protocol):
         env: Mapping[str, str],
         timeout: float | None,
         user: str,
+        stdin: bytes | None = None,
     ) -> SandboxCommand:
         """Start a shell command in the sandbox, as `user`, without waiting for it.
+
+        `stdin`, when given, is written to the command's stdin, which is then
+        closed; otherwise the command gets no stdin stream.
 
         A transport that fails before the command starts is not raised: the
         returned command has no output and ends `disconnected`, so a client
@@ -270,6 +279,7 @@ class SdkE2BClient:
         env: Mapping[str, str],
         timeout: float | None,
         user: str,
+        stdin: bytes | None = None,
     ) -> SandboxCommand:
         chunks = _ChunkQueue()
         try:
@@ -281,6 +291,7 @@ class SdkE2BClient:
                 cwd=cwd,
                 user=user,
                 on_stdout=chunks.put,
+                stdin=stdin is not None,
                 # 0 means the SDK does not bound the command; ours is enforced
                 # by `timeout` in the sandbox (see E2BWorkspaceProvider).
                 timeout=0,
@@ -289,6 +300,15 @@ class SdkE2BClient:
             # Any failure before a handle exists is the transport's, whatever
             # its type (SandboxException, ConnectError, an httpx error).
             return UnstartedCommand(f"cannot start a command in {sandbox_id}: {exc!r}")
+        if stdin is not None:
+            try:
+                await sandbox.commands.send_stdin(handle.pid, stdin)
+                await sandbox.commands.close_stdin(handle.pid)
+            except Exception as exc:
+                # The command would wait on stdin forever: kill it, report it lost.
+                with contextlib.suppress(Exception):
+                    await handle.kill()
+                return UnstartedCommand(f"cannot write stdin of pid {handle.pid}: {exc!r}")
         return _SdkCommand(handle, chunks)
 
     async def reconnect(self, sandbox_id: str, pid: int) -> SandboxCommand:
