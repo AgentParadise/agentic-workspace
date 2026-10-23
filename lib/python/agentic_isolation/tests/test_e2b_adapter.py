@@ -351,6 +351,42 @@ async def test_start_on_an_unreachable_sandbox_is_a_disconnected_command(
     assert await command.kill() is False
 
 
+class _StdinStallingCommands:
+    """`sandbox.commands`: starts a command whose stdin is never consumed."""
+
+    def __init__(self) -> None:
+        self.killed = 0
+
+    async def run(self, _command: str, **_kwargs: object) -> object:
+        async def kill() -> bool:
+            self.killed += 1
+            return True
+
+        return type("Handle", (), {"pid": 17, "kill": staticmethod(kill)})()
+
+    async def send_stdin(self, _pid: int, _data: bytes) -> None:
+        await asyncio.Event().wait()
+
+
+async def test_a_start_cancelled_while_sending_stdin_kills_the_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = _StdinStallingCommands()
+
+    async def sandbox(_self: SdkE2BClient, _sandbox_id: str) -> object:
+        return type("Sandbox", (), {"commands": commands})()
+
+    monkeypatch.setattr(SdkE2BClient, "_sandbox", sandbox)
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.05):
+            await SdkE2BClient(api_key="unused").start(
+                "sbx-1", "cat", cwd=None, env={}, timeout=None, user="agent", stdin=b"x"
+            )
+
+    assert commands.killed == 1
+
+
 class _ScriptedCommands:
     """`sandbox.commands`: every command writes `output`, two bytes per SDK event."""
 

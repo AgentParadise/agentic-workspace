@@ -69,6 +69,11 @@ from agentic_isolation.providers.contained_files import (
     _open_contained,
 )
 from agentic_isolation.providers.docker_operations import DockerOperations
+from agentic_isolation.providers.file_transfer import (
+    DEFAULT_READ_LIMITS,
+    ReadFilesResult,
+    ReadLimits,
+)
 from agentic_isolation.providers.operation_spool import OperationFailure
 from agentic_isolation.providers.teardown_report import (
     DeleteFallback,
@@ -824,12 +829,13 @@ class WorkspaceDockerProvider(BaseProvider):
         patterns: Sequence[str],
         *,
         base_path: TransferRoot,
-    ) -> list[tuple[str, bytes]]:
+        limits: ReadLimits = DEFAULT_READ_LIMITS,
+    ) -> ReadFilesResult:
         """SupportsFileTransfer: exact bytes, from inside the container."""
         container_name = workspace._handle
         if not container_name:
             raise RuntimeError("Container not available")
-        return await docker_capabilities.read_files(container_name, patterns, base_path)
+        return await docker_capabilities.read_files(container_name, patterns, base_path, limits)
 
     async def list_owned(self, labels: Mapping[str, str]) -> list[OwnedWorkspace]:
         """SupportsOwnership: this provider's workspaces carrying all of `labels`."""

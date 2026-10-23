@@ -58,7 +58,7 @@ The SDK behaviour this relies on is cited in `e2b_client.py`.
 from __future__ import annotations
 
 import asyncio
-import fnmatch
+import base64
 import posixpath
 import shlex
 import time
@@ -79,6 +79,7 @@ from agentic_isolation.contract import (
 )
 from agentic_isolation.providers.base import CredentialResolver, ExecuteResult, Workspace
 from agentic_isolation.providers.capabilities import (
+    TRANSFER_ROOTS,
     OwnedWorkspace,
     StreamOutcome,
     StreamSession,
@@ -97,6 +98,20 @@ from agentic_isolation.providers.e2b_client import (
     SdkE2BClient,
 )
 from agentic_isolation.providers.e2b_operations import E2BOperations
+from agentic_isolation.providers.file_transfer import (
+    DEFAULT_READ_LIMITS,
+    ReadFilesError,
+    ReadFilesResult,
+    ReadFilesTimeoutError,
+    ReadLimits,
+    collect,
+    listing_cap,
+    listing_script,
+    plan_reads,
+    read_cap,
+    read_script,
+    read_stdin,
+)
 from agentic_isolation.providers.teardown_report import TeardownReport, TeardownUsage
 
 _PROVIDER = "e2b"
@@ -308,6 +323,7 @@ class E2BWorkspaceProvider:
         cwd: str | None,
         env: Mapping[str, str] | None,
         timeout: float | None,
+        stdin: bytes | None = None,
     ) -> E2BStreamSession:
         merged_env = {**workspace.config.checked_environment(), **(env or {})}
         command = await self._client.start(
@@ -317,6 +333,7 @@ class E2BWorkspaceProvider:
             env=merged_env,
             timeout=timeout,
             user=self._run_as,
+            stdin=stdin,
         )
         return E2BStreamSession(self._client, workspace.id, command, timeout=timeout)
 
@@ -352,27 +369,82 @@ class E2BWorkspaceProvider:
         patterns: Sequence[str],
         *,
         base_path: TransferRoot,
-    ) -> list[tuple[str, bytes]]:
-        listing = await self.execute(
+        limits: ReadLimits = DEFAULT_READ_LIMITS,
+    ) -> ReadFilesResult:
+        if base_path not in TRANSFER_ROOTS:
+            raise ValueError(f"base_path must be one of {', '.join(TRANSFER_ROOTS)}")
+        # Bytes cross the command stream as base64, which is text-safe; the
+        # files API is not used because it follows symlinks.
+        listing = await self._sandbox_bytes(
             workspace,
-            shlex.join(["find", ".", "-type", "f", "-print0"]),
-            cwd=base_path,
+            listing_script(base_path, limits, base64=True),
+            b"",
+            listing_cap(limits),
+            limits.timeout_seconds,
         )
-        if not listing.success:
-            raise FileNotFoundError(f"cannot list {base_path} in sandbox {workspace.id}")
-        relative = sorted(
-            entry.removeprefix("./") for entry in listing.stdout.rstrip("\n").split("\0") if entry
+        plan = plan_reads(listing, patterns, limits, base_path)
+        if not plan.reads:
+            return collect(b"", plan, limits, base_path)
+        read = await self._sandbox_bytes(
+            workspace,
+            read_script(base_path, limits, base64=True),
+            read_stdin(plan),
+            read_cap(plan, limits),
+            limits.timeout_seconds,
         )
-        matched = [path for path in relative if any(fnmatch.fnmatch(path, p) for p in patterns)]
-        return [
-            (
-                path,
-                await self._client.read_bytes(
-                    workspace.id, f"{base_path}/{path}", user=self._run_as
-                ),
+        return collect(read, plan, limits, base_path)
+
+    async def _sandbox_bytes(
+        self, workspace: Workspace, script: str, stdin: bytes, cap: int, timeout: float
+    ) -> bytes:
+        """The decoded output of `script`, failing past `cap` bytes or `timeout` seconds.
+
+        E2B kills the command at `timeout`; the host stops waiting then too,
+        since a killed command's stream may never end. The host deadline
+        covers the start as well: sending the paths blocks once the sandbox
+        stops reading them, as it does when a read blocks on a FIFO.
+        """
+        session: E2BStreamSession | None = None
+        encoded: list[str] = []
+        size = 0
+        try:
+            async with asyncio.timeout(timeout):
+                session = await self._start(
+                    workspace, ["sh", "-c", script], cwd="/", env=None, timeout=timeout, stdin=stdin
+                )
+                async for text in session.output():
+                    # base64 is ASCII, so this is the encoded length; anything else
+                    # the stream carries is counted by its UTF-8 bytes all the same.
+                    size += len(text.encode("utf-8", "surrogateescape"))
+                    if size > 4 * (cap // 3 + 1):
+                        await session.cancel()
+                        raise ReadFilesError(f"sandbox {workspace.id} sent more than {cap} bytes")
+                    encoded.append(text)
+                outcome = await session.outcome()
+        except TimeoutError as exc:
+            expired = ReadFilesTimeoutError(
+                f"read in sandbox {workspace.id} did not finish within {timeout:g}s"
             )
-            for path in matched
-        ]
+            # Before a session exists the adapter has already killed whatever it started.
+            if session is not None:
+                try:
+                    await asyncio.wait_for(session.cancel(), timeout=_KILL_SECONDS)
+                except Exception as leak:
+                    expired.add_note(f"the kill of the timed-out command is unconfirmed: {leak!r}")
+            raise expired from exc
+        if outcome.end == "timed_out":
+            raise ReadFilesTimeoutError(
+                f"read in sandbox {workspace.id} did not finish within {timeout:g}s"
+            )
+        if not outcome.completed or outcome.exit_code != 0:
+            raise ReadFilesError(
+                f"read in sandbox {workspace.id} ended {outcome.end} "
+                f"(exit {outcome.exit_code}): {outcome.detail or ''}".rstrip(": ")
+            )
+        try:
+            return base64.b64decode("".join(encoded).strip(), validate=True)
+        except ValueError as exc:  # binascii.Error, or text that is not ASCII
+            raise ReadFilesError(f"sandbox {workspace.id} sent output that is not base64") from exc
 
     async def list_owned(self, labels: Mapping[str, str]) -> list[OwnedWorkspace]:
         held = {

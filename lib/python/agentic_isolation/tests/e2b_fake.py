@@ -11,7 +11,8 @@ conformance suite can check real pids and files. Each behaviour of
 `executing_root` and a `-spool` sibling of it, in `cwd` and in the command
 alike, so nothing runs against the host's root;
 `envs` are added to the sandbox's environment; `stdin` is written then closed
-(`send_stdin`, `close_stdin`); stdout is decoded as UTF-8 with replacement by
+(`send_stdin`, `close_stdin`), and the command is killed if that write fails
+or is cancelled; stdout is decoded as UTF-8 with replacement by
 an incremental decoder (`AsyncCommandHandle`), and the stream ends only after
 `wait` returns, as `_SdkCommand` closes its queue in `wait`; `kill` is SIGKILL to the one
 pid and nothing else (its docstring), so descendants survive it.
@@ -134,8 +135,10 @@ class ExecutedCommand:
     async def kill(self) -> bool:
         if self._process.returncode is not None:
             return False
+        # Its whole group, so a child blocked in the sandbox does not hold
+        # the output open past the kill.
         with contextlib.suppress(ProcessLookupError):
-            os.kill(self._process.pid, signal.SIGKILL)
+            os.killpg(self._process.pid, signal.SIGKILL)
         return True
 
 
@@ -297,12 +300,18 @@ class FakeE2BClient:
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
         )
-        if process.stdin is not None:
-            process.stdin.write(stdin or b"")
-            await process.stdin.drain()
-            process.stdin.close()
         made = ExecutedCommand(process)
         self.executed.append(made)
+        if process.stdin is not None:
+            try:
+                process.stdin.write(stdin or b"")
+                await process.stdin.drain()
+            except BaseException:
+                # As `SdkE2BClient.start`: a command whose stdin could not be
+                # written, the caller's cancellation included, is killed.
+                await made.kill()
+                raise
+            process.stdin.close()
         return made
 
     def sandbox_paths(self, text: str) -> str:

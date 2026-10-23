@@ -66,6 +66,13 @@ from agentic_isolation.providers.e2b_template import (
     build_template,
     manifest_hash,
 )
+from agentic_isolation.providers.file_transfer import (
+    FileRefusal,
+    ReadFilesError,
+    ReadFilesResult,
+    ReadFilesTimeoutError,
+    ReadLimits,
+)
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 from agentic_isolation.providers.teardown_report import (
     DeleteFallback,
@@ -109,6 +116,11 @@ __all__ = [
     "StreamOutcome",
     "StreamReconnectUnsupportedError",
     "SupportsFileTransfer",
+    "ReadLimits",
+    "ReadFilesResult",
+    "FileRefusal",
+    "ReadFilesError",
+    "ReadFilesTimeoutError",
     "SupportsOwnership",
     "OwnedWorkspace",
     "WorkspaceNotFoundError",
