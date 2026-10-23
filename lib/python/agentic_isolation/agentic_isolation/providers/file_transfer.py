@@ -243,13 +243,14 @@ def plan_reads(
 
     The records come from the sandbox, so they are parsed strictly and only
     the first `max_entries + 1` are looked at, whatever the sandbox sent.
+    The limits are then applied in path order, not the walk's, so which
+    files fit the total does not depend on the order the directory lists.
     """
     fields = listing.split(b"\0")
     if fields[-1] != b"" or (len(fields) - 1) % _FIELDS:
         raise ReadFilesError("the sandbox listing is not whole NUL-terminated records")
-    reads: list[tuple[str, int]] = []
+    records: list[tuple[str, str, int, int, int, bytes]] = []
     refused: list[FileRefusal] = []
-    total = 0
     for index in range(0, len(fields) - 1, _FIELDS):
         head, raw_path, raw_target = fields[index : index + _FIELDS]
         path = raw_path.decode("utf-8", "surrogateescape")
@@ -263,6 +264,10 @@ def plan_reads(
             raise ReadFilesError(f"the sandbox listing has a malformed record {head!r}") from exc
         if not path or path.startswith("/") or ".." in path.split("/"):
             raise ReadFilesError(f"the sandbox listing named a path outside the root: {path!r}")
+        records.append((path, kind, nlink, nbytes, level, raw_target))
+    reads: list[tuple[str, int]] = []
+    total = 0
+    for path, kind, nlink, nbytes, level, raw_target in sorted(records):
         if level > limits.max_depth:
             # A directory past the limit is not walked, so what it holds is unknown.
             if kind == "d" or _matches(path, patterns):
@@ -285,7 +290,7 @@ def plan_reads(
         else:
             total += nbytes
             reads.append((path, nbytes))
-    return ReadPlan(tuple(sorted(reads)), tuple(refused))
+    return ReadPlan(tuple(reads), tuple(refused))
 
 
 def _inside(resolved: str, base_path: str) -> bool:

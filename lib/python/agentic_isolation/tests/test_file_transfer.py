@@ -9,6 +9,7 @@ case, to check what the reader does and how much the walk and read cost.
 
 from __future__ import annotations
 
+import itertools
 import os
 import subprocess
 from pathlib import Path
@@ -69,6 +70,19 @@ def test_the_plan_looks_at_no_more_records_than_the_entry_limit_allows() -> None
 
     assert plan == ReadPlan(
         reads=(("f0", 1), ("f1", 1)), refused=(FileRefusal("f2", "entry_limit_exceeded"),)
+    )
+
+
+@pytest.mark.parametrize("order", list(itertools.permutations(("a", "b", "c"))))
+def test_the_total_is_allocated_in_path_order_whatever_order_the_walk_lists(
+    order: tuple[str, ...],
+) -> None:
+    listing = b"".join(_record("f", path, size=4) for path in order)
+
+    plan = plan_reads(listing, ["*"], ReadLimits(max_total_bytes=8), "/workspace")
+
+    assert plan == ReadPlan(
+        reads=(("a", 4), ("b", 4)), refused=(FileRefusal("c", "total_bytes_exceeded"),)
     )
 
 
