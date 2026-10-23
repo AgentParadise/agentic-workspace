@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+index a2626c3..8c5b26d 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_client.py
+@@ -306,7 +306,7 @@ class SdkE2BClient:
+             try:
+                 await sandbox.commands.send_stdin(handle.pid, stdin)
+                 await sandbox.commands.close_stdin(handle.pid)
+-            except BaseException as exc:
++            except Exception as exc:
+                 # The command would wait on stdin forever: kill it, report it lost.
+                 # A cancelled caller (its deadline passed while the sandbox was
+                 # not reading) gets the same bounded kill, then its cancellation.

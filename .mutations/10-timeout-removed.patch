@@ -21,21 +21,18 @@ index 13cf445..8bae5d7 100644
  
  async def read_files(
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-index b67a2a4..469f682 100644
+index 7b83e37..0b1f236 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b.py
-@@ -403,12 +403,12 @@ class E2BWorkspaceProvider:
-         since a killed command's stream may never end.
-         """
-         session = await self._start(
--            workspace, ["sh", "-c", script], cwd="/", env=None, timeout=timeout, stdin=stdin
-+            workspace, ["sh", "-c", script], cwd="/", env=None, timeout=None, stdin=stdin
-         )
+@@ -408,9 +408,9 @@ class E2BWorkspaceProvider:
          encoded: list[str] = []
          size = 0
          try:
 -            async with asyncio.timeout(timeout):
 +            async with asyncio.timeout(None):
+                 session = await self._start(
+-                    workspace, ["sh", "-c", script], cwd="/", env=None, timeout=timeout, stdin=stdin
++                    workspace, ["sh", "-c", script], cwd="/", env=None, timeout=None, stdin=stdin
+                 )
                  async for text in session.output():
                      # base64 is ASCII, so this is the encoded length; anything else
-                     # the stream carries is counted by its UTF-8 bytes all the same.
