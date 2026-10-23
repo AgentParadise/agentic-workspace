@@ -40,24 +40,39 @@ Differences from Docker, and why:
   teardown.
 
 Reattach (#103), which Docker does not offer: the wrapper keeps a state
-directory in the sandbox (`STATE_ROOT/<operation_id>`) holding the SHA-256 of
-the operation's token, its execution id and start time, the group pid, and,
-once known, the exit status or the word a confirmed termination wrote. Ids
-are random, so two provider instances never mint the same one. A fresh
-instance given the ref and the token (`reattach_token`) checks the digest in
-the sandbox, then answers `status` and `cancel` from that directory and
-/proc, never from caller memory. What it cannot see it does not guess:
+directory in the sandbox (`STATE_ROOT/<operation_id>`) holding the owner
+digest (`_owner_digest`, bound to the operation id), its execution id and
+start time, the group pid, and, once known, the exit status or the word a
+confirmed termination wrote. Ids are random, so two provider instances never
+mint the same one. A fresh instance given the ref and the token
+(`reattach_token`) checks the digest in the sandbox, then answers `status`
+and `cancel` from that directory and /proc, never from caller memory. What
+it cannot see it does not guess:
 
 - a probe that does not answer raises `provider_unavailable`; a missing
   directory or a token that does not match raises `unknown_operation`;
-- no exit status and no process carrying the token is `lost`, or `failed`
+- a process carrying the operation's marker is `running`, whatever exit
+  status or termination word the directory holds;
+- no exit status and no process carrying the marker is `lost`, or `failed`
   after a cancel this instance could not confirm, never `cancelled`;
 - `observe` raises `unsupported_capability`: the output was spooled by the
   instance that started the operation and went with it.
 
-The directory is written by the workload's user, so a reattached status is
-only as trustworthy as the workload: it can forge its own exit status, but
-it cannot make a ref with another operation's token pass the digest.
+The token itself never enters the sandbox: processes carry its marker
+(`owner_marker`), a one-way digest. The directory is written by the
+workload's user, so nothing in it is authority on its own:
+
+- the owner digest needs the token and the operation id, so a workload
+  cannot mint a valid directory for any other id, and a copied one fails;
+- a recorded group is signalled only if its leader is alive, leads its own
+  group and carries the marker, checked in the termination command itself;
+- liveness and the processes a cancel stops are found by the marker in
+  /proc, so a forged exit status or termination word never hides a live
+  process, and a forged group never reaches another operation's.
+
+A fresh instance cannot follow a descendant that both cleared its
+environment and was orphaned once the leader exited; the starting instance,
+which knows the group from the launch header, still can.
 """
 
 from __future__ import annotations
@@ -137,8 +152,8 @@ _ENCODE = (
 # Line one is the group's pid, then the marker line if one was given, then the
 # workload replaces this shell.
 _INNER = 'echo "$$"; [ -n "$1" ] && printf "%s\\n" "$1"; shift; exec "$@"'
-# Every process started for an operation inherits this variable, set to the
-# operation's token, so a descendant that leaves the group (`setsid`) or loses
+# Every process started for an operation inherits this variable, set to
+# `owner_marker` of the operation's token, so a descendant that leaves the group (`setsid`) or loses
 # its parent is still found by its own /proc environ.
 OWNER_VARIABLE = "AGENTIC_E2B_OPERATION"
 # Members of operation $2 (group $1): every non-zombie in the group and its
@@ -151,13 +166,20 @@ OWNER_VARIABLE = "AGENTIC_E2B_OPERATION"
 # the encoder, which must outlive the workload. TERM each member, wait up to
 # $3 tenths of a second for all to go, then KILL and wait up to 2s. Exits 0
 # only once none is left, 1 listing the survivors, 2 for a group it refuses to
-# signal. On exit 0 it writes $5 (`cancelled` or `timed_out`) to `stopped` in
+# signal. With $6 `verify` (a group read from the workload's directory), the
+# group is used only if its leader is alive, leads it and carries `$2`;
+# otherwise it is `-` and only processes carrying `$2` (and those already
+# seen) are members. On exit 0 it writes $5 (`cancelled` or `timed_out`) to `stopped` in
 # the reattach directory $4, so a fresh instance reads why the group is gone.
 # /proc, `cat` and `grep` only: slim images ship no `ps`. `members`
 # sets `$m` rather than printing it, so `$known` outlives each scan.
 _TERMINATE = (
-    "group=$1; owner=$2; grace=$3; state=$4; word=$5; "
-    '[ "$group" -gt 1 ] 2>/dev/null || exit 2; known=" "; '
+    "group=$1; owner=$2; grace=$3; state=$4; word=$5; mode=$6; "
+    'if [ "$mode" = verify ]; then [ "$group" -gt 1 ] 2>/dev/null '
+    '&& lead=$(cat "/proc/$group/stat" 2>/dev/null) && set -- ${lead##*) } '
+    '&& [ "$1" != Z ] && [ "$3" = "$group" ] '
+    '&& grep -qzxF "$owner" "/proc/$group/environ" 2>/dev/null || group=-; '
+    'elif ! [ "$group" -gt 1 ] 2>/dev/null; then exit 2; fi; known=" "; '
     'stopped() { echo "$word" > "$state/stopped" 2>/dev/null; exit 0; }; '
     "members() { procs=; for s in /proc/[0-9]*/stat; do "
     'st=$(cat "$s" 2>/dev/null) || continue; p=${s#/proc/}; set -- ${st##*) }; '
@@ -169,7 +191,7 @@ _TERMINATE = (
     'for e in $(grep -lzxF "$owner" /proc/[0-9]*/environ 2>/dev/null); do '
     'p=${e#/proc/}; p=${p%/environ}; case "$m" in *" $p "*) ;; *) m="$m$p ";; esac; done; }; '
     'signal() { members; for p in $m; do kill -s "$1" "$p" 2>/dev/null; done; '
-    'kill -s "$1" -- "-$group" 2>/dev/null; }; '
+    '[ "$group" = - ] || kill -s "$1" -- "-$group" 2>/dev/null; }; '
     'settle() { n=$1; while members; [ -n "${m# }" ]; do [ "$n" -le 0 ] && return 1; '
     "sleep 0.1; n=$((n-1)); done; return 0; }; "
     'signal TERM; settle "$grace" && stopped; '
@@ -178,8 +200,9 @@ _TERMINATE = (
 # Where each operation's reattach directory lives, by operation id.
 STATE_ROOT = "/tmp/agentic-operations"
 # Prints the reattach directory $1 as `name=value` lines, then `alive=1` when
-# some process carries `$OWNER_VARIABLE=$2`, which the wrapper does until the
-# workload's status is written. Exits 3 when there is no such directory.
+# some process carries `$OWNER_VARIABLE=$2`: the wrapper until the workload's
+# status is written, and every descendant that kept its environment. Exits 3
+# when there is no such directory.
 _PROBE = (
     'd=$1; [ -r "$d/owner" ] || exit 3; '
     "for f in owner execution started group exit ended stopped; do "
@@ -240,8 +263,18 @@ class _Probe:
     alive: bool
 
 
-def _digest(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+def owner_marker(token: str) -> str:
+    """`OWNER_VARIABLE`'s value for the operation whose reattach token is `token`.
+
+    One-way, so a workload that reads its own environment learns nothing
+    that authorises a reattach.
+    """
+    return hashlib.sha256(f"marker\n{token}".encode()).hexdigest()
+
+
+def _owner_digest(ref: OperationRef, token: str) -> str:
+    """What the launch writes to `owner`: needs the token, so only the starter can mint it."""
+    return hashlib.sha256(f"owner\n{ref.operation_id}\n{token}".encode()).hexdigest()
 
 
 def _state_dir(ref: OperationRef) -> str:
@@ -255,7 +288,7 @@ class _Operation:
     sandbox_id: str
     spool: OperationSpool
     started_at: str
-    # `OWNER_VARIABLE`'s value for this operation, unguessable by other workloads.
+    # The reattach token; `OWNER_VARIABLE` carries its `owner_marker`, never itself.
     token: str = field(default_factory=lambda: secrets_module.token_hex(16))
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     leader_known: asyncio.Event = field(default_factory=asyncio.Event)
@@ -452,9 +485,9 @@ class E2BOperations:
                 **workspace.config.checked_environment(),
                 **spec.environment,
                 **secrets,
-                OWNER_VARIABLE: operation.token,
+                OWNER_VARIABLE: owner_marker(operation.token),
                 # Read and unset by the wrapper before the workload starts.
-                "OWNER_DIGEST": _digest(operation.token),
+                "OWNER_DIGEST": _owner_digest(ref, operation.token),
                 "EXECUTION_HEX": spec.execution_id.encode().hex(),
                 "STARTED_AT": operation.started_at,
             },
@@ -521,7 +554,14 @@ class E2BOperations:
         command = await self._client.start(
             ref.workspace.resource_id,
             shlex.join(
-                ["sh", "-c", _PROBE, "aw-probe", _state_dir(ref), f"{OWNER_VARIABLE}={token}"]
+                [
+                    "sh",
+                    "-c",
+                    _PROBE,
+                    "aw-probe",
+                    _state_dir(ref),
+                    f"{OWNER_VARIABLE}={owner_marker(token)}",
+                ]
             ),
             cwd="/",
             env={},
@@ -544,7 +584,7 @@ class E2BOperations:
                 ref,
             )
         fields = dict(line.partition("=")[::2] for line in output.splitlines() if "=" in line)
-        if not secrets_module.compare_digest(fields.get("owner", ""), _digest(token)):
+        if not secrets_module.compare_digest(fields.get("owner", ""), _owner_digest(ref, token)):
             raise _error("unknown_operation", f"{ref.operation_id} is not owned by this token", ref)
         try:
             execution_id = bytes.fromhex(fields.get("execution", "")).decode()
@@ -589,6 +629,10 @@ class E2BOperations:
         exit_code: int | None = None
         signal_name: str | None = None
         state: OperationState
+        if probe.alive:
+            # A live process outranks any marker: the leader's exit leaves
+            # descendants running, and the workload can write `stopped`.
+            return OperationStatus.model_validate({**common, "state": "running"})
         if probe.stopped is not None:
             state = probe.stopped
         elif probe.exit_code is not None:
@@ -596,8 +640,6 @@ class E2BOperations:
             if exit_code > 128 and exit_code - 128 < signal.NSIG:
                 signal_name = signal.Signals(exit_code - 128).name
             state = "succeeded" if exit_code == 0 else "failed"
-        elif probe.alive:
-            return OperationStatus.model_validate({**common, "state": "running"})
         else:
             # Gone with no status: never `cancelled` unless a termination said so.
             state = "failed" if operation.cancel_requested else "lost"
@@ -858,7 +900,7 @@ class E2BOperations:
         Raises provider_unavailable when there is no trusted group or the
         termination is not confirmed: the operation may still be running.
         """
-        if operation.group is None:
+        if operation.group is None and isinstance(operation, _Operation):
             raise _error(
                 "provider_unavailable",
                 f"no launch header from {operation.ref.operation_id}; "
@@ -874,11 +916,14 @@ class E2BOperations:
                     "-c",
                     _TERMINATE,
                     "aw-terminate",
-                    str(operation.group),
-                    f"{OWNER_VARIABLE}={operation.token}",
+                    "-" if operation.group is None else str(operation.group),
+                    f"{OWNER_VARIABLE}={owner_marker(operation.token)}",
                     str(tenths),
                     _state_dir(operation.ref),
                     reason,
+                    # The starter read the group from its own stream; a
+                    # reattached one read it from the workload's directory.
+                    "verify" if isinstance(operation, _Reattached) else "trusted",
                 ]
             ),
             cwd="/",

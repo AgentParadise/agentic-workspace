@@ -27,7 +27,7 @@ from agentic_isolation.providers import (
 from agentic_isolation.providers.base import Workspace
 from agentic_isolation.providers.e2b import E2BWorkspaceProvider
 from agentic_isolation.providers.e2b_client import CommandExit, E2BTransportError
-from agentic_isolation.providers.e2b_operations import OWNER_VARIABLE
+from agentic_isolation.providers.e2b_operations import OWNER_VARIABLE, owner_marker
 from agentic_isolation.providers.operation_spool import OperationFailure
 from tests.e2b_fake import FakeE2BClient, FakeRun
 
@@ -147,6 +147,105 @@ async def test_a_wrong_token_cannot_reattach_or_cancel(tmp_path: Path) -> None:
     await first.cancel(other, grace_seconds=0)
 
 
+async def test_a_writer_left_by_an_exited_leader_is_running_until_cancel_kills_it(
+    tmp_path: Path,
+) -> None:
+    pidfile = tmp_path / "ws" / "writer"
+    gate = tmp_path / "ws" / "go"
+    # The writer leaves the leader's group and stream; the leader exits 0.
+    client, first, _, ref, token = await _started(
+        tmp_path,
+        f"setsid sh -c 'echo $$ > {pidfile}; exec sleep 60' >/dev/null 2>&1 & "
+        f"while [ ! -e {gate} ]; do sleep 0.05; done; exit 0",
+    )
+    writer = await _pid(pidfile)
+    fresh = _fresh(client)
+    await fresh.reattach(ref, token)
+    assert (await fresh.status(ref)).state == "running"
+    gate.touch()
+    try:
+        await _pid(tmp_path / "ws-ops" / ref.operation_id / "exit")
+        # The leader's exit is recorded, yet its writer lives: not terminal.
+        assert (await fresh.status(ref)).state == "running"
+        cancelled = await fresh.cancel(ref, grace_seconds=0)
+        assert not _alive(writer)
+        assert cancelled.state == "cancelled"
+    finally:
+        if _alive(writer):
+            os.kill(writer, signal.SIGKILL)
+
+
+async def test_a_completed_operation_keeps_its_exit_status_after_reattach(
+    tmp_path: Path,
+) -> None:
+    client, _, _, ref, token = await _started(tmp_path, "sleep 0.3; exit 0")
+    await _pid(tmp_path / "ws-ops" / ref.operation_id / "exit")
+    fresh = _fresh(client)
+    await fresh.reattach(ref, token)
+    for _ in range(100):
+        ended = await fresh.status(ref)
+        if ended.state != "running":
+            break
+        await asyncio.sleep(0.05)
+    assert (ended.state, ended.exit_code) == ("succeeded", 0)
+    assert (await fresh.cancel(ref, grace_seconds=0)).state == "succeeded"
+
+
+async def test_a_forged_stopped_word_does_not_hide_a_live_workload(tmp_path: Path) -> None:
+    pidfile = tmp_path / "ws" / "pid"
+    client, first, _, ref, token = await _started(tmp_path, f"echo $$ > {pidfile}; exec sleep 60")
+    pid = await _pid(pidfile)
+    fresh = _fresh(client)
+    await fresh.reattach(ref, token)
+    # Written with the workload's own uid, as the workload could.
+    (tmp_path / "ws-ops" / ref.operation_id / "stopped").write_text("cancelled\n")
+    assert (await fresh.status(ref)).state == "running"
+    await fresh.cancel(ref, grace_seconds=0)
+    assert not _alive(pid)
+
+
+async def test_a_workload_cannot_aim_its_token_at_another_operation(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    victim_pidfile = root / "victim"
+    client, first, workspace, victim, _ = await _started(
+        tmp_path, f"echo $$ > {victim_pidfile}; exec sleep 60"
+    )
+    victim_pid = await _pid(victim_pidfile)
+    victim_group = (tmp_path / "ws-ops" / victim.operation_id / "group").read_text().strip()
+    forged_id = f"{workspace.id}-op-{'a' * 16}"
+    # Run AS THE WORKLOAD: copy every reattach directory it can read to a
+    # new id, and point every group it can write, its own included, at B.
+    attacker_script = (
+        f"forged=/tmp/agentic-operations/{forged_id}; "
+        "for d in /tmp/agentic-operations/*-op-*; do "
+        '[ -e "$d/group" ] || continue; '
+        '[ -e "$forged" ] || cp -r "$d" "$forged"; '
+        f'echo {victim_group} > "$d/group"; done; '
+        f'echo {victim_group} > "$forged/group"; '
+        "touch /workspace/forged; exec sleep 60"
+    )
+    attacker = await first.start(workspace, _spec(attacker_script, key="attacker"))
+    token = first.reattach_token(attacker)
+    await _pid(tmp_path / "ws-ops" / attacker.operation_id / "group")
+    for _ in range(100):
+        if (root / "forged").exists():
+            break
+        await asyncio.sleep(0.05)
+    assert (root / "forged").exists()
+    fresh = _fresh(client)
+    try:
+        with pytest.raises(OperationFailure) as refused:
+            await fresh.reattach(attacker.model_copy(update={"operation_id": forged_id}), token)
+        assert refused.value.error.kind == "unknown_operation"
+        # A's own ref, its group rewritten to B's: cancel stops A, never B.
+        await fresh.reattach(attacker, token)
+        assert (await fresh.cancel(attacker, grace_seconds=0)).state == "cancelled"
+        assert _alive(victim_pid)
+    finally:
+        await first.cancel(attacker, grace_seconds=0)
+        await first.cancel(victim, grace_seconds=0)
+
+
 async def test_a_probe_that_does_not_answer_is_unavailable_not_stopped(
     tmp_path: Path,
 ) -> None:
@@ -180,7 +279,7 @@ async def test_a_workload_gone_without_a_status_is_lost_not_cancelled(tmp_path: 
     fresh = _fresh(client)
     await fresh.reattach(ref, token)
     # The sandbox's processes die under the wrapper, as on a sandbox restart.
-    owner = f"{OWNER_VARIABLE}={token}".encode()
+    owner = f"{OWNER_VARIABLE}={owner_marker(token)}".encode()
     for environ in Path("/proc").glob("[0-9]*/environ"):
         with contextlib.suppress(OSError):
             if owner in environ.read_bytes().split(b"\0"):
