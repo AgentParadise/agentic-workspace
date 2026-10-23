@@ -1,9 +1,10 @@
 # Mutations for #100 (bounded, link-safe `read_files`)
 
-Each patch re-introduces one bug in
+Patches 01-08 each re-introduce one bug in
 `lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py`,
 in the host's plan and check and, where the reader decides, in the
-in-sandbox reader script. 01-04 were regenerated when the tar archive was
+in-sandbox reader script. 09 and 10 re-introduce a bug in the provider
+transports, `providers/docker_capabilities.py` and `providers/e2b.py`. 01-04 were regenerated when the tar archive was
 replaced by the descriptor-checked reader; each keeps the defect it names.
 Named tests to run (repo-relative):
 
@@ -23,6 +24,9 @@ lib/python/agentic_isolation/tests/integration/test_remote_capabilities_conforma
 | `05-ancestor-swap-followed.patch` | B1: the reader does not check where its descriptor resolved, so an ancestor swapped for a symlink after the listing is read | `test_read_files_refuses_an_ancestor_swapped_for_a_symlink_after_the_listing`, `test_the_reader_refuses_an_ancestor_swapped_for_a_symlink_out_of_the_root` |
 | `06-post-listing-link-followed.patch` | B2: the reader does not check the link count of its descriptor, so a hard link made after the listing is read | `test_read_files_refuses_a_hard_link_made_after_the_listing`, `test_the_reader_refuses_a_hard_link_made_after_the_listing` |
 | `07-walk-unbounded.patch` | B3: the walk spools the whole find before `head` applies `max_entries` | `test_the_walk_stops_once_the_entry_limit_is_out` |
+| `08-limits-applied-before-sorting.patch` | review finding 1: the plan applies the total in the walk's order and sorts only what it kept, so which files fit depends on directory order | `test_the_total_is_allocated_in_path_order_whatever_order_the_walk_lists` (4 of its 6 permutations) |
+| `09-stderr-read-after-stdout.patch` | review finding 2: the Docker transport reads stderr only after stdout ends, so a sandbox that fills the stderr pipe stalls the call | `test_a_sandbox_flooding_stderr_cannot_stall_the_read` |
+| `10-timeout-removed.patch` | review finding 2: no deadline on either transport (Docker host wait and in-sandbox `timeout`, E2B command timeout and host wait), so a stalled sandbox hangs the call | `test_read_files_times_out_on_a_sandbox_that_never_answers`, `test_read_files_times_out_on_a_file_swapped_for_a_fifo_after_its_check` (in both `test_remote_capabilities.py` and `test_e2b_provider.py`) |
 
 Locally (no Docker), against the E2B double and the unit tests only, at the
 commit that added 05-07: 01 failed 5 tests, 02 failed 5, 03 failed 3, 04
@@ -30,3 +34,8 @@ failed 20, 05 failed 2, 06 failed 2, 07 failed 1. 07's killer runs a `find`
 wrapper from its tmp dir, so it needs an executable `TMPDIR` (a GitHub
 runner's `/tmp` is). The Docker parametrisations need the runner. This is
 not mutation evidence; the trusted run is the orchestrator's.
+
+Locally, at the commit that added 08-10, with the same named tests: 01-07
+failed the same counts as above, 08 failed 4, 09 failed 1 and 10 failed 3.
+09 and 10 make their killers hang, so those fail on the test's own 20 s
+`asyncio.wait_for` bound, not on an assertion.
