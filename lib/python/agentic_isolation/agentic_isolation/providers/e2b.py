@@ -59,7 +59,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
 import posixpath
 import shlex
 import time
@@ -104,13 +103,13 @@ from agentic_isolation.providers.file_transfer import (
     ReadFilesError,
     ReadFilesResult,
     ReadLimits,
-    archive_cap,
-    archive_script,
-    archive_stdin,
     collect,
     listing_cap,
     listing_script,
     plan_reads,
+    read_cap,
+    read_script,
+    read_stdin,
 )
 from agentic_isolation.providers.teardown_report import TeardownReport, TeardownUsage
 
@@ -381,13 +380,13 @@ class E2BWorkspaceProvider:
         plan = plan_reads(listing, patterns, limits, base_path)
         if not plan.reads:
             return collect(b"", plan, limits, base_path)
-        archive = await self._sandbox_bytes(
+        read = await self._sandbox_bytes(
             workspace,
-            archive_script(base_path, base64=True),
-            archive_stdin(plan),
-            archive_cap(plan, limits),
+            read_script(base_path, limits, base64=True),
+            read_stdin(plan),
+            read_cap(plan, limits),
         )
-        return collect(archive, plan, limits, base_path)
+        return collect(read, plan, limits, base_path)
 
     async def _sandbox_bytes(
         self, workspace: Workspace, script: str, stdin: bytes, cap: int
@@ -398,7 +397,9 @@ class E2BWorkspaceProvider:
         encoded: list[str] = []
         size = 0
         async for text in session.output():
-            size += len(text)
+            # base64 is ASCII, so this is the encoded length; anything else
+            # the stream carries is counted by its UTF-8 bytes all the same.
+            size += len(text.encode("utf-8", "surrogateescape"))
             if size > 4 * (cap // 3 + 1):
                 await session.cancel()
                 raise ReadFilesError(f"sandbox {workspace.id} sent more than {cap} bytes")
@@ -411,7 +412,7 @@ class E2BWorkspaceProvider:
             )
         try:
             return base64.b64decode("".join(encoded).strip(), validate=True)
-        except binascii.Error as exc:
+        except ValueError as exc:  # binascii.Error, or text that is not ASCII
             raise ReadFilesError(f"sandbox {workspace.id} sent output that is not base64") from exc
 
     async def list_owned(self, labels: Mapping[str, str]) -> list[OwnedWorkspace]:

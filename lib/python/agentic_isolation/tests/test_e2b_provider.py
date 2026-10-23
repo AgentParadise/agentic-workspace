@@ -17,6 +17,7 @@ import pytest
 from agentic_isolation import (
     ReadFilesError,
     ReadFilesResult,
+    ReadLimits,
     ResourceLimits,
     StreamOutcome,
     SupportsFileTransfer,
@@ -38,6 +39,7 @@ from agentic_isolation.providers import (
     SandboxListing,
     SandboxRemovalError,
     TemplateSpecError,
+    file_transfer,
     manifest_hash,
 )
 from agentic_isolation.providers import e2b as e2b_module
@@ -281,8 +283,8 @@ async def test_read_files_matches_patterns_and_returns_exact_bytes(tmp_path: Pat
     got = await provider.read_files(workspace, ["*.jsonl"], base_path="/spool")
 
     assert got == ReadFilesResult(files=(("a/one.jsonl", blob),), refused=())
-    assert len(client.started) == 3  # create's root check, the listing, the archive
-    assert client.stdins[-1] == b"./a/one.jsonl\0"
+    assert len(client.started) == 3  # create's root check, the listing, the read
+    assert client.stdins[-1] == b"a/one.jsonl\0"
 
 
 async def test_read_files_reports_a_sandbox_that_answers_outside_the_contract(
@@ -293,6 +295,24 @@ async def test_read_files_reports_a_sandbox_that_answers_outside_the_contract(
 
     with pytest.raises(ReadFilesError, match="not base64"):
         await provider.read_files(workspace, ["*"], base_path="/spool")
+
+
+async def test_read_files_counts_what_the_sandbox_sends_in_bytes_not_characters(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    # The reader only ever sends base64, which is ASCII; a sandbox that sends
+    # anything else is held to the cap by its bytes and refused as not base64.
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+    limits = ReadLimits(max_entries=1)
+    cap = 4 * (file_transfer.listing_cap(limits) // 3 + 1)
+    client.responder = lambda _c: FakeRun(chunks=["é" * (cap // 2 + 1)])
+
+    with pytest.raises(ReadFilesError, match="more than"):
+        await provider.read_files(workspace, ["*"], base_path="/spool", limits=limits)
+
+    client.responder = lambda _c: FakeRun(chunks=["é"])
+    with pytest.raises(ReadFilesError, match="not base64"):
+        await provider.read_files(workspace, ["*"], base_path="/spool", limits=limits)
 
 
 async def test_file_paths_cannot_escape_the_workspace(provider: E2BWorkspaceProvider) -> None:

@@ -46,6 +46,7 @@ from agentic_isolation import (
     WorkspaceOwnershipError,
     WorkspaceProvider,
 )
+from agentic_isolation.providers import docker_capabilities
 from agentic_isolation.providers.capabilities import TransferRoot
 from agentic_isolation.providers.docker_capabilities import DockerStreamSession
 from agentic_isolation.providers.e2b import E2BStreamSession
@@ -426,6 +427,119 @@ async def test_read_files_refuses_every_name_of_a_hard_link(
         FileRefusal("out/b.bin", "hard_link"),
     )
     assert both.files == ()
+
+
+def _after_the_listing(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: TransferProvider,
+    workspace: Workspace,
+    code: str,
+) -> list[bool]:
+    """Plant `code` once the listing is in and before the read opens anything.
+
+    The hook sits in the provider's transport and fires on the read, the one
+    call that carries paths on stdin, so the change lands between the two
+    sandbox commands every time, with no timing involved.
+    """
+    fired: list[bool] = []
+
+    async def plant() -> None:
+        fired.append(True)
+        await _plant(provider, workspace, code)
+
+    if isinstance(provider, E2BWorkspaceProvider):
+        sandbox_bytes = provider._sandbox_bytes
+
+        async def hooked_e2b(ws: Workspace, script: str, stdin: bytes, cap: int) -> bytes:
+            if stdin:
+                await plant()
+            return await sandbox_bytes(ws, script, stdin, cap)
+
+        monkeypatch.setattr(provider, "_sandbox_bytes", hooked_e2b)
+    else:
+        docker_bounded = docker_capabilities._docker_bounded
+
+        async def hooked_docker(args: list[str], stdin: bytes, cap: int) -> bytes:
+            if stdin:
+                await plant()
+            return await docker_bounded(args, stdin, cap)
+
+        monkeypatch.setattr(docker_capabilities, "_docker_bounded", hooked_docker)
+    return fired
+
+
+async def test_read_files_refuses_an_ancestor_swapped_for_a_symlink_after_the_listing(
+    transfer: tuple[TransferProvider, Workspace], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The listing sees a real directory; the read must not follow the
+    # symlink that replaced it to a file outside the root.
+    provider, workspace = transfer
+    await _plant(
+        provider,
+        workspace,
+        "import os; os.makedirs('/spool/out', exist_ok=True); "
+        "os.makedirs('/workspace/outside', exist_ok=True); "
+        "open('/spool/out/secret', 'wb').write(b'safe'); "
+        "open('/workspace/outside/secret', 'wb').write(b'OUTSIDE_SECRET')",
+    )
+    fired = _after_the_listing(
+        monkeypatch,
+        provider,
+        workspace,
+        "import os; os.rename('/spool/out', '/spool/old-out'); "
+        "os.symlink('/workspace/outside', '/spool/out')",
+    )
+
+    got = await provider.read_files(workspace, ["out/*"], base_path="/spool")
+
+    assert fired == [True]
+    assert got == ReadFilesResult(
+        files=(), refused=(FileRefusal("out/secret", "escaping_symlink"),)
+    )
+
+
+async def test_read_files_refuses_a_hard_link_made_after_the_listing(
+    transfer: tuple[TransferProvider, Workspace], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only one name of the inode is asked for, and when it was listed it
+    # had one link; what is opened has two, so it is refused, not read.
+    provider, workspace = transfer
+    await _plant(
+        provider,
+        workspace,
+        "import os; os.makedirs('/workspace/out', exist_ok=True); "
+        "os.makedirs('/workspace/private', exist_ok=True); "
+        "open('/workspace/out/secret', 'wb').write(b'safe'); "
+        "open('/workspace/private/secret', 'wb').write(b'PRIVATE_SECRET')",
+    )
+    fired = _after_the_listing(
+        monkeypatch,
+        provider,
+        workspace,
+        "import os; os.unlink('/workspace/out/secret'); "
+        "os.link('/workspace/private/secret', '/workspace/out/secret')",
+    )
+
+    got = await provider.read_files(workspace, ["out/*"], base_path="/workspace")
+
+    assert fired == [True]
+    assert got == ReadFilesResult(files=(), refused=(FileRefusal("out/secret", "hard_link"),))
+
+
+async def test_read_files_holds_a_file_grown_after_the_listing_to_the_limits(
+    transfer: tuple[TransferProvider, Workspace], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, workspace = transfer
+    await _plant(provider, workspace, "open('/spool/grow', 'wb').write(b'x')")
+    fired = _after_the_listing(
+        monkeypatch, provider, workspace, f"open('/spool/grow', 'wb').truncate({8 * 1024 * 1024})"
+    )
+    limits = ReadLimits(max_file_bytes=64, max_total_bytes=64)
+
+    got = await provider.read_files(workspace, ["grow"], base_path="/spool", limits=limits)
+
+    assert fired == [True]
+    assert got == ReadFilesResult(files=(), refused=(FileRefusal("grow", "file_too_large"),))
 
 
 async def test_read_files_refuses_symlinks_that_escape_the_root(

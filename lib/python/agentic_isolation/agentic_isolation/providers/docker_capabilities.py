@@ -27,13 +27,13 @@ from agentic_isolation.providers.file_transfer import (
     ReadFilesError,
     ReadFilesResult,
     ReadLimits,
-    archive_cap,
-    archive_script,
-    archive_stdin,
     collect,
     listing_cap,
     listing_script,
     plan_reads,
+    read_cap,
+    read_script,
+    read_stdin,
 )
 
 WORKSPACE_ID_LABEL = "agentic.workspace.id"
@@ -266,7 +266,7 @@ async def _docker_bounded(args: Sequence[str], stdin: bytes, cap: int) -> bytes:
 async def read_files(
     container: str, patterns: Sequence[str], base_path: TransferRoot, limits: ReadLimits
 ) -> ReadFilesResult:
-    """List, then archive only what the listing allows, from inside the sandbox."""
+    """List, then read only what the listing allows, from inside the sandbox."""
     if base_path not in TRANSFER_ROOTS:
         raise ValueError(f"base_path must be one of {', '.join(TRANSFER_ROOTS)}")
     listing = await _docker_bounded(
@@ -275,12 +275,12 @@ async def read_files(
     plan = plan_reads(listing, patterns, limits, base_path)
     if not plan.reads:
         return collect(b"", plan, limits, base_path)
-    archive = await _docker_bounded(
-        ["exec", "-i", container, "sh", "-c", archive_script(base_path)],
-        archive_stdin(plan),
-        archive_cap(plan, limits),
+    read = await _docker_bounded(
+        ["exec", "-i", container, "sh", "-c", read_script(base_path, limits)],
+        read_stdin(plan),
+        read_cap(plan, limits),
     )
-    return collect(archive, plan, limits, base_path)
+    return collect(read, plan, limits, base_path)
 
 
 async def inspect_containers(container_ids: Sequence[str]) -> list[tuple[str, dict[str, str]]]:

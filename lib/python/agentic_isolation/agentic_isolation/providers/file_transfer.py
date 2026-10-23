@@ -2,23 +2,31 @@
 
 The workspace is untrusted, so what it holds decides nothing: every provider
 lists the root with the same in-sandbox walk, decides here what may be read,
-archives only that, and checks the archive here again. A provider supplies
-only the transport. Every entry the caller asked for comes back either as
-bytes or as a `FileRefusal` naming the path and the reason; none is skipped.
+reads only that, and checks the result here again. A provider supplies only
+the transport. Every entry the caller asked for comes back either as bytes or
+as a `FileRefusal` naming the path and the reason; none is skipped.
 
-The sandbox needs GNU find, head and tar, as the Docker and E2B base images
-have. A file swapped between the listing and the archive is still caught as a
-symlink or special file by the archive check; a new hard link made in that
-window is not, and can only alias a file the sandbox can already read.
+The listing is only a plan. The sandbox can change any path after it, so the
+reader opens each file once and checks the descriptor itself: the path the
+kernel resolved it to, its type and its link count, then copies the bytes
+from that same descriptor. Swapping a name or an ancestor for a symlink, or
+linking in another file, after the listing is refused, not read.
+
+Both the walk and the reads stream, so the sandbox's work and temp storage
+are bounded by the limits: the walk stops once `max_entries + 1` records are
+out (plus one pipe buffer), and at most `max_file_bytes + 1` bytes of one
+file are held at a time.
+
+The sandbox needs /proc and GNU find, xargs, head and stat, as the Docker and
+E2B base images have. A file replaced by a FIFO between the reader's type
+check and its open can block that read; it cannot return the FIFO's bytes.
 """
 
 from __future__ import annotations
 
 import fnmatch
-import io
 import posixpath
 import shlex
-import tarfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -101,26 +109,37 @@ class ReadPlan:
 
 
 _FIELDS = 3  # "%y %n %s %d", "%P", "%l": each NUL-terminated
-# Per-entry tar overhead allowed on top of the content: header, GNU long
-# name and long link records for paths up to PATH_MAX, and block padding.
-_TAR_ENTRY_OVERHEAD = 3 * 512 + 2 * 4096 + 512
-_TAR_TRAILER = 20 * 512
 _LISTING_ENTRY_BYTES = 2 * 4096 + 64
+# Per-file framing on top of the content: kind, length, the path and, for a
+# refusal, the link or opened path it names, each up to PATH_MAX.
+_READ_ENTRY_BYTES = 2 * 4096 + 64
+_SIGPIPE_STATUS = 141
 
 
-def _script(command: str, emit: str, *, base64: bool) -> str:
-    """Run `command` into a sandbox temp file, then emit it, keeping its status."""
+def _script(command: str, then: str, *, base64: bool, stopped_ok: bool = False) -> str:
+    """Pipe `command` into `then` as it runs, exiting with `command`'s status.
+
+    Nothing is spooled: once `then` has read what it needs it exits, and
+    `command` stops on the broken pipe, which `stopped_ok` accepts.
+    """
     encode = " | base64 -w0" if base64 else ""
+    accept = (
+        f'[ "$rc" -eq 0 ] || [ "$rc" -eq {_SIGPIPE_STATUS} ]' if stopped_ok else '[ "$rc" -eq 0 ]'
+    )
     return (
-        "t=$(mktemp) || exit 1; "
-        f'{command} > "$t"; rc=$?; '
-        f'if [ "$rc" -eq 0 ]; then {emit} "$t"{encode}; rc=$?; fi; '
-        'rm -f "$t"; exit "$rc"'
+        "s=$(mktemp) || exit 1; "
+        f'{{ ({command}); echo "$?" > "$s"; }} | {then}{encode}; out=$?; '
+        'rc=$(cat "$s"); rm -f "$s"; '
+        f'if {accept}; then exit "$out"; fi; exit "${{rc:-1}}"'
     )
 
 
 def listing_script(base_path: str, limits: ReadLimits, *, base64: bool = False) -> str:
-    """The walk: at most `max_entries + 1` records, none deeper than `max_depth + 1`."""
+    """The walk: at most `max_entries + 1` records, none deeper than `max_depth + 1`.
+
+    find writes into head, which exits after the last record wanted, so the
+    walk goes no further than that plus what one pipe buffer holds.
+    """
     find = shlex.join(
         [
             "find",
@@ -134,7 +153,9 @@ def listing_script(base_path: str, limits: ReadLimits, *, base64: bool = False) 
         ]
     )
     head = f"head -z -n {_FIELDS * (limits.max_entries + 1)}"
-    return f"cd -- {shlex.quote(base_path)} || exit 1; " + _script(find, head, base64=base64)
+    return f"cd -- {shlex.quote(base_path)} || exit 1; " + _script(
+        find, head, base64=base64, stopped_ok=True
+    )
 
 
 def listing_cap(limits: ReadLimits) -> int:
@@ -142,46 +163,77 @@ def listing_cap(limits: ReadLimits) -> int:
     return (limits.max_entries + 1) * _LISTING_ENTRY_BYTES
 
 
-def archive_script(base_path: str, *, base64: bool = False) -> str:
-    """Archive the NUL-separated `./path` names on stdin, never following links."""
-    tar = shlex.join(
-        [
-            "tar",
-            "-C",
-            base_path,
-            "--no-recursion",
-            "--null",
-            "--verbatim-files-from",
-            "-cf",
-            "-",
-            "-T",
-            "-",
-        ]
+# One record per path on the command line, in order: "<kind> <n>\0<path>\0"
+# then n bytes. Each file is opened once, as fd 3, and judged by what fd 3
+# is, not by its name: the path the kernel holds for it must be the one asked
+# for under the root (so no symlink, in the name or any ancestor, was
+# followed), it must be a regular file, and it must have one link. Its bytes
+# are then copied from fd 3, at most `max_file_bytes + 1` of them, into a
+# temp file so the record can carry the length. Kinds: f content, l symlink
+# (its target), r opened elsewhere (the path opened), s special, h hard link,
+# b over the per-file limit, t over the total.
+_READER = r"""
+t=$1; shift; used=0
+emit() { printf '%s %s\0%s\0%s' "$1" "${#2}" "$p" "$2"; }
+for p; do
+  if [ -L "./$p" ]; then
+    x=$(readlink -- "./$p"; echo .); x=${x%.}; emit l "${x%?}"
+  elif [ ! -f "./$p" ]; then
+    emit s ""
+  elif ! command exec 3<"./$p"; then
+    exit 1
+  else
+    x=$(readlink /proc/self/fd/3; echo .); x=${x%.}; x=${x%?}
+    if [ "$x" != "$ROOT/$p" ]; then
+      emit r "$x"
+    elif [ ! -f /proc/self/fd/3 ]; then
+      emit s ""
+    elif [ "$(stat -L -c %h /proc/self/fd/3)" != 1 ]; then
+      emit h ""
+    else
+      head -c "$((FILE + 1))" <&3 > "$t" || exit 1
+      n=$(wc -c < "$t")
+      if [ "$n" -gt "$FILE" ]; then
+        emit b ""
+      elif [ "$((used + n))" -gt "$TOTAL" ]; then
+        emit t ""
+      else
+        used=$((used + n)); printf 'f %s\0%s\0' "$n" "$p"; cat "$t" || exit 1
+      fi
+    fi
+    exec 3<&-
+  fi
+done
+"""
+
+
+def read_script(base_path: str, limits: ReadLimits, *, base64: bool = False) -> str:
+    """Read the NUL-separated paths on stdin under `base_path`, one record each."""
+    settings = (
+        f"ROOT={shlex.quote(base_path.rstrip('/'))} FILE={limits.max_file_bytes} "
+        f"TOTAL={limits.max_total_bytes}"
     )
-    return _script(tar, "cat", base64=base64)
-
-
-def archive_stdin(plan: ReadPlan) -> bytes:
-    return b"".join(
-        b"./" + path.encode("utf-8", "surrogateescape") + b"\0" for path, _ in plan.reads
+    reader = (
+        "t=$(mktemp) || exit 1; "
+        f'{settings} xargs -0 -r sh -c {shlex.quote(_READER)} sh "$t"; rc=$?; '
+        'rm -f "$t"; exit "$rc"'
+    )
+    return f"cd -- {shlex.quote(base_path)} || exit 1; export LC_ALL=C; " + _script(
+        reader, "cat", base64=base64
     )
 
 
-def archive_cap(plan: ReadPlan, limits: ReadLimits) -> int:
-    """The most archive bytes the planned reads can produce within `limits`."""
-    return limits.max_total_bytes + len(plan.reads) * _TAR_ENTRY_OVERHEAD + _TAR_TRAILER
+def read_stdin(plan: ReadPlan) -> bytes:
+    return b"".join(path.encode("utf-8", "surrogateescape") + b"\0" for path, _ in plan.reads)
+
+
+def read_cap(plan: ReadPlan, limits: ReadLimits) -> int:
+    """The most bytes the planned reads can produce within `limits`."""
+    return limits.max_total_bytes + len(plan.reads) * _READ_ENTRY_BYTES
 
 
 def _matches(path: str, patterns: Sequence[str]) -> bool:
     return any(fnmatch.fnmatchcase(path, p) for p in patterns)
-
-
-def _escapes(path: str, target: str, base_path: str) -> bool:
-    if target.startswith("/"):
-        resolved = posixpath.normpath(target)
-        return resolved != base_path and not resolved.startswith(base_path.rstrip("/") + "/")
-    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
-    return resolved == ".." or resolved.startswith("../")
 
 
 def plan_reads(
@@ -236,47 +288,81 @@ def plan_reads(
     return ReadPlan(tuple(sorted(reads)), tuple(refused))
 
 
-def collect(archive: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str) -> ReadFilesResult:
-    """Check the sandbox's archive of `plan.reads` against `limits` and return the result.
+def _inside(resolved: str, base_path: str) -> bool:
+    return resolved == base_path or resolved.startswith(base_path.rstrip("/") + "/")
 
-    Anything that changed since the listing is refused here by what the
-    archive says it is now; an archive holding other names is an error.
-    With nothing planned, no archive was taken and `archive` is ignored.
+
+def _escapes(path: str, target: str, base_path: str) -> bool:
+    if target.startswith("/"):
+        return not _inside(posixpath.normpath(target), base_path)
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+    return resolved == ".." or resolved.startswith("../")
+
+
+_REFUSED_BY_KIND: dict[bytes, RefusalReason] = {
+    b"s": "special_file",
+    b"h": "hard_link",
+    b"b": "file_too_large",
+    b"t": "total_bytes_exceeded",
+}
+
+
+def collect(stream: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str) -> ReadFilesResult:
+    """Check the sandbox's records for `plan.reads` against `limits` and return the result.
+
+    The sandbox judged each file by the descriptor it read from, and the
+    limits are applied here again; records for other names, out of order,
+    or not whole are an error. With nothing planned, nothing was read and
+    `stream` is ignored.
     """
     if not plan.reads:
         return ReadFilesResult(files=(), refused=_by_path(plan.refused))
-    expected = {path for path, _ in plan.reads}
     files: list[tuple[str, bytes]] = []
     refused = list(plan.refused)
     total = 0
-    try:
-        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as members:
-            for member in members:
-                path = member.name.removeprefix("./")
-                if path not in expected:
-                    raise ReadFilesError(f"the sandbox archive holds an unrequested entry {path!r}")
-                expected.remove(path)
-                if member.islnk():
-                    refused.append(FileRefusal(path, "hard_link"))
-                elif member.issym():
-                    escaping = _escapes(path, member.linkname, base_path)
-                    refused.append(FileRefusal(path, "escaping_symlink" if escaping else "symlink"))
-                elif not member.isreg():
-                    refused.append(FileRefusal(path, "special_file"))
-                elif member.size > limits.max_file_bytes:
-                    refused.append(FileRefusal(path, "file_too_large"))
-                elif total + member.size > limits.max_total_bytes:
-                    refused.append(FileRefusal(path, "total_bytes_exceeded"))
-                else:
-                    handle = members.extractfile(member)
-                    assert handle is not None  # extractfile returns a reader for a regular file
-                    total += member.size
-                    files.append((path, handle.read()))
-    except tarfile.TarError as exc:
-        raise ReadFilesError(f"the sandbox archive is not a readable tar: {exc}") from exc
-    if expected:
-        raise ReadFilesError(f"the sandbox archive is missing {', '.join(sorted(expected))}")
+    at = 0
+    for path, _ in plan.reads:
+        kind, payload, at = _next_record(stream, at, path)
+        if kind == b"f":
+            if len(payload) > limits.max_file_bytes:
+                refused.append(FileRefusal(path, "file_too_large"))
+            elif total + len(payload) > limits.max_total_bytes:
+                refused.append(FileRefusal(path, "total_bytes_exceeded"))
+            else:
+                total += len(payload)
+                files.append((path, payload))
+        elif kind == b"l":
+            escaping = _escapes(path, payload.decode("utf-8", "surrogateescape"), base_path)
+            refused.append(FileRefusal(path, "escaping_symlink" if escaping else "symlink"))
+        elif kind == b"r":
+            opened = payload.decode("utf-8", "surrogateescape")
+            inside = _inside(posixpath.normpath(opened), base_path)
+            refused.append(FileRefusal(path, "symlink" if inside else "escaping_symlink"))
+        elif kind in _REFUSED_BY_KIND:
+            refused.append(FileRefusal(path, _REFUSED_BY_KIND[kind]))
+        else:
+            raise ReadFilesError(f"the sandbox read {path!r} as unknown kind {kind!r}")
+    if at != len(stream):
+        raise ReadFilesError("the sandbox sent records past the planned reads")
     return ReadFilesResult(files=tuple(sorted(files)), refused=_by_path(refused))
+
+
+def _next_record(stream: bytes, at: int, path: str) -> tuple[bytes, bytes, int]:
+    """The kind and payload of the record for `path` at `at`, and where the next starts."""
+    head_end = stream.find(b"\0", at)
+    path_end = stream.find(b"\0", head_end + 1) if head_end >= 0 else -1
+    if path_end < 0:
+        raise ReadFilesError(f"the sandbox read is missing {path!r}")
+    kind, _, size = stream[at:head_end].partition(b" ")
+    if not size.isdigit():
+        raise ReadFilesError(f"the sandbox read has a malformed record {stream[at:head_end]!r}")
+    named = stream[head_end + 1 : path_end].decode("utf-8", "surrogateescape")
+    if named != path:
+        raise ReadFilesError(f"the sandbox read {named!r} where {path!r} was planned")
+    end = path_end + 1 + int(size)
+    if end > len(stream):
+        raise ReadFilesError(f"the sandbox read of {path!r} is cut short")
+    return kind, stream[path_end + 1 : end], end
 
 
 def _by_path(refused: Sequence[FileRefusal]) -> tuple[FileRefusal, ...]:
