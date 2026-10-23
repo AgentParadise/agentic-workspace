@@ -101,7 +101,6 @@ class ReadPlan:
 
 
 _FIELDS = 3  # "%y %n %s %d", "%P", "%l": each NUL-terminated
-_SPECIAL = {"b", "c", "p", "s", "D"}
 # Per-entry tar overhead allowed on top of the content: header, GNU long
 # name and long link records for paths up to PATH_MAX, and block padding.
 _TAR_ENTRY_OVERHEAD = 3 * 512 + 2 * 4096 + 512
