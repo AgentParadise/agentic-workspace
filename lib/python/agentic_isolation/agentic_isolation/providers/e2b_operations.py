@@ -37,13 +37,34 @@ Differences from Docker, and why:
   is not confirmed raises `provider_unavailable` and the operation settles
   `failed`, with the reason in `metadata["cancel_signal_failure"]`.
 - Records live as long as the workspace; `forget_workspace` drops them at
-  teardown. There is no reattach, as for Docker.
+  teardown.
+
+Reattach (#103), which Docker does not offer: the wrapper keeps a state
+directory in the sandbox (`STATE_ROOT/<operation_id>`) holding the SHA-256 of
+the operation's token, its execution id and start time, the group pid, and,
+once known, the exit status or the word a confirmed termination wrote. Ids
+are random, so two provider instances never mint the same one. A fresh
+instance given the ref and the token (`reattach_token`) checks the digest in
+the sandbox, then answers `status` and `cancel` from that directory and
+/proc, never from caller memory. What it cannot see it does not guess:
+
+- a probe that does not answer raises `provider_unavailable`; a missing
+  directory or a token that does not match raises `unknown_operation`;
+- no exit status and no process carrying the token is `lost`, or `failed`
+  after a cancel this instance could not confirm, never `cancelled`;
+- `observe` raises `unsupported_capability`: the output was spooled by the
+  instance that started the operation and went with it.
+
+The directory is written by the workload's user, so a reattached status is
+only as trustworthy as the workload: it can forge its own exit status, but
+it cannot make a ref with another operation's token pass the digest.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import posixpath
 import secrets as secrets_module
 import shlex
@@ -85,10 +106,23 @@ _PROVIDER = "e2b"
 # and the workload's status comes back on fd 4, never through that pipe. The
 # encoder drops `OWNER_VARIABLE`, so a cancel never kills it before the
 # workload's last output is sent.
+#
+# `$state` is the reattach directory: the token digest, execution id (hex) and
+# start time go in before the workload starts, its group as soon as it has
+# one, and its status (with the end time) once `wait` returns. A directory
+# that cannot be made leaves the operation running but not reattachable.
 _OUTER = (
-    "exec 2>&1 3>&1; IFS= read -r argv0; IFS= read -r line; inner=$1; encode=$2; shift 2; "
-    'status=$( { { setsid sh -c "$inner" "$argv0" "$line" "$@" 2>&1 3>&- 4>&- & wait "$!"; '
+    "exec 2>&1 3>&1; IFS= read -r argv0; IFS= read -r line; "
+    "inner=$1; encode=$2; state=$3; shift 3; "
+    'mkdir -p "$state" 2>/dev/null && printf "%s\\n" "$OWNER_DIGEST" > "$state/owner" '
+    '&& printf "%s\\n" "$EXECUTION_HEX" > "$state/execution" '
+    '&& printf "%s\\n" "$STARTED_AT" > "$state/started"; '
+    "unset OWNER_DIGEST EXECUTION_HEX STARTED_AT; "
+    'status=$( { { setsid sh -c "$inner" "$argv0" "$line" "$@" 2>&1 3>&- 4>&- & '
+    'echo "$!" > "$state/group" 2>/dev/null; wait "$!"; '
     'echo "$?" >&4; } | env -u AGENTIC_E2B_OPERATION sh -c "$encode" >&3; } 4>&1 ); '
+    '{ date -u +%Y-%m-%dT%H:%M:%SZ > "$state/ended" && echo "$status" > "$state/exit"; } '
+    "2>/dev/null; "
     'exit "$status"'
 )
 # Each read of the workload's output, as one line of lowercase hex. The SDK
@@ -117,10 +151,14 @@ OWNER_VARIABLE = "AGENTIC_E2B_OPERATION"
 # the encoder, which must outlive the workload. TERM each member, wait up to
 # $3 tenths of a second for all to go, then KILL and wait up to 2s. Exits 0
 # only once none is left, 1 listing the survivors, 2 for a group it refuses to
-# signal. /proc, `cat` and `grep` only: slim images ship no `ps`. `members`
+# signal. On exit 0 it writes $5 (`cancelled` or `timed_out`) to `stopped` in
+# the reattach directory $4, so a fresh instance reads why the group is gone.
+# /proc, `cat` and `grep` only: slim images ship no `ps`. `members`
 # sets `$m` rather than printing it, so `$known` outlives each scan.
 _TERMINATE = (
-    'group=$1; owner=$2; grace=$3; [ "$group" -gt 1 ] 2>/dev/null || exit 2; known=" "; '
+    "group=$1; owner=$2; grace=$3; state=$4; word=$5; "
+    '[ "$group" -gt 1 ] 2>/dev/null || exit 2; known=" "; '
+    'stopped() { echo "$word" > "$state/stopped" 2>/dev/null; exit 0; }; '
     "members() { procs=; for s in /proc/[0-9]*/stat; do "
     'st=$(cat "$s" 2>/dev/null) || continue; p=${s#/proc/}; set -- ${st##*) }; '
     '[ "$1" != Z ] && procs="$procs ${p%/stat},$2,$3,${20}"; done; '
@@ -134,8 +172,20 @@ _TERMINATE = (
     'kill -s "$1" -- "-$group" 2>/dev/null; }; '
     'settle() { n=$1; while members; [ -n "${m# }" ]; do [ "$n" -le 0 ] && return 1; '
     "sleep 0.1; n=$((n-1)); done; return 0; }; "
-    'signal TERM; settle "$grace" && exit 0; '
-    "signal KILL; settle 20 && exit 0; members; echo survivors $m; exit 1"
+    'signal TERM; settle "$grace" && stopped; '
+    "signal KILL; settle 20 && stopped; members; echo survivors $m; exit 1"
+)
+# Where each operation's reattach directory lives, by operation id.
+STATE_ROOT = "/tmp/agentic-operations"
+# Prints the reattach directory $1 as `name=value` lines, then `alive=1` when
+# some process carries `$OWNER_VARIABLE=$2`, which the wrapper does until the
+# workload's status is written. Exits 3 when there is no such directory.
+_PROBE = (
+    'd=$1; [ -r "$d/owner" ] || exit 3; '
+    "for f in owner execution started group exit ended stopped; do "
+    'v=$(head -n 1 "$d/$f" 2>/dev/null); printf "%s=%s\n" "$f" "$v"; done; '
+    'if grep -lzxF "$2" /proc/[0-9]*/environ >/dev/null 2>&1; '
+    "then echo alive=1; else echo alive=0; fi"
 )
 # How long a termination command, or a command's end after one, may take.
 _CONTROL_SECONDS = 30.0
@@ -150,6 +200,52 @@ class _Replay:
     spec: OperationSpec
     ref: OperationRef
     policy: bytes
+
+
+@dataclass
+class _Reattached:
+    """An operation another instance started, known only from its sandbox."""
+
+    ref: OperationRef
+    token: str
+    sandbox_id: str
+    execution_id: str
+    started_at: str
+    group: int | None = None
+    cancel_requested: bool = False
+    cancel_confirmed: bool = False
+    ended_at: str | None = None
+    stopping: asyncio.Lock = field(default_factory=asyncio.Lock)
+    signal_failure: str | None = None
+    escalated: bool = False
+    stop_failed: bool = False
+
+    def note(self, failure: str) -> None:
+        self.signal_failure = (
+            failure if self.signal_failure is None else f"{self.signal_failure}; {failure}"
+        )
+
+
+@dataclass(frozen=True)
+class _Probe:
+    """One read of a reattach directory and of /proc."""
+
+    owner: str
+    execution_id: str
+    started_at: str
+    group: int | None
+    exit_code: int | None
+    ended_at: str | None
+    stopped: str
+    alive: bool
+
+
+def _digest(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _state_dir(ref: OperationRef) -> str:
+    return posixpath.join(STATE_ROOT, ref.operation_id)
 
 
 @dataclass
@@ -187,6 +283,17 @@ class _Operation:
         )
 
 
+def _stop_failure_metadata(operation: _Operation | _Reattached) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    if operation.escalated:
+        metadata["cancel_escalation"] = (
+            "sandbox_kill_failed" if operation.stop_failed else "sandbox_killed"
+        )
+    if operation.signal_failure is not None:
+        metadata["cancel_signal_failure"] = operation.signal_failure
+    return metadata
+
+
 def _decode(line: str) -> bytes:
     """One `_ENCODE` line as the bytes the workload wrote.
 
@@ -204,7 +311,9 @@ def _now() -> str:
 
 
 def _error(
-    kind: Literal["unknown_operation", "conflict", "provider_unavailable"],
+    kind: Literal[
+        "unknown_operation", "conflict", "provider_unavailable", "unsupported_capability"
+    ],
     message: str,
     ref: OperationRef | None = None,
 ) -> OperationFailure:
@@ -229,9 +338,9 @@ class E2BOperations:
         self._retention = retention_bytes
         self._max_page = max_page_bytes
         self._operations: dict[str, _Operation] = {}
+        self._reattached: dict[str, _Reattached] = {}
         self._by_key: dict[tuple[str, str], _Replay] = {}
         self._launching: dict[tuple[str, str], asyncio.Lock] = {}
-        self._sequence = 0
 
     def describe(self) -> ProviderDescriptor:
         return ProviderDescriptor(
@@ -307,10 +416,10 @@ class E2BOperations:
                 )
             secrets[binding.target] = await self._credentials.resolve(binding.ref)
             resolved.append(secrets[binding.target])
-        self._sequence += 1
         ref = OperationRef(
             workspace=WorkspaceRef(provider=_PROVIDER, resource_id=workspace.id),
-            operation_id=f"{workspace.id}-op{self._sequence}",
+            # Random, not a counter: a fresh instance must not mint a live id again.
+            operation_id=f"{workspace.id}-op-{secrets_module.token_hex(8)}",
             operation_key=spec.operation_key,
         )
         operation = _Operation(
@@ -326,13 +435,28 @@ class E2BOperations:
         )
         command = await self._client.start(
             workspace.id,
-            shlex.join(["sh", "-c", _OUTER, "aw-operation", _INNER, _ENCODE, *spec.argv]),
+            shlex.join(
+                [
+                    "sh",
+                    "-c",
+                    _OUTER,
+                    "aw-operation",
+                    _INNER,
+                    _ENCODE,
+                    _state_dir(ref),
+                    *spec.argv,
+                ]
+            ),
             cwd=posixpath.normpath(posixpath.join("/workspace", spec.working_directory)),
             env={
                 **workspace.config.checked_environment(),
                 **spec.environment,
                 **secrets,
                 OWNER_VARIABLE: operation.token,
+                # Read and unset by the wrapper before the workload starts.
+                "OWNER_DIGEST": _digest(operation.token),
+                "EXECUTION_HEX": spec.execution_id.encode().hex(),
+                "STARTED_AT": operation.started_at,
             },
             timeout=None,
             user=self._run_as,
@@ -350,6 +474,162 @@ class E2BOperations:
                 del self._operations[operation.ref.operation_id]
         for key in [key for key in self._by_key if key[0] == workspace_id]:
             del self._by_key[key]
+        for reattached in list(self._reattached.values()):
+            if reattached.sandbox_id == workspace_id:
+                del self._reattached[reattached.ref.operation_id]
+
+    def reattach_token(self, ref: OperationRef) -> str:
+        """The secret a fresh instance needs, with `ref`, to `reattach`.
+
+        Only the instance that started the operation (or one that reattached
+        it) has it; persist it beside the ref and treat it as a credential.
+        """
+        operation = self._operations.get(ref.operation_id) or self._reattached.get(ref.operation_id)
+        if operation is None or operation.ref != ref:
+            raise _error(
+                "unknown_operation", f"no operation {ref.operation_id} in this provider", ref
+            )
+        return operation.token
+
+    async def reattach(self, ref: OperationRef, token: str) -> None:
+        """Make `status` and `cancel` answer for `ref`, started by another instance.
+
+        Ownership is checked in the sandbox against the digest the launch
+        wrote, so a ref with a forged or another operation's token raises
+        `unknown_operation`; a sandbox that does not answer raises
+        `provider_unavailable`.
+        """
+        known = self._operations.get(ref.operation_id) or self._reattached.get(ref.operation_id)
+        if known is not None:
+            if known.ref != ref or not secrets_module.compare_digest(known.token, token):
+                raise _error(
+                    "unknown_operation", f"{ref.operation_id} is not owned by this token", ref
+                )
+            return
+        probe = await self._probe(ref, token)
+        self._reattached[ref.operation_id] = _Reattached(
+            ref=ref,
+            token=token,
+            sandbox_id=ref.workspace.resource_id,
+            execution_id=probe.execution_id,
+            started_at=probe.started_at,
+            group=probe.group,
+        )
+
+    async def _probe(self, ref: OperationRef, token: str) -> _Probe:
+        """Read the reattach directory, checking that `token` owns it."""
+        command = await self._client.start(
+            ref.workspace.resource_id,
+            shlex.join(
+                ["sh", "-c", _PROBE, "aw-probe", _state_dir(ref), f"{OWNER_VARIABLE}={token}"]
+            ),
+            cwd="/",
+            env={},
+            timeout=None,
+            user=self._run_as,
+        )
+        ended, output = await _finish(command, _CONTROL_SECONDS)
+        if ended.end == "exited" and ended.exit_code == 3:
+            raise _error(
+                "unknown_operation",
+                f"no reattach state for {ref.operation_id} in sandbox {ref.workspace.resource_id}",
+                ref,
+            )
+        if ended.end != "exited" or ended.exit_code != 0:
+            raise _error(
+                "provider_unavailable",
+                f"reading {ref.operation_id} in sandbox {ref.workspace.resource_id} did not "
+                f"answer ({ended.end} {ended.exit_code} {ended.detail or ''}{output.strip()}); "
+                "its state is unknown",
+                ref,
+            )
+        fields = dict(line.partition("=")[::2] for line in output.splitlines() if "=" in line)
+        if not secrets_module.compare_digest(fields.get("owner", ""), _digest(token)):
+            raise _error("unknown_operation", f"{ref.operation_id} is not owned by this token", ref)
+        try:
+            execution_id = bytes.fromhex(fields.get("execution", "")).decode()
+        except ValueError:
+            execution_id = ""
+        group, code = fields.get("group", ""), fields.get("exit", "")
+        return _Probe(
+            owner=fields["owner"],
+            execution_id=execution_id or ref.operation_id,
+            started_at=fields.get("started", ""),
+            group=int(group) if group.isdigit() else None,
+            exit_code=int(code) if code.isdigit() else None,
+            ended_at=fields.get("ended") or None,
+            stopped=fields.get("stopped", ""),
+            alive=fields.get("alive") == "1",
+        )
+
+    async def _reattached_status(self, operation: _Reattached) -> OperationStatus:
+        metadata = _stop_failure_metadata(operation)
+        common: dict[str, object] = {
+            "schema": "apss.workspace-status/v1",
+            "ref": operation.ref,
+            "execution_id": operation.execution_id,
+            "metadata": metadata,
+        }
+        if operation.started_at:
+            common["started_at"] = operation.started_at
+        if operation.cancel_confirmed:
+            # Confirmed here; after an escalation the sandbox is gone, so not probed.
+            return OperationStatus.model_validate(
+                {**common, "state": "cancelled", "ended_at": operation.ended_at or _now()}
+            )
+        probe = await self._probe(operation.ref, operation.token)
+        operation.group = probe.group if probe.group is not None else operation.group
+        exit_code: int | None = None
+        signal_name: str | None = None
+        state: OperationState
+        if probe.stopped in ("cancelled", "timed_out"):
+            state = "cancelled" if probe.stopped == "cancelled" else "timed_out"
+        elif probe.exit_code is not None:
+            exit_code = probe.exit_code
+            if exit_code > 128 and exit_code - 128 < signal.NSIG:
+                signal_name = signal.Signals(exit_code - 128).name
+            state = "succeeded" if exit_code == 0 else "failed"
+        elif probe.alive:
+            return OperationStatus.model_validate({**common, "state": "running"})
+        else:
+            # Gone with no status: never `cancelled` unless a termination said so.
+            state = "failed" if operation.cancel_requested else "lost"
+        return OperationStatus.model_validate(
+            {
+                **common,
+                "state": state,
+                "exit_code": exit_code,
+                "signal": signal_name,
+                "ended_at": probe.ended_at or _now(),
+            }
+        )
+
+    async def _cancel_reattached(
+        self, operation: _Reattached, *, grace_seconds: float
+    ) -> OperationStatus:
+        status = await self._reattached_status(operation)
+        if status.state in TERMINAL_STATES:
+            return status
+        deadline = asyncio.get_running_loop().time() + _LEADER_SECONDS
+        # The group is written just after the launch; wait for it rather than guess.
+        while operation.group is None and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.1)
+            status = await self._reattached_status(operation)
+            if status.state in TERMINAL_STATES:
+                return status
+        async with operation.stopping:
+            operation.cancel_requested = True
+            try:
+                await self._stop(operation, grace_seconds=grace_seconds, reason="cancelled")
+            except OperationFailure as e:
+                operation.note(e.error.message)
+                raise
+            except asyncio.CancelledError:
+                operation.note("cancel interrupted before termination was confirmed")
+                raise
+            operation.cancel_confirmed = True
+            operation.ended_at = _now()
+        return await self._reattached_status(operation)
 
     async def _collect(self, operation: _Operation, command: SandboxCommand) -> None:
         reader = asyncio.create_task(self._read(operation, command))
@@ -361,7 +641,7 @@ class E2BOperations:
                 operation.timed_out = True
                 async with operation.stopping:
                     try:
-                        await self._stop(operation, grace_seconds=1.0)
+                        await self._stop(operation, grace_seconds=1.0, reason="timed_out")
                     except OperationFailure as e:
                         operation.note(e.error.message)
                 done, _ = await asyncio.wait({waiting}, timeout=_CONTROL_SECONDS)
@@ -442,13 +722,9 @@ class E2BOperations:
 
     async def status(self, ref: OperationRef) -> OperationStatus:
         operation = self._lookup(ref)
-        metadata = dict(operation.spec.metadata)
-        if operation.escalated:
-            metadata["cancel_escalation"] = (
-                "sandbox_kill_failed" if operation.stop_failed else "sandbox_killed"
-            )
-        if operation.signal_failure is not None:
-            metadata["cancel_signal_failure"] = operation.signal_failure
+        if isinstance(operation, _Reattached):
+            return await self._reattached_status(operation)
+        metadata = {**operation.spec.metadata, **_stop_failure_metadata(operation)}
         if operation.state not in TERMINAL_STATES:
             return OperationStatus(
                 schema="apss.workspace-status/v1",
@@ -479,6 +755,13 @@ class E2BOperations:
         wait_seconds: float = 0,
     ) -> ObservationPage:
         operation = self._lookup(ref)
+        if isinstance(operation, _Reattached):
+            raise _error(
+                "unsupported_capability",
+                f"{ref.operation_id} was reattached; its output was observed by the "
+                "instance that started it and is not recoverable",
+                ref,
+            )
         limit = min(max_bytes, self._max_page)
         page = operation.spool.page(ref, state=operation.state, cursor=cursor, max_page_bytes=limit)
         if page.complete or page.data_b64 or wait_seconds <= 0:
@@ -490,6 +773,8 @@ class E2BOperations:
 
     async def cancel(self, ref: OperationRef, *, grace_seconds: float) -> OperationStatus:
         operation = self._lookup(ref)
+        if isinstance(operation, _Reattached):
+            return await self._cancel_reattached(operation, grace_seconds=grace_seconds)
         if operation.state not in TERMINAL_STATES:
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(_LEADER_SECONDS):
@@ -499,7 +784,7 @@ class E2BOperations:
                     return await self.status(ref)
                 operation.cancel_requested = True
                 try:
-                    await self._stop(operation, grace_seconds=grace_seconds)
+                    await self._stop(operation, grace_seconds=grace_seconds, reason="cancelled")
                 except OperationFailure as e:
                     operation.note(e.error.message)
                     raise
@@ -511,7 +796,13 @@ class E2BOperations:
                 await operation.collector
         return await self.status(ref)
 
-    async def _stop(self, operation: _Operation, *, grace_seconds: float) -> None:
+    async def _stop(
+        self,
+        operation: _Operation | _Reattached,
+        *,
+        grace_seconds: float,
+        reason: Literal["cancelled", "timed_out"],
+    ) -> None:
         """Terminate the operation in the sandbox; failing that, kill the sandbox.
 
         As Docker stops the container when its group will not die, the
@@ -520,7 +811,7 @@ class E2BOperations:
         operation may still be running.
         """
         try:
-            await self._terminate(operation, grace_seconds=grace_seconds)
+            await self._terminate(operation, grace_seconds=grace_seconds, reason=reason)
             return
         except OperationFailure as e:
             operation.note(e.error.message)
@@ -548,7 +839,13 @@ class E2BOperations:
                 operation.ref,
             ) from e
 
-    async def _terminate(self, operation: _Operation, *, grace_seconds: float) -> None:
+    async def _terminate(
+        self,
+        operation: _Operation | _Reattached,
+        *,
+        grace_seconds: float,
+        reason: Literal["cancelled", "timed_out"] = "cancelled",
+    ) -> None:
         """TERM the group, KILL after the grace, and confirm none is left, in the sandbox.
 
         Raises provider_unavailable when there is no trusted group or the
@@ -573,6 +870,8 @@ class E2BOperations:
                     str(operation.group),
                     f"{OWNER_VARIABLE}={operation.token}",
                     str(tenths),
+                    _state_dir(operation.ref),
+                    reason,
                 ]
             ),
             cwd="/",
@@ -580,27 +879,7 @@ class E2BOperations:
             timeout=None,
             user=self._run_as,
         )
-        chunks: list[str] = []
-
-        async def drain() -> None:
-            async for text in command.output():
-                chunks.append(text)
-
-        # Drained alongside `wait`, never before it: the SDK adapter ends its
-        # output only once `wait` has seen the command end.
-        reader = asyncio.create_task(drain())
-        try:
-            async with asyncio.timeout(_CONTROL_SECONDS + grace_seconds):
-                ended = await command.wait()
-                await reader
-        except TimeoutError:
-            ended = CommandExit(end="disconnected", detail="termination did not answer")
-        finally:
-            if not reader.done():
-                reader.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await reader
-        output = "".join(chunks)
+        ended, output = await _finish(command, _CONTROL_SECONDS + grace_seconds)
         if ended.end != "exited" or ended.exit_code != 0:
             raise _error(
                 "provider_unavailable",
@@ -610,10 +889,35 @@ class E2BOperations:
                 operation.ref,
             )
 
-    def _lookup(self, ref: OperationRef) -> _Operation:
-        operation = self._operations.get(ref.operation_id)
+    def _lookup(self, ref: OperationRef) -> _Operation | _Reattached:
+        operation = self._operations.get(ref.operation_id) or self._reattached.get(ref.operation_id)
         if operation is None or operation.ref != ref:
             raise _error(
                 "unknown_operation", f"no operation {ref.operation_id} in this provider", ref
             )
         return operation
+
+
+async def _finish(command: SandboxCommand, seconds: float) -> tuple[CommandExit, str]:
+    """How a control command ended, and what it printed, within `seconds`."""
+    chunks: list[str] = []
+
+    async def drain() -> None:
+        async for text in command.output():
+            chunks.append(text)
+
+    # Drained alongside `wait`, never before it: the SDK adapter ends its
+    # output only once `wait` has seen the command end.
+    reader = asyncio.create_task(drain())
+    try:
+        async with asyncio.timeout(seconds):
+            ended = await command.wait()
+            await reader
+    except TimeoutError:
+        ended = CommandExit(end="disconnected", detail="control command did not answer")
+    finally:
+        if not reader.done():
+            reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reader
+    return ended, "".join(chunks)
