@@ -45,12 +45,6 @@ from agentic_isolation.providers.capabilities import (
     WorkspaceNotFoundError,
     WorkspaceOwnershipError,
 )
-from agentic_isolation.providers.file_transfer import (
-    FileRefusal,
-    ReadFilesError,
-    ReadFilesResult,
-    ReadLimits,
-)
 from agentic_isolation.providers.docker import ContainerRemovalError, WorkspaceDockerProvider
 from agentic_isolation.providers.e2b import (
     E2BStreamSession,
@@ -71,6 +65,12 @@ from agentic_isolation.providers.e2b_template import (
     TemplateSpecError,
     build_template,
     manifest_hash,
+)
+from agentic_isolation.providers.file_transfer import (
+    FileRefusal,
+    ReadFilesError,
+    ReadFilesResult,
+    ReadLimits,
 )
 from agentic_isolation.providers.local import WorkspaceLocalProvider
 from agentic_isolation.providers.teardown_report import (

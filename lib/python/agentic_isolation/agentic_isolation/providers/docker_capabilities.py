@@ -258,9 +258,8 @@ async def _docker_bounded(args: Sequence[str], stdin: bytes, cap: int) -> bytes:
     err = await proc.stderr.read()
     code = await proc.wait()
     if code != 0:
-        raise ReadFilesError(
-            f"{shlex.join(args[:2])} failed: {err.decode(errors='replace').strip() or f'exit {code}'}"
-        )
+        detail = err.decode(errors="replace").strip() or f"exit {code}"
+        raise ReadFilesError(f"{shlex.join(args[:2])} failed: {detail}")
     return bytes(out)
 
 

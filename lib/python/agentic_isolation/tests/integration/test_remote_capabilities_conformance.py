@@ -19,16 +19,21 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import sys
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 import pytest
 
 from agentic_isolation import (
     E2BWorkspaceProvider,
+    FileRefusal,
+    ReadFilesResult,
+    ReadLimits,
     SecurityConfig,
     StreamOutcome,
     StreamSession,
@@ -45,6 +50,7 @@ from agentic_isolation.providers.capabilities import TransferRoot
 from agentic_isolation.providers.docker_capabilities import DockerStreamSession
 from agentic_isolation.providers.e2b import E2BStreamSession
 from agentic_isolation.providers.e2b_client import SdkE2BClient, _SdkCommand
+from tests.e2b_fake import FakeE2BClient
 
 pytestmark = [pytest.mark.docker_conformance, pytest.mark.integration]
 
@@ -336,45 +342,257 @@ async def test_cancel_stops_the_sandbox_process(
     assert (await provider.execute(workspace, f"test -e {marker}")).exit_code != 0
 
 
+TransferProvider = ConformanceProvider | E2BWorkspaceProvider
+
+
+@pytest.fixture(params=[*sorted(_HARNESSES), "e2b-double"])
+async def transfer(
+    request: pytest.FixtureRequest, tmp_path: Path
+) -> AsyncIterator[tuple[TransferProvider, Workspace]]:
+    """A provider and a fresh workspace for the `read_files` cases (#100).
+
+    Docker is real and E2B live is local only, as above. The E2B double runs
+    the provider's real sandbox commands against local roots, so CI covers the
+    E2B read path without a key.
+    """
+    if request.param == "e2b-double":
+        root = tmp_path / "sandbox"
+        root.mkdir()
+        client = FakeE2BClient(executing_root=root)
+        client.spool_root.mkdir()
+        made: TransferProvider = E2BWorkspaceProvider("t", client=client)
+        workspace = await made.create(WorkspaceConfig(provider="e2b"))
+    else:
+        chosen = _HARNESSES[request.param]
+        if not chosen.available():
+            if chosen.required():
+                pytest.fail(f"{request.param} conformance is required here but is not available")
+            pytest.skip(f"NOT RUN: {request.param} backend not available")
+        made = chosen.new_provider()
+        workspace = await made.create(chosen.workspace_config(made.name, {}))
+    try:
+        assert isinstance(made, SupportsFileTransfer)
+        yield made, workspace
+    finally:
+        await made.destroy(workspace)
+
+
+async def _plant(provider: TransferProvider, workspace: Workspace, code: str) -> None:
+    """Run `code` as Python in the sandbox, as an agent planting files would."""
+    written = await provider.execute(workspace, shlex.join(["python3", "-c", code]))
+    assert written.exit_code == 0, written.stdout + written.stderr
+
+
 @pytest.mark.parametrize("base_path", ["/workspace", "/spool"])
 async def test_read_files_round_trips_binary(
-    provider: ConformanceProvider, make_workspace: MakeWorkspace, base_path: TransferRoot
+    transfer: tuple[TransferProvider, Workspace], base_path: TransferRoot
 ) -> None:
-    workspace = await make_workspace({})
-    write = (
-        "import sys; d = bytes(range(256)) * 4; "
+    provider, workspace = transfer
+    await _plant(
+        provider,
+        workspace,
         f"import os; os.makedirs('{base_path}/out/nested', exist_ok=True); "
-        f"open('{base_path}/out/nested/blob.bin', 'wb').write(d); "
-        f"open('{base_path}/out/skip.txt', 'w').write('no')"
+        f"open('{base_path}/out/nested/blob.bin', 'wb').write(bytes(range(256)) * 4); "
+        f"open('{base_path}/out/skip.txt', 'w').write('no')",
     )
-    written = await provider.execute(workspace, f'python3 -c "{write}"')
-    assert written.exit_code == 0, written.stderr
 
-    files = await provider.read_files(workspace, ["out/*.bin"], base_path=base_path)
+    got = await provider.read_files(workspace, ["out/*.bin"], base_path=base_path)
 
-    assert files == [("out/nested/blob.bin", BINARY)]
+    assert got == ReadFilesResult(files=(("out/nested/blob.bin", BINARY),), refused=())
+    assert got.complete
 
 
 @pytest.mark.parametrize("base_path", ["/workspace", "/spool"])
-async def test_read_files_returns_every_name_of_a_hard_link(
-    provider: ConformanceProvider, make_workspace: MakeWorkspace, base_path: TransferRoot
+async def test_read_files_refuses_every_name_of_a_hard_link(
+    transfer: tuple[TransferProvider, Workspace], base_path: TransferRoot
 ) -> None:
-    workspace = await make_workspace({})
-    write = (
+    # Reverses the #85 contract, which returned the bytes under every name:
+    # a hard link lets the sandbox alias a file it did not write there.
+    provider, workspace = transfer
+    await _plant(
+        provider,
+        workspace,
         f"import os; os.makedirs('{base_path}/out', exist_ok=True); "
-        f"open('{base_path}/out/a.bin', 'wb').write(bytes(range(256)) * 4); "
-        f"os.link('{base_path}/out/a.bin', '{base_path}/out/b.bin')"
+        f"open('{base_path}/out/a.bin', 'wb').write(b'aliased'); "
+        f"os.link('{base_path}/out/a.bin', '{base_path}/out/b.bin')",
     )
-    written = await provider.execute(workspace, f'python3 -c "{write}"')
-    assert written.exit_code == 0, written.stderr
 
-    # Either name alone, whichever one the archive stores the bytes under.
     for name in ("out/a.bin", "out/b.bin"):
-        assert await provider.read_files(workspace, [name], base_path=base_path) == [(name, BINARY)]
-    assert await provider.read_files(workspace, ["out/*.bin"], base_path=base_path) == [
-        ("out/a.bin", BINARY),
-        ("out/b.bin", BINARY),
-    ]
+        got = await provider.read_files(workspace, [name], base_path=base_path)
+        assert got == ReadFilesResult(files=(), refused=(FileRefusal(name, "hard_link"),))
+    both = await provider.read_files(workspace, ["out/*.bin"], base_path=base_path)
+    assert both.refused == (
+        FileRefusal("out/a.bin", "hard_link"),
+        FileRefusal("out/b.bin", "hard_link"),
+    )
+    assert both.files == ()
+
+
+async def test_read_files_refuses_symlinks_that_escape_the_root(
+    transfer: tuple[TransferProvider, Workspace],
+) -> None:
+    provider, workspace = transfer
+    await _plant(
+        provider,
+        workspace,
+        "import os; os.makedirs('/workspace/out', exist_ok=True); "
+        "os.symlink('/etc/passwd', '/workspace/out/absolute'); "
+        "os.symlink('../../etc/passwd', '/workspace/out/relative')",
+    )
+
+    got = await provider.read_files(workspace, ["out/*"], base_path="/workspace")
+
+    assert got == ReadFilesResult(
+        files=(),
+        refused=(
+            FileRefusal("out/absolute", "escaping_symlink"),
+            FileRefusal("out/relative", "escaping_symlink"),
+        ),
+    )
+
+
+async def test_read_files_refuses_a_symlink_inside_the_root_and_reads_its_target(
+    transfer: tuple[TransferProvider, Workspace],
+) -> None:
+    provider, workspace = transfer
+    await _plant(
+        provider,
+        workspace,
+        "import os; os.makedirs('/workspace/out', exist_ok=True); "
+        "open('/workspace/out/real.txt', 'wb').write(b'real'); "
+        "os.symlink('real.txt', '/workspace/out/alias.txt')",
+    )
+
+    got = await provider.read_files(workspace, ["out/*.txt"], base_path="/workspace")
+
+    assert got == ReadFilesResult(
+        files=(("out/real.txt", b"real"),), refused=(FileRefusal("out/alias.txt", "symlink"),)
+    )
+
+
+async def test_read_files_refuses_special_files(
+    transfer: tuple[TransferProvider, Workspace],
+) -> None:
+    provider, workspace = transfer
+    await _plant(
+        provider,
+        workspace,
+        "import os, socket; os.makedirs('/workspace/out', exist_ok=True); "
+        "os.mkfifo('/workspace/out/fifo'); "
+        "socket.socket(socket.AF_UNIX).bind('/workspace/out/sock')",
+    )
+
+    got = await provider.read_files(workspace, ["out/*"], base_path="/workspace")
+
+    assert got == ReadFilesResult(
+        files=(),
+        refused=(FileRefusal("out/fifo", "special_file"), FileRefusal("out/sock", "special_file")),
+    )
+
+
+async def test_read_files_refuses_a_file_over_the_per_file_limit(
+    transfer: tuple[TransferProvider, Workspace],
+) -> None:
+    provider, workspace = transfer
+    await _plant(
+        provider,
+        workspace,
+        "import os; os.makedirs('/workspace/out', exist_ok=True); "
+        "open('/workspace/out/fits', 'wb').write(b'x' * 10); "
+        "open('/workspace/out/over', 'wb').write(b'x' * 11)",
+    )
+
+    got = await provider.read_files(
+        workspace, ["out/*"], base_path="/workspace", limits=ReadLimits(max_file_bytes=10)
+    )
+
+    assert got == ReadFilesResult(
+        files=(("out/fits", b"x" * 10),), refused=(FileRefusal("out/over", "file_too_large"),)
+    )
+
+
+async def test_read_files_refuses_what_would_pass_the_total_byte_limit(
+    transfer: tuple[TransferProvider, Workspace],
+) -> None:
+    provider, workspace = transfer
+    await _plant(
+        provider,
+        workspace,
+        "import os; os.makedirs('/workspace/out', exist_ok=True); "
+        "[open(f'/workspace/out/{n}', 'wb').write(b'x' * 4) for n in 'abc']",
+    )
+
+    got = await provider.read_files(
+        workspace, ["out/*"], base_path="/workspace", limits=ReadLimits(max_total_bytes=10)
+    )
+
+    assert got == ReadFilesResult(
+        files=(("out/a", b"xxxx"), ("out/b", b"xxxx")),
+        refused=(FileRefusal("out/c", "total_bytes_exceeded"),),
+    )
+
+
+async def test_read_files_stops_the_walk_at_the_entry_limit_and_says_so(
+    transfer: tuple[TransferProvider, Workspace],
+) -> None:
+    provider, workspace = transfer
+    await _plant(
+        provider,
+        workspace,
+        "[open(f'/spool/f{n}', 'wb').write(b'x') for n in range(5)]",
+    )
+
+    capped = await provider.read_files(
+        workspace, ["f*"], base_path="/spool", limits=ReadLimits(max_entries=3)
+    )
+    whole = await provider.read_files(
+        workspace, ["f*"], base_path="/spool", limits=ReadLimits(max_entries=100)
+    )
+
+    assert not capped.complete
+    assert [r.reason for r in capped.refused] == ["entry_limit_exceeded"]
+    assert len(capped.files) <= 3
+    assert whole.complete and [path for path, _ in whole.files] == [f"f{n}" for n in range(5)]
+
+
+async def test_read_files_does_not_walk_below_the_depth_limit(
+    transfer: tuple[TransferProvider, Workspace],
+) -> None:
+    provider, workspace = transfer
+    await _plant(
+        provider,
+        workspace,
+        "import os; os.makedirs('/workspace/a/b/c', exist_ok=True); "
+        "open('/workspace/a/ok.txt', 'wb').write(b'ok'); "
+        "open('/workspace/a/b/edge.txt', 'wb').write(b'edge'); "
+        "open('/workspace/a/b/c/deep.txt', 'wb').write(b'deep')",
+    )
+
+    got = await provider.read_files(
+        workspace, ["a/*"], base_path="/workspace", limits=ReadLimits(max_depth=2)
+    )
+
+    assert got == ReadFilesResult(
+        files=(("a/ok.txt", b"ok"),),
+        refused=(
+            FileRefusal("a/b/c", "depth_exceeded"),
+            FileRefusal("a/b/edge.txt", "depth_exceeded"),
+        ),
+    )
+
+
+async def test_read_files_without_limits_is_bounded_by_default(
+    transfer: tuple[TransferProvider, Workspace],
+) -> None:
+    # One byte past the default per-file limit: a caller that passes no
+    # limits must still be refused, not handed the whole file.
+    provider, workspace = transfer
+    over = ReadLimits().max_file_bytes + 1
+    await _plant(provider, workspace, f"open('/spool/big', 'wb').truncate({over})")
+
+    got = await provider.read_files(workspace, ["big"], base_path="/spool")
+
+    assert got == ReadFilesResult(files=(), refused=(FileRefusal("big", "file_too_large"),))
 
 
 async def test_list_owned_returns_exactly_the_host_workspaces(

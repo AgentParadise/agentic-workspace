@@ -80,10 +80,10 @@ from agentic_isolation.contract import (
 )
 from agentic_isolation.providers.base import CredentialResolver, ExecuteResult, Workspace
 from agentic_isolation.providers.capabilities import (
+    TRANSFER_ROOTS,
     OwnedWorkspace,
     StreamOutcome,
     StreamSession,
-    TRANSFER_ROOTS,
     TransferRoot,
     WorkspaceNotFoundError,
     WorkspaceOwnershipError,
@@ -100,6 +100,7 @@ from agentic_isolation.providers.e2b_client import (
 )
 from agentic_isolation.providers.e2b_operations import E2BOperations
 from agentic_isolation.providers.file_transfer import (
+    DEFAULT_READ_LIMITS,
     ReadFilesError,
     ReadFilesResult,
     ReadLimits,
@@ -368,7 +369,7 @@ class E2BWorkspaceProvider:
         patterns: Sequence[str],
         *,
         base_path: TransferRoot,
-        limits: ReadLimits = ReadLimits(),
+        limits: ReadLimits = DEFAULT_READ_LIMITS,
     ) -> ReadFilesResult:
         if base_path not in TRANSFER_ROOTS:
             raise ValueError(f"base_path must be one of {', '.join(TRANSFER_ROOTS)}")

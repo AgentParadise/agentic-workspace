@@ -18,7 +18,11 @@ from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
 from agentic_isolation.providers.base import Workspace
-from agentic_isolation.providers.file_transfer import ReadFilesResult, ReadLimits
+from agentic_isolation.providers.file_transfer import (
+    DEFAULT_READ_LIMITS,
+    ReadFilesResult,
+    ReadLimits,
+)
 
 # Absolute roots `read_files` accepts. Returned paths are relative to the root.
 TransferRoot = Literal["/workspace", "/spool", "/opt/agentic"]
@@ -140,7 +144,7 @@ class SupportsFileTransfer(Protocol):
         patterns: Sequence[str],
         *,
         base_path: TransferRoot,
-        limits: ReadLimits = ReadLimits(),
+        limits: ReadLimits = DEFAULT_READ_LIMITS,
     ) -> ReadFilesResult:
         """Read every regular file under `base_path` whose relative path
         matches any pattern, within `limits`.
@@ -150,7 +154,7 @@ class SupportsFileTransfer(Protocol):
         a hard link, a symlink (escaping the root or not; none is followed), a
         device, FIFO or socket, or past a limit is returned as a
         `FileRefusal`, never skipped. Omitting `limits` gets the finite
-        `ReadLimits()` defaults. Raises `ReadFilesError` when the sandbox's
+        `DEFAULT_READ_LIMITS`. Raises `ReadFilesError` when the sandbox's
         walk or archive fails or breaks the contract.
         """
         ...

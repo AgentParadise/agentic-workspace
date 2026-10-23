@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 
 from agentic_isolation import (
+    ReadFilesError,
+    ReadFilesResult,
     ResourceLimits,
     StreamOutcome,
     SupportsFileTransfer,
@@ -263,20 +265,34 @@ async def test_reconnect_reattaches_to_the_same_pid(
     assert [line async for line in again.lines()] == ["again"]
 
 
-async def test_read_files_matches_patterns_and_returns_exact_bytes(
-    provider: E2BWorkspaceProvider, client: FakeE2BClient
-) -> None:
-    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+async def test_read_files_matches_patterns_and_returns_exact_bytes(tmp_path: Path) -> None:
+    # The sandbox commands really run, over local roots: the bytes cross the
+    # command stream, never the files API, which would follow a symlink.
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    client = FakeE2BClient(executing_root=root)
+    (client.spool_root / "a").mkdir(parents=True)
     blob = bytes(range(256))
-    client.sandboxes[workspace.id].files.update(
-        {"/spool/a/one.jsonl": blob, "/spool/b.txt": b"skip"}
-    )
-    client.responder = lambda c: FakeRun(chunks=["./b.txt\0./a/one.jsonl\0"] if "find" in c else [])
+    (client.spool_root / "a" / "one.jsonl").write_bytes(blob)
+    (client.spool_root / "b.txt").write_bytes(b"skip")
+    provider = E2BWorkspaceProvider("tmpl-1", client=client)
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
 
     got = await provider.read_files(workspace, ["*.jsonl"], base_path="/spool")
 
-    assert got == [("a/one.jsonl", blob)]
-    assert client.started[-1][2] == "/spool"
+    assert got == ReadFilesResult(files=(("a/one.jsonl", blob),), refused=())
+    assert len(client.started) == 3  # create's root check, the listing, the archive
+    assert client.stdins[-1] == b"./a/one.jsonl\0"
+
+
+async def test_read_files_reports_a_sandbox_that_answers_outside_the_contract(
+    provider: E2BWorkspaceProvider, client: FakeE2BClient
+) -> None:
+    workspace = await provider.create(WorkspaceConfig(provider="e2b"))
+    client.responder = lambda _c: FakeRun(chunks=["not base64!"])
+
+    with pytest.raises(ReadFilesError, match="not base64"):
+        await provider.read_files(workspace, ["*"], base_path="/spool")
 
 
 async def test_file_paths_cannot_escape_the_workspace(provider: E2BWorkspaceProvider) -> None:

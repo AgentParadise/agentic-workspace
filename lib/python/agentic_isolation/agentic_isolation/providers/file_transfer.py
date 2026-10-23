@@ -59,6 +59,10 @@ class ReadLimits:
                 raise ValueError(f"ReadLimits.{name} must be a positive int, got {value!r}")
 
 
+# What a caller that passes no limits gets: finite, never unlimited.
+DEFAULT_READ_LIMITS = ReadLimits()
+
+
 @dataclass(frozen=True)
 class FileRefusal:
     """An entry `read_files` would not return, relative to the root, and why.
@@ -109,7 +113,7 @@ def _script(command: str, emit: str, *, base64: bool) -> str:
     """Run `command` into a sandbox temp file, then emit it, keeping its status."""
     encode = " | base64 -w0" if base64 else ""
     return (
-        't=$(mktemp) || exit 1; '
+        "t=$(mktemp) || exit 1; "
         f'{command} > "$t"; rc=$?; '
         f'if [ "$rc" -eq 0 ]; then {emit} "$t"{encode}; rc=$?; fi; '
         'rm -f "$t"; exit "$rc"'
@@ -142,14 +146,26 @@ def listing_cap(limits: ReadLimits) -> int:
 def archive_script(base_path: str, *, base64: bool = False) -> str:
     """Archive the NUL-separated `./path` names on stdin, never following links."""
     tar = shlex.join(
-        ["tar", "-C", base_path, "--no-recursion", "--null", "--verbatim-files-from",
-         "-cf", "-", "-T", "-"]
+        [
+            "tar",
+            "-C",
+            base_path,
+            "--no-recursion",
+            "--null",
+            "--verbatim-files-from",
+            "-cf",
+            "-",
+            "-T",
+            "-",
+        ]
     )
     return _script(tar, "cat", base64=base64)
 
 
 def archive_stdin(plan: ReadPlan) -> bytes:
-    return b"".join(b"./" + path.encode("utf-8", "surrogateescape") + b"\0" for path, _ in plan.reads)
+    return b"".join(
+        b"./" + path.encode("utf-8", "surrogateescape") + b"\0" for path, _ in plan.reads
+    )
 
 
 def archive_cap(plan: ReadPlan, limits: ReadLimits) -> int:
@@ -221,14 +237,15 @@ def plan_reads(
     return ReadPlan(tuple(sorted(reads)), tuple(refused))
 
 
-def collect(
-    archive: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str
-) -> ReadFilesResult:
+def collect(archive: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str) -> ReadFilesResult:
     """Check the sandbox's archive of `plan.reads` against `limits` and return the result.
 
     Anything that changed since the listing is refused here by what the
     archive says it is now; an archive holding other names is an error.
+    With nothing planned, no archive was taken and `archive` is ignored.
     """
+    if not plan.reads:
+        return ReadFilesResult(files=(), refused=_by_path(plan.refused))
     expected = {path for path, _ in plan.reads}
     files: list[tuple[str, bytes]] = []
     refused = list(plan.refused)
@@ -260,6 +277,8 @@ def collect(
         raise ReadFilesError(f"the sandbox archive is not a readable tar: {exc}") from exc
     if expected:
         raise ReadFilesError(f"the sandbox archive is missing {', '.join(sorted(expected))}")
-    return ReadFilesResult(
-        files=tuple(sorted(files)), refused=tuple(sorted(refused, key=lambda r: r.path))
-    )
+    return ReadFilesResult(files=tuple(sorted(files)), refused=_by_path(refused))
+
+
+def _by_path(refused: Sequence[FileRefusal]) -> tuple[FileRefusal, ...]:
+    return tuple(sorted(refused, key=lambda r: r.path))

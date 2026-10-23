@@ -64,12 +64,16 @@ from agentic_isolation.providers.capabilities import (
     WorkspaceOwnershipError,
     mismatched_labels,
 )
-from agentic_isolation.providers.file_transfer import ReadFilesResult, ReadLimits
 from agentic_isolation.providers.contained_files import (
     NotARegularFileError,
     _open_contained,
 )
 from agentic_isolation.providers.docker_operations import DockerOperations
+from agentic_isolation.providers.file_transfer import (
+    DEFAULT_READ_LIMITS,
+    ReadFilesResult,
+    ReadLimits,
+)
 from agentic_isolation.providers.operation_spool import OperationFailure
 from agentic_isolation.providers.teardown_report import (
     DeleteFallback,
@@ -825,7 +829,7 @@ class WorkspaceDockerProvider(BaseProvider):
         patterns: Sequence[str],
         *,
         base_path: TransferRoot,
-        limits: ReadLimits = ReadLimits(),
+        limits: ReadLimits = DEFAULT_READ_LIMITS,
     ) -> ReadFilesResult:
         """SupportsFileTransfer: exact bytes, from inside the container."""
         container_name = workspace._handle

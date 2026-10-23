@@ -8,7 +8,6 @@ import asyncio
 import json
 import os
 import signal
-import subprocess
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -16,6 +15,10 @@ from pathlib import Path
 import pytest
 
 from agentic_isolation import (
+    FileRefusal,
+    ReadFilesError,
+    ReadFilesResult,
+    ReadLimits,
     SecurityConfig,
     StreamOutcome,
     SupportsFileTransfer,
@@ -27,7 +30,7 @@ from agentic_isolation import (
     WorkspaceLocalProvider,
     WorkspaceOwnershipError,
 )
-from agentic_isolation.providers import docker_capabilities
+from agentic_isolation.providers import docker_capabilities, file_transfer
 from agentic_isolation.providers.capabilities import mismatched_labels
 from agentic_isolation.providers.docker_capabilities import DockerStreamSession
 
@@ -261,24 +264,53 @@ async def test_concurrent_observers_agree_on_a_recorded_exit(
         assert outcome == StreamOutcome(end="completed", exit_code=7)
 
 
-async def test_read_files_returns_every_name_of_a_hard_link(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+# A `docker` on PATH that runs `exec [-i] <container> argv...` locally, with
+# /workspace moved under $FAKE_ROOT, so the real listing and archive scripts
+# and the real bounded pipe run; FAKE_FLOOD makes it answer with junk instead.
+_FAKE_DOCKER = """#!/bin/sh
+shift
+[ "$1" = "-i" ] && shift
+shift
+if [ -n "$FAKE_FLOOD" ]; then head -c "$FAKE_FLOOD" /dev/zero; exit 0; fi
+script=$(printf '%s' "$3" | sed "s#/workspace#$FAKE_ROOT#g")
+exec "$1" "$2" "$script"
+"""
+
+
+@pytest.fixture
+def local_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "docker").write_text(_FAKE_DOCKER)
+    (bin_dir / "docker").chmod(0o755)
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_ROOT", str(root))
+    return root
+
+
+async def test_read_files_refuses_hard_links_and_returns_exact_bytes(local_docker: Path) -> None:
+    (local_docker / "a.bin").write_bytes(b"aliased")
+    os.link(local_docker / "a.bin", local_docker / "b.bin")
+    (local_docker / "c.bin").write_bytes(bytes(range(256)))
+
+    got = await docker_capabilities.read_files("c", ["*.bin"], "/workspace", ReadLimits())
+
+    assert got == ReadFilesResult(
+        files=(("c.bin", bytes(range(256))),),
+        refused=(FileRefusal("a.bin", "hard_link"), FileRefusal("b.bin", "hard_link")),
+    )
+
+
+async def test_read_files_stops_reading_a_sandbox_that_floods_the_pipe(
+    local_docker: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    (tmp_path / "a.bin").write_bytes(bytes(range(256)))
-    os.link(tmp_path / "a.bin", tmp_path / "b.bin")
-    archive = subprocess.run(
-        ["tar", "-cf", "-", "-C", str(tmp_path), "."], check=True, capture_output=True
-    ).stdout
+    limits = ReadLimits(max_entries=1)
+    monkeypatch.setenv("FAKE_FLOOD", str(file_transfer.listing_cap(limits) + 1))
 
-    async def tar_transport(*args: str) -> tuple[int, bytes, bytes]:
-        return 0, archive, b""
-
-    monkeypatch.setattr(docker_capabilities, "_docker", tar_transport)
-
-    for name in ("a.bin", "b.bin"):
-        assert await docker_capabilities.read_files("unused", [name], "/workspace") == [
-            (name, bytes(range(256)))
-        ]
+    with pytest.raises(ReadFilesError, match="more than"):
+        await docker_capabilities.read_files("c", ["*"], "/workspace", limits)
 
 
 def _victim() -> Workspace:
