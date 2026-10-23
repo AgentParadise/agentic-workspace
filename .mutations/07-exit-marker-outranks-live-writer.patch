@@ -1,0 +1,15 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+index 84a593e..231031b 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+@@ -629,9 +629,7 @@ class E2BOperations:
+         exit_code: int | None = None
+         signal_name: str | None = None
+         state: OperationState
+-        if probe.alive:
+-            # A live process outranks any marker: the leader's exit leaves
+-            # descendants running, and the workload can write `stopped`.
++        if probe.stopped is None and probe.exit_code is None and probe.alive:
+             return OperationStatus.model_validate({**common, "state": "running"})
+         if probe.stopped is not None:
+             state = probe.stopped

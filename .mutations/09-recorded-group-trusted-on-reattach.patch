@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+index 84a593e..32fcb61 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+@@ -923,7 +923,7 @@ class E2BOperations:
+                     reason,
+                     # The starter read the group from its own stream; a
+                     # reattached one read it from the workload's directory.
+-                    "verify" if isinstance(operation, _Reattached) else "trusted",
++                    "trusted",
+                 ]
+             ),
+             cwd="/",

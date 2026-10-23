@@ -24,3 +24,22 @@ Locally, at the commit that added them, over the e2b-double: 01 failed 6
 tests, 02 failed 2, 03 1, 04 1, 05 1 (2 in one of two runs), 06 1. That
 run is not mutation evidence; the trusted run is `mutation-evidence.yml` on
 a GitHub runner.
+
+## Added by the verification fix (B1, B2)
+
+The fix for verification findings B1 (an exited leader hid a live writer)
+and B2 (workload-writable state authorised cancellation) changed the lines
+patches 03 and 05 touch, so they no longer apply. They are left as they
+were. 10 and 11 make the same mutations against the fixed code. The
+selection is still the one file above, now 14 node ids, none parametrised.
+
+| Patch | Bug | Killing tests |
+|---|---|---|
+| `07-exit-marker-outranks-live-writer.patch` | an exit status or `stopped` word in the reattach directory outranks a live process carrying the marker | `test_a_writer_left_by_an_exited_leader_is_running_until_cancel_kills_it`, `test_a_forged_stopped_word_does_not_hide_a_live_workload` |
+| `08-owner-digest-not-bound-to-id.patch` | the owner digest leaves out the operation id, so a workload's copy of its own directory under a new id passes reattach | `test_a_workload_cannot_aim_its_token_at_another_operation` |
+| `09-recorded-group-trusted-on-reattach.patch` | a reattached cancel signals the group read from the workload's directory without checking its leader, so a rewritten group kills another operation | `test_a_workload_cannot_aim_its_token_at_another_operation` |
+| `10-reattach-ownership-unchecked-rebased.patch` | 03 against the fixed code: the probe accepts any owner digest | `test_a_wrong_token_cannot_reattach_or_cancel`, `test_a_workload_cannot_aim_its_token_at_another_operation` |
+| `11-gone-without-status-reads-cancelled-rebased.patch` | 05 against the fixed code: gone with no status reads `cancelled` | `test_a_workload_gone_without_a_status_is_lost_not_cancelled` |
+
+Locally, over the e2b-double at the fix commit: 07 failed 2 tests, 08 1,
+09 1, 10 2, 11 1. As above, that is not mutation evidence.

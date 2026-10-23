@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+index 84a593e..efd9952 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/e2b_operations.py
+@@ -584,7 +584,7 @@ class E2BOperations:
+                 ref,
+             )
+         fields = dict(line.partition("=")[::2] for line in output.splitlines() if "=" in line)
+-        if not secrets_module.compare_digest(fields.get("owner", ""), _owner_digest(ref, token)):
++        if not fields.get("owner"):
+             raise _error("unknown_operation", f"{ref.operation_id} is not owned by this token", ref)
+         try:
+             execution_id = bytes.fromhex(fields.get("execution", "")).decode()
