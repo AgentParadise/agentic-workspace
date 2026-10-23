@@ -35,7 +35,10 @@ wrapper from its tmp dir, so it needs an executable `TMPDIR` (a GitHub
 runner's `/tmp` is). The Docker parametrisations need the runner. This is
 not mutation evidence; the trusted run is the orchestrator's.
 
-Locally, at the commit that added 08-10, with the same named tests: 01-07
-failed the same counts as above, 08 failed 4, 09 failed 1 and 10 failed 3.
+Locally, at the commit that regenerated 01 and 03 for the per-call total
+and the `vanished` kind (only their context changed), with the same named
+tests: 01 failed 5, 02 failed 5, 03 failed 3, 04 failed 21 (the added
+`vanished` case is one more refusal it drops), 05 failed 2, 06 failed 2, 07
+failed 1, 08 failed 4, 09 failed 1 and 10 failed 3.
 09 and 10 make their killers hang, so those fail on the test's own 20 s
 `asyncio.wait_for` bound, not on an assertion.

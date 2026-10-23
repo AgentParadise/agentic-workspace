@@ -1,8 +1,8 @@
 diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
-index 059d443..599562a 100644
+index 46dba4f..3f71ea8 100644
 --- a/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
 +++ b/lib/python/agentic_isolation/agentic_isolation/providers/file_transfer.py
-@@ -193,9 +193,7 @@ for p; do
+@@ -219,9 +219,7 @@ for p; do
      else
        head -c "$((FILE + 1))" <&3 > "$t" || exit 1
        n=$(wc -c < "$t")
@@ -12,8 +12,8 @@ index 059d443..599562a 100644
 +      if [ "$((used + n))" -gt "$TOTAL" ]; then
          emit t ""
        else
-         used=$((used + n)); printf 'f %s\0%s\0' "$n" "$p"; cat "$t" || exit 1
-@@ -278,8 +276,6 @@ def plan_reads(
+         used=$((used + n)); echo "$used" > "$t.used" || exit 1
+@@ -310,8 +308,6 @@ def plan_reads(
              refused.append(FileRefusal(path, "special_file"))
          elif nlink > 1:
              refused.append(FileRefusal(path, "hard_link"))
@@ -22,7 +22,7 @@ index 059d443..599562a 100644
          elif total + nbytes > limits.max_total_bytes:
              refused.append(FileRefusal(path, "total_bytes_exceeded"))
          else:
-@@ -324,9 +320,7 @@ def collect(stream: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str) -
+@@ -357,9 +353,7 @@ def collect(stream: bytes, plan: ReadPlan, limits: ReadLimits, base_path: str) -
      for path, _ in plan.reads:
          kind, payload, at = _next_record(stream, at, path)
          if kind == b"f":
