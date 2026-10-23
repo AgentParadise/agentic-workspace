@@ -1,11 +1,13 @@
-"""Provider-neutral `SupportsOperations` conformance, run for Docker and Local.
+"""Provider-neutral `SupportsOperations` conformance, run for Docker, Local and E2B.
 
 Plan section 7 row 4: the protocol-level checks of the row 3 suite (a, c, e,
 f, g, h, i, j, k, m, unknown ref, run_to_completion), driven only through the
 `SupportsOperations` surface of each provider. Docker runs through the stand-in
 `docker` of `test_docker_operations`; its Docker-only checks (client argv,
-daemon presence, namespaces) stay there. Local-only checks (the W-6.2 opt-in
-guard, the pgid guard, escaped descendants, destroy) follow the suite.
+daemon presence, namespaces) stay there. E2B runs over `FakeE2BClient` in its
+executing mode, whose every behaviour is cited from the SDK in `e2b_fake.py`.
+Local-only checks (the W-6.2 opt-in guard, the pgid guard, escaped
+descendants, destroy) follow the suite.
 
 Cancel tests spawn process groups: run locally as `setsid -w uv run pytest`.
 Each test is bounded by `asyncio.timeout` instead of a pytest-timeout plugin.
@@ -48,9 +50,11 @@ from agentic_isolation.providers.base import (
 )
 from agentic_isolation.providers.docker import WorkspaceDockerProvider
 from agentic_isolation.providers.docker_operations import DockerOperations
+from agentic_isolation.providers.e2b import E2BWorkspaceProvider
 from agentic_isolation.providers.local import InsecureProviderError, WorkspaceLocalProvider
 from agentic_isolation.providers.local_operations import LocalOperations, unsafe_group
 from agentic_isolation.providers.operation_spool import OperationFailure
+from tests.e2b_fake import FakeE2BClient
 from tests.test_docker_operations import FAKE_DOCKER
 
 FIXTURES = Path(__file__).parent / "fixtures" / "apss_exp_v1_0006" / "valid" / "workspace-provider"
@@ -81,7 +85,7 @@ async def _bounded() -> AsyncIterator[None]:
         yield
 
 
-@pytest.fixture(params=["docker", "local"])
+@pytest.fixture(params=["docker", "local", "e2b"])
 async def make(
     request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> AsyncIterator[Factory]:
@@ -104,6 +108,14 @@ async def make(
                 id="ws1", provider="docker", path=Path("."), config=WorkspaceConfig(), _handle="c1"
             )
             return docker, workspace, tmp_path
+        if request.param == "e2b":
+            e2b = E2BWorkspaceProvider(
+                "template",
+                client=FakeE2BClient(executing_root=tmp_path),
+                retention_bytes=retention,
+                max_page_bytes=page,
+            )
+            return e2b, await e2b.create(WorkspaceConfig()), tmp_path
         local = WorkspaceLocalProvider(base_dir=tmp_path, allow_insecure=True)
         local._operations = LocalOperations(
             credentials=None, retention_bytes=retention, max_page_bytes=page
@@ -243,13 +255,16 @@ async def test_h_foreign_generation_cursor_is_unknown_operation(make: Factory) -
 
 
 async def test_i_every_serialised_page_fits_max_page_bytes(make: Factory) -> None:
-    ops, workspace, _ = await make(page=700)
+    ops, workspace, root = await make(page=700)
     async with _bounded():
-        ref = await ops.start(workspace, _spec("head -c 20000 /dev/urandom"))
+        ref = await ops.start(
+            workspace, _spec(f"head -c 20000 /dev/urandom | tee {root / 'sent.bin'}")
+        )
         pages = await _pages(ops, ref, max_bytes=100_000)
     assert len(pages) > 10
     assert all(len(p.encode()) <= 700 for p in pages)
     assert len(_data(pages)) == 20000
+    assert _data(pages) == (root / "sent.bin").read_bytes()
 
 
 async def test_j_late_read_drains_the_rest_and_only_then_completes(make: Factory) -> None:
