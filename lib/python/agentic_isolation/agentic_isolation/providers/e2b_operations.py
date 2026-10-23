@@ -184,7 +184,7 @@ _PROBE = (
     'd=$1; [ -r "$d/owner" ] || exit 3; '
     "for f in owner execution started group exit ended stopped; do "
     'v=$(head -n 1 "$d/$f" 2>/dev/null); printf "%s=%s\n" "$f" "$v"; done; '
-    'if grep -lzxF "$2" /proc/[0-9]*/environ >/dev/null 2>&1; '
+    'if grep -qzxF "$2" /proc/[0-9]*/environ 2>/dev/null; '
     "then echo alive=1; else echo alive=0; fi"
 )
 # How long a termination command, or a command's end after one, may take.

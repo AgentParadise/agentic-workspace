@@ -7,9 +7,10 @@ By default a started command is scripted (`FakeRun`). With `executing_root`
 it really runs, as a local `sh -c` in a new session, so the operation
 conformance suite can check real pids and files. Each behaviour of
 `ExecutedCommand` is what the pinned SDK does (e2b==2.52.0):
-`/workspace` and `/spool` are the sandbox's own disk, mapped here to
-`executing_root` and a `-spool` sibling of it, in `cwd` and in the command
-alike, so nothing runs against the host's root;
+`/workspace`, `/spool` and `STATE_ROOT` are the sandbox's own disk, mapped
+here to `executing_root` and `-spool` and `-ops` siblings of it, in `cwd` and
+in the command alike (so two provider instances over one client see one
+sandbox disk), so nothing runs against the host's root;
 `envs` are added to the sandbox's environment; `stdin` is written then closed
 (`send_stdin`, `close_stdin`), and the command is killed if that write fails
 or is cancelled; stdout is decoded as UTF-8 with replacement by
@@ -35,10 +36,10 @@ from agentic_isolation.providers.e2b_client import (
     E2BTransportError,
     SandboxListing,
 )
-from agentic_isolation.providers.e2b_operations import OWNER_VARIABLE
+from agentic_isolation.providers.e2b_operations import OWNER_VARIABLE, STATE_ROOT
 
 # A sandbox root at the start of a path: not `/workspaces`, not `a/workspace`.
-_SANDBOX_ROOT = re.compile(r"(?<![\w./-])(/workspace|/spool)(?![\w.-])")
+_SANDBOX_ROOT = re.compile(rf"(?<![\w./-])(/workspace|/spool|{re.escape(STATE_ROOT)})(?![\w.-])")
 
 
 def _kill_sandbox_processes(process: asyncio.subprocess.Process, owners: tuple[str, ...]) -> None:
@@ -258,6 +259,10 @@ class FakeE2BClient:
             raise E2BTransportError(f"pause of {sandbox_id} refused")
         self.sandboxes[sandbox_id].paused = True
 
+    async def resume(self, sandbox_id: str) -> None:
+        self.events.append(f"resume {sandbox_id}")
+        self.sandboxes[sandbox_id].paused = False
+
     async def start(
         self,
         sandbox_id: str,
@@ -317,7 +322,11 @@ class FakeE2BClient:
     def sandbox_paths(self, text: str) -> str:
         """`text` with each sandbox root (`/workspace`, `/spool`) moved under the test's root."""
         assert self.executing_root is not None
-        roots = {"/workspace": self.executing_root, "/spool": self.spool_root}
+        roots = {
+            "/workspace": self.executing_root,
+            "/spool": self.spool_root,
+            STATE_ROOT: self.executing_root.with_name(f"{self.executing_root.name}-ops"),
+        }
         # Host paths the test passed in (its tmp dir may sit under /workspace) stay as given.
         hosted = tuple(str(root) for root in roots.values())
 
