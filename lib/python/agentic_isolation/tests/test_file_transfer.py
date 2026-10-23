@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from agentic_isolation import FileRefusal, ReadFilesError, ReadFilesResult, ReadLimits
+from agentic_isolation.providers import file_transfer
 from agentic_isolation.providers.file_transfer import (
     ReadPlan,
     collect,
@@ -218,6 +219,44 @@ def test_the_reader_refuses_a_hard_link_made_after_the_listing(tmp_path: Path) -
     assert _read_now(root, plan, limits) == ReadFilesResult(
         files=(), refused=(FileRefusal("out/secret", "hard_link"),)
     )
+
+
+def test_the_reader_names_a_file_removed_after_the_listing_as_vanished(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "gone").write_bytes(b"x")
+    (root / "kept").write_bytes(b"y")
+    limits = ReadLimits()
+    plan = _plan(root, ["*"], limits)
+
+    (root / "gone").unlink()
+
+    assert _read_now(root, plan, limits) == ReadFilesResult(
+        files=(("kept", b"y"),), refused=(FileRefusal("gone", "vanished"),)
+    )
+
+
+def test_the_reader_keeps_one_total_across_the_batches_xargs_splits_the_paths_into(
+    tmp_path: Path,
+) -> None:
+    # 600 names of 250 bytes are more than one xargs command line holds, so
+    # the reader runs more than once; the total must not restart with it.
+    root = tmp_path / "root"
+    root.mkdir()
+    names = [f"{n:04}".ljust(250, "x") for n in range(600)]
+    for name in names:
+        (root / name).write_bytes(b"z")
+    limits = ReadLimits(max_total_bytes=500)
+    plan = ReadPlan(reads=tuple((name, 1) for name in names), refused=())
+
+    out = _sh(read_script(str(root), limits), read_stdin(plan))
+
+    kinds = []
+    at = 0
+    for name in names:
+        kind, _, at = file_transfer._next_record(out, at, name)
+        kinds.append(kind)
+    assert kinds == [b"f"] * 500 + [b"t"] * 100
 
 
 def test_the_reader_returns_exact_bytes_of_what_it_opened(tmp_path: Path) -> None:

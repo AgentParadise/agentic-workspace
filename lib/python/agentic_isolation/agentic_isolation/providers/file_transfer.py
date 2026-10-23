@@ -38,6 +38,7 @@ RefusalReason = Literal[
     "symlink",
     "escaping_symlink",
     "special_file",
+    "vanished",
     "file_too_large",
     "total_bytes_exceeded",
     "depth_exceeded",
@@ -190,15 +191,19 @@ def listing_cap(limits: ReadLimits) -> int:
 # for under the root (so no symlink, in the name or any ancestor, was
 # followed), it must be a regular file, and it must have one link. Its bytes
 # are then copied from fd 3, at most `max_file_bytes + 1` of them, into a
-# temp file so the record can carry the length. Kinds: f content, l symlink
-# (its target), r opened elsewhere (the path opened), s special, h hard link,
-# b over the per-file limit, t over the total.
+# temp file so the record can carry the length. xargs may run this more than
+# once per call, so the bytes used so far are kept in "$t.used". Kinds: f
+# content, l symlink (its target), r opened elsewhere (the path opened), s
+# special, v gone since the listing, h hard link, b over the per-file limit,
+# t over the total.
 _READER = r"""
-t=$1; shift; used=0
+t=$1; shift; used=$(cat "$t.used") || exit 1
 emit() { printf '%s %s\0%s\0%s' "$1" "${#2}" "$p" "$2"; }
 for p; do
   if [ -L "./$p" ]; then
     x=$(readlink -- "./$p"; echo .); x=${x%.}; emit l "${x%?}"
+  elif [ ! -e "./$p" ]; then
+    emit v ""
   elif [ ! -f "./$p" ]; then
     emit s ""
   elif ! command exec 3<"./$p"; then
@@ -219,7 +224,8 @@ for p; do
       elif [ "$((used + n))" -gt "$TOTAL" ]; then
         emit t ""
       else
-        used=$((used + n)); printf 'f %s\0%s\0' "$n" "$p"; cat "$t" || exit 1
+        used=$((used + n)); echo "$used" > "$t.used" || exit 1
+        printf 'f %s\0%s\0' "$n" "$p"; cat "$t" || exit 1
       fi
     fi
     exec 3<&-
@@ -235,9 +241,9 @@ def read_script(base_path: str, limits: ReadLimits, *, base64: bool = False) -> 
         f"TOTAL={limits.max_total_bytes}"
     )
     reader = (
-        "t=$(mktemp) || exit 1; "
+        't=$(mktemp) || exit 1; echo 0 > "$t.used" || exit 1; '
         f'{settings} xargs -0 -r sh -c {shlex.quote(_READER)} sh "$t"; rc=$?; '
-        'rm -f "$t"; exit "$rc"'
+        'rm -f "$t" "$t.used"; exit "$rc"'
     )
     return f"cd -- {shlex.quote(base_path)} || exit 1; export LC_ALL=C; " + _script(
         reader, "cat", base64=base64
@@ -327,6 +333,7 @@ def _escapes(path: str, target: str, base_path: str) -> bool:
 
 _REFUSED_BY_KIND: dict[bytes, RefusalReason] = {
     b"s": "special_file",
+    b"v": "vanished",
     b"h": "hard_link",
     b"b": "file_too_large",
     b"t": "total_bytes_exceeded",
