@@ -148,6 +148,7 @@ def main() -> None:
                 json.dumps(
                     {
                         "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
                             "permissionDecision": "deny",
                             "permissionDecisionReason": result.get(
                                 "reason", "Blocked by security validator"

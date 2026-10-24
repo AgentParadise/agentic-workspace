@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.4.4
+- PreToolUse deny output now includes `"hookEventName": "PreToolUse"` in `hookSpecificOutput`. Without it Claude Code rejects the JSON ("hookSpecificOutput missing hookEventName"), so a security-validator block showed as a hook error instead of a clean deny with its reason.
+
 ## 1.4.1
 - Apply current ruff formatting to `hooks/validators/security/file.py` and `hooks/validators/security/python.py` (line wrapping only, no behavior change). CI installed ruff unpinned, so a newer ruff release turned the hook-format check red without any code change; the workflow now pins `ruff==0.14.6`.
 
