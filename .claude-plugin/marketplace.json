@@ -1,0 +1,34 @@
+{
+  "name": "agentic-workspace",
+  "description": "Claude Code plugins for agent workspaces: SDLC, delegation, workspace lifecycle, and observability",
+  "owner": {
+    "name": "NeuralEmpowerment",
+    "url": "https://github.com/AgentParadise"
+  },
+  "plugins": [
+    {
+      "name": "sdlc",
+      "description": "Software Development Lifecycle: commit, review, QA, testing, security hooks, git hooks, and infrastructure configuration",
+      "source": "./plugins/sdlc",
+      "category": "development"
+    },
+    {
+      "name": "workspace",
+      "description": "Observable isolated workspaces: lifecycle and observability hooks emitting structured JSONL events",
+      "source": "./plugins/workspace",
+      "category": "development"
+    },
+    {
+      "name": "observability",
+      "description": "Full-spectrum agent observability: hooks every Claude Code lifecycle event and emits structured JSONL events",
+      "source": "./plugins/observability",
+      "category": "observability"
+    },
+    {
+      "name": "delegation",
+      "description": "Handing work off to other agents: autonomous `claude -p` and Codex (`codex exec`) delegation, plus structured session-to-session handoff documents",
+      "source": "./plugins/delegation",
+      "category": "development"
+    }
+  ]
+}
