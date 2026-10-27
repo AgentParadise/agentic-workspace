@@ -135,12 +135,13 @@ jobs:
       - run: uv run scripts/build-provider.py claude-cli --stage-only
       - run: uv run scripts/build-provider.py omni-agent --stage-only
       - run: uv run scripts/build-provider.py toolchain --stage-only
-      - name: Lint toolchain and release scripts
+      - name: Lint toolchain, scripted-agent and release scripts
         run: |
           shellcheck \
             implementations/docker/images/toolchain/scripts/toolchain-entrypoint.sh \
             implementations/docker/images/toolchain/smoke/run.sh \
             implementations/docker/images/toolchain/smoke/inside.sh \
+            implementations/docker/images/scripted-agent/smoke/run.sh \
             .github/scripts/release-image-tags.sh
 
   docker-conformance:

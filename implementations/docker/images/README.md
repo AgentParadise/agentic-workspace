@@ -11,7 +11,7 @@ Pre-configured Docker images for running AI agents in isolated environments.
 | `omni-agent` | Claude and Codex on the shared capability runtime | ✅ |
 | `toolchain` | `omni-agent` plus a native toolchain: build-essential, pkg-config, unzip, rustup (no toolchain; the repo's `rust-toolchain.toml` installs one on first use), pnpm via corepack, bun, Vulkan loader + Mesa lavapipe (software Vulkan, no GPU) + vulkan-tools. Tool homes live under `/workspace/.tools`, cargo jobs follow the CPU quota. Built FROM an omni digest; compile smoke in [`toolchain/smoke/`](./toolchain/smoke/run.sh). | ✅ (inherited) |
 | `base` | Minimal secure base (no agent) | N/A |
-| `scripted-agent` | Load tests only: `claude-cli` with `claude`/`codex` replaced by the token-free [scripted-agent replayer](../../../lib/python/scripted_agent/README.md). Built FROM a claude-cli digest; never a production image. | ✅ (inherited; every model reported as `syn-scripted-agent`) |
+| `scripted-agent` | Load tests only: `claude-cli` with `claude`/`codex` replaced by the token-free [scripted-agent replayer](../../../lib/python/scripted_agent/README.md). Built FROM a claude-cli digest; replay smoke in [`scripted-agent/smoke/`](./scripted-agent/smoke/run.sh); never a production image. | ✅ (inherited; every model reported as `syn-scripted-agent`) |
 
 ## Browser QA
 
@@ -46,8 +46,12 @@ with cosign, and never tagged `latest`. See [`docs/RELEASE.md`](../../../docs/RE
 | `claude-cli` | `ghcr.io/agentparadise/agentic-workspace-claude` |
 | `omni-agent` | `ghcr.io/agentparadise/agentic-workspace-omni-agent` |
 | `toolchain` | `ghcr.io/agentparadise/agentic-workspace-toolchain` |
+| `scripted-agent` | `ghcr.io/agentparadise/agentic-workspace-scripted-agent` (load tests only) |
 
-`interactive-tmux` and `base` are not published. `scripted-agent` is not published yet: its release job needs a workflow change (see #44).
+`interactive-tmux` and `base` are not published. `scripted-agent` is built FROM
+the claude-cli digest of the same run and passes the replay smoke in
+[`scripted-agent/smoke/`](./scripted-agent/smoke/run.sh) on both architectures
+before it is signed.
 
 ## Building Images
 
