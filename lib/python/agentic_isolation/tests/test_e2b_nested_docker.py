@@ -148,6 +148,9 @@ def test_a_docker_template_below_the_spec_floor_is_refused() -> None:
     "engine",
     [
         {"docker_ce_version": "latest"},
+        # Ends in the suite, so only the exact-version rule refuses these.
+        {"docker_ce_version": "latest~bookworm"},
+        {"docker_ce_version": "5:29.* ~bookworm"},
         {"docker_ce_version": "5:29.9.2-1~debian.12~bookworm; curl x | sh"},
         {"compose_version": "5.6.1-1~debian.13~trixie"},
         {"apt_suite": "bookworm stable"},
