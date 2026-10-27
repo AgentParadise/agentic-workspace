@@ -54,6 +54,9 @@ def test_no_integration_test_holds_or_passes_a_secret() -> None:
         # The name aliased, then read through the alias.
         'NAME = "E2B_API_KEY"\nkey = os.environ[NAME]',
         'from os import environ\nkey = environ["E2B_GHCR_TOKEN"]',
+        # A computed key outside the env helpers: the name could come from anywhere.
+        "key = os.environ[name]",
+        "key = os.environ.get(prefix + suffix)",
         'key = os.environ.pop("E2B_API_KEY")',
         'present = bool(os.environ.get("E2B_API_KEY", "")) or os.environ["E2B_API_KEY"]',
         'print(os.environ.get("E2B_API_KEY"))',
