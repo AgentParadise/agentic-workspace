@@ -26,7 +26,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Literal, TypeVar
 
 from agentic_isolation.config import (
     CODEX_IMAGE_LABEL,
@@ -166,9 +166,6 @@ class WorkspaceDockerProvider(BaseProvider):
         self._workspace_host_dir = Path(workspace_host_dir) if workspace_host_dir else None
         self._credentials = credentials
         self._workspaces: dict[str, Workspace] = {}
-        # Cleanups of a `create` that was cancelled. Held so they are not
-        # garbage-collected, and so a repeated cancel cannot interrupt them.
-        self._abandoned_creates: set[asyncio.Task[None]] = set()
         # Workspaces whose container is gone but whose directory is kept,
         # keyed by container name (the `WorkspaceRef.resource_id`). An entry
         # lives from container removal until the directory is deleted, so a
@@ -376,13 +373,10 @@ class WorkspaceDockerProvider(BaseProvider):
 
         except asyncio.CancelledError:
             # Not an `Exception`, so without this arm a cancel left the
-            # `docker run` child running and its container behind. The
-            # cleanup is shielded: a second cancel must not interrupt it.
-            task = asyncio.create_task(self._abandon_create(proc, container_name, workspace_dir))
-            self._abandoned_creates.add(task)
-            task.add_done_callback(self._abandoned_creates.discard)
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.shield(task)
+            # `docker run` child running and its container behind. Every
+            # await below is bounded and outlives a repeated cancel, so this
+            # always finishes before the cancel is re-raised.
+            await self._abandon_create(proc, container_name, workspace_dir)
             raise
         except Exception as e:
             logger.exception("Failed to create container: %s", e)
@@ -394,7 +388,11 @@ class WorkspaceDockerProvider(BaseProvider):
             raise
 
     #: Bounds waiting for a cancelled `docker run` before it is killed.
-    _ABANDON_RUN_TIMEOUT_SECONDS = 60.0
+    _ABANDON_RUN_TIMEOUT_SECONDS = 30.0
+    #: Bounds the `docker rm -f` after a cancelled create.
+    _ABANDON_RM_TIMEOUT_SECONDS = 15.0
+    #: Bounds reaping a `docker run` client killed after its timeout.
+    _ABANDON_KILL_TIMEOUT_SECONDS = 5.0
 
     async def _abandon_create(
         self,
@@ -402,19 +400,32 @@ class WorkspaceDockerProvider(BaseProvider):
         container_name: str,
         workspace_dir: Path,
     ) -> None:
-        """Clean up after a cancelled `create`. Never raises.
+        """Clean up after a cancelled `create`. Never raises; bounded.
 
-        The `docker run` client is let finish first: killing it mid-create
+        Each step runs under `_settle`, so a further cancel, including the
+        one `asyncio.run` sends every task at shutdown, cannot stop it
+        part-way. The `docker run` client is let finish first: killing it
         does not stop the daemon, which could then create the container
-        after the `rm` below had already run.
+        after the `rm` had run. When it has to be killed anyway, or the
+        cancel landed before it spawned, that container can still appear;
+        it carries the provider's labels, so listing finds it.
+
+        `rm -f` only, no `docker stop`: nothing ran in the container yet,
+        so there are no finalizer logs to keep.
         """
         try:
             if proc is not None and proc.returncode is None:
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=self._ABANDON_RUN_TIMEOUT_SECONDS)
-                except TimeoutError:
-                    await self._terminate(proc)
-            await self._cleanup_container(container_name)
+                if await _settle(proc.wait(), self._ABANDON_RUN_TIMEOUT_SECONDS) is None:
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        proc.kill()
+                    await _settle(proc.wait(), self._ABANDON_KILL_TIMEOUT_SECONDS)
+            removed = await _settle(self._remove(container_name), self._ABANDON_RM_TIMEOUT_SECONDS)
+            if not removed:
+                logger.warning(
+                    "docker rm -f %s after a cancelled create failed or timed out; "
+                    "the container may still exist",
+                    container_name,
+                )
         except Exception as exc:  # noqa: BLE001 - nobody is left to raise to
             logger.warning("cleanup of cancelled create %s failed: %s", container_name, exc)
         finally:
@@ -1537,6 +1548,33 @@ class WorkspaceDockerProvider(BaseProvider):
             logger.warning("docker rm -f %s failed; the container may still exist", container_name)
             return False
         return True
+
+
+_T = TypeVar("_T")
+
+
+async def _settle(awaitable: Awaitable[_T], timeout: float) -> _T | None:
+    """Await to completion through any number of cancels, within `timeout`.
+
+    None when it timed out (it is then cancelled), failed, or was cancelled
+    directly. A cancel of the caller is absorbed, not re-raised: the caller
+    is cleanup that must finish, and re-raises its own cancel afterwards.
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(awaitable)
+    deadline = loop.time() + timeout
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            task.cancel()
+            return None
+        # `asyncio.wait` never cancels what it waits on, so a cancel of this
+        # caller leaves the task running and the loop goes round again.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait({task}, timeout=remaining)
+    if task.cancelled() or task.exception() is not None:
+        return None
+    return task.result()
 
 
 def _rmtree(path: str) -> OSError | None:
