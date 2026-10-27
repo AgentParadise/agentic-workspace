@@ -73,26 +73,63 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # from their own archive; the ICD assertion below fails the build if that
 # ever stops holding.
 #
+# KNOWN RISK, ACCEPTED. bookworm-backports stopped receiving updates on
+# 2026-08-09 (https://backports.debian.org/Instructions/), so this Mesa 25.0.7
+# and libdrm 2.4.123 are frozen: no further security fixes. Accepted because
+# stock 22.3 fails the doctor and DreamShip's goldens match Mesa 25, and the
+# exposure is narrow: a CPU-only Vulkan driver in a hardened, sandboxed
+# workspace, running only the repository's own shaders.
+# TODO(#111): move the omni/toolchain base to trixie (Mesa 25.0 with
+# lvp_icd.json in main) and delete this backports block.
+#
+# SCOPE OF BACKPORTS. Never `-t bookworm-backports`: that raises the whole
+# suite to 990 and lets any dependency come from it. Instead the suite is
+# pinned to -1 except an allowlist at 600 (above main's 500): the three
+# requested packages plus exactly the backported dependencies apt needs.
+# mesa-vulkan-drivers 25.0.7-2~bpo12+1 Depends libdrm2 and libdrm-amdgpu1
+# (>= 2.4.121; bookworm has 2.4.114), and libdrm2 2.4.123-1~bpo12+1 Depends
+# libdrm-common (>= itself). Everything else (libllvm15, libz3-4, the xcb
+# and wayland libs, libvulkan1, vulkan-tools) resolves from bookworm main;
+# libvulkan1 and vulkan-tools have no backport and are listed only so the
+# allowlist names what was asked for. Source list and pin are removed in the
+# same layer, and the installed Mesa must be 25.x or the build fails, so a
+# silent fallback to 22.3 cannot ship.
+#
 # Size: ~205 MiB installed (mesa-vulkan-drivers 65, libllvm15 115, libz3 23),
 # ~42 MiB compressed. Here and not in omni, for the same reason as the C
 # toolchain: omni consumers do not compile or render.
 RUN set -eux; \
     . /etc/os-release; \
-    target_release=""; \
     if [ "${VERSION_CODENAME}" = bookworm ]; then \
-      echo "deb http://deb.debian.org/debian bookworm-backports main" \
+      test -f /usr/share/keyrings/debian-archive-keyring.gpg; \
+      echo "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian.org/debian bookworm-backports main" \
         > /etc/apt/sources.list.d/bookworm-backports.list; \
-      target_release="bookworm-backports"; \
+      printf '%s\n' \
+        'Package: *' \
+        'Pin: release n=bookworm-backports' \
+        'Pin-Priority: -1' \
+        '' \
+        'Package: libvulkan1 mesa-vulkan-drivers vulkan-tools libdrm2 libdrm-amdgpu1 libdrm-common' \
+        'Pin: release n=bookworm-backports' \
+        'Pin-Priority: 600' \
+        > /etc/apt/preferences.d/bookworm-backports-vulkan; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      ${target_release:+-t "${target_release}"} \
       libvulkan1 \
       mesa-vulkan-drivers \
       vulkan-tools; \
-    rm -f /etc/apt/sources.list.d/bookworm-backports.list; \
+    rm -f /etc/apt/sources.list.d/bookworm-backports.list \
+          /etc/apt/preferences.d/bookworm-backports-vulkan; \
     rm -rf /var/lib/apt/lists/*; \
     apt-get clean; \
+    if [ "${VERSION_CODENAME}" = bookworm ]; then \
+      mesa_version="$(dpkg-query -W -f='${Version}' mesa-vulkan-drivers)"; \
+      case "${mesa_version}" in \
+        25.*~bpo12*) ;; \
+        *) echo "mesa-vulkan-drivers ${mesa_version} is not the bookworm-backports 25.x build" >&2; exit 1 ;; \
+      esac; \
+    fi; \
     test -f /usr/share/vulkan/icd.d/lvp_icd.json; \
     command -v vulkaninfo
 
