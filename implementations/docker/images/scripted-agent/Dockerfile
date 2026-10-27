@@ -21,8 +21,11 @@
 # BUILD. The context is the repository root (it needs lib/python and the
 # claude-cli recordings), so build-provider.py does not stage it:
 #
+#   mapfile -t version_args < <(uv run --no-project scripts/version_manifest.py \
+#     build-args scripted-agent --format docker)
 #   docker build -f implementations/docker/images/scripted-agent/Dockerfile \
-#     --build-arg CLAUDE_IMAGE=ghcr.io/agentparadise/agentic-workspace-claude@sha256:... .
+#     --build-arg CLAUDE_IMAGE=ghcr.io/agentparadise/agentic-workspace-claude@sha256:... \
+#     "${version_args[@]}" .
 #
 # BASE PINNING. CLAUDE_IMAGE has no default on purpose, as in toolchain: an
 # unset value fails the build instead of resolving a mutable tag. Pass a
@@ -65,5 +68,28 @@ RUN npm uninstall -g @anthropic-ai/claude-code @openai/codex \
     done \
     && chmod -R a+rX /opt/scripted-agent \
     && ! find / -xdev -path /proc -prune -o -name cli.js -path '*claude-code*' -print | grep -q .
+
+# =============================================================================
+# Image version manifest: /opt/agentic/version.json (#93)
+# =============================================================================
+# What this image is, for syntropic137 (ImageManifest) and the E2B template's
+# expected_manifest_hash. Written by scripts/version_manifest.py, bind-mounted
+# for this RUN only, from the AGENTIC_* build args (exported to RUN as env) that
+# `version_manifest.py build-args` computes (build-provider.py and the release
+# workflow pass them; an unset one fails the build). Each component is checked
+# against the binary on PATH before it is recorded. Deterministic per commit:
+# built_at is the commit's time, never the wall clock. Carries claude-cli's components forward
+# minus the two real harnesses this image uninstalled, and records the
+# replayer's own package version instead.
+ARG AGENTIC_PROVIDER
+ARG AGENTIC_PROVIDER_VERSION
+ARG AGENTIC_MANIFEST_DIGEST
+ARG AGENTIC_BUILD_COMMIT
+ARG AGENTIC_BUILT_AT
+RUN --mount=type=bind,source=scripts/version_manifest.py,target=/tmp/version_manifest.py \
+    /opt/venv/bin/python /tmp/version_manifest.py write \
+      --inherit-from claude-cli \
+      --drop claude_cli --drop codex_cli \
+      --component "scripted_agent=$(/opt/scripted-agent/venv/bin/python -c 'import importlib.metadata as m; print(m.version("scripted-agent"))')"
 
 USER agent

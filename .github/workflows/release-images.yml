@@ -38,6 +38,10 @@
 # Cargo.toml [workspace.package]) only the first time they are published.
 # Never `latest`. See .github/scripts/release-image-tags.sh.
 #
+# VERSION MANIFEST. Every image writes /opt/agentic/version.json from the
+# AGENTIC_* build args scripts/version_manifest.py computes for this commit
+# (#93); the gate and the smokes check it before anything is signed.
+#
 # Every published digest gets: BuildKit SBOM + max-mode provenance, a keyless
 # cosign signature over the index (which covers the attestation manifests),
 # and a cosign verify against the exact identity above before it is tagged.
@@ -56,6 +60,8 @@ on:
       - "plugins/**"
       - "lib/python/**"
       - "scripts/build-provider.py"
+      - "scripts/version_manifest.py"
+      - "scripts/check-image-version-manifest.sh"
       - "tests/integration/**"
       - ".github/workflows/release-images.yml"
       - ".github/actions/sign-and-verify-image/**"
@@ -133,12 +139,22 @@ jobs:
       # build-provider.py (see the scripted-agent Dockerfile header).
       - name: Build scripted-agent
         run: |
+          set -euo pipefail
+          mapfile -t version_args < <(uv run --no-project scripts/version_manifest.py build-args scripted-agent --format docker)
           docker build -f implementations/docker/images/scripted-agent/Dockerfile \
             --build-arg CLAUDE_IMAGE=agentic-workspace-claude-cli:latest \
+            "${version_args[@]}" \
             -t agentic-workspace-scripted-agent:latest .
       - run: uv run scripts/build-provider.py omni-agent
       # FROM the omni just built (the manifest's local OMNI_IMAGE default).
       - run: uv run scripts/build-provider.py toolchain
+      # Every image carries /opt/agentic/version.json for this commit (#93).
+      # toolchain and scripted-agent are checked again by their smokes below.
+      - name: Version manifest in claude-cli and omni-agent
+        run: |
+          set -euo pipefail
+          scripts/check-image-version-manifest.sh agentic-workspace-claude-cli:latest claude-cli
+          scripts/check-image-version-manifest.sh omni-agent-workspace:latest omni-agent
       - name: Run entrypoint integration suite
         working-directory: lib/python/agentic_isolation
         run: |
@@ -209,6 +225,17 @@ jobs:
           v="$(sed -n 's/^version: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "implementations/docker/images/${PROVIDER}/manifest.yaml")"
           [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad manifest version: '$v'"; exit 1; }
           echo "manifest_version=$v" >> "$GITHUB_OUTPUT"
+      # The AGENTIC_* build args every image's version.json is written from
+      # (#93): this commit, its committer time, the manifest version and sha256.
+      - name: Version manifest build args
+        id: version_args
+        run: |
+          set -euo pipefail
+          {
+            echo 'build_args<<EOF_VERSION_ARGS'
+            uv run --no-project scripts/version_manifest.py build-args "$PROVIDER" --commit "$GITHUB_SHA"
+            echo 'EOF_VERSION_ARGS'
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
         with:
           platforms: ${{ env.PLATFORMS }}
@@ -231,6 +258,8 @@ jobs:
           context: build/${{ env.PROVIDER }}
           file: build/${{ env.PROVIDER }}/Dockerfile
           platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            ${{ steps.version_args.outputs.build_args }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.title=agentic-workspace-claude
@@ -246,6 +275,13 @@ jobs:
           cache-to: type=gha,scope=${{ env.PROVIDER }},mode=max
           provenance: mode=max
           sbom: true
+      # version.json in the pushed, still unsigned digest (#93). amd64 here;
+      # arm64 is proven by the toolchain / scripted-agent build, which
+      # inherits this file per platform and fails if it is missing.
+      - name: Version manifest (linux/amd64)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: scripts/check-image-version-manifest.sh "${IMAGE}@${DIGEST}" "$PROVIDER" linux/amd64
       - uses: ./.github/actions/sign-and-verify-image
         with:
           image: ${{ env.IMAGE }}
@@ -296,6 +332,17 @@ jobs:
           v="$(sed -n 's/^version: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "implementations/docker/images/${PROVIDER}/manifest.yaml")"
           [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad manifest version: '$v'"; exit 1; }
           echo "manifest_version=$v" >> "$GITHUB_OUTPUT"
+      # The AGENTIC_* build args every image's version.json is written from
+      # (#93): this commit, its committer time, the manifest version and sha256.
+      - name: Version manifest build args
+        id: version_args
+        run: |
+          set -euo pipefail
+          {
+            echo 'build_args<<EOF_VERSION_ARGS'
+            uv run --no-project scripts/version_manifest.py build-args "$PROVIDER" --commit "$GITHUB_SHA"
+            echo 'EOF_VERSION_ARGS'
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
         with:
           platforms: ${{ env.PLATFORMS }}
@@ -329,6 +376,8 @@ jobs:
           context: build/${{ env.PROVIDER }}
           file: build/${{ env.PROVIDER }}/Dockerfile
           platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            ${{ steps.version_args.outputs.build_args }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.title=agentic-workspace-omni-agent
@@ -344,6 +393,13 @@ jobs:
           cache-to: type=gha,scope=${{ env.PROVIDER }},mode=max
           provenance: mode=max
           sbom: true
+      # version.json in the pushed, still unsigned digest (#93). amd64 here;
+      # arm64 is proven by the toolchain / scripted-agent build, which
+      # inherits this file per platform and fails if it is missing.
+      - name: Version manifest (linux/amd64)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: scripts/check-image-version-manifest.sh "${IMAGE}@${DIGEST}" "$PROVIDER" linux/amd64
       - uses: ./.github/actions/sign-and-verify-image
         with:
           image: ${{ env.IMAGE }}
@@ -395,6 +451,17 @@ jobs:
           v="$(sed -n 's/^version: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "implementations/docker/images/${PROVIDER}/manifest.yaml")"
           [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad manifest version: '$v'"; exit 1; }
           echo "manifest_version=$v" >> "$GITHUB_OUTPUT"
+      # The AGENTIC_* build args every image's version.json is written from
+      # (#93): this commit, its committer time, the manifest version and sha256.
+      - name: Version manifest build args
+        id: version_args
+        run: |
+          set -euo pipefail
+          {
+            echo 'build_args<<EOF_VERSION_ARGS'
+            uv run --no-project scripts/version_manifest.py build-args "$PROVIDER" --commit "$GITHUB_SHA"
+            echo 'EOF_VERSION_ARGS'
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
         with:
           platforms: ${{ env.PLATFORMS }}
@@ -429,6 +496,7 @@ jobs:
           platforms: ${{ env.PLATFORMS }}
           build-args: |
             OMNI_IMAGE=${{ env.OMNI_REF }}
+            ${{ steps.version_args.outputs.build_args }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.title=agentic-workspace-toolchain
@@ -503,6 +571,7 @@ jobs:
           persist-credentials: false
       # No staging: the Dockerfile builds from the repository root (it needs
       # lib/python/scripted_agent and the claude-cli recordings).
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v6
       - name: Read manifest version
         id: version
         run: |
@@ -510,6 +579,17 @@ jobs:
           v="$(sed -n 's/^version: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "implementations/docker/images/${PROVIDER}/manifest.yaml")"
           [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad manifest version: '$v'"; exit 1; }
           echo "manifest_version=$v" >> "$GITHUB_OUTPUT"
+      # The AGENTIC_* build args every image's version.json is written from
+      # (#93): this commit, its committer time, the manifest version and sha256.
+      - name: Version manifest build args
+        id: version_args
+        run: |
+          set -euo pipefail
+          {
+            echo 'build_args<<EOF_VERSION_ARGS'
+            uv run --no-project scripts/version_manifest.py build-args "$PROVIDER" --commit "$GITHUB_SHA"
+            echo 'EOF_VERSION_ARGS'
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
         with:
           platforms: ${{ env.PLATFORMS }}
@@ -544,6 +624,7 @@ jobs:
           platforms: ${{ env.PLATFORMS }}
           build-args: |
             CLAUDE_IMAGE=${{ env.CLAUDE_REF }}
+            ${{ steps.version_args.outputs.build_args }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.title=agentic-workspace-scripted-agent

@@ -53,6 +53,13 @@ the claude-cli digest of the same run and passes the replay smoke in
 [`scripted-agent/smoke/`](./scripted-agent/smoke/run.sh) on both architectures
 before it is signed.
 
+## Version Manifest
+
+Every published image carries `/opt/agentic/version.json`: provider, provider
+version, source commit and its time, the sha256 of its `manifest.yaml`, and the
+verified versions of the harness CLIs and pinned tools it ships. Deterministic
+per commit. Schema and checks: [`docs/RELEASE.md`](../../../docs/RELEASE.md#version-manifest-optagenticversionjson).
+
 ## Building Images
 
 Use the build script to create workspace images:
@@ -80,6 +87,8 @@ The build process:
    - Dockerfile
    - Plugins (from `plugins/`, per manifest `plugins.include`)
    - Python wheels (agentic_events)
+   - `scripts/version_manifest.py` (bind-mounted for one RUN, never shipped),
+     plus the `AGENTIC_*` build args it computes
 3. **Builds Docker image** - Self-contained, reproducible
 
 ```
