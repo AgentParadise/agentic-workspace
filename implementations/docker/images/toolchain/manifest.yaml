@@ -7,11 +7,12 @@
 # See ADR-040 section 12: The workspace image contract
 
 name: toolchain
-version: "1.7.0"
+version: "1.8.0"
 description: >-
   omni-agent (claude + codex on the shared capability runtime) plus a native
   toolchain: build-essential, pkg-config, unzip, rustup (toolchain chosen by
-  the repository's rust-toolchain.toml), pnpm via corepack, and bun.
+  the repository's rust-toolchain.toml), pnpm via corepack, bun, and the
+  Vulkan loader with Mesa lavapipe (software Vulkan, no GPU) plus vulkan-tools.
 
 # Built FROM the omni-agent image, never from source. The whole capability
 # runtime, harness set and plugin set are inherited unchanged. The build
@@ -77,6 +78,11 @@ capabilities:
       source: corepack
     - name: build-essential
       source: debian-bookworm
+    - name: vulkan
+      # libvulkan1 + mesa-vulkan-drivers (lavapipe) + vulkan-tools. Mesa 25.0
+      # from bookworm-backports; ICD at /usr/share/vulkan/icd.d/lvp_icd.json.
+      driver: lavapipe
+      source: debian-bookworm-backports
 
 health:
   interval: 30s
@@ -86,6 +92,6 @@ health:
 
 labels:
   org.opencontainers.image.title: "Agentic Workspace - Toolchain"
-  org.opencontainers.image.description: "omni-agent plus a native toolchain (C toolchain, rustup, pnpm, bun)"
+  org.opencontainers.image.description: "omni-agent plus a native toolchain (C toolchain, rustup, pnpm, bun, Vulkan lavapipe)"
   org.opencontainers.image.vendor: "Agentic Workspace"
   org.opencontainers.image.source: "https://github.com/AgentParadise/agentic-workspace"

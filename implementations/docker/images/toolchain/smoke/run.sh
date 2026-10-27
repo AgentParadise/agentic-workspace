@@ -11,6 +11,7 @@
 #     installs on first use,
 #   - pnpm install through corepack with a hash-pinned packageManager,
 #   - bun run a TypeScript entry that imports the installed package,
+#   - enumerate an llvmpipe Vulkan adapter (Mesa lavapipe) with no GPU,
 # and that the toolchain entrypoint wrapper fails closed on a planted
 # /workspace/.tools symlink. Needs network (toolchain, pnpm, npm registry).
 set -euo pipefail

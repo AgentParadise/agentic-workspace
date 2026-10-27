@@ -55,6 +55,85 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean
 
 # =============================================================================
+# Vulkan loader + Mesa lavapipe (software Vulkan on the CPU)
+# =============================================================================
+# Workspaces have no GPU. Repositories with GPU code (wgpu, ash) run their
+# render-correctness tests on lavapipe, Mesa's CPU Vulkan driver, exactly as a
+# GitHub ubuntu-latest runner does after
+#   apt-get install mesa-vulkan-drivers libvulkan1 vulkan-tools
+# (dream-ship-os render-correctness.yml). Its doctor checks all three packages
+# by dpkg, the ICD at /usr/share/vulkan/icd.d/lvp_icd.json, and an llvmpipe
+# adapter in `vulkaninfo --summary`, so vulkan-tools is required, not a nicety.
+#
+# WHY BACKPORTS ON BOOKWORM. Bookworm's own Mesa is 22.3 and installs the ICD
+# arch-suffixed (lvp_icd.x86_64.json), which that doctor refuses. Backports
+# carries Mesa 25.0, the same series ubuntu-latest runs, and names it
+# lvp_icd.json. Matching the runner's lavapipe also matters for golden-image
+# tests: a different rasteriser can differ by a pixel. Other bases install
+# from their own archive; the ICD assertion below fails the build if that
+# ever stops holding.
+#
+# KNOWN RISK, ACCEPTED. bookworm-backports stopped receiving updates on
+# 2026-08-09 (https://backports.debian.org/Instructions/), so this Mesa 25.0.7
+# and libdrm 2.4.123 are frozen: no further security fixes. Accepted because
+# stock 22.3 fails the doctor and DreamShip's goldens match Mesa 25, and the
+# exposure is narrow: a CPU-only Vulkan driver in a hardened, sandboxed
+# workspace, running only the repository's own shaders.
+# TODO(#111): move the omni/toolchain base to trixie (Mesa 25.0 with
+# lvp_icd.json in main) and delete this backports block.
+#
+# SCOPE OF BACKPORTS. Never `-t bookworm-backports`: that raises the whole
+# suite to 990 and lets any dependency come from it. Instead the suite is
+# pinned to -1 except an allowlist at 600 (above main's 500): the three
+# requested packages plus exactly the backported dependencies apt needs.
+# mesa-vulkan-drivers 25.0.7-2~bpo12+1 Depends libdrm2 and libdrm-amdgpu1
+# (>= 2.4.121; bookworm has 2.4.114), and libdrm2 2.4.123-1~bpo12+1 Depends
+# libdrm-common (>= itself). Everything else (libllvm15, libz3-4, the xcb
+# and wayland libs, libvulkan1, vulkan-tools) resolves from bookworm main;
+# libvulkan1 and vulkan-tools have no backport and are listed only so the
+# allowlist names what was asked for. Source list and pin are removed in the
+# same layer, and the installed Mesa must be 25.x or the build fails, so a
+# silent fallback to 22.3 cannot ship.
+#
+# Size: ~205 MiB installed (mesa-vulkan-drivers 65, libllvm15 115, libz3 23),
+# ~42 MiB compressed. Here and not in omni, for the same reason as the C
+# toolchain: omni consumers do not compile or render.
+RUN set -eux; \
+    . /etc/os-release; \
+    if [ "${VERSION_CODENAME}" = bookworm ]; then \
+      test -f /usr/share/keyrings/debian-archive-keyring.gpg; \
+      echo "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian.org/debian bookworm-backports main" \
+        > /etc/apt/sources.list.d/bookworm-backports.list; \
+      printf '%s\n' \
+        'Package: *' \
+        'Pin: release n=bookworm-backports' \
+        'Pin-Priority: -1' \
+        '' \
+        'Package: libvulkan1 mesa-vulkan-drivers vulkan-tools libdrm2 libdrm-amdgpu1 libdrm-common' \
+        'Pin: release n=bookworm-backports' \
+        'Pin-Priority: 600' \
+        > /etc/apt/preferences.d/bookworm-backports-vulkan; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      libvulkan1 \
+      mesa-vulkan-drivers \
+      vulkan-tools; \
+    rm -f /etc/apt/sources.list.d/bookworm-backports.list \
+          /etc/apt/preferences.d/bookworm-backports-vulkan; \
+    rm -rf /var/lib/apt/lists/*; \
+    apt-get clean; \
+    if [ "${VERSION_CODENAME}" = bookworm ]; then \
+      mesa_version="$(dpkg-query -W -f='${Version}' mesa-vulkan-drivers)"; \
+      case "${mesa_version}" in \
+        25.*~bpo12*) ;; \
+        *) echo "mesa-vulkan-drivers ${mesa_version} is not the bookworm-backports 25.x build" >&2; exit 1 ;; \
+      esac; \
+    fi; \
+    test -f /usr/share/vulkan/icd.d/lvp_icd.json; \
+    command -v vulkaninfo
+
+# =============================================================================
 # rustup (binary + proxies, NO toolchain)
 # =============================================================================
 # A repository's own rust-toolchain.toml selects and installs its pinned
@@ -139,7 +218,8 @@ RUN chmod 755 /opt/agentic/toolchain-entrypoint.sh \
 RUN claude --version && codex --version && python3 --version && node --version \
     && uv --version && gh --version && just --version && make --version \
     && cc --version && c++ --version && pkg-config --version \
-    && rustup --version && test -L /usr/local/bin/pnpm && bun --version
+    && rustup --version && test -L /usr/local/bin/pnpm && bun --version \
+    && test -f /usr/share/vulkan/icd.d/lvp_icd.json && command -v vulkaninfo
 
 # Re-apply omni's setuid/setgid strip: the packages above ran as root and could
 # have introduced new ones.

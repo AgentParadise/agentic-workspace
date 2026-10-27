@@ -54,6 +54,19 @@ out="$(bun run index.ts)"
 [ "$out" = "toolchain-smoke bun-ok 7200000" ] || fail "bun printed '$out'"
 say "bun run ok (bun $(bun --version))"
 
+# --- Vulkan on lavapipe, as the agent, with no GPU --------------------------
+# The same three checks a render-correctness doctor makes (dream-ship-os
+# harness/sensors/bin/render-correctness): packages, the unsuffixed ICD, and
+# an llvmpipe adapter the loader actually enumerates.
+for pkg in libvulkan1 mesa-vulkan-drivers vulkan-tools; do
+  dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -qx 'install ok installed' \
+    || fail "package $pkg not installed"
+done
+[ -f /usr/share/vulkan/icd.d/lvp_icd.json ] || fail "lavapipe ICD missing at /usr/share/vulkan/icd.d/lvp_icd.json"
+vk="$(vulkaninfo --summary 2>&1)" || fail "vulkaninfo --summary failed: $vk"
+grep -qi 'deviceName.*llvmpipe' <<<"$vk" || fail "no llvmpipe adapter in vulkaninfo: $vk"
+say "vulkan ok ($(grep -i -m1 'deviceName' <<<"$vk" | sed 's/^[[:space:]]*//'))"
+
 # --- $HOME tmpfs stayed small ----------------------------------------------
 used_kb="$(du -sk "$HOME" | cut -f1)"
 [ "$used_kb" -lt 65536 ] || fail "\$HOME grew to ${used_kb} KB; tool homes leaked onto the tmpfs"
