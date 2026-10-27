@@ -8,6 +8,9 @@ written as NOT RUN, so a run without a backend (or without E2B_API_KEY,
 
 import pytest
 
+# Redacts E2B/GHCR secret values from every report in this directory (#91).
+from tests.integration.secret_guard import pytest_runtest_makereport  # noqa: F401
+
 _MARKERS = ("docker_conformance", "e2b_live")
 _outcomes: dict[str, str] = {}
 # A later phase can only make a test's record worse: a teardown or cleanup

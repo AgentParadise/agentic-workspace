@@ -55,6 +55,7 @@ Firecracker VM itself.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shlex
 from dataclasses import dataclass
@@ -291,19 +292,54 @@ def manifest_hash(manifest_path: Path) -> str:
     return "sha256:" + hashlib.sha256(manifest_path.read_bytes()).hexdigest()
 
 
+@dataclass(frozen=True)
+class RegistryCredentialsEnv:
+    """The NAMES of the environment variables holding registry credentials.
+
+    `build_template` reads the values itself, so a caller never holds the
+    secret in a variable or passes it as an argument, where a failing
+    traceback would print it (pytest shows every frame's arguments).
+    """
+
+    username_variable: str
+    password_variable: str
+
+
 async def build_template(
     spec: E2BTemplateSpec,
     *,
     registry_username: str | None = None,
     registry_password: str | None = None,
+    registry_env: RegistryCredentialsEnv | None = None,
     api_key: str | None = None,
 ) -> E2BTemplateBuild:
-    """Build `spec` on E2B and return its receipt. Needs the `e2b` extra and a key."""
+    """Build `spec` on E2B and return its receipt. Needs the `e2b` extra and a key.
+
+    Prefer `registry_env` to `registry_username`/`registry_password`, and
+    leaving `api_key` unset (the SDK then reads `E2B_API_KEY`), so no secret
+    is ever an argument.
+    """
     from e2b import AsyncTemplate
     from e2b.template.main import TemplateBuilder, TemplateFinal
 
+    if registry_env is not None:
+        if registry_username is not None or registry_password is not None:
+            raise TemplateSpecError("pass registry_env or registry credentials, not both")
+        missing = [
+            name
+            for name in (registry_env.username_variable, registry_env.password_variable)
+            if not os.environ.get(name)
+        ]
+        if missing:
+            raise TemplateSpecError(f"registry credential variable(s) unset: {', '.join(missing)}")
     builder = AsyncTemplate().from_image(
-        spec.image, username=registry_username, password=registry_password
+        spec.image,
+        username=(
+            os.environ[registry_env.username_variable] if registry_env else registry_username
+        ),
+        password=(
+            os.environ[registry_env.password_variable] if registry_env else registry_password
+        ),
     )
     template: TemplateBuilder | TemplateFinal = builder
     if spec.docker is not None:

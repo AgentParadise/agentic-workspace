@@ -39,7 +39,12 @@ from pathlib import Path
 import pytest
 
 from agentic_isolation import E2BWorkspaceProvider, Workspace, WorkspaceConfig
-from agentic_isolation.providers import E2BTemplateSpec, SdkE2BClient, build_template
+from agentic_isolation.providers import (
+    E2BTemplateSpec,
+    RegistryCredentialsEnv,
+    SdkE2BClient,
+    build_template,
+)
 from agentic_isolation.providers import e2b as e2b_module
 from agentic_isolation.providers.e2b import SandboxRemovalError
 
@@ -236,7 +241,8 @@ _LIST_SAMPLES = 10
 
 
 async def test_q5_private_ghcr_digest_builds_and_launches(tmp_path: Path) -> None:
-    _, image, username, token, expected = _required(
+    # Secrets stay in the environment: `registry_env` names them, never holds them.
+    _, image, _, _, expected = _required(
         "E2B_API_KEY",
         "E2B_PRIVATE_IMAGE",
         "E2B_GHCR_USERNAME",
@@ -252,7 +258,9 @@ async def test_q5_private_ghcr_digest_builds_and_launches(tmp_path: Path) -> Non
         cpu_count=2,
         memory_mb=2048,
     )
-    receipt = await build_template(spec, registry_username=username, registry_password=token)
+    receipt = await build_template(
+        spec, registry_env=RegistryCredentialsEnv("E2B_GHCR_USERNAME", "E2B_GHCR_TOKEN")
+    )
     receipt_path = Path(os.environ.get("E2B_BUILD_RECEIPT", tmp_path / "receipt.json"))
     receipt_path.write_text(json.dumps(dataclasses.asdict(receipt), indent=2))
     print(f"build receipt: {receipt_path}")

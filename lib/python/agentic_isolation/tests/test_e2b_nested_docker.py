@@ -27,6 +27,7 @@ from agentic_isolation.providers import (
     E2BTemplateSpec,
     E2BWorkspaceProvider,
     PrePull,
+    RegistryCredentialsEnv,
     TemplateSpecError,
     build_template,
 )
@@ -373,3 +374,42 @@ def test_the_build_records_every_resolved_version_and_expects_the_pins() -> None
     for package in (*engine.expected_versions(), "ca-certificates", "curl", "gnupg", "iptables"):
         assert f" {package}" in record
     assert engine.expected_versions()["containerd.io"] == engine.containerd_version
+
+
+# Registry credentials named by environment variable, never passed (#91).
+
+_ENV = RegistryCredentialsEnv("AW91_TEST_REGISTRY_USER", "AW91_TEST_REGISTRY_TOKEN")
+
+
+async def test_registry_env_reads_the_credentials_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from e2b import AsyncTemplate
+
+    seen: dict[str, object] = {}
+
+    async def build(template: object, name: str, **kwargs: object) -> _Info:
+        seen["template"] = template
+        return _Info("tpl-r", "bld-r")
+
+    monkeypatch.setattr(AsyncTemplate, "build", staticmethod(build))
+    monkeypatch.setenv(_ENV.username_variable, "invented-user")
+    monkeypatch.setenv(_ENV.password_variable, "invented-token-0000")
+    await build_template(_spec(docker=None, memory_mb=2048), registry_env=_ENV)
+    built = vars(seen["template"])["_template"]
+    assert built._registry_config == {
+        "type": "registry",
+        "username": "invented-user",
+        "password": "invented-token-0000",
+    }
+
+
+async def test_registry_env_refuses_unset_variables_and_explicit_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(_ENV.username_variable, raising=False)
+    monkeypatch.delenv(_ENV.password_variable, raising=False)
+    with pytest.raises(TemplateSpecError, match="unset: AW91_TEST_REGISTRY_USER"):
+        await build_template(_spec(), registry_env=_ENV)
+    with pytest.raises(TemplateSpecError, match="not both"):
+        await build_template(_spec(), registry_env=_ENV, registry_password="x")
