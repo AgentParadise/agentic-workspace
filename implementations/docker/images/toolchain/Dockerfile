@@ -55,6 +55,48 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean
 
 # =============================================================================
+# Vulkan loader + Mesa lavapipe (software Vulkan on the CPU)
+# =============================================================================
+# Workspaces have no GPU. Repositories with GPU code (wgpu, ash) run their
+# render-correctness tests on lavapipe, Mesa's CPU Vulkan driver, exactly as a
+# GitHub ubuntu-latest runner does after
+#   apt-get install mesa-vulkan-drivers libvulkan1 vulkan-tools
+# (dream-ship-os render-correctness.yml). Its doctor checks all three packages
+# by dpkg, the ICD at /usr/share/vulkan/icd.d/lvp_icd.json, and an llvmpipe
+# adapter in `vulkaninfo --summary`, so vulkan-tools is required, not a nicety.
+#
+# WHY BACKPORTS ON BOOKWORM. Bookworm's own Mesa is 22.3 and installs the ICD
+# arch-suffixed (lvp_icd.x86_64.json), which that doctor refuses. Backports
+# carries Mesa 25.0, the same series ubuntu-latest runs, and names it
+# lvp_icd.json. Matching the runner's lavapipe also matters for golden-image
+# tests: a different rasteriser can differ by a pixel. Other bases install
+# from their own archive; the ICD assertion below fails the build if that
+# ever stops holding.
+#
+# Size: ~205 MiB installed (mesa-vulkan-drivers 65, libllvm15 115, libz3 23),
+# ~42 MiB compressed. Here and not in omni, for the same reason as the C
+# toolchain: omni consumers do not compile or render.
+RUN set -eux; \
+    . /etc/os-release; \
+    target_release=""; \
+    if [ "${VERSION_CODENAME}" = bookworm ]; then \
+      echo "deb http://deb.debian.org/debian bookworm-backports main" \
+        > /etc/apt/sources.list.d/bookworm-backports.list; \
+      target_release="bookworm-backports"; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ${target_release:+-t "${target_release}"} \
+      libvulkan1 \
+      mesa-vulkan-drivers \
+      vulkan-tools; \
+    rm -f /etc/apt/sources.list.d/bookworm-backports.list; \
+    rm -rf /var/lib/apt/lists/*; \
+    apt-get clean; \
+    test -f /usr/share/vulkan/icd.d/lvp_icd.json; \
+    command -v vulkaninfo
+
+# =============================================================================
 # rustup (binary + proxies, NO toolchain)
 # =============================================================================
 # A repository's own rust-toolchain.toml selects and installs its pinned
@@ -139,7 +181,8 @@ RUN chmod 755 /opt/agentic/toolchain-entrypoint.sh \
 RUN claude --version && codex --version && python3 --version && node --version \
     && uv --version && gh --version && just --version && make --version \
     && cc --version && c++ --version && pkg-config --version \
-    && rustup --version && test -L /usr/local/bin/pnpm && bun --version
+    && rustup --version && test -L /usr/local/bin/pnpm && bun --version \
+    && test -f /usr/share/vulkan/icd.d/lvp_icd.json && command -v vulkaninfo
 
 # Re-apply omni's setuid/setgid strip: the packages above ran as root and could
 # have introduced new ones.
