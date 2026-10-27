@@ -47,6 +47,12 @@ Decisions that differ from Docker, and why:
   every create. Create confirms both roots are writable before returning.
 - `SupportsOperations` is delegated to `E2BOperations` (#95), which has
   Docker's `OperationSpec` semantics; see `e2b_operations.py`.
+- `nested_docker=True` says the template was built with a `DockerEngine`
+  (#91). Create then also waits, for up to `docker_ready_seconds`, for
+  `docker info` to answer as the workspace user, and fails (removing the
+  sandbox) if it never does; `describe()` publishes `NESTED_DOCKER` only on
+  such a provider. The flag is the caller's claim about its template, and the
+  readiness check is what keeps the claim from being taken on trust.
 - Workspace-level credential bindings, host mounts and `limits.network=False` are refused:
   none has an E2B delivery yet, and silently dropping one would launch a
   workspace without what the caller asked for. The mutable `environment` is
@@ -98,6 +104,7 @@ from agentic_isolation.providers.e2b_client import (
     SdkE2BClient,
 )
 from agentic_isolation.providers.e2b_operations import E2BOperations
+from agentic_isolation.providers.e2b_template import NESTED_DOCKER
 from agentic_isolation.providers.file_transfer import (
     DEFAULT_READ_LIMITS,
     ReadFilesError,
@@ -129,6 +136,8 @@ _REMOVAL_SECONDS = 30.0
 _LISTING_SECONDS = 30.0
 # How often either is read again.
 _POLL_SECONDS = 0.5
+# The readiness check of a nested-docker workspace (#91).
+_DOCKER_READY = "docker info --format '{{.ServerVersion}}'"
 
 
 class SandboxRemovalError(RuntimeError):
@@ -155,6 +164,8 @@ class E2BWorkspaceProvider:
         credentials: CredentialResolver | None = None,
         retention_bytes: int = 1 << 24,
         max_page_bytes: int = 1 << 16,
+        nested_docker: bool = False,
+        docker_ready_seconds: float = 30.0,
     ) -> None:
         """
         Args:
@@ -167,11 +178,19 @@ class E2BWorkspaceProvider:
                 binding without one is refused as `rejected_policy`.
             retention_bytes: Output each operation keeps for `observe`.
             max_page_bytes: The largest serialised page `observe` returns.
+            nested_docker: The template runs a Docker daemon `run_as` can use
+                (built with a `DockerEngine`); create checks it, and
+                `describe()` publishes `NESTED_DOCKER`.
+            docker_ready_seconds: How long create waits for `docker info`.
         """
+        if docker_ready_seconds <= 0:
+            raise ValueError("docker_ready_seconds must be positive")
         self._template = template
         self._client = client if client is not None else SdkE2BClient()
         self._lifetime_seconds = lifetime_seconds
         self._run_as = run_as
+        self._nested_docker = nested_docker
+        self._docker_ready_seconds = docker_ready_seconds
         self._workspaces: dict[str, Workspace] = {}
         self._retained: dict[str, Workspace] = {}
         # Sandboxes E2B was seen not to know by id after this provider killed them.
@@ -221,6 +240,8 @@ class E2BWorkspaceProvider:
                     f"sandbox {sandbox_id}: {' and '.join(roots)} are not writable by "
                     f"user {self._run_as}: {result.stdout.strip()}"
                 )
+            if self._nested_docker:
+                await self._await_docker(workspace)
         except BaseException as exc:
             # The caller never gets this workspace, so nobody else can free it.
             self._workspaces.pop(sandbox_id, None)
@@ -236,6 +257,23 @@ class E2BWorkspaceProvider:
                 exc.add_note(f"sandbox {sandbox_id} is still allocated: {leak!r}")
             raise
         return workspace
+
+    async def _await_docker(self, workspace: Workspace) -> None:
+        """Return once `docker info` answers as `run_as`; raise past the bound."""
+        last = ""
+        try:
+            async with asyncio.timeout(self._docker_ready_seconds):
+                while True:
+                    probe = await self.execute(workspace, _DOCKER_READY, cwd="/")
+                    if probe.success and probe.stdout.strip():
+                        return
+                    last = probe.stdout.strip()
+                    await asyncio.sleep(_POLL_SECONDS)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"sandbox {workspace.id}: Docker did not answer `docker info` as user "
+                f"{self._run_as} within {self._docker_ready_seconds:g}s: {last}"
+            ) from exc
 
     async def _remove(self, sandbox_id: str) -> None:
         """Kill a sandbox and wait until E2B no longer knows it by id.
@@ -338,7 +376,15 @@ class E2BWorkspaceProvider:
         return E2BStreamSession(self._client, workspace.id, command, timeout=timeout)
 
     def describe(self) -> ProviderDescriptor:
-        return self._operations.describe()
+        descriptor = self._operations.describe()
+        if not self._nested_docker:
+            return descriptor
+        return descriptor.model_validate(
+            {
+                **descriptor.model_dump(by_alias=True),
+                "capabilities": (*descriptor.capabilities, NESTED_DOCKER),
+            }
+        )
 
     async def start(
         self, workspace: Workspace, spec: OperationSpec, *, redact: Collection[str] = ()

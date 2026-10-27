@@ -21,12 +21,38 @@ https://e2b.dev/docs/template/private-registries and
 https://e2b.dev/docs/template/build (accessed 2026-10-17). Building from a
 private GHCR digest has NOT been run (Q5); tests/integration/test_e2b_live.py
 holds that proof.
+
+Nested Docker (AgentParadise/agentic-workspace#91). `DockerEngine` layers
+Docker CE, the compose and buildx plugins and containerd onto the pinned image
+in the E2B build itself, so no second image variant has to pass the release
+channel. Provenance stays explicit rather than collapsed into one digest: the
+base is still the verified digest, every Docker package is an exact apt
+version from Docker's repository, whose signing key is checked against its
+published fingerprint before any package is trusted, and every pre-pulled
+image is pulled by digest and only then tagged. A base image on another
+Debian release fails the build, because the pinned versions name it.
+
+E2B boots every sandbox, including a build step, under its own systemd as
+PID 1 even when the image has none (measured live 2026-10-27 on the pinned
+omni-agent image), so the package's own `docker.service` starts dockerd: no
+start command is needed. The template's ready command is `docker info`, so the
+snapshot is taken only once the daemon answers. E2B runs that command as the
+template's user, its own `user` unless one is set (measured live 2026-10-27:
+`permission denied` on the socket, then a 10 minute build timeout), so the
+template sets the image's user (`agent`) first, which also makes it the
+sandbox's default user, as the image declares.
+
+The `docker` group is root in the sandbox (a `--privileged` container is
+uid 0 with every capability), so a nested-docker workspace has no privilege
+boundary between the agent and root inside the VM. The boundary is the
+Firecracker VM itself.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +62,133 @@ _PINNED_IMAGE = re.compile(r"(?P<repository>[^@\s]+)@(?P<digest>sha256:[0-9a-f]{
 
 class TemplateSpecError(ValueError):
     """A template spec that would not build a pinned, verified, sized template."""
+
+
+#: The capability name a provider publishes in `ProviderDescriptor.capabilities`
+#: when its template runs a Docker daemon the workspace user can reach.
+NESTED_DOCKER = "nested_docker"
+
+#: Docker's Debian apt signing key, "Docker Release (CE deb)", created
+#: 2017-02-22: the primary key fingerprint of the key served at
+#: `_DOCKER_APT_KEY_URL`, read with `gpg --show-keys` on 2026-10-27.
+DOCKER_APT_KEY_FINGERPRINT = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+#: The template's ready command; E2B takes the snapshot once it exits 0.
+DOCKER_READY_CMD = "docker info >/dev/null 2>&1"
+_DOCKER_APT_KEY_URL = "https://download.docker.com/linux/debian/gpg"
+_DOCKER_APT_REPO = "https://download.docker.com/linux/debian"
+_APT_VERSION = re.compile(r"[0-9][A-Za-z0-9.+:~-]*")
+_SUITE = re.compile(r"[a-z]+")
+_USER = re.compile(r"[a-z_][a-z0-9_-]*")
+_FINGERPRINT = re.compile(r"[0-9A-F]{40}")
+_IMAGE_REF = re.compile(r"[a-z0-9][a-z0-9._/:-]*")
+
+
+@dataclass(frozen=True)
+class PrePull:
+    """An image pulled by `digest` at build time, then tagged `reference`.
+
+    Compose files name tags (`postgres:16`), so the tag is what makes the
+    cached image usable; the digest is what makes it the image that was meant.
+    """
+
+    reference: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        if _IMAGE_REF.fullmatch(self.reference) is None or "@" in self.reference:
+            raise TemplateSpecError(f"pre-pull reference {self.reference!r} is not repo[:tag]")
+        if _DIGEST.fullmatch(self.digest) is None:
+            raise TemplateSpecError(f"pre-pull {self.reference} digest must be sha256:<64 hex>")
+
+    @property
+    def repository(self) -> str:
+        last = self.reference.rsplit("/", 1)[-1]
+        return self.reference.rsplit(":", 1)[0] if ":" in last else self.reference
+
+
+@dataclass(frozen=True)
+class DockerEngine:
+    """The Docker layer of a nested-docker template, every input pinned.
+
+    Defaults are the versions proven live (2026-10-21 and 2026-10-27) on
+    Debian 12. The spec floor is config, not a constant at the call site.
+    """
+
+    docker_ce_version: str = "5:29.9.2-1~debian.12~bookworm"
+    containerd_version: str = "2.4.2-3~debian.12~bookworm"
+    compose_version: str = "5.6.1-1~debian.12~bookworm"
+    buildx_version: str = "0.38.1-1~debian.12~bookworm"
+    #: The Debian suite of the base image; the versions above must name it.
+    apt_suite: str = "bookworm"
+    apt_key_fingerprint: str = DOCKER_APT_KEY_FINGERPRINT
+    #: The workspace user added to the `docker` group (the image's USER).
+    docker_user: str = "agent"
+    pre_pull: tuple[PrePull, ...] = ()
+    #: The smallest sandbox Docker is allowed in: 2 vCPU, 4 GiB (issue #91).
+    min_cpu_count: int = 2
+    min_memory_mb: int = 4096
+
+    def __post_init__(self) -> None:
+        versions = (
+            self.docker_ce_version,
+            self.containerd_version,
+            self.compose_version,
+            self.buildx_version,
+        )
+        for version in versions:
+            if _APT_VERSION.fullmatch(version) is None:
+                raise TemplateSpecError(f"apt version {version!r} is not an exact version")
+        if _SUITE.fullmatch(self.apt_suite) is None:
+            raise TemplateSpecError(f"apt suite {self.apt_suite!r} is not a Debian codename")
+        if any(not version.endswith(f"~{self.apt_suite}") for version in versions):
+            raise TemplateSpecError(f"every Docker package version must target {self.apt_suite}")
+        if _FINGERPRINT.fullmatch(self.apt_key_fingerprint) is None:
+            raise TemplateSpecError("apt_key_fingerprint must be 40 uppercase hex digits")
+        if _USER.fullmatch(self.docker_user) is None:
+            raise TemplateSpecError(f"docker_user {self.docker_user!r} is not a user name")
+        if len({p.reference for p in self.pre_pull}) != len(self.pre_pull):
+            raise TemplateSpecError("pre_pull names one reference twice")
+        if self.min_cpu_count < 1 or self.min_memory_mb < 1:
+            raise TemplateSpecError("the Docker spec floor must be positive")
+
+    def install_commands(self) -> list[str]:
+        """Root build steps that install the pinned engine and grant `docker_user`."""
+        packages = [
+            f"docker-ce={self.docker_ce_version}",
+            f"docker-ce-cli={self.docker_ce_version}",
+            f"containerd.io={self.containerd_version}",
+            f"docker-compose-plugin={self.compose_version}",
+            f"docker-buildx-plugin={self.buildx_version}",
+        ]
+        apt = "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends"
+        return [
+            "set -eu",
+            "apt-get update",
+            f"{apt} ca-certificates curl gnupg iptables",
+            "install -m 0755 -d /etc/apt/keyrings",
+            f"curl -fsSL {_DOCKER_APT_KEY_URL} -o /etc/apt/keyrings/docker.asc",
+            # The key is trusted only if it is the one Docker publishes.
+            "gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc | grep -qx "
+            + shlex.quote(f"fpr:::::::::{self.apt_key_fingerprint}:"),
+            # The suite is checked to be a bare codename, so it needs no quoting.
+            "printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] "
+            f'{_DOCKER_APT_REPO} {self.apt_suite} stable\\n\' "$(dpkg --print-architecture)"'
+            " > /etc/apt/sources.list.d/docker.list",
+            "apt-get update",
+            f"{apt} {shlex.join(packages)}",
+            "rm -rf /var/lib/apt/lists/*",
+            f"usermod -aG docker {shlex.quote(self.docker_user)}",
+            "docker --version && docker compose version",
+        ]
+
+    def pre_pull_commands(self) -> list[str]:
+        """Root build steps that pull each image by digest and tag it."""
+        commands = ["set -eu", "systemctl start docker", "docker info >/dev/null"]
+        for image in self.pre_pull:
+            pinned = f"{image.repository}@{image.digest}"
+            commands.append(f"docker pull {shlex.quote(pinned)}")
+            commands.append(f"docker tag {shlex.quote(pinned)} {shlex.quote(image.reference)}")
+        return commands
 
 
 @dataclass(frozen=True)
@@ -50,6 +203,10 @@ class E2BTemplateSpec:
     expected_manifest_hash: str
     cpu_count: int
     memory_mb: int
+    #: Present for a nested-docker template; None builds the image as it is.
+    docker: DockerEngine | None = None
+    #: Free root disk to request after the build steps (MiB); None is E2B's default.
+    min_free_disk_mb: int | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -72,6 +229,16 @@ class E2BTemplateSpec:
             )
         if self.cpu_count < 1 or self.memory_mb < 1:
             raise TemplateSpecError("cpu_count and memory_mb must be pinned to positive values")
+        if self.min_free_disk_mb is not None and self.min_free_disk_mb < 0:
+            raise TemplateSpecError("min_free_disk_mb must not be negative")
+        if self.docker is not None and (
+            self.cpu_count < self.docker.min_cpu_count or self.memory_mb < self.docker.min_memory_mb
+        ):
+            raise TemplateSpecError(
+                f"nested Docker needs at least {self.docker.min_cpu_count} vCPU and "
+                f"{self.docker.min_memory_mb} MB; the spec has {self.cpu_count} and "
+                f"{self.memory_mb}"
+            )
 
 
 @dataclass(frozen=True)
@@ -97,15 +264,25 @@ async def build_template(
 ) -> E2BTemplateBuild:
     """Build `spec` on E2B and return its receipt. Needs the `e2b` extra and a key."""
     from e2b import AsyncTemplate
+    from e2b.template.main import TemplateBuilder, TemplateFinal
 
-    template = AsyncTemplate().from_image(
+    builder = AsyncTemplate().from_image(
         spec.image, username=registry_username, password=registry_password
     )
+    template: TemplateBuilder | TemplateFinal = builder
+    if spec.docker is not None:
+        builder = builder.run_cmd(spec.docker.install_commands(), user="root")
+        if spec.docker.pre_pull:
+            builder = builder.run_cmd(spec.docker.pre_pull_commands(), user="root")
+        # The ready command runs as the template's user: the docker one (#91).
+        builder = builder.set_user(spec.docker.docker_user)
+        template = builder.set_ready_cmd(DOCKER_READY_CMD)
     info = await AsyncTemplate.build(
         template,
         spec.name,
         cpu_count=spec.cpu_count,
         memory_mb=spec.memory_mb,
+        min_free_disk_mb=spec.min_free_disk_mb,
         api_key=api_key,
     )
     return E2BTemplateBuild(template_id=info.template_id, build_id=info.build_id, spec=spec)

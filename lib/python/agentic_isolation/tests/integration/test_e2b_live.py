@@ -10,6 +10,11 @@ path the platform reads; the test fails if it is absent, it does not assume
 it). E2B_BUILD_RECEIPT, when
 set, is where the build receipt is written as JSON.
 
+The nested-docker test (#91) needs E2B_API_KEY and E2B_DOCKER_MANIFEST_HASH,
+plus either E2B_DOCKER_BASE_IMAGE (it builds an `aw91-docker-test-*` template
+and leaves it in place) or E2B_DOCKER_TEMPLATE (one built that way). The key
+lives with the owner only: CI never has one, so CI reports this NOT RUN.
+
 Without those inputs each test is reported NOT RUN by
 tests/integration/conftest.py, never as a pass, and REQUIRE_E2B_LIVE=1 turns
 every NOT RUN into a failure. None of these has been run yet: no E2B key
@@ -231,7 +236,7 @@ _LIST_SAMPLES = 10
 
 
 async def test_q5_private_ghcr_digest_builds_and_launches(tmp_path: Path) -> None:
-    api_key, image, username, token, expected = _required(
+    _, image, username, token, expected = _required(
         "E2B_API_KEY",
         "E2B_PRIVATE_IMAGE",
         "E2B_GHCR_USERNAME",
@@ -247,9 +252,7 @@ async def test_q5_private_ghcr_digest_builds_and_launches(tmp_path: Path) -> Non
         cpu_count=2,
         memory_mb=2048,
     )
-    receipt = await build_template(
-        spec, registry_username=username, registry_password=token, api_key=api_key
-    )
+    receipt = await build_template(spec, registry_username=username, registry_password=token)
     receipt_path = Path(os.environ.get("E2B_BUILD_RECEIPT", tmp_path / "receipt.json"))
     receipt_path.write_text(json.dumps(dataclasses.asdict(receipt), indent=2))
     print(f"build receipt: {receipt_path}")
@@ -417,3 +420,100 @@ async def test_a_fresh_provider_reattaches_cancels_and_pause_resume_keeps_the_sa
     await fresh.resume(workspace)
     marker = await provider.execute(workspace, "echo resumed")
     assert "resumed" in marker.stdout
+
+
+# Nested Docker (AgentParadise/agentic-workspace#91).
+
+# postgres:16 and hello-world:latest index digests, read from Docker Hub 2026-10-27.
+_POSTGRES_16 = "sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97"
+_HELLO_WORLD = "sha256:11a3eb1597e864c51b3f56733cb2e8a90bf0c284bfc05f9444d81c558bc848aa"
+_COMPOSE = """\
+services:
+  db:
+    image: postgres:16
+    pull_policy: never
+    environment:
+      POSTGRES_PASSWORD: aw91-not-a-secret
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      retries: 60
+"""
+
+
+async def _run(provider: E2BWorkspaceProvider, workspace: Workspace, command: str) -> str:
+    started = time.monotonic()
+    result = await provider.execute(workspace, command, timeout=300)
+    print(f"$ {command}  [{time.monotonic() - started:.1f}s, exit {result.exit_code}]")
+    print(result.stdout.rstrip())
+    assert result.success, f"{command!r} failed: {result.stdout}"
+    return result.stdout
+
+
+async def test_nested_docker_template_runs_compose_postgres() -> None:
+    """#91: the pinned workspace image plus `DockerEngine`, built and used on E2B.
+
+    Builds a template named `aw91-docker-test-<hex>` from E2B_DOCKER_BASE_IMAGE
+    (`repo@sha256:<digest>`), unless E2B_DOCKER_TEMPLATE names one already
+    built this way. E2B_DOCKER_MANIFEST_HASH is the sha256 of the file at
+    E2B_MANIFEST_PATH in the base image; the test reads it back from the
+    workspace, so the Docker layer is shown not to have replaced the base.
+    The template is NOT deleted: E2B templates are kept for the owner to review.
+    """
+    from agentic_isolation.providers import NESTED_DOCKER, DockerEngine, PrePull
+
+    # The SDK reads the key from the environment. Never hold it in a local or
+    # pass it as an argument: a failing traceback prints both (it did, #91).
+    _, expected = _required("E2B_API_KEY", "E2B_DOCKER_MANIFEST_HASH")
+    manifest = os.environ.get("E2B_MANIFEST_PATH", "/opt/agentic/version.json")
+    template = os.environ.get("E2B_DOCKER_TEMPLATE")
+    if not template:
+        (image,) = _required("E2B_DOCKER_BASE_IMAGE")
+        spec = E2BTemplateSpec(
+            name=f"aw91-docker-test-{uuid.uuid4().hex[:8]}",
+            image=image,
+            verified_oci_digest=image.rpartition("@")[2],
+            expected_manifest_hash=expected,
+            cpu_count=2,
+            memory_mb=4096,
+            docker=DockerEngine(pre_pull=(PrePull("postgres:16", _POSTGRES_16),)),
+        )
+        started = time.monotonic()
+        receipt = await build_template(spec)
+        template = receipt.template_id
+        print(
+            f"built {spec.name}: template {receipt.template_id}, build {receipt.build_id}, "
+            f"{time.monotonic() - started:.1f}s"
+        )
+
+    provider = E2BWorkspaceProvider(template, nested_docker=True)
+    assert NESTED_DOCKER in provider.describe().capabilities
+    run = {"e2b_live.run": uuid.uuid4().hex}
+    started = time.monotonic()
+    workspace = await provider.create(WorkspaceConfig(provider="e2b", labels=run))
+    print(f"create with docker readiness: {time.monotonic() - started:.1f}s")
+    try:
+        hashed = await _run(provider, workspace, f"sha256sum {shlex.quote(manifest)}")
+        assert "sha256:" + hashed.split()[0] == expected
+        groups = await _run(provider, workspace, "id -un; id -nG")
+        assert groups.split()[0] == "agent" and "docker" in groups.split()[1:]
+        await _run(
+            provider,
+            workspace,
+            "docker version --format '{{.Server.Version}}'; docker compose version --short",
+        )
+        hello = await _run(provider, workspace, f"docker run --rm hello-world@{_HELLO_WORLD}")
+        assert "Hello from Docker!" in hello
+        # Pre-pulled by digest at build time and tagged as compose names it.
+        digests = await _run(
+            provider, workspace, "docker image inspect postgres:16 --format '{{.RepoDigests}}'"
+        )
+        assert _POSTGRES_16 in digests
+        await provider.write_file(workspace, "compose.yaml", _COMPOSE)
+        await _run(provider, workspace, "docker compose up -d --wait --wait-timeout 120")
+        ready = await _run(provider, workspace, "docker compose exec -T db pg_isready -U postgres")
+        assert "accepting connections" in ready
+        await _run(provider, workspace, "docker compose down -v")
+    finally:
+        await provider.destroy(workspace)
+        assert await provider.list_owned(run) == []
