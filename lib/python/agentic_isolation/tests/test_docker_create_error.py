@@ -210,14 +210,16 @@ async def test_a_docker_run_that_never_exits_is_killed_then_removed(
     monkeypatch.setattr(provider, "_ABANDON_RUN_TIMEOUT_SECONDS", 0.05)
     _wire(monkeypatch, provider, run, events)
 
-    async with asyncio.timeout(5):
-        task = asyncio.create_task(provider.create(WorkspaceConfig(provider="docker")))
-        await run.started.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+    task = asyncio.create_task(provider.create(WorkspaceConfig(provider="docker")))
+    await run.started.wait()
+    # Finite, so an unbounded wait fails this test instead of hanging it:
+    # the cleanup absorbs cancels, a test timeout included.
+    asyncio.get_running_loop().call_later(2, run.finish.set)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
-    assert run.killed
+    assert run.killed, "the client was waited out, not killed at the bound"
     assert len(events) == 1 and events[0].startswith("rm agentic-ws-")
     assert list(tmp_path.iterdir()) == []
 
@@ -231,19 +233,23 @@ async def test_a_stalled_rm_cannot_hang_the_cancel(
     _wire(monkeypatch, provider, run, [])
 
     async def stalled_rm(_name: str) -> bool:
-        await asyncio.Event().wait()
+        # Finite, so an unbounded cleanup fails this test instead of hanging
+        # it: the cleanup absorbs cancels, a test timeout included.
+        await asyncio.sleep(2)
         return True
 
     monkeypatch.setattr(provider, "_remove", stalled_rm)
 
-    async with asyncio.timeout(5):
-        task = asyncio.create_task(provider.create(WorkspaceConfig(provider="docker")))
-        await run.started.wait()
-        task.cancel()
-        run.finish.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+    loop = asyncio.get_running_loop()
+    task = asyncio.create_task(provider.create(WorkspaceConfig(provider="docker")))
+    await run.started.wait()
+    started = loop.time()
+    task.cancel()
+    run.finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
+    assert loop.time() - started < 1, "the rm bound did not hold"
     assert list(tmp_path.iterdir()) == []
 
 
