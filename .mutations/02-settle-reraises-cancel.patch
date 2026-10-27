@@ -1,0 +1,14 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
+index 9418b4a..bc8deb0 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
+@@ -1579,8 +1579,7 @@ async def _settle(step: Callable[[], Awaitable[_T]], timeout: float) -> _T | Non
+                 return None
+             # `asyncio.wait` never cancels what it waits on, so a cancel of
+             # this caller leaves the task running and the loop goes round.
+-            with contextlib.suppress(asyncio.CancelledError):
+-                await asyncio.wait({task}, timeout=remaining)
++            await asyncio.wait({task}, timeout=remaining)
+         if not task.cancelled():
+             return None if task.exception() is not None else task.result()
+ 

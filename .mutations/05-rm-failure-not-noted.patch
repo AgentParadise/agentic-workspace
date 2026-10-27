@@ -1,0 +1,13 @@
+diff --git a/lib/python/agentic_isolation/agentic_isolation/providers/docker.py b/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
+index 9418b4a..093ef02 100644
+--- a/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
++++ b/lib/python/agentic_isolation/agentic_isolation/providers/docker.py
+@@ -380,7 +380,7 @@ class WorkspaceDockerProvider(BaseProvider):
+             raise
+         except Exception as e:
+             logger.exception("Failed to create container: %s", e)
+-            if not await self._cleanup_container(container_name):
++            if not await self._cleanup_container(container_name) and False:
+                 # The original type is kept: callers catch it by type.
+                 # Listing by the provider's labels finds the survivor.
+                 e.add_note(f"docker rm -f {container_name} failed; the container may still exist")
