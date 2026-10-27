@@ -18,6 +18,7 @@ import pytest
 
 from agentic_isolation import WorkspaceConfig
 from agentic_isolation.providers import (
+    DELTA_PATH,
     DOCKER_APT_KEY_FINGERPRINT,
     DOCKER_READY_CMD,
     NESTED_DOCKER,
@@ -367,13 +368,57 @@ def test_a_base_on_another_debian_release_fails_the_build(
     assert (_sh(command, tmp_path).returncode == 0) is accepted
 
 
-def test_the_build_records_every_resolved_version_and_expects_the_pins() -> None:
+_BASE_DPKG = "ii  bash=5.2.15-2\nii  libc6=2.36-9\nrc  oldpkg=1.0\n"
+# After the layer: a pinned package, a pulled-in dependency, an upgraded one.
+_LAYERED_DPKG = (
+    "ii  bash=5.2.15-2\nii  libc6=2.36-9+deb12u9\nrc  oldpkg=1.0\n"
+    "ii  docker-ce=5:29.9.2-1~debian.12~bookworm\nii  pigz=2.6-1\n"
+)
+
+
+def test_the_build_records_the_full_inventory_and_the_layer_delta(tmp_path: Path) -> None:
+    """Every installed package is recorded, and the delta shows deps apt pulled or upgraded."""
+    commands = DockerEngine().install_commands()
+    before = _step(commands, "> /tmp/aw-nested-docker-before.versions")
+    after = [c for c in commands if VERSIONS_PATH in c or DELTA_PATH in c or "before" in c]
+    paths = {
+        "/tmp/aw-nested-docker-before.versions": str(tmp_path / "before"),
+        VERSIONS_PATH: str(tmp_path / "versions"),
+        DELTA_PATH: str(tmp_path / "delta"),
+    }
+
+    def local(command: str) -> str:
+        for sandbox, here in paths.items():
+            command = command.replace(sandbox, here)
+        return command
+
+    assert _sh(local(before), tmp_path, **{"dpkg-query": _BASE_DPKG}).returncode == 0
+    layered = " && ".join(local(c) for c in after if c != before)
+    assert _sh(layered, tmp_path, **{"dpkg-query": _LAYERED_DPKG}).returncode == 0
+
+    assert (tmp_path / "versions").read_text().splitlines() == [
+        "bash=5.2.15-2",
+        "docker-ce=5:29.9.2-1~debian.12~bookworm",
+        "libc6=2.36-9+deb12u9",
+        "pigz=2.6-1",
+    ]
+    assert (tmp_path / "delta").read_text().splitlines() == [
+        "docker-ce=5:29.9.2-1~debian.12~bookworm",
+        "libc6=2.36-9+deb12u9",
+        "pigz=2.6-1",
+    ]
+    assert not (tmp_path / "before").exists()
+
+
+def test_expected_versions_are_the_five_pins() -> None:
     engine = DockerEngine()
-    record = _step(engine.install_commands(), "dpkg-query")
-    assert record.endswith(f"> {VERSIONS_PATH}")
-    for package in (*engine.expected_versions(), "ca-certificates", "curl", "gnupg", "iptables"):
-        assert f" {package}" in record
-    assert engine.expected_versions()["containerd.io"] == engine.containerd_version
+    assert engine.expected_versions() == {
+        "docker-ce": engine.docker_ce_version,
+        "docker-ce-cli": engine.docker_ce_version,
+        "containerd.io": engine.containerd_version,
+        "docker-compose-plugin": engine.compose_version,
+        "docker-buildx-plugin": engine.buildx_version,
+    }
 
 
 # Registry credentials named by environment variable, never passed (#91).

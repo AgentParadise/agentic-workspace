@@ -51,19 +51,29 @@ from agentic_isolation.providers.e2b import SandboxRemovalError
 pytestmark = [pytest.mark.e2b_live, pytest.mark.integration]
 
 
-def _required(*names: str) -> list[str]:
-    """The values of `names`; NOT RUN without them, a failure when live is required."""
-    missing = [name for name in names if not os.environ.get(name)]
+def _require_set(*names: str) -> None:
+    """NOT RUN unless every one of `names` is set; a failure when live is required.
+
+    Returns nothing, so it is the way to require a secret: its value never
+    reaches the test (tests/integration/secret_guard.py enforces this).
+    """
+    missing = [name for name in names if not bool(os.environ.get(name))]
     if missing:
         if os.environ.get("REQUIRE_E2B_LIVE") == "1":
             pytest.fail(f"REQUIRE_E2B_LIVE=1 but {', '.join(missing)} unset")
         pytest.skip(f"NOT RUN: {', '.join(missing)} required")
+
+
+def _required(*names: str) -> list[str]:
+    """The values of `names`, which must not be secrets; required as `_require_set`."""
+    _require_set(*names)
     return [os.environ[name] for name in names]
 
 
 @pytest.fixture
 def template() -> str:
-    return _required("E2B_API_KEY", "E2B_TEMPLATE")[1]
+    _require_set("E2B_API_KEY")
+    return _required("E2B_TEMPLATE")[0]
 
 
 @pytest.fixture
@@ -242,12 +252,9 @@ _LIST_SAMPLES = 10
 
 async def test_q5_private_ghcr_digest_builds_and_launches(tmp_path: Path) -> None:
     # Secrets stay in the environment: `registry_env` names them, never holds them.
-    _, image, _, _, expected = _required(
-        "E2B_API_KEY",
-        "E2B_PRIVATE_IMAGE",
-        "E2B_GHCR_USERNAME",
-        "E2B_GHCR_TOKEN",
-        "E2B_EXPECTED_MANIFEST_HASH",
+    _require_set("E2B_API_KEY", "E2B_GHCR_TOKEN")
+    image, _, expected = _required(
+        "E2B_PRIVATE_IMAGE", "E2B_GHCR_USERNAME", "E2B_EXPECTED_MANIFEST_HASH"
     )
     manifest = os.environ.get("E2B_MANIFEST_PATH", "/opt/agentic/version.json")
     spec = E2BTemplateSpec(
@@ -470,11 +477,18 @@ async def test_nested_docker_template_runs_compose_postgres() -> None:
     workspace, so the Docker layer is shown not to have replaced the base.
     The template is NOT deleted: E2B templates are kept for the owner to review.
     """
-    from agentic_isolation.providers import NESTED_DOCKER, VERSIONS_PATH, DockerEngine, PrePull
+    from agentic_isolation.providers import (
+        DELTA_PATH,
+        NESTED_DOCKER,
+        VERSIONS_PATH,
+        DockerEngine,
+        PrePull,
+    )
 
     # The SDK reads the key from the environment. Never hold it in a local or
     # pass it as an argument: a failing traceback prints both (it did, #91).
-    _, expected = _required("E2B_API_KEY", "E2B_DOCKER_MANIFEST_HASH")
+    _require_set("E2B_API_KEY")
+    (expected,) = _required("E2B_DOCKER_MANIFEST_HASH")
     manifest = os.environ.get("E2B_MANIFEST_PATH", "/opt/agentic/version.json")
     # An E2B_DOCKER_TEMPLATE must have been built with this same engine.
     engine = DockerEngine(pre_pull=(PrePull("postgres:16", _POSTGRES_16),))
@@ -513,6 +527,8 @@ async def test_nested_docker_template_runs_compose_postgres() -> None:
         recorded = await _run(provider, workspace, f"cat {VERSIONS_PATH}")
         installed = dict(line.split("=", 1) for line in recorded.split())
         assert {name: installed.get(name) for name in expected_versions} == expected_versions
+        delta = await _run(provider, workspace, f"cat {DELTA_PATH}")
+        assert {f"{n}={v}" for n, v in expected_versions.items()} <= set(delta.split())
         # What dpkg holds now, not only what the build wrote down.
         held = await _run(
             provider,

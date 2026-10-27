@@ -62,6 +62,7 @@ from agentic_isolation.providers.e2b_client import (
     SdkE2BClient,
 )
 from agentic_isolation.providers.e2b_template import (
+    DELTA_PATH,
     DOCKER_APT_KEY_FINGERPRINT,
     DOCKER_READY_CMD,
     NESTED_DOCKER,
@@ -167,6 +168,7 @@ __all__ = [
     "NESTED_DOCKER",
     "DOCKER_APT_KEY_FINGERPRINT",
     "DOCKER_READY_CMD",
+    "DELTA_PATH",
     "VERSIONS_PATH",
     "TemplateSpecError",
     "build_template",

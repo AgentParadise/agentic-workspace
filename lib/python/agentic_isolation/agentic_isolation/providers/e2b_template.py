@@ -30,11 +30,16 @@ base is still the verified digest, every Docker package is an exact apt
 version from Docker's repository, whose key file must hold exactly one primary
 key with the pinned fingerprint before any package is trusted, and every
 pre-pulled image is pulled by digest and only then tagged. A base image on
-another Debian release fails the build (`/etc/os-release` is checked). The
-four bootstrap packages (ca-certificates, curl, gnupg, iptables) come from the
-base's own Debian sources and are NOT pinned; the build records every
-resolved version, theirs included, at `VERSIONS_PATH`, so a template says
-what it holds even where the spec could not fix it.
+another Debian release fails the build (`/etc/os-release` is checked).
+
+Pinning limits (AgentParadise/agentic-workspace#113): only the five Docker
+packages are pinned. The four bootstrap packages (ca-certificates, curl,
+gnupg, iptables), and any dependency apt pulls in or upgrades for either set,
+are resolved from the live mirrors at build time and are NOT pinned, so two
+builds of one spec can differ there. The build therefore records instead of
+fixing: `VERSIONS_PATH` is the full installed inventory after the layer, and
+`DELTA_PATH` the lines the layer added or changed. There is no single signed
+digest for the template; #113 tracks a signed image variant or mirror pinning.
 
 E2B boots every sandbox, including a build step, under its own systemd as
 PID 1 even when the image has none (measured live 2026-10-27 on the pinned
@@ -82,19 +87,16 @@ DOCKER_READY_CMD = "docker info >/dev/null 2>&1"
 _DOCKER_APT_KEY_URL = "https://download.docker.com/linux/debian/gpg"
 _DOCKER_APT_REPO = "https://download.docker.com/linux/debian"
 _DOCKER_KEYRING = "/etc/apt/keyrings/docker.asc"
-#: Written at build time: `package=version` for every package the layer installs.
+#: Written at build time: `package=version` for EVERY installed package, sorted.
 VERSIONS_PATH = "/opt/agentic/nested-docker.versions"
-_RECORDED_PACKAGES = (
-    "docker-ce",
-    "docker-ce-cli",
-    "containerd.io",
-    "docker-compose-plugin",
-    "docker-buildx-plugin",
-    "ca-certificates",
-    "curl",
-    "gnupg",
-    "iptables",
+#: Written at build time: the `VERSIONS_PATH` lines this layer added or changed.
+DELTA_PATH = "/opt/agentic/nested-docker.delta"
+# Installed packages only (status `ii`), one `package=version` per line, C-sorted.
+_INVENTORY = (
+    "dpkg-query -W -f '${db:Status-Abbrev} ${Package}=${Version}\\n'"
+    " | awk '$1 == \"ii\" { print $2 }' | LC_ALL=C sort"
 )
+_INVENTORY_BEFORE = "/tmp/aw-nested-docker-before.versions"
 _APT_VERSION = re.compile(r"[0-9][A-Za-z0-9.+:~-]*")
 _SUITE = re.compile(r"[a-z]+")
 _USER = re.compile(r"[a-z_][a-z0-9_-]*")
@@ -180,11 +182,12 @@ class DockerEngine:
             f"docker-buildx-plugin={self.buildx_version}",
         ]
         apt = "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends"
-        names = " ".join(_RECORDED_PACKAGES)
         return [
             "set -eu",
             # The pinned versions name a Debian release; refuse any other base.
             f"grep -qx VERSION_CODENAME={self.apt_suite} /etc/os-release",
+            # The base's inventory, to compute what this layer added or changed.
+            f"{_INVENTORY} > {_INVENTORY_BEFORE}",
             "apt-get update",
             f"{apt} ca-certificates curl gnupg iptables",
             "install -m 0755 -d /etc/apt/keyrings",
@@ -203,9 +206,12 @@ class DockerEngine:
             f"{apt} {shlex.join(packages)}",
             "rm -rf /var/lib/apt/lists/*",
             f"usermod -aG docker {shlex.quote(self.docker_user)}",
-            # What was resolved, the unpinned bootstrap packages included.
-            f"dpkg-query -W -f '${{Package}}=${{Version}}\\n' {names} > {VERSIONS_PATH}",
-            f"cat {VERSIONS_PATH}",
+            # Every installed package as it now is, and the lines this layer
+            # added or changed (dependencies apt pulled in or upgraded included).
+            f"{_INVENTORY} > {VERSIONS_PATH}",
+            f"LC_ALL=C comm -13 {_INVENTORY_BEFORE} {VERSIONS_PATH} > {DELTA_PATH}",
+            f"rm -f {_INVENTORY_BEFORE}",
+            f"cat {DELTA_PATH}",
         ]
 
     def expected_versions(self) -> dict[str, str]:
