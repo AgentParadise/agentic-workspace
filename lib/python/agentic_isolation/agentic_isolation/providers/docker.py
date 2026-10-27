@@ -415,11 +415,13 @@ class WorkspaceDockerProvider(BaseProvider):
         """
         try:
             if proc is not None and proc.returncode is None:
-                if await _settle(proc.wait(), self._ABANDON_RUN_TIMEOUT_SECONDS) is None:
+                if await _settle(proc.wait, self._ABANDON_RUN_TIMEOUT_SECONDS) is None:
                     with contextlib.suppress(ProcessLookupError, OSError):
                         proc.kill()
-                    await _settle(proc.wait(), self._ABANDON_KILL_TIMEOUT_SECONDS)
-            removed = await _settle(self._remove(container_name), self._ABANDON_RM_TIMEOUT_SECONDS)
+                    await _settle(proc.wait, self._ABANDON_KILL_TIMEOUT_SECONDS)
+            removed = await _settle(
+                lambda: self._remove(container_name), self._ABANDON_RM_TIMEOUT_SECONDS
+            )
             if not removed:
                 logger.warning(
                     "docker rm -f %s after a cancelled create failed or timed out; "
@@ -1553,28 +1555,43 @@ class WorkspaceDockerProvider(BaseProvider):
 _T = TypeVar("_T")
 
 
-async def _settle(awaitable: Awaitable[_T], timeout: float) -> _T | None:
-    """Await to completion through any number of cancels, within `timeout`.
+async def _settle(step: Callable[[], Awaitable[_T]], timeout: float) -> _T | None:
+    """Run `step` to completion through any number of cancels, within `timeout`.
 
-    None when it timed out (it is then cancelled), failed, or was cancelled
-    directly. A cancel of the caller is absorbed, not re-raised: the caller
-    is cleanup that must finish, and re-raises its own cancel afterwards.
+    A cancel of the caller is absorbed, not re-raised: the caller is cleanup
+    that must finish, and re-raises its own cancel afterwards. A cancel of
+    the step itself from outside (`asyncio.run` cancels every task once at
+    shutdown) re-runs it, so `step` must be safe to repeat. None when the
+    deadline passed or the step failed.
     """
     loop = asyncio.get_running_loop()
-    task = asyncio.ensure_future(awaitable)
     deadline = loop.time() + timeout
-    while not task.done():
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            task.cancel()
-            return None
-        # `asyncio.wait` never cancels what it waits on, so a cancel of this
-        # caller leaves the task running and the loop goes round again.
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.wait({task}, timeout=remaining)
-    if task.cancelled() or task.exception() is not None:
-        return None
-    return task.result()
+    while True:
+        task = asyncio.ensure_future(step())
+        while not task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                task.cancel()
+                # Held until it settles, and its outcome read, so neither
+                # garbage collection nor an unretrieved exception is logged.
+                _abandoned_steps.add(task)
+                task.add_done_callback(_forget_step)
+                return None
+            # `asyncio.wait` never cancels what it waits on, so a cancel of
+            # this caller leaves the task running and the loop goes round.
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({task}, timeout=remaining)
+        if not task.cancelled():
+            return None if task.exception() is not None else task.result()
+
+
+_abandoned_steps: set[object] = set()
+
+
+def _forget_step(task: asyncio.Future[_T]) -> None:
+    _abandoned_steps.discard(task)
+    if not task.cancelled():
+        task.exception()
 
 
 def _rmtree(path: str) -> OSError | None:

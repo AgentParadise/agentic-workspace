@@ -10,6 +10,13 @@ from agentic_isolation.config import SecurityConfig, WorkspaceConfig, WorkspaceR
 from agentic_isolation.providers.docker import WorkspaceDockerProvider
 
 
+def _config() -> WorkspaceConfig:
+    # Explicit runc on the config, which wins over the provider's: auto would
+    # probe the real daemon before `docker run`.
+    security = replace(SecurityConfig.production(), runtime=WorkspaceRuntime.RUNC)
+    return WorkspaceConfig(provider="docker", security=security)
+
+
 @pytest.mark.parametrize(
     ("returncode", "stdout", "stderr", "expected"),
     [
@@ -56,7 +63,7 @@ async def test_failed_create_reports_output_and_exit_code(
     monkeypatch.setattr(provider, "_cleanup_container", removed)
 
     with pytest.raises(RuntimeError) as exc:
-        await provider.create(WorkspaceConfig(provider="docker"))
+        await provider.create(_config())
 
     message = str(exc.value)
     assert expected in message
@@ -66,9 +73,7 @@ async def test_failed_create_reports_output_and_exit_code(
 
 
 def _provider(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> WorkspaceDockerProvider:
-    # Explicit runc: auto would probe the real daemon before `docker run`.
-    security = replace(SecurityConfig.production(), runtime=WorkspaceRuntime.RUNC)
-    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path, security=security)
+    provider = WorkspaceDockerProvider(workspace_base_dir=tmp_path)
 
     async def plain_image(_image: str) -> tuple[str, dict[str, str]]:
         return "sha256:" + "0" * 64, {}
@@ -101,7 +106,7 @@ async def test_failed_rm_after_failed_create_is_noted_on_the_original_error(
     monkeypatch.setattr(provider, "_cleanup_container", rm_failed)
 
     with pytest.raises(RuntimeError) as exc:
-        await provider.create(WorkspaceConfig(provider="docker"))
+        await provider.create(_config())
 
     # The type callers catch is unchanged; the survivor is reported on it.
     assert type(exc.value) is RuntimeError
@@ -160,8 +165,8 @@ async def test_repeated_cancel_keeps_create_pending_until_the_container_is_remov
     _wire(monkeypatch, provider, run, events)
 
     async with asyncio.timeout(5):
-        task = asyncio.create_task(provider.create(WorkspaceConfig(provider="docker")))
-        await run.started.wait()
+        task = asyncio.create_task(provider.create(_config()))
+        await asyncio.wait_for(run.started.wait(), 5)
         task.cancel()
         await asyncio.sleep(0.01)
         task.cancel()
@@ -185,8 +190,8 @@ def test_cleanup_finishes_when_asyncio_run_shuts_down_mid_create(
     async def main() -> None:
         run = _Run(exits=False)
         _wire(monkeypatch, provider, run, events)
-        task = asyncio.create_task(provider.create(WorkspaceConfig(provider="docker")))
-        await run.started.wait()
+        task = asyncio.create_task(provider.create(_config()))
+        await asyncio.wait_for(run.started.wait(), 5)
         # Cleanup is already under way when shutdown starts, so shutdown
         # cancels it directly rather than starting it.
         task.cancel()
@@ -210,8 +215,8 @@ async def test_a_docker_run_that_never_exits_is_killed_then_removed(
     monkeypatch.setattr(provider, "_ABANDON_RUN_TIMEOUT_SECONDS", 0.05)
     _wire(monkeypatch, provider, run, events)
 
-    task = asyncio.create_task(provider.create(WorkspaceConfig(provider="docker")))
-    await run.started.wait()
+    task = asyncio.create_task(provider.create(_config()))
+    await asyncio.wait_for(run.started.wait(), 5)
     # Finite, so an unbounded wait fails this test instead of hanging it:
     # the cleanup absorbs cancels, a test timeout included.
     asyncio.get_running_loop().call_later(2, run.finish.set)
@@ -241,8 +246,8 @@ async def test_a_stalled_rm_cannot_hang_the_cancel(
     monkeypatch.setattr(provider, "_remove", stalled_rm)
 
     loop = asyncio.get_running_loop()
-    task = asyncio.create_task(provider.create(WorkspaceConfig(provider="docker")))
-    await run.started.wait()
+    task = asyncio.create_task(provider.create(_config()))
+    await asyncio.wait_for(run.started.wait(), 5)
     started = loop.time()
     task.cancel()
     run.finish.set()
@@ -270,11 +275,43 @@ async def test_cancel_while_waiting_for_the_container_to_run_removes_it(
     monkeypatch.setattr(provider, "_wait_for_running", never_running)
 
     async with asyncio.timeout(5):
-        task = asyncio.create_task(provider.create(WorkspaceConfig(provider="docker")))
-        await waiting.wait()
+        task = asyncio.create_task(provider.create(_config()))
+        await asyncio.wait_for(waiting.wait(), 5)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
     assert len(events) == 1 and events[0].startswith("rm agentic-ws-")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cleanup_reruns_an_rm_that_shutdown_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    provider = _provider(monkeypatch, tmp_path)
+
+    async def main() -> None:
+        run = _Run(exits=False)
+        _wire(monkeypatch, provider, run, events)
+        rm_started = asyncio.Event()
+
+        async def slow_rm(name: str) -> bool:
+            events.append("rm start")
+            rm_started.set()
+            await asyncio.sleep(0.1)
+            events.append("rm done")
+            return True
+
+        monkeypatch.setattr(provider, "_remove", slow_rm)
+        task = asyncio.create_task(provider.create(_config()))
+        await asyncio.wait_for(run.started.wait(), 5)
+        task.cancel()
+        run.finish.set()
+        await asyncio.wait_for(rm_started.wait(), 5)
+        # Returning now makes asyncio.run cancel the rm in flight.
+
+    asyncio.run(main())
+
+    assert events[-1] == "rm done", events
     assert list(tmp_path.iterdir()) == []
