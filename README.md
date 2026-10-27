@@ -43,6 +43,7 @@ immutable commit it is built from.
 | `claude-cli` | `ghcr.io/agentparadise/agentic-workspace-claude` | Claude Code CLI with native OpenTelemetry, plus Codex as a delegation target |
 | `omni-agent` | `ghcr.io/agentparadise/agentic-workspace-omni-agent` | Claude Code and Codex on the shared capability runtime |
 | `toolchain` | `ghcr.io/agentparadise/agentic-workspace-toolchain` | `omni-agent` plus a native toolchain (compiler toolchain, rustup, pnpm, bun) for repositories that compile code |
+| `scripted-agent` | `ghcr.io/agentparadise/agentic-workspace-scripted-agent` | Load tests only: `claude-cli` with `claude` and `codex` replaced by the token-free scripted-agent replayer. Never a production image |
 | `interactive-tmux` | not published | Interactive CLIs in one tmux session, driven from the host |
 | `base` | not published | Minimal base image with no agent |
 
@@ -55,7 +56,9 @@ Images are published only from the protected `release` branch by
 multi-architecture images (amd64, arm64). Each digest carries a keyless
 Sigstore signature plus BuildKit SBOM and provenance attestations.
 `toolchain` is built FROM the exact `omni-agent` digest of the same run and
-passes a compile smoke test on both architectures before it is signed. There
+passes a compile smoke test on both architectures before it is signed;
+`scripted-agent` is built FROM the exact `claude-cli` digest of the same run
+and passes a replay smoke test on both architectures before it is signed. There
 is no `latest` tag.
 
 1. Pin by digest, never by tag.

@@ -7,6 +7,7 @@
 | `ghcr.io/agentparadise/agentic-workspace-claude` | `implementations/docker/images/claude-cli` | source |
 | `ghcr.io/agentparadise/agentic-workspace-omni-agent` | `implementations/docker/images/omni-agent` | source |
 | `ghcr.io/agentparadise/agentic-workspace-toolchain` | `implementations/docker/images/toolchain` | the omni-agent digest pushed in the same run |
+| `ghcr.io/agentparadise/agentic-workspace-scripted-agent` | `implementations/docker/images/scripted-agent` | the claude-cli digest pushed in the same run (load tests only, never a production image) |
 
 These names are distinct from every Agentic Primitives package, so the two
 repositories never publish to one package. Note the claude-cli image is
@@ -43,8 +44,9 @@ consumer's verification.
 2. Open a pull request from `main` into `release`. `CI` and the release
    workflow's `Integration Gate` run on it; nothing is published.
 3. Merge it. The push to `release` runs:
-   1. **Integration gate**: single-arch builds of all three images, the
-      entrypoint integration suite, and the amd64 toolchain compile smoke.
+   1. **Integration gate**: single-arch builds of all four images, the
+      entrypoint integration suite, the amd64 toolchain compile smoke and the
+      amd64 scripted-agent replay smoke.
    2. **claude-cli** and **omni-agent** in parallel: multi-arch build, push
       untagged by digest with BuildKit SBOM + max-mode provenance, keyless
       cosign sign, verify against the identity above, then tag.
@@ -54,6 +56,13 @@ consumer's verification.
       `pnpm install`, `bun run`) on **linux/amd64 and linux/arm64** against
       that digest, then sign, verify and tag. What was tested is byte for byte
       what is tagged.
+   4. **scripted-agent**, after claude-cli: verify claude-cli's signature,
+      build FROM `agentic-workspace-claude@<that digest>` with the repository
+      root as context, push untagged by digest, run the replay smoke
+      (`claude` and `codex` replay a two-phase profile from the baked
+      recordings with `--network none`, every model reported as
+      `syn-scripted-agent`, a missing profile refused) on **linux/amd64 and
+      linux/arm64** against that digest, then sign, verify and tag.
 
 ## Tags
 
@@ -66,9 +75,9 @@ consumer's verification.
 - **No `latest`.** It is never published.
 
 Labels on every release image include `agentic.image.channel=release`,
-`org.opencontainers.image.revision=<commit>`, and for toolchain
-`org.opencontainers.image.base.name` / `base.digest` naming the omni digest it
-was built on.
+`org.opencontainers.image.revision=<commit>`, and for toolchain and
+scripted-agent `org.opencontainers.image.base.name` / `base.digest` naming the
+omni or claude-cli digest it was built on.
 
 ## Consuming
 
@@ -83,6 +92,11 @@ uv run scripts/build-provider.py omni-agent        # tags omni-agent-workspace:l
 uv run scripts/build-provider.py toolchain        # FROM omni-agent-workspace:latest
 uv run scripts/build-provider.py toolchain --build-arg OMNI_IMAGE=<ref>   # any other base
 implementations/docker/images/toolchain/smoke/run.sh agentic-workspace-toolchain:latest
+uv run scripts/build-provider.py claude-cli       # tags agentic-workspace-claude-cli:latest locally
+docker build -f implementations/docker/images/scripted-agent/Dockerfile \
+  --build-arg CLAUDE_IMAGE=agentic-workspace-claude-cli:latest \
+  -t agentic-workspace-scripted-agent:latest .      # repository-root context, not staged
+implementations/docker/images/scripted-agent/smoke/run.sh agentic-workspace-scripted-agent:latest
 ```
 
 Local tags such as `:latest` exist only in your Docker daemon; they are what
