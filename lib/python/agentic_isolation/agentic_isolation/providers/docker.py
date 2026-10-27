@@ -166,6 +166,9 @@ class WorkspaceDockerProvider(BaseProvider):
         self._workspace_host_dir = Path(workspace_host_dir) if workspace_host_dir else None
         self._credentials = credentials
         self._workspaces: dict[str, Workspace] = {}
+        # Cleanups of a `create` that was cancelled. Held so they are not
+        # garbage-collected, and so a repeated cancel cannot interrupt them.
+        self._abandoned_creates: set[asyncio.Task[None]] = set()
         # Workspaces whose container is gone but whose directory is kept,
         # keyed by container name (the `WorkspaceRef.resource_id`). An entry
         # lives from container removal until the directory is deleted, so a
@@ -318,6 +321,7 @@ class WorkspaceDockerProvider(BaseProvider):
             runtime.alias,
         )
 
+        proc: asyncio.subprocess.Process | None = None
         try:
             # Credential values reach docker through its own environment;
             # `-e NAME` makes the CLI copy them, so no value is in the argv.
@@ -370,11 +374,51 @@ class WorkspaceDockerProvider(BaseProvider):
             logger.info("Container created (id=%s, container=%s)", workspace_id, container_name)
             return workspace
 
+        except asyncio.CancelledError:
+            # Not an `Exception`, so without this arm a cancel left the
+            # `docker run` child running and its container behind. The
+            # cleanup is shielded: a second cancel must not interrupt it.
+            task = asyncio.create_task(self._abandon_create(proc, container_name, workspace_dir))
+            self._abandoned_creates.add(task)
+            task.add_done_callback(self._abandoned_creates.discard)
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(task)
+            raise
         except Exception as e:
             logger.exception("Failed to create container: %s", e)
-            await self._cleanup_container(container_name)
+            if not await self._cleanup_container(container_name):
+                # The original type is kept: callers catch it by type.
+                # Listing by the provider's labels finds the survivor.
+                e.add_note(f"docker rm -f {container_name} failed; the container may still exist")
             shutil.rmtree(workspace_dir, ignore_errors=True)
             raise
+
+    #: Bounds waiting for a cancelled `docker run` before it is killed.
+    _ABANDON_RUN_TIMEOUT_SECONDS = 60.0
+
+    async def _abandon_create(
+        self,
+        proc: asyncio.subprocess.Process | None,
+        container_name: str,
+        workspace_dir: Path,
+    ) -> None:
+        """Clean up after a cancelled `create`. Never raises.
+
+        The `docker run` client is let finish first: killing it mid-create
+        does not stop the daemon, which could then create the container
+        after the `rm` below had already run.
+        """
+        try:
+            if proc is not None and proc.returncode is None:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=self._ABANDON_RUN_TIMEOUT_SECONDS)
+                except TimeoutError:
+                    await self._terminate(proc)
+            await self._cleanup_container(container_name)
+        except Exception as exc:  # noqa: BLE001 - nobody is left to raise to
+            logger.warning("cleanup of cancelled create %s failed: %s", container_name, exc)
+        finally:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
 
     def _build_run_command(
         self,
@@ -1481,8 +1525,8 @@ class WorkspaceDockerProvider(BaseProvider):
         )
         return await proc.wait() == 0
 
-    async def _cleanup_container(self, container_name: str) -> None:
-        """Stop and remove a container.
+    async def _cleanup_container(self, container_name: str) -> bool:
+        """Stop and remove a container. False if it may still exist.
 
         Composed from the same steps the staged protocol exposes, so the
         combined path and the staged path cannot drift into behaving
@@ -1491,6 +1535,8 @@ class WorkspaceDockerProvider(BaseProvider):
         await self._stop(container_name)
         if not await self._remove(container_name):
             logger.warning("docker rm -f %s failed; the container may still exist", container_name)
+            return False
+        return True
 
 
 def _rmtree(path: str) -> OSError | None:
