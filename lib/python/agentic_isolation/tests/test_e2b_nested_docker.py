@@ -8,8 +8,11 @@ tests/integration/test_e2b_live.py::test_nested_docker_template_runs_compose_pos
 
 from __future__ import annotations
 
+import os
 import shlex
+import subprocess
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +21,7 @@ from agentic_isolation.providers import (
     DOCKER_APT_KEY_FINGERPRINT,
     DOCKER_READY_CMD,
     NESTED_DOCKER,
+    VERSIONS_PATH,
     CommandExit,
     DockerEngine,
     E2BTemplateSpec,
@@ -100,7 +104,7 @@ async def test_docker_template_layers_the_pinned_engine_on_the_pinned_image(
     ):
         assert package in install[0]
     # The key is checked before the repository is added or any package trusted.
-    key_check = install[0].index(f"fpr:::::::::{DOCKER_APT_KEY_FINGERPRINT}:")
+    key_check = install[0].index(f"= {DOCKER_APT_KEY_FINGERPRINT}")
     assert key_check < install[0].index("sources.list.d/docker.list")
     assert "usermod -aG docker agent" in install[0]
     assert "get.docker.com" not in install[0]
@@ -275,3 +279,97 @@ def test_docker_ready_seconds_must_be_positive() -> None:
 def test_specs_compare_by_value_so_a_receipt_records_the_engine() -> None:
     spec = _spec()
     assert replace(spec, docker=DockerEngine()) != spec
+
+
+# The generated build steps, executed by a real shell with stand-in tools.
+
+
+def _step(commands: list[str], marker: str) -> str:
+    (step,) = [command for command in commands if marker in command]
+    return step
+
+
+def _sh(command: str, tmp_path: Path, **tools: str) -> subprocess.CompletedProcess[str]:
+    """Run `command` with each of `tools` replaced by a script printing its value."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name, output in tools.items():
+        (bin_dir / name).write_text(f"#!/bin/sh\ncat <<'OUT'\n{output}OUT\n")
+        (bin_dir / name).chmod(0o755)
+    return subprocess.run(
+        ["sh", "-c", command],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _pub(fingerprint: str) -> str:
+    return (
+        "pub:-:4096:1:8D81803C0EBFCD88:1487788586:::-:::scESA::::::23::0:\n"
+        f"fpr:::::::::{fingerprint}:\n"
+    )
+
+
+_SUB = (
+    "sub:-:4096:1:7EA0A9C3F273FCD8:1487792064:::-:::s::::::23:\n"
+    "fpr:::::::::D3306A018370199E527AE7997EA0A9C3F273FCD8:\n"
+)
+_OTHER = "0123456789ABCDEF0123456789ABCDEF01234567"
+
+
+@pytest.mark.parametrize(
+    ("listing", "trusted"),
+    [
+        (_pub(DOCKER_APT_KEY_FINGERPRINT) + _SUB, True),
+        (_pub(_OTHER), False),
+        # Docker's key plus any other primary key: apt would trust both.
+        (_pub(DOCKER_APT_KEY_FINGERPRINT) + _SUB + _pub(_OTHER), False),
+        (_pub(_OTHER) + _pub(DOCKER_APT_KEY_FINGERPRINT), False),
+        ("", False),
+    ],
+)
+def test_the_key_check_trusts_exactly_one_primary_key_docker_s(
+    tmp_path: Path, listing: str, trusted: bool
+) -> None:
+    check = _step(DockerEngine().install_commands(), "gpg --show-keys")
+    assert (_sh(check, tmp_path, gpg=listing).returncode == 0) is trusted
+
+
+def test_the_apt_source_is_one_line_naming_the_suite(tmp_path: Path) -> None:
+    source = _step(DockerEngine().install_commands(), "printf")
+    target = tmp_path / "docker.list"
+    command = source.replace("/etc/apt/sources.list.d/docker.list", str(target))
+    assert _sh(command, tmp_path, dpkg="amd64\n").returncode == 0
+    assert target.read_text() == (
+        "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] "
+        "https://download.docker.com/linux/debian bookworm stable\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("os_release", "accepted"),
+    [
+        ("ID=debian\nVERSION_CODENAME=bookworm\n", True),
+        ("ID=debian\nVERSION_CODENAME=trixie\n", False),
+        ("ID=debian\nVERSION_CODENAME=bookworm-backports\n", False),
+    ],
+)
+def test_a_base_on_another_debian_release_fails_the_build(
+    tmp_path: Path, os_release: str, accepted: bool
+) -> None:
+    release = tmp_path / "os-release"
+    release.write_text(os_release)
+    check = _step(DockerEngine().install_commands(), "/etc/os-release")
+    command = check.replace("/etc/os-release", str(release))
+    assert (_sh(command, tmp_path).returncode == 0) is accepted
+
+
+def test_the_build_records_every_resolved_version_and_expects_the_pins() -> None:
+    engine = DockerEngine()
+    record = _step(engine.install_commands(), "dpkg-query")
+    assert record.endswith(f"> {VERSIONS_PATH}")
+    for package in (*engine.expected_versions(), "ca-certificates", "curl", "gnupg", "iptables"):
+        assert f" {package}" in record
+    assert engine.expected_versions()["containerd.io"] == engine.containerd_version

@@ -27,10 +27,14 @@ Docker CE, the compose and buildx plugins and containerd onto the pinned image
 in the E2B build itself, so no second image variant has to pass the release
 channel. Provenance stays explicit rather than collapsed into one digest: the
 base is still the verified digest, every Docker package is an exact apt
-version from Docker's repository, whose signing key is checked against its
-published fingerprint before any package is trusted, and every pre-pulled
-image is pulled by digest and only then tagged. A base image on another
-Debian release fails the build, because the pinned versions name it.
+version from Docker's repository, whose key file must hold exactly one primary
+key with the pinned fingerprint before any package is trusted, and every
+pre-pulled image is pulled by digest and only then tagged. A base image on
+another Debian release fails the build (`/etc/os-release` is checked). The
+four bootstrap packages (ca-certificates, curl, gnupg, iptables) come from the
+base's own Debian sources and are NOT pinned; the build records every
+resolved version, theirs included, at `VERSIONS_PATH`, so a template says
+what it holds even where the spec could not fix it.
 
 E2B boots every sandbox, including a build step, under its own systemd as
 PID 1 even when the image has none (measured live 2026-10-27 on the pinned
@@ -76,6 +80,20 @@ DOCKER_APT_KEY_FINGERPRINT = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
 DOCKER_READY_CMD = "docker info >/dev/null 2>&1"
 _DOCKER_APT_KEY_URL = "https://download.docker.com/linux/debian/gpg"
 _DOCKER_APT_REPO = "https://download.docker.com/linux/debian"
+_DOCKER_KEYRING = "/etc/apt/keyrings/docker.asc"
+#: Written at build time: `package=version` for every package the layer installs.
+VERSIONS_PATH = "/opt/agentic/nested-docker.versions"
+_RECORDED_PACKAGES = (
+    "docker-ce",
+    "docker-ce-cli",
+    "containerd.io",
+    "docker-compose-plugin",
+    "docker-buildx-plugin",
+    "ca-certificates",
+    "curl",
+    "gnupg",
+    "iptables",
+)
 _APT_VERSION = re.compile(r"[0-9][A-Za-z0-9.+:~-]*")
 _SUITE = re.compile(r"[a-z]+")
 _USER = re.compile(r"[a-z_][a-z0-9_-]*")
@@ -161,15 +179,21 @@ class DockerEngine:
             f"docker-buildx-plugin={self.buildx_version}",
         ]
         apt = "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends"
+        names = " ".join(_RECORDED_PACKAGES)
         return [
             "set -eu",
+            # The pinned versions name a Debian release; refuse any other base.
+            f"grep -qx VERSION_CODENAME={self.apt_suite} /etc/os-release",
             "apt-get update",
             f"{apt} ca-certificates curl gnupg iptables",
             "install -m 0755 -d /etc/apt/keyrings",
-            f"curl -fsSL {_DOCKER_APT_KEY_URL} -o /etc/apt/keyrings/docker.asc",
-            # The key is trusted only if it is the one Docker publishes.
-            "gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc | grep -qx "
-            + shlex.quote(f"fpr:::::::::{self.apt_key_fingerprint}:"),
+            f"curl -fsSL {_DOCKER_APT_KEY_URL} -o {_DOCKER_KEYRING}",
+            # Trusted only if the file holds exactly one primary key, Docker's:
+            # apt trusts every key in a signed-by file, so a second must fail.
+            'test "$(gpg --show-keys --with-colons '
+            + _DOCKER_KEYRING
+            + ' | awk -F: \'$1 == "pub" { getline; print $10 }\')" = '
+            + self.apt_key_fingerprint,
             # The suite is checked to be a bare codename, so it needs no quoting.
             "printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] "
             f'{_DOCKER_APT_REPO} {self.apt_suite} stable\\n\' "$(dpkg --print-architecture)"'
@@ -178,8 +202,20 @@ class DockerEngine:
             f"{apt} {shlex.join(packages)}",
             "rm -rf /var/lib/apt/lists/*",
             f"usermod -aG docker {shlex.quote(self.docker_user)}",
-            "docker --version && docker compose version",
+            # What was resolved, the unpinned bootstrap packages included.
+            f"dpkg-query -W -f '${{Package}}=${{Version}}\\n' {names} > {VERSIONS_PATH}",
+            f"cat {VERSIONS_PATH}",
         ]
+
+    def expected_versions(self) -> dict[str, str]:
+        """The pinned package versions `VERSIONS_PATH` must show, by package."""
+        return {
+            "docker-ce": self.docker_ce_version,
+            "docker-ce-cli": self.docker_ce_version,
+            "containerd.io": self.containerd_version,
+            "docker-compose-plugin": self.compose_version,
+            "docker-buildx-plugin": self.buildx_version,
+        }
 
     def pre_pull_commands(self) -> list[str]:
         """Root build steps that pull each image by digest and tag it."""

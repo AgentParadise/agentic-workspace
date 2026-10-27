@@ -435,7 +435,9 @@ services:
     environment:
       POSTGRES_PASSWORD: aw91-not-a-secret
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
+      # Over TCP: the image's first-boot init runs a socket-only server that
+      # a socket check reports ready and that then stops (measured live, #91).
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
       interval: 1s
       retries: 60
 """
@@ -460,12 +462,14 @@ async def test_nested_docker_template_runs_compose_postgres() -> None:
     workspace, so the Docker layer is shown not to have replaced the base.
     The template is NOT deleted: E2B templates are kept for the owner to review.
     """
-    from agentic_isolation.providers import NESTED_DOCKER, DockerEngine, PrePull
+    from agentic_isolation.providers import NESTED_DOCKER, VERSIONS_PATH, DockerEngine, PrePull
 
     # The SDK reads the key from the environment. Never hold it in a local or
     # pass it as an argument: a failing traceback prints both (it did, #91).
     _, expected = _required("E2B_API_KEY", "E2B_DOCKER_MANIFEST_HASH")
     manifest = os.environ.get("E2B_MANIFEST_PATH", "/opt/agentic/version.json")
+    # An E2B_DOCKER_TEMPLATE must have been built with this same engine.
+    engine = DockerEngine(pre_pull=(PrePull("postgres:16", _POSTGRES_16),))
     template = os.environ.get("E2B_DOCKER_TEMPLATE")
     if not template:
         (image,) = _required("E2B_DOCKER_BASE_IMAGE")
@@ -476,7 +480,7 @@ async def test_nested_docker_template_runs_compose_postgres() -> None:
             expected_manifest_hash=expected,
             cpu_count=2,
             memory_mb=4096,
-            docker=DockerEngine(pre_pull=(PrePull("postgres:16", _POSTGRES_16),)),
+            docker=engine,
         )
         started = time.monotonic()
         receipt = await build_template(spec)
@@ -497,6 +501,17 @@ async def test_nested_docker_template_runs_compose_postgres() -> None:
         assert "sha256:" + hashed.split()[0] == expected
         groups = await _run(provider, workspace, "id -un; id -nG")
         assert groups.split()[0] == "agent" and "docker" in groups.split()[1:]
+        expected_versions = engine.expected_versions()
+        recorded = await _run(provider, workspace, f"cat {VERSIONS_PATH}")
+        installed = dict(line.split("=", 1) for line in recorded.split())
+        assert {name: installed.get(name) for name in expected_versions} == expected_versions
+        # What dpkg holds now, not only what the build wrote down.
+        held = await _run(
+            provider,
+            workspace,
+            "dpkg-query -W -f '${Package}=${Version}\\n' " + " ".join(expected_versions),
+        )
+        assert dict(line.split("=", 1) for line in held.split()) == expected_versions
         await _run(
             provider,
             workspace,
@@ -511,7 +526,9 @@ async def test_nested_docker_template_runs_compose_postgres() -> None:
         assert _POSTGRES_16 in digests
         await provider.write_file(workspace, "compose.yaml", _COMPOSE)
         await _run(provider, workspace, "docker compose up -d --wait --wait-timeout 120")
-        ready = await _run(provider, workspace, "docker compose exec -T db pg_isready -U postgres")
+        ready = await _run(
+            provider, workspace, "docker compose exec -T db pg_isready -h 127.0.0.1 -U postgres"
+        )
         assert "accepting connections" in ready
         await _run(provider, workspace, "docker compose down -v")
     finally:
