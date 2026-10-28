@@ -225,6 +225,29 @@ RUN claude --version && codex --version && python3 --version && node --version \
 # have introduced new ones.
 RUN find / -path /usr/local -prune -o -path /proc -prune -o -perm /6000 -type f -exec chmod a-s {} \; 2>/dev/null || true
 
+# =============================================================================
+# Image version manifest: /opt/agentic/version.json (#93)
+# =============================================================================
+# What this image is, for syntropic137 (ImageManifest) and the E2B template's
+# expected_manifest_hash. Written by scripts/version_manifest.py, bind-mounted
+# for this RUN only, from the AGENTIC_* build args (exported to RUN as env) that
+# `version_manifest.py build-args` computes (build-provider.py and the release
+# workflow pass them; an unset one fails the build). Each component is checked
+# against the binary on PATH before it is recorded. Deterministic per commit:
+# built_at is the commit's time, never the wall clock. Carries omni's components forward
+# (fails if the base has no manifest or is not omni-agent) and adds the
+# toolchain's own. Before the $HOME ownership gate below, which it must pass.
+ARG AGENTIC_PROVIDER
+ARG AGENTIC_PROVIDER_VERSION
+ARG AGENTIC_MANIFEST_DIGEST
+ARG AGENTIC_BUILD_COMMIT
+ARG AGENTIC_BUILT_AT
+RUN --mount=type=bind,source=scripts/version_manifest.py,target=/tmp/version_manifest.py \
+    /opt/venv/bin/python /tmp/version_manifest.py write \
+      --inherit-from omni-agent \
+      --component "rustup=${RUSTUP_VERSION}@rustup" \
+      --component "bun=${BUN_VERSION}@bun"
+
 # Give $HOME back to agent, then PROVE it.
 #
 # Everything above ran as root while HOME stayed /home/agent (inherited from

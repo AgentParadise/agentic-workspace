@@ -9,7 +9,9 @@
 # with --network none and a tmpfs $HOME as production runs it: claude and
 # codex replay a tiny two-phase profile from the baked recordings, every model
 # is reported as syn-scripted-agent, the artifacts are written, and a missing
-# profile is refused. See check.py for the full list. Needs no network.
+# profile is refused. See check.py for the full list. Then checks
+# /opt/agentic/version.json (scripts/check-image-version-manifest.sh). Needs no
+# network.
 set -euo pipefail
 
 image="${1:?usage: run.sh IMAGE [PLATFORM]}"
@@ -60,5 +62,9 @@ if ! docker run --rm \
   exit 1
 fi
 grep -qx 'SCRIPTED AGENT SMOKE PASS' "$log" || { echo "== FAIL: no pass marker" >&2; exit 1; }
+
+# The image version manifest (#93): present, parseable, and describing this
+# image built from this checkout's commit, without the real harnesses.
+"${here}/../../../../../scripts/check-image-version-manifest.sh" "$image" scripted-agent "$platform"
 
 echo "== scripted-agent smoke PASS: ${image} ${platform:-native}"

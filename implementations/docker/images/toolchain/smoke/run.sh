@@ -13,7 +13,9 @@
 #   - bun run a TypeScript entry that imports the installed package,
 #   - enumerate an llvmpipe Vulkan adapter (Mesa lavapipe) with no GPU,
 # and that the toolchain entrypoint wrapper fails closed on a planted
-# /workspace/.tools symlink. Needs network (toolchain, pnpm, npm registry).
+# /workspace/.tools symlink, and that /opt/agentic/version.json describes this
+# image (scripts/check-image-version-manifest.sh). Needs network (toolchain,
+# pnpm, npm registry).
 set -euo pipefail
 
 image="${1:?usage: run.sh IMAGE [PLATFORM]}"
@@ -108,5 +110,9 @@ if [ "$neg_rc" -eq 0 ] || grep -q COMMAND_RAN <<<"$neg_out" \
   exit 1
 fi
 echo "[smoke] planted /workspace/.tools symlink refused (rc=${neg_rc})"
+
+# 3. The image version manifest (#93): present, parseable, and describing
+#    this image built from this checkout's commit.
+"${here}/../../../../../scripts/check-image-version-manifest.sh" "$image" toolchain "$platform"
 
 echo "== toolchain smoke PASS: ${image} ${platform:-native}"

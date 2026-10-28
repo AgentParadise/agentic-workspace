@@ -429,6 +429,33 @@ RUN typescript-language-server --version \
 # Security: Remove setuid/setgid binaries (exclude /usr/local)
 RUN find / -path /usr/local -prune -o -perm /6000 -type f -exec chmod a-s {} \; 2>/dev/null || true
 
+# =============================================================================
+# Image version manifest: /opt/agentic/version.json (#93)
+# =============================================================================
+# What this image is, for syntropic137 (ImageManifest) and the E2B template's
+# expected_manifest_hash. Written by scripts/version_manifest.py, bind-mounted
+# for this RUN only, from the AGENTIC_* build args (exported to RUN as env) that
+# `version_manifest.py build-args` computes (build-provider.py and the release
+# workflow pass them; an unset one fails the build). Each component is checked
+# against the binary on PATH before it is recorded. Deterministic per commit:
+# built_at is the commit's time, never the wall clock. Late in the file so a
+# new commit rebuilds only this layer.
+ARG AGENTIC_PROVIDER
+ARG AGENTIC_PROVIDER_VERSION
+ARG AGENTIC_MANIFEST_DIGEST
+ARG AGENTIC_BUILD_COMMIT
+ARG AGENTIC_BUILT_AT
+ARG CLAUDE_CLI_VERSION
+ARG CODEX_CLI_VERSION
+ARG SKILLS_CLI_VERSION
+ARG PLAYWRIGHT_VERSION
+RUN --mount=type=bind,source=scripts/version_manifest.py,target=/tmp/version_manifest.py \
+    /opt/venv/bin/python /tmp/version_manifest.py write \
+      --component "claude_cli=${CLAUDE_CLI_VERSION}@claude" \
+      --component "codex_cli=${CODEX_CLI_VERSION}@codex" \
+      --component "skills_cli=${SKILLS_CLI_VERSION}@skills" \
+      --component "playwright=${PLAYWRIGHT_VERSION}@playwright"
+
 # Set working directory
 WORKDIR /workspace
 

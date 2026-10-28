@@ -142,6 +142,7 @@ jobs:
             implementations/docker/images/toolchain/smoke/run.sh \
             implementations/docker/images/toolchain/smoke/inside.sh \
             implementations/docker/images/scripted-agent/smoke/run.sh \
+            scripts/check-image-version-manifest.sh \
             .github/scripts/release-image-tags.sh
 
   docker-conformance:
