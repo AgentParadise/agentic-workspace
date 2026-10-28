@@ -21,8 +21,11 @@
 # BUILD. The context is the repository root (it needs lib/python and the
 # claude-cli recordings), so build-provider.py does not stage it:
 #
+#   mapfile -t version_args < <(uv run --no-project scripts/version_manifest.py \
+#     build-args scripted-agent --format docker)
 #   docker build -f implementations/docker/images/scripted-agent/Dockerfile \
-#     --build-arg CLAUDE_IMAGE=ghcr.io/agentparadise/agentic-workspace-claude@sha256:... .
+#     --build-arg CLAUDE_IMAGE=ghcr.io/agentparadise/agentic-workspace-claude@sha256:... \
+#     "${version_args[@]}" .
 #
 # BASE PINNING. CLAUDE_IMAGE has no default on purpose, as in toolchain: an
 # unset value fails the build instead of resolving a mutable tag. Pass a
@@ -65,5 +68,41 @@ RUN npm uninstall -g @anthropic-ai/claude-code @openai/codex \
     done \
     && chmod -R a+rX /opt/scripted-agent \
     && ! find / -xdev -path /proc -prune -o -name cli.js -path '*claude-code*' -print | grep -q .
+
+# The APS-V1-0004 session exporter, so the session-store capability can capture
+# the native transcripts the replayer writes (syntropic137#1918, decision D8:
+# copy it in and keep claude-cli as the base). The SAME pinned, cosign-verified
+# digest as omni-agent; see the omni-agent Dockerfile for its provenance record.
+# CI checks the two pins are equal and the release verifies the signature
+# before building. The version is asserted, not printed, as in omni-agent.
+COPY --from=ghcr.io/agentparadise/agentic-session-exporter@sha256:3bed7d12fa0529621787cf6ea7964f34218fe8f6ee72fad6309d2b86f0cd63f3 \
+     /apss-session-exporter /usr/local/bin/
+RUN chmod 755 /usr/local/bin/apss-session-exporter \
+    && /usr/local/bin/apss-session-exporter --version \
+       | grep -q '^apss-session-exporter 0\.6\.0 '
+
+# =============================================================================
+# Image version manifest: /opt/agentic/version.json (#93)
+# =============================================================================
+# What this image is, for syntropic137 (ImageManifest) and the E2B template's
+# expected_manifest_hash. Written by scripts/version_manifest.py, bind-mounted
+# for this RUN only, from the AGENTIC_* build args (exported to RUN as env) that
+# `version_manifest.py build-args` computes (build-provider.py and the release
+# workflow pass them; an unset one fails the build). Each component is checked
+# against the binary on PATH before it is recorded. Deterministic per commit:
+# built_at is the commit's time, never the wall clock. Carries claude-cli's components forward
+# minus the two real harnesses this image uninstalled, and records the
+# replayer's own package version instead.
+ARG AGENTIC_PROVIDER
+ARG AGENTIC_PROVIDER_VERSION
+ARG AGENTIC_MANIFEST_DIGEST
+ARG AGENTIC_BUILD_COMMIT
+ARG AGENTIC_BUILT_AT
+RUN --mount=type=bind,source=scripts/version_manifest.py,target=/tmp/version_manifest.py \
+    /opt/venv/bin/python /tmp/version_manifest.py write \
+      --inherit-from claude-cli \
+      --drop claude_cli --drop codex_cli \
+      --component "apss_session_exporter=0.6.0@apss-session-exporter" \
+      --component "scripted_agent=$(/opt/scripted-agent/venv/bin/python -c 'import importlib.metadata as m; print(m.version("scripted-agent"))')"
 
 USER agent

@@ -4,6 +4,9 @@
 #
 # Built FROM a claude-cli digest with the repository root as context, so
 # scripts/build-provider.py does not stage it; see the Dockerfile header.
+# Released as ghcr.io/agentparadise/agentic-workspace-scripted-agent by
+# .github/workflows/release-images.yml, FROM the claude-cli digest signed in
+# the same run, after smoke/run.sh passes on amd64 and arm64.
 
 name: scripted-agent
 version: "0.1.0"

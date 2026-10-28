@@ -23,7 +23,11 @@ never part of a production image.
    claude tool use is a `tool_use` block; a codex one is an `item.started` of a
    `command_execution` or `file_change`, as syntropic137's
    `CodexStreamProcessor` counts them.
-4. Prints the recording's events at recorded timing x `pacing_factor`, every
+4. Starts a fresh session: every occurrence of the recording's session id
+   (claude `session_id`, codex `thread_id`) is replaced by a new UUID, as a
+   real harness starts each run with one. Replays of one recording therefore
+   never share a session in the store.
+5. Prints the recording's events at recorded timing x `pacing_factor`, every
    `model` (and `modelUsage` key) rewritten to `syn-scripted-agent` (codex
    names no model on stdout, so its first event carries one), then
    sleeps the recorded delay before the closing event. The phase's work runs
@@ -33,11 +37,25 @@ never part of a production image.
    assistant `text` block) is replaced by a fixed note. syntropic137's
    `VerdictReader` ranks FAILURE over SUCCESS across every message, so a
    recorded failure left in the stream would outrank the profile's verdict.
-5. Runs the workload (`none`, `synthetic`, or `just preflight-agent` in the
+6. Runs the workload (`none`, `synthetic`, or `just preflight-agent` in the
    cloned fixture repo), performs the side effect with git/gh, writes
    `artifacts/output/<phase_id>.md` via `render_artifact`, and prints
    `task_result(phase_id)`: as the claude `result` event's `result`, or as a
    last codex `agent_message` before the recording's `turn.completed`.
+7. Throughout, writes the native transcript the harness would leave
+   (`scripted_agent/transcript.py`). It is opened before the first event and
+   each event is appended, stamped and flushed as it is printed; the closing
+   events are recorded before they are printed, so a phase that fails part way
+   leaves a partial session and success is never printed for an unwritten one.
+   Claude rows at
+   `$CLAUDE_CONFIG_DIR/projects/<cwd slug>/<session>.jsonl` (default
+   `~/.claude`), a codex rollout at
+   `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl` (default
+   `~/.codex`). The rows are the shapes `agentic_isolation`'s transcript
+   sources, native evidence and conversation readers already read
+   (`tests/test_transcript.py` reads them back through those readers), so
+   the session-store capability captures a replay like a real run. The image
+   ships `apss-session-exporter` for that capture.
 
 It opens no network connection itself. git and gh talk only to the fixture
 repository, with the workspace's credential.
@@ -50,6 +68,7 @@ repository, with the workspace's credential.
 | 78 | no profile, an invalid one, or no phase/execution id to read it for |
 | 65 | the recording is not the declared stream (malformed, version, tool uses, subagents) |
 | 69 | a workload or git/gh step failed |
+| 74 | the native transcript could not be opened or written (no `$HOME`, an unwritable root); it is opened before the first event, so an unusable root prints nothing |
 
 ## Limits
 
@@ -60,6 +79,12 @@ repository, with the workspace's credential.
 - Recordings that launch subagents (`Task` or `Agent` tool uses) are refused.
   The session observer records those as subagent starts, not tool executions,
   so the driver's read-back count could never equal `tool_uses`.
+- The transcript is rebuilt from the stream, not recorded from the harness:
+  claude rows carry the stream's messages with the native envelope fields and
+  no human prompt row; a codex rollout carries only `AgentMessage` and
+  `CommandExecution` items (other `codex exec --json` item kinds get no row).
+  Enough for every reader above and for the exporter, not a byte-faithful
+  copy of a real session file.
 - Recordings ship at `/opt/scripted-agent/recordings/` in the image; a profile's
   `stream.recording` names a path there.
 

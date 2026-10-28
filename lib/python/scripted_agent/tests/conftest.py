@@ -36,3 +36,13 @@ def no_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(socket.socket, "connect", connect)
     monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
     return contacted
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> Any:
+    """Every replay writes a native transcript under $HOME; never the real one."""
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    return home

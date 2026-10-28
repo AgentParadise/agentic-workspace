@@ -26,7 +26,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Literal, TypeVar
 
 from agentic_isolation.config import (
     CODEX_IMAGE_LABEL,
@@ -318,6 +318,7 @@ class WorkspaceDockerProvider(BaseProvider):
             runtime.alias,
         )
 
+        proc: asyncio.subprocess.Process | None = None
         try:
             # Credential values reach docker through its own environment;
             # `-e NAME` makes the CLI copy them, so no value is in the argv.
@@ -370,11 +371,67 @@ class WorkspaceDockerProvider(BaseProvider):
             logger.info("Container created (id=%s, container=%s)", workspace_id, container_name)
             return workspace
 
+        except asyncio.CancelledError:
+            # Not an `Exception`, so without this arm a cancel left the
+            # `docker run` child running and its container behind. Every
+            # await below is bounded and outlives a repeated cancel, so this
+            # always finishes before the cancel is re-raised.
+            await self._abandon_create(proc, container_name, workspace_dir)
+            raise
         except Exception as e:
             logger.exception("Failed to create container: %s", e)
-            await self._cleanup_container(container_name)
+            if not await self._cleanup_container(container_name):
+                # The original type is kept: callers catch it by type.
+                # Listing by the provider's labels finds the survivor.
+                e.add_note(f"docker rm -f {container_name} failed; the container may still exist")
             shutil.rmtree(workspace_dir, ignore_errors=True)
             raise
+
+    #: Bounds waiting for a cancelled `docker run` before it is killed.
+    _ABANDON_RUN_TIMEOUT_SECONDS = 30.0
+    #: Bounds the `docker rm -f` after a cancelled create.
+    _ABANDON_RM_TIMEOUT_SECONDS = 15.0
+    #: Bounds reaping a `docker run` client killed after its timeout.
+    _ABANDON_KILL_TIMEOUT_SECONDS = 5.0
+
+    async def _abandon_create(
+        self,
+        proc: asyncio.subprocess.Process | None,
+        container_name: str,
+        workspace_dir: Path,
+    ) -> None:
+        """Clean up after a cancelled `create`. Never raises; bounded.
+
+        Each step runs under `_settle`, so a further cancel, including the
+        one `asyncio.run` sends every task at shutdown, cannot stop it
+        part-way. The `docker run` client is let finish first: killing it
+        does not stop the daemon, which could then create the container
+        after the `rm` had run. When it has to be killed anyway, or the
+        cancel landed before it spawned, that container can still appear;
+        it carries the provider's labels, so listing finds it.
+
+        `rm -f` only, no `docker stop`: nothing ran in the container yet,
+        so there are no finalizer logs to keep.
+        """
+        try:
+            if proc is not None and proc.returncode is None:
+                if await _settle(proc.wait, self._ABANDON_RUN_TIMEOUT_SECONDS) is None:
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        proc.kill()
+                    await _settle(proc.wait, self._ABANDON_KILL_TIMEOUT_SECONDS)
+            removed = await _settle(
+                lambda: self._remove(container_name), self._ABANDON_RM_TIMEOUT_SECONDS
+            )
+            if not removed:
+                logger.warning(
+                    "docker rm -f %s after a cancelled create failed or timed out; "
+                    "the container may still exist",
+                    container_name,
+                )
+        except Exception as exc:  # noqa: BLE001 - nobody is left to raise to
+            logger.warning("cleanup of cancelled create %s failed: %s", container_name, exc)
+        finally:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
 
     def _build_run_command(
         self,
@@ -1481,8 +1538,8 @@ class WorkspaceDockerProvider(BaseProvider):
         )
         return await proc.wait() == 0
 
-    async def _cleanup_container(self, container_name: str) -> None:
-        """Stop and remove a container.
+    async def _cleanup_container(self, container_name: str) -> bool:
+        """Stop and remove a container. False if it may still exist.
 
         Composed from the same steps the staged protocol exposes, so the
         combined path and the staged path cannot drift into behaving
@@ -1491,6 +1548,50 @@ class WorkspaceDockerProvider(BaseProvider):
         await self._stop(container_name)
         if not await self._remove(container_name):
             logger.warning("docker rm -f %s failed; the container may still exist", container_name)
+            return False
+        return True
+
+
+_T = TypeVar("_T")
+
+
+async def _settle(step: Callable[[], Awaitable[_T]], timeout: float) -> _T | None:
+    """Run `step` to completion through any number of cancels, within `timeout`.
+
+    A cancel of the caller is absorbed, not re-raised: the caller is cleanup
+    that must finish, and re-raises its own cancel afterwards. A cancel of
+    the step itself from outside (`asyncio.run` cancels every task once at
+    shutdown) re-runs it, so `step` must be safe to repeat. None when the
+    deadline passed or the step failed.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        task = asyncio.ensure_future(step())
+        while not task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                task.cancel()
+                # Held until it settles, and its outcome read, so neither
+                # garbage collection nor an unretrieved exception is logged.
+                _abandoned_steps.add(task)
+                task.add_done_callback(_forget_step)
+                return None
+            # `asyncio.wait` never cancels what it waits on, so a cancel of
+            # this caller leaves the task running and the loop goes round.
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({task}, timeout=remaining)
+        if not task.cancelled():
+            return None if task.exception() is not None else task.result()
+
+
+_abandoned_steps: set[object] = set()
+
+
+def _forget_step(task: asyncio.Future[_T]) -> None:
+    _abandoned_steps.discard(task)
+    if not task.cancelled():
+        task.exception()
 
 
 def _rmtree(path: str) -> OSError | None:

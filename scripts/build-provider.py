@@ -33,6 +33,9 @@ from pathlib import Path
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import version_manifest  # noqa: E402  (sibling module, stdlib only)
+
 # Paths relative to the Agentic Workspace root
 ROOT = Path(__file__).parent.parent
 IMAGES_DIR = ROOT / "implementations" / "docker" / "images"
@@ -113,6 +116,22 @@ def stage_scripts(provider: str, build_context: Path) -> None:
     for path in sorted(scripts_dst.rglob("*")):
         if path.is_file():
             print(f"  ✓ Script: {path.relative_to(scripts_dst)}")
+
+
+def stage_version_manifest(provider: str, build_context: Path) -> None:
+    """Stage the version.json writer (#93) at scripts/version_manifest.py.
+
+    The same path the scripted-agent Dockerfile reads from the repository
+    root, so every image bind-mounts it identically. Never shipped: the
+    Dockerfile mounts it for one RUN only. Images outside the release set
+    (interactive-tmux) neither need nor get it.
+    """
+    if provider not in version_manifest.REQUIRED_COMPONENTS:
+        return
+    dst = build_context / "scripts" / "version_manifest.py"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(Path(version_manifest.__file__), dst)
+    print("  ✓ Script: version_manifest.py (version.json writer)")
 
 
 def stage_workspace_runtime(build_context: Path) -> None:
@@ -322,6 +341,7 @@ def main():
     # Stage files
     stage_dockerfile(provider, build_context)
     stage_scripts(provider, build_context)
+    stage_version_manifest(provider, build_context)
     stage_plugins(manifest, build_context)
     stage_workspace_runtime(build_context)
     build_wheels(build_context)
@@ -330,8 +350,13 @@ def main():
         print(f"\n✅ Staged to: {build_context}")
         return
 
-    # Build image
-    docker_build(build_context, tag, args.no_cache, resolve_build_args(manifest, args.build_arg))
+    # Build image. Every release image requires the version.json build args
+    # (#93); an explicit --build-arg still wins.
+    build_args = {}
+    if provider in version_manifest.REQUIRED_COMPONENTS:
+        build_args = version_manifest.build_args(provider, None)
+    build_args.update(resolve_build_args(manifest, args.build_arg))
+    docker_build(build_context, tag, args.no_cache, build_args)
 
 
 if __name__ == "__main__":
