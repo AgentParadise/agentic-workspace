@@ -69,6 +69,18 @@ RUN npm uninstall -g @anthropic-ai/claude-code @openai/codex \
     && chmod -R a+rX /opt/scripted-agent \
     && ! find / -xdev -path /proc -prune -o -name cli.js -path '*claude-code*' -print | grep -q .
 
+# The APS-V1-0004 session exporter, so the session-store capability can capture
+# the native transcripts the replayer writes (syntropic137#1918, decision D8:
+# copy it in and keep claude-cli as the base). The SAME pinned, cosign-verified
+# digest as omni-agent; see the omni-agent Dockerfile for its provenance record.
+# CI checks the two pins are equal and the release verifies the signature
+# before building. The version is asserted, not printed, as in omni-agent.
+COPY --from=ghcr.io/agentparadise/agentic-session-exporter@sha256:3bed7d12fa0529621787cf6ea7964f34218fe8f6ee72fad6309d2b86f0cd63f3 \
+     /apss-session-exporter /usr/local/bin/
+RUN chmod 755 /usr/local/bin/apss-session-exporter \
+    && /usr/local/bin/apss-session-exporter --version \
+       | grep -q '^apss-session-exporter 0\.6\.0 '
+
 # =============================================================================
 # Image version manifest: /opt/agentic/version.json (#93)
 # =============================================================================
@@ -90,6 +102,7 @@ RUN --mount=type=bind,source=scripts/version_manifest.py,target=/tmp/version_man
     /opt/venv/bin/python /tmp/version_manifest.py write \
       --inherit-from claude-cli \
       --drop claude_cli --drop codex_cli \
+      --component "apss_session_exporter=0.6.0@apss-session-exporter" \
       --component "scripted_agent=$(/opt/scripted-agent/venv/bin/python -c 'import importlib.metadata as m; print(m.version("scripted-agent"))')"
 
 USER agent

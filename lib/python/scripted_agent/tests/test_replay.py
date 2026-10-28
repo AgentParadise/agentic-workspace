@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import socket
 from collections.abc import Iterator, Sequence
 from pathlib import Path
@@ -105,6 +106,8 @@ def _env(phase_id: str, profile: dict[str, Any] | None = None) -> dict[str, str]
         SCRIPTED_AGENT_PROFILE_ENV: json.dumps(profile or _profile()),
         TAGS_ENV: f"execution_id:exec-1a2b,workspace_id:ws-1,phase_id:{phase_id}",
         "ANTHROPIC_BASE_URL": BASE_URL,
+        # The isolated HOME tests/conftest.py sets: every replay writes a transcript there.
+        "HOME": os.environ["HOME"],
     }
 
 

@@ -10,6 +10,13 @@ two-phase profile through both harness names:
   codex recording, every model reported as ``syn-scripted-agent``, each
   stream closing with the profile's ``TASK_RESULT``,
 - each phase writes its rendered artifact under ``/workspace/artifacts/output``,
+- each phase leaves the native transcript its harness would, under ``$HOME``
+  (``.claude/projects/-workspace/<session>.jsonl``,
+  ``.codex/sessions/.../rollout-*-<thread>.jsonl``), named for the session id
+  on its stream,
+- the baked ``apss-session-exporter`` (0.6.0) archives both into a local spool
+  as one ClaudeCode and one Codex session with those ids, each recording the
+  scripted model,
 - no profile at all is refused with exit 78 (EX_CONFIG).
 
 Prints ``SCRIPTED AGENT SMOKE PASS`` as its last line only when all hold.
@@ -168,6 +175,83 @@ def check_versions() -> None:
     print("[smoke] --version reports each phase's recorded CLI version")
 
 
+HOME = Path(os.environ.get("HOME", "/home/agent"))
+SESSIONS: dict[str, str] = {}
+"""Native session id per agent, as each phase's stream named it."""
+
+
+def rows(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def check_claude_transcript(stream: list[dict[str, object]]) -> None:
+    session = str(stream[0].get("session_id"))
+    path = HOME / ".claude" / "projects" / "-workspace" / f"{session}.jsonl"
+    if not path.is_file():
+        fail(f"no claude transcript at {path}")
+    written = rows(path)
+    if {r.get("sessionId") for r in written} != {session}:
+        fail(f"claude transcript rows are not all session {session}")
+    if set().union(*(models(r) for r in written)) != {MODEL}:
+        fail("claude transcript reports a model other than the scripted one")
+    last = written[-1].get("message")
+    want = [{"type": "text", "text": stream[-1].get("result")}]
+    if not isinstance(last, dict) or last.get("content") != want:
+        fail("claude transcript does not end with the stream's result")
+    SESSIONS["ClaudeCode"] = session
+    print(f"[smoke] claude transcript {path.name}: {len(written)} rows")
+
+
+def check_codex_transcript(stream: list[dict[str, object]]) -> None:
+    session = str(stream[0].get("thread_id"))
+    found = sorted((HOME / ".codex" / "sessions").rglob(f"rollout-*-{session}.jsonl"))
+    if len(found) != 1:
+        fail(f"want one codex rollout for {session}, found {found}")
+    written = rows(found[0])
+    header = written[0]
+    payload = header.get("payload")
+    if header.get("type") != "session_meta" or not isinstance(payload, dict):
+        fail("codex rollout does not open with session_meta")
+    if payload.get("id") != session or payload.get("session_id") != session:
+        fail(f"codex session_meta does not name {session}: {payload}")
+    SESSIONS["Codex"] = session
+    print(f"[smoke] codex rollout {found[0].name}: {len(written)} rows")
+
+
+def exporter(*args: str) -> str:
+    env = {**os.environ, "EXPORTER_SPOOL_DIR": "/tmp/scripted-agent-smoke-spool"}
+    done = subprocess.run(
+        ["apss-session-exporter", *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    if done.returncode != 0:
+        fail(f"apss-session-exporter {' '.join(args)} exited {done.returncode}")
+    return done.stdout
+
+
+def check_exporter() -> None:
+    """The real exporter captures what the replayer wrote, as session-store would."""
+    if not exporter("--version").startswith("apss-session-exporter 0.6.0 "):
+        fail("apss-session-exporter is not 0.6.0")
+    counts = json.loads(exporter("--spool-only"))
+    if counts.get("discovered") != 2 or counts.get("stored") != 2:
+        fail(f"exporter sweep found {counts}, want 2 discovered and stored")
+    listed = json.loads(exporter("--spool-list", "0"))
+    got = {e["agent"]: e["native_session_id"] for e in listed["entries"]}
+    if got != SESSIONS:
+        fail(f"exporter archived {got}, want {SESSIONS}")
+    for entry in listed["entries"]:
+        envelope = json.loads(exporter("--spool-read", str(entry["sequence"])))
+        model = (envelope.get("metadata") or {}).get("model")
+        if model != MODEL:
+            fail(f"{entry['agent']} envelope records model {model!r}, want {MODEL}")
+    print("[smoke] apss-session-exporter 0.6.0 archived both sessions, model scripted")
+
+
 def check_claude_phase() -> None:
     argv = ["claude", "-p", "smoke", "--output-format", "stream-json"]
     stream = events(run(argv, "implement"), "claude")
@@ -184,6 +268,7 @@ def check_claude_phase() -> None:
     if artifact != f"implement {EXECUTION} on loadtest/{EXECUTION}":
         fail(f"implement artifact is {artifact!r}")
     print(f"[smoke] claude replayed {len(stream)} events; artifact written")
+    check_claude_transcript(stream)
 
 
 def check_codex_phase() -> None:
@@ -205,6 +290,7 @@ def check_codex_phase() -> None:
     if artifact != "review CERTIFIED":
         fail(f"review artifact is {artifact!r}")
     print(f"[smoke] codex replayed {len(stream)} events; verdict and artifact written")
+    check_codex_transcript(stream)
 
 
 def check_refuses_without_profile() -> None:
@@ -221,6 +307,7 @@ def main() -> None:
     check_versions()
     check_claude_phase()
     check_codex_phase()
+    check_exporter()
     check_refuses_without_profile()
     print("SCRIPTED AGENT SMOKE PASS")
 

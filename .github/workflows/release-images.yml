@@ -605,6 +605,17 @@ jobs:
           MANIFEST_VERSION: ${{ steps.version.outputs.manifest_version }}
           REPO_VERSION: ${{ needs.plan.outputs.repo_version }}
         run: .github/scripts/release-image-tags.sh "$IMAGE" "$MANIFEST_VERSION" "$REPO_VERSION" "$GITHUB_SHA" > "$RUNNER_TEMP/tags.txt"
+      # The exporter pin (same digest as omni-agent's, CI checks they match)
+      # is verified before the build, as publish-omni verifies its own.
+      - name: Verify pinned session exporter input
+        run: |
+          set -euo pipefail
+          ref="$(grep -oE 'ghcr\.io/agentparadise/agentic-session-exporter@sha256:[0-9a-f]{64}' "implementations/docker/images/${PROVIDER}/Dockerfile" | head -1)"
+          [ -n "$ref" ] || { echo "::error::no pinned exporter digest in the Dockerfile"; exit 1; }
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/AgentParadise/agentic-session-exporter/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
+            --certificate-oidc-issuer "$OIDC_ISSUER" \
+            "$ref" > /dev/null
       # The base must be the claude-cli this run signed, checked against the
       # same exact identity consumers use, before anything is built on it.
       - name: Verify claude-cli base digest

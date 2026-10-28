@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,7 @@ from urllib.parse import unquote
 
 from pydantic import ValidationError
 
+from scripted_agent import transcript
 from scripted_agent.errors import ProfileRefused, Refusal, SideEffectFailed
 from scripted_agent.profile import (
     SCRIPTED_AGENT_PROFILE_ENV,
@@ -78,33 +80,64 @@ def replay(
     run: Run,
     sleep: Callable[[float], None],
     out: TextIO,
-) -> None:
-    """Carry out this workspace's phase: stream, workload, side effect, artifact, verdict."""
+    *,
+    cwd: Path | None = None,
+    new_session_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+    clock: transcript.Clock = transcript.now,
+) -> Path:
+    """Carry out this workspace's phase: stream, workload, side effect, artifact, verdict,
+    writing the native transcript the harness would leave as it goes. Returns its path.
+
+    The transcript is opened before the first event is printed and every event
+    is recorded there before it is printed, the closing ones included, so the
+    stream never reports success for a session whose transcript was not written.
+    """
     profile = load_profile(environ)
     target = _Target.from_tags(environ.get(TAGS_ENV, ""), profile)
     phase = profile.phases[target.phase_id]
-    recording = Recording.load(phase.stream)
+    recording = Recording.load(phase.stream).as_session(new_session_id())
+    session = transcript.Transcript(
+        recording.harness,
+        recording.session_id,
+        environ,
+        Path.cwd() if cwd is None else cwd,
+        phase.stream.cli_version,
+        clock,
+    )
 
-    previous = 0
-    for event, offset in zip(recording.events, recording.offsets_ms, strict=True):
-        sleep(max(offset - previous, 0) / 1000 * phase.stream.pacing_factor)
-        previous = offset
+    def emit(event: Mapping[str, object]) -> None:
+        session.add(event)
         _emit(out, event)
-    # The recorded delay before the closing event is slept here, before the work,
-    # so the verdict can never precede its scaled schedule; the phase's own work
-    # comes on top of it rather than overlapping it.
-    sleep(max(recording.result_offset_ms - previous, 0) / 1000 * phase.stream.pacing_factor)
 
-    repo = workspace / "repos" / profile.fixture_repo.split("/")[1]
-    _run_workload(phase, repo, run)
-    pr_url = _side_effect(profile, phase, target, repo, run)
-    artifact = _render(profile, phase, target, pr_url, run)
-    output = workspace / "artifacts" / "output" / f"{target.phase_id}.md"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(artifact, encoding="utf-8")
+    try:
+        previous = 0
+        for event, offset in zip(recording.events, recording.offsets_ms, strict=True):
+            sleep(max(offset - previous, 0) / 1000 * phase.stream.pacing_factor)
+            previous = offset
+            emit(event)
+        # The recorded delay before the closing event is slept here, before the work,
+        # so the verdict can never precede its scaled schedule; the phase's own work
+        # comes on top of it rather than overlapping it.
+        sleep(max(recording.result_offset_ms - previous, 0) / 1000 * phase.stream.pacing_factor)
 
-    for event in recording.closing(profile.task_result(target.phase_id)):
+        repo = workspace / "repos" / profile.fixture_repo.split("/")[1]
+        _run_workload(phase, repo, run)
+        pr_url = _side_effect(profile, phase, target, repo, run)
+        artifact = _render(profile, phase, target, pr_url, run)
+        output = workspace / "artifacts" / "output" / f"{target.phase_id}.md"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(artifact, encoding="utf-8")
+
+        closing = recording.closing(profile.task_result(target.phase_id))
+        for event in closing:
+            session.add(event)
+        path = session.close()
+    except BaseException:
+        session.abandon()
+        raise
+    for event in closing:
         _emit(out, event)
+    return path
 
 
 def cli_version(environ: Mapping[str, str]) -> str:
