@@ -11,7 +11,7 @@ Pre-configured Docker images for running AI agents in isolated environments.
 | `omni-agent` | Claude and Codex on the shared capability runtime | ✅ |
 | `toolchain` | `omni-agent` plus a native toolchain: build-essential, pkg-config, unzip, rustup (no toolchain; the repo's `rust-toolchain.toml` installs one on first use), pnpm via corepack, bun, Vulkan loader + Mesa lavapipe (software Vulkan, no GPU) + vulkan-tools. Tool homes live under `/workspace/.tools`, cargo jobs follow the CPU quota. Built FROM an omni digest; compile smoke in [`toolchain/smoke/`](./toolchain/smoke/run.sh). | ✅ (inherited) |
 | `base` | Minimal secure base (no agent) | N/A |
-| `scripted-agent` | Load tests only: `claude-cli` with `claude`/`codex` replaced by the token-free [scripted-agent replayer](../../../lib/python/scripted_agent/README.md). Built FROM a claude-cli digest; replay smoke in [`scripted-agent/smoke/`](./scripted-agent/smoke/run.sh); never a production image. | ✅ (inherited; every model reported as `syn-scripted-agent`) |
+| `scripted-agent` | Load tests only: `claude-cli` with `claude`/`codex` replaced by the token-free [scripted-agent replayer](../../../lib/python/scripted_agent/README.md). Writes each phase's native Claude/Codex transcript and ships the pinned `apss-session-exporter`, so session-store captures it like a real run. Built FROM a claude-cli digest; replay smoke in [`scripted-agent/smoke/`](./scripted-agent/smoke/run.sh); never a production image. | ✅ (inherited; every model reported as `syn-scripted-agent`) |
 
 ## Browser QA
 

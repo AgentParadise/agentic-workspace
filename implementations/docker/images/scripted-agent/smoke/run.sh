@@ -9,7 +9,8 @@
 # with --network none and a tmpfs $HOME as production runs it: claude and
 # codex replay a tiny two-phase profile from the baked recordings, every model
 # is reported as syn-scripted-agent, the artifacts are written, and a missing
-# profile is refused. See check.py for the full list. Then checks
+# profile is refused, each phase leaves its native transcript and the baked
+# apss-session-exporter archives both. See check.py for the full list. Then checks
 # /opt/agentic/version.json (scripts/check-image-version-manifest.sh). Needs no
 # network.
 set -euo pipefail

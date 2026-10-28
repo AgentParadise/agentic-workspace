@@ -8,7 +8,7 @@ is the only place those declarations meet the file (#44 contract points 4, 5).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final, Literal
 
@@ -58,6 +58,9 @@ class Recording:
     last message (see ``closing``)."""
     result_offset_ms: int
     """When the closing event was printed; the stub's verdict is never sooner."""
+    session_id: str
+    """The session's id: claude's ``session_id``, codex's ``thread_id``. Every
+    recording names exactly one (``load`` refuses one that does not)."""
 
     @classmethod
     def load(cls, stream: ScriptedStream) -> Recording:
@@ -113,6 +116,20 @@ class Recording:
             offsets_ms=tuple(_offset(e) for e in replayed),
             result=_rewrite(result),
             result_offset_ms=_offset(result),
+            session_id=_session_id(path, harness, records),
+        )
+
+    def as_session(self, session_id: str) -> Recording:
+        """This recording as a new session: every occurrence of the recorded id
+        replaced by ``session_id``, as a real harness starts each run with a
+        fresh one. Without this every replay of one recording would share an id,
+        and their transcripts would collide in the session store."""
+        old = self.session_id
+        return replace(
+            self,
+            events=tuple(_rename(e, old, session_id) for e in self.events),
+            result=_rename(self.result, old, session_id),
+            session_id=session_id,
         )
 
     def closing(self, verdict: str) -> tuple[Event, ...]:
@@ -144,6 +161,33 @@ def _structure(path: Path, rows: list[Any], terminal: str) -> tuple[Event, list[
             f"{len(terminals)} at event(s) {[n + 1 for n in terminals]} of {len(records)}"
         )
     return header, records
+
+
+def _session_id(path: Path, harness: Harness, records: list[Event]) -> str:
+    """The one session the recording is: claude names it on every event as
+    ``session_id``, codex opens with ``thread.started`` naming ``thread_id``.
+    Refused when absent or when two differ, since a replay renames exactly one."""
+    key = "thread_id" if harness == "codex" else "session_id"
+    named = {str(e[key]) for e in records if isinstance(e.get(key), str) and e[key]}
+    if harness == "codex" and records[0].get("type") != "thread.started":
+        raise RecordingRefused(f"recording {path} must open with a thread.started event")
+    if harness == "claude" and not isinstance(records[0].get(key), str):
+        raise RecordingRefused(f"recording {path} must name its session_id on its first event")
+    if len(named) != 1:
+        raise RecordingRefused(
+            f"recording {path} must name exactly one {key}; found {sorted(named)}"
+        )
+    return next(iter(named))
+
+
+def _rename(value: Any, old: str, new: str) -> Any:
+    if isinstance(value, str):
+        return new if value == old else value
+    if isinstance(value, dict):
+        return {k: _rename(v, old, new) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_rename(v, old, new) for v in value]
+    return value
 
 
 def _offset(event: Event) -> int:

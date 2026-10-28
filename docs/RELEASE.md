@@ -61,7 +61,9 @@ consumer's verification.
       root as context, push untagged by digest, run the replay smoke
       (`claude` and `codex` replay a two-phase profile from the baked
       recordings with `--network none`, every model reported as
-      `syn-scripted-agent`, a missing profile refused) on **linux/amd64 and
+      `syn-scripted-agent`, each phase's native transcript written and
+      archived by the baked `apss-session-exporter`, a missing profile
+      refused) on **linux/amd64 and
       linux/arm64** against that digest, then sign, verify and tag.
 
 ## Tags
@@ -111,7 +113,8 @@ holds exactly these fields, no more (Syntropic137 parses it with
   `<binary> --version` in the build before it is written. `omni-agent` adds
   `rtk`, `just` and `apss_session_exporter`; `toolchain` inherits omni's and
   adds `rustup` and `bun`; `scripted-agent` inherits claude-cli's, drops
-  `claude_cli` and `codex_cli` (it uninstalls both) and adds `scripted_agent`.
+  `claude_cli` and `codex_cli` (it uninstalls both) and adds `scripted_agent`
+  and `apss_session_exporter`.
   An inheriting build fails if its base has no manifest.
 - **Written from build args.** `scripts/version_manifest.py build-args
   <provider>` prints the `AGENTIC_*` args (provider, version, manifest sha256,

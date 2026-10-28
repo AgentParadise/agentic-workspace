@@ -131,7 +131,7 @@ def _rendered_for(provider: str, components: dict[str, str]) -> str:
 def test_check_accepts_what_the_build_would_write() -> None:
     head = vm._git("rev-parse", "HEAD")
     text = _rendered_for(
-        "scripted-agent", {"scripted_agent": "0.1.0", "playwright": "1.63.0"}
+        "scripted-agent", {"scripted_agent": "0.1.0", "apss_session_exporter": "0.6.0"}
     )
     assert vm.check("scripted-agent", text, head).provider == "scripted-agent"
 
@@ -149,7 +149,12 @@ def test_check_refuses_a_manifest_that_does_not_describe_the_image() -> None:
     with pytest.raises(ManifestError, match="missing"):
         vm.check("claude-cli", missing, head)
     lying = _rendered_for(
-        "scripted-agent", {"scripted_agent": "0.1.0", "claude_cli": "2.1.293"}
+        "scripted-agent",
+        {
+            "scripted_agent": "0.1.0",
+            "apss_session_exporter": "0.6.0",
+            "claude_cli": "2.1.293",
+        },
     )
     with pytest.raises(ManifestError, match="not in this image"):
         vm.check("scripted-agent", lying, head)

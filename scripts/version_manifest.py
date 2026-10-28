@@ -55,7 +55,7 @@ REQUIRED_COMPONENTS: dict[str, frozenset[str]] = {
     "toolchain": frozenset(
         {"claude_cli", "codex_cli", "apss_session_exporter", "rustup", "bun"}
     ),
-    "scripted-agent": frozenset({"scripted_agent"}),
+    "scripted-agent": frozenset({"scripted_agent", "apss_session_exporter"}),
 }
 
 #: Components an image must NOT list: scripted-agent uninstalls both real

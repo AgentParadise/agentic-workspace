@@ -27,3 +27,9 @@ class SideEffectFailed(Refusal):
     """A workload or git/gh step the phase declares did not succeed."""
 
     exit_code = 69  # EX_UNAVAILABLE
+
+
+class TranscriptFailed(Refusal):
+    """The native transcript a real harness would leave could not be written."""
+
+    exit_code = 74  # EX_IOERR
