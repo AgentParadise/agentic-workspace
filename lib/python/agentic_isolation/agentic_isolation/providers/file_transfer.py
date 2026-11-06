@@ -212,7 +212,9 @@ def listing_script(
     pattern-derived string is ever a find operand.
     """
     head = f"head -z -n {_FIELDS * (limits.max_entries + 1)}"
-    prefix = walk_prefix(patterns)
+    # Nothing below max_depth + 1 is listed, so no deeper ancestor is worth a
+    # predicate; this also bounds the command by the limit, not the pattern.
+    prefix = walk_prefix(patterns)[: limits.max_depth + 1]
     keep: list[str] = []
     if prefix:
         ancestors = ["./" + "/".join(prefix[: n + 1]) for n in range(len(prefix))]

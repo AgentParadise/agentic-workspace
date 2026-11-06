@@ -510,3 +510,15 @@ def test_the_output_glob_reads_a_deliverable_at_the_top_of_the_output(tmp_path: 
         "artifacts/output/deliverable.md",
         "artifacts/output/notes/n.md",
     ]
+
+
+def test_a_pattern_deeper_than_the_limit_costs_the_limit_not_the_pattern(tmp_path: Path) -> None:
+    deep = "/".join(["segment0"] * 300 + ["*"])
+    limits = ReadLimits(max_depth=4)
+    script = listing_script(str(tmp_path), limits, patterns=[deep])
+    assert len(script) < 2_000
+
+    root = tmp_path / "workspace"
+    (root / "/".join(["segment0"] * 6)).mkdir(parents=True)
+    plan = _plan_for(root, [deep], limits)
+    assert [r.reason for r in plan.refused] == ["depth_exceeded"]
