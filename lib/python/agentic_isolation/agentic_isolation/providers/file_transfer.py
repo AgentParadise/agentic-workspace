@@ -17,13 +17,10 @@ are bounded by the limits: the walk stops once `max_entries + 1` records are
 out (plus one pipe buffer), and at most `max_file_bytes + 1` bytes of one
 file are held at a time.
 
-The walk starts at the directory the patterns' literal prefix names
-(`artifacts/output` for `artifacts/output/**/*`), not at the root: nothing
-outside it can match, and counting it against `max_entries` failed every
-read in a root that also held a tool cache or a large `.git`
-(syntropic137/syntropic137#2185). If any directory on that prefix is a
-symlink the whole root is walked, as before, so the walk never follows a link
-out of the root.
+The walk prunes what the patterns' literal prefix rules out
+(`artifacts/output` for `artifacts/output/**/*`): nothing outside it can
+match, and counting it against `max_entries` failed every read in a root that
+also held a tool cache or a large `.git` (syntropic137/syntropic137#2185).
 
 The sandbox needs /proc and GNU find, xargs, head, stat and timeout, as the
 Docker and E2B base images have. A file replaced by a FIFO between the
@@ -165,7 +162,8 @@ def _script(command: str, then: str, *, base64: bool, stopped_ok: bool = False) 
     )
 
 
-_GLOB_CHARS = frozenset("*?[")
+# Characters that make a component a pattern, to fnmatch or to find's -path.
+_GLOB_CHARS = frozenset("*?[\\")
 
 
 def walk_prefix(patterns: Sequence[str]) -> tuple[str, ...]:
@@ -193,21 +191,6 @@ def walk_prefix(patterns: Sequence[str]) -> tuple[str, ...]:
     return tuple(common)
 
 
-def _find(start: str, path_format: str, max_depth: int) -> str:
-    return shlex.join(
-        [
-            "find",
-            start,
-            "-mindepth",
-            "1",
-            "-maxdepth",
-            str(max_depth),
-            "-printf",
-            rf"%y %n %s %d\0{path_format}\0%l\0",
-        ]
-    )
-
-
 def listing_script(
     base_path: str,
     limits: ReadLimits,
@@ -218,29 +201,40 @@ def listing_script(
     """The walk: at most `max_entries + 1` records, none deeper than `max_depth + 1`.
 
     find writes into head, which exits after the last record wanted, so the
-    walk goes no further than that plus what one pipe buffer holds. It starts
-    at the patterns' literal prefix (`walk_prefix`): a prefix that is missing,
-    or not a directory, lists nothing, and one with a symlink on it walks the
-    whole root. Paths and depths stay relative to the root either way.
+    walk goes no further than that plus what one pipe buffer holds.
+
+    It always starts at the root, and prunes every directory that is not on
+    the patterns' literal prefix (`walk_prefix`) or under it, printing only
+    those: an entry nothing can match neither counts against `max_entries`
+    nor is descended into. Walking from the root, never from the prefix, is
+    what keeps it inside: find does not follow a symlink it meets, so an
+    ancestor swapped for one is listed as a link, not walked through, and no
+    pattern-derived string is ever a find operand.
     """
     head = f"head -z -n {_FIELDS * (limits.max_entries + 1)}"
-    whole = _find(".", "%P", limits.max_depth + 1)
     prefix = walk_prefix(patterns)
-    remaining = limits.max_depth + 1 - len(prefix)
-    if not prefix or remaining < 1:
-        walk = whole
-    else:
-        ancestors = ["/".join(prefix[: n + 1]) for n in range(len(prefix))]
-        start = ancestors[-1]
-        walk = (
-            "w=; for d in " + " ".join(shlex.quote(a) for a in ancestors) + "; do "
-            'if [ -L "$d" ]; then w=.; break; fi; '
-            'if [ ! -d "$d" ]; then w=-; break; fi; '
-            "done; "
-            f'case "$w" in .) {whole} ;; -) : ;; *) {_find(start, "%p", remaining)} ;; esac'
-        )
+    keep: list[str] = []
+    if prefix:
+        ancestors = ["./" + "/".join(prefix[: n + 1]) for n in range(len(prefix))]
+        keep = ["("]
+        for path in [*ancestors, ancestors[-1] + "/*"]:
+            keep += [*(["-o"] if len(keep) > 1 else []), "-path", path]
+        keep.append(")")
+    print_record = ["-printf", r"%y %n %s %d\0%P\0%l\0"]
+    expression = [*keep, *print_record, "-o", "-prune"] if keep else print_record
+    find = shlex.join(
+        [
+            "find",
+            ".",
+            "-mindepth",
+            "1",
+            "-maxdepth",
+            str(limits.max_depth + 1),
+            *expression,
+        ]
+    )
     return f"cd -- {shlex.quote(base_path)} || exit 1; " + _script(
-        walk, head, base64=base64, stopped_ok=True
+        find, head, base64=base64, stopped_ok=True
     )
 
 
@@ -324,23 +318,28 @@ def read_cap(plan: ReadPlan, limits: ReadLimits) -> int:
 
 
 def _matches(path: str, patterns: Sequence[str]) -> bool:
-    """`fnmatch`, where `**/` may also match no directory at all.
+    """`fnmatch`, where one `**/` component may also match no directory at all.
 
     Under plain `fnmatch`, `artifacts/output/**/*` needs a `/` after
     `output/`, so it never matched `artifacts/output/deliverable.md`: the file
     every phase writes (syntropic137/syntropic137#2185). Callers mean the
-    globstar reading, and this only widens: what matched before still does.
+    globstar reading. This only widens, and only a pattern with exactly one
+    `**/` component and no character class, so it costs at most two matches
+    and cannot reach inside a `[...]`.
     """
     return any(fnmatch.fnmatchcase(path, v) for p in patterns for v in _variants(p))
 
 
-def _variants(pattern: str) -> set[str]:
-    """`pattern`, and it with each `**/` dropped, alone or together."""
-    parts = pattern.split("**/")
-    variants = {""}
-    for part in parts[:-1]:
-        variants = {v + part + keep for v in variants for keep in ("**/", "")}
-    return {v + parts[-1] for v in variants}
+def _variants(pattern: str) -> tuple[str, ...]:
+    """`pattern`, and it with its one `**/` component dropped when it has exactly one."""
+    if "[" in pattern:
+        return (pattern,)
+    parts = pattern.split("/")
+    globstars = [n for n, c in enumerate(parts[:-1]) if c == "**"]
+    if len(globstars) != 1 or pattern.count("**") != 1:
+        return (pattern,)
+    n = globstars[0]
+    return (pattern, "/".join(parts[:n] + parts[n + 1 :]))
 
 
 def plan_reads(
@@ -366,15 +365,11 @@ def plan_reads(
             break
         try:
             kind, links, size, depth = head.decode().split(" ")
-            nlink, nbytes = int(links), int(size)
-            int(depth)
+            nlink, nbytes, level = int(links), int(size), int(depth)
         except ValueError as exc:
             raise ReadFilesError(f"the sandbox listing has a malformed record {head!r}") from exc
         if not path or path.startswith("/") or ".." in path.split("/"):
             raise ReadFilesError(f"the sandbox listing named a path outside the root: {path!r}")
-        # From the path, not find's %d: a walk started below the root counts
-        # depth from its own start, and the limit is relative to the root.
-        level = path.count("/") + 1
         records.append((path, kind, nlink, nbytes, level, raw_target))
     reads: list[tuple[str, int]] = []
     total = 0

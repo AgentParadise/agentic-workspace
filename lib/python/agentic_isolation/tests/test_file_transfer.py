@@ -403,7 +403,7 @@ def test_the_depth_limit_still_counts_from_the_root(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("make", ["missing", "a file"])
-def test_a_prefix_that_is_no_directory_lists_nothing(tmp_path: Path, make: str) -> None:
+def test_a_prefix_that_is_no_directory_reads_nothing(tmp_path: Path, make: str) -> None:
     root = tmp_path / "workspace"
     (root / ".tools").mkdir(parents=True)
     (root / ".tools" / "x").touch()
@@ -413,6 +413,43 @@ def test_a_prefix_that_is_no_directory_lists_nothing(tmp_path: Path, make: str) 
     plan = _plan_for(root, _OUTPUT, ReadLimits())
 
     assert plan == ReadPlan((), ())
+
+
+def test_a_prefix_that_looks_like_a_find_option_is_a_path_not_an_action(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    (root / "-delete").mkdir(parents=True)
+    (root / "-delete" / "x").write_bytes(b"x")
+    (root / "keep").write_bytes(b"keep")
+    limits = ReadLimits()
+
+    result = _read_now(root, _plan_for(root, ["-delete/*"], limits), limits)
+
+    assert result.files == (("-delete/x", b"x"),)
+    assert (root / "keep").read_bytes() == b"keep"
+
+
+def test_an_ancestor_swapped_for_a_symlink_is_listed_never_walked(tmp_path: Path) -> None:
+    # Walking from the root, find meets the link itself and does not follow
+    # it, so no name, size or target from outside the root reaches the listing.
+    outside = tmp_path / "outside"
+    (outside / "output").mkdir(parents=True)
+    (outside / "output" / "secret-name").write_bytes(b"x")
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "artifacts").symlink_to(outside)
+
+    listing = _sh(listing_script(str(root), ReadLimits(), patterns=_OUTPUT))
+
+    assert b"secret-name" not in listing
+    assert listing.split(b"\0")[1] == b"artifacts"
+
+
+def test_one_globstar_widens_and_many_do_not_multiply() -> None:
+    assert file_transfer._variants("a/**/b") == ("a/**/b", "a/b")
+    assert file_transfer._variants("a/**/b/**/c") == ("a/**/b/**/c",)
+    assert file_transfer._variants("a/[**/].txt") == ("a/[**/].txt",)
+    many = "/".join(["**", "x"] * 30)
+    assert file_transfer._variants(many) == (many,)
 
 
 @pytest.mark.parametrize("link", ["artifacts", "artifacts/output"])
@@ -448,8 +485,9 @@ def test_a_symlink_on_the_prefix_walks_the_whole_root_and_never_follows_it(
         ("artifacts/input/x.md", "artifacts/output/**/*", False),
         ("a/b/c.txt", "**/*.txt", True),
         ("c.txt", "**/*.txt", True),
-        ("x/y/z", "x/**/y/**/z", True),
+        ("x/y/z", "x/**/y/**/z", False),  # two globstars: plain fnmatch only
         ("x/z", "x/**/y/**/z", False),
+        ("a/[].txt", "a/[**/].txt", False),
         ("x/y/z", "*", True),
     ],
 )
