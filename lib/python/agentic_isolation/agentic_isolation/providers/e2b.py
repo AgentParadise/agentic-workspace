@@ -437,7 +437,7 @@ class E2BWorkspaceProvider:
         # files API is not used because it follows symlinks.
         listing = await self._sandbox_bytes(
             workspace,
-            listing_script(base_path, limits, base64=True),
+            listing_script(base_path, limits, base64=True, patterns=patterns),
             b"",
             listing_cap(limits),
             limits.timeout_seconds,
