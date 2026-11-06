@@ -320,3 +320,155 @@ def test_the_walk_stops_once_the_entry_limit_is_out(tmp_path: Path) -> None:
     assert status.read_text().strip() != "0"
     plan = plan_reads(listing, ["wanted"], limits, str(root))
     assert [r.reason for r in plan.refused] == ["entry_limit_exceeded"]
+
+
+@pytest.mark.parametrize(
+    ("patterns", "prefix"),
+    [
+        (["artifacts/output/**/*"], ("artifacts", "output")),
+        (["artifacts/output/a.md", "artifacts/output/b/*"], ("artifacts", "output")),
+        (["artifacts/output/*", "artifacts/logs/*"], ("artifacts",)),
+        (["*.md"], ()),
+        (["a*/output/*"], ()),
+        (["artifacts/../etc/*"], ()),
+        (["/etc/*"], ()),
+        ([], ()),
+    ],
+)
+def test_the_walk_starts_at_the_literal_prefix_every_pattern_shares(
+    patterns: list[str], prefix: tuple[str, ...]
+) -> None:
+    assert file_transfer.walk_prefix(patterns) == prefix
+
+
+_OUTPUT = ["artifacts/output/**/*"]
+
+
+def _output_root(tmp_path: Path) -> Path:
+    root = tmp_path / "workspace"
+    out = root / "artifacts" / "output"
+    out.mkdir(parents=True)
+    (out / "deliverable.md").write_bytes(b"the work")
+    return root
+
+
+def _plan_for(root: Path, patterns: list[str], limits: ReadLimits) -> ReadPlan:
+    listing = _sh(listing_script(str(root), limits, patterns=patterns))
+    return plan_reads(listing, patterns, limits, str(root))
+
+
+def test_a_large_tree_beside_the_output_neither_counts_nor_truncates_the_read(
+    tmp_path: Path,
+) -> None:
+    # A toolchain image keeps its cargo registry in /workspace/.tools, and a
+    # superproject's .git/modules is as large: 20k entries the patterns can
+    # never match (syntropic137/syntropic137#2185).
+    root = _output_root(tmp_path)
+    cache = root / ".tools" / "cargo"
+    cache.mkdir(parents=True)
+    for n in range(20_000):
+        (cache / f"crate-{n:05}").touch()
+    limits = ReadLimits()
+
+    whole = plan_reads(_sh(listing_script(str(root), limits)), _OUTPUT, limits, str(root))
+    assert [r.reason for r in whole.refused] == ["entry_limit_exceeded"], "the hazard"
+
+    plan = _plan_for(root, _OUTPUT, limits)
+    result = _read_now(root, plan, limits)
+    assert result.complete
+    assert result.files == (("artifacts/output/deliverable.md", b"the work"),)
+
+
+def test_the_entry_limit_still_counts_what_is_under_the_prefix(tmp_path: Path) -> None:
+    root = _output_root(tmp_path)
+    for n in range(5):
+        (root / "artifacts" / "output" / f"extra-{n}").touch()
+
+    plan = _plan_for(root, _OUTPUT, ReadLimits(max_entries=3))
+
+    assert [r.reason for r in plan.refused] == ["entry_limit_exceeded"]
+
+
+def test_the_depth_limit_still_counts_from_the_root(tmp_path: Path) -> None:
+    root = _output_root(tmp_path)
+    deep = root / "artifacts" / "output" / "a"
+    deep.mkdir()
+    (deep / "b.md").touch()
+    limits = ReadLimits(max_depth=3)
+
+    plan = _plan_for(root, _OUTPUT, limits)
+
+    assert FileRefusal("artifacts/output/a/b.md", "depth_exceeded") in plan.refused
+    assert ("artifacts/output/deliverable.md", 8) in plan.reads
+
+
+@pytest.mark.parametrize("make", ["missing", "a file"])
+def test_a_prefix_that_is_no_directory_lists_nothing(tmp_path: Path, make: str) -> None:
+    root = tmp_path / "workspace"
+    (root / ".tools").mkdir(parents=True)
+    (root / ".tools" / "x").touch()
+    if make == "a file":
+        (root / "artifacts").write_bytes(b"not a directory")
+
+    plan = _plan_for(root, _OUTPUT, ReadLimits())
+
+    assert plan == ReadPlan((), ())
+
+
+@pytest.mark.parametrize("link", ["artifacts", "artifacts/output"])
+def test_a_symlink_on_the_prefix_walks_the_whole_root_and_never_follows_it(
+    tmp_path: Path, link: str
+) -> None:
+    outside = tmp_path / "outside"
+    (outside / "output").mkdir(parents=True)
+    (outside / "output" / "secret").write_bytes(b"not yours")
+    (outside / "secret").write_bytes(b"not yours")
+    root = tmp_path / "workspace"
+    root.mkdir()
+    if link == "artifacts":
+        (root / "artifacts").symlink_to(outside)
+    else:
+        (root / "artifacts").mkdir()
+        (root / "artifacts" / "output").symlink_to(outside)
+    limits = ReadLimits()
+
+    plan = _plan_for(root, _OUTPUT, limits)
+    result = _read_now(root, plan, limits)
+
+    assert result.files == ()
+    assert all(b"not yours" not in body for _, body in result.files)
+    assert plan.reads == ()
+
+
+@pytest.mark.parametrize(
+    ("path", "pattern", "matches"),
+    [
+        ("artifacts/output/deliverable.md", "artifacts/output/**/*", True),
+        ("artifacts/output/a/b.md", "artifacts/output/**/*", True),
+        ("artifacts/input/x.md", "artifacts/output/**/*", False),
+        ("a/b/c.txt", "**/*.txt", True),
+        ("c.txt", "**/*.txt", True),
+        ("x/y/z", "x/**/y/**/z", True),
+        ("x/z", "x/**/y/**/z", False),
+        ("x/y/z", "*", True),
+    ],
+)
+def test_globstar_may_match_no_directory_and_nothing_else_changes(
+    path: str, pattern: str, matches: bool
+) -> None:
+    assert file_transfer._matches(path, [pattern]) is matches
+
+
+def test_the_output_glob_reads_a_deliverable_at_the_top_of_the_output(tmp_path: Path) -> None:
+    root = _output_root(tmp_path)
+    nested = root / "artifacts" / "output" / "notes"
+    nested.mkdir()
+    (nested / "n.md").write_bytes(b"n")
+    limits = ReadLimits()
+
+    result = _read_now(root, _plan_for(root, _OUTPUT, limits), limits)
+
+    assert [p for p, _ in result.files] == [
+        "artifacts/output/deliverable.md",
+        "artifacts/output/notes/n.md",
+    ]
