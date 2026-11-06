@@ -17,6 +17,11 @@ are bounded by the limits: the walk stops once `max_entries + 1` records are
 out (plus one pipe buffer), and at most `max_file_bytes + 1` bytes of one
 file are held at a time.
 
+The walk prunes what the patterns' literal prefix rules out
+(`artifacts/output` for `artifacts/output/**/*`): nothing outside it can
+match, and counting it against `max_entries` failed every read in a root that
+also held a tool cache or a large `.git` (syntropic137/syntropic137#2185).
+
 The sandbox needs /proc and GNU find, xargs, head, stat and timeout, as the
 Docker and E2B base images have. A file replaced by a FIFO between the
 reader's type check and its open can block that read; it cannot return the
@@ -27,6 +32,7 @@ FIFO's bytes, and the call ends with `ReadFilesTimeoutError` once
 from __future__ import annotations
 
 import fnmatch
+import itertools
 import posixpath
 import shlex
 from collections.abc import Sequence
@@ -156,12 +162,68 @@ def _script(command: str, then: str, *, base64: bool, stopped_ok: bool = False) 
     )
 
 
-def listing_script(base_path: str, limits: ReadLimits, *, base64: bool = False) -> str:
+# Characters that make a component a pattern, to fnmatch or to find's -path.
+_GLOB_CHARS = frozenset("*?[\\")
+
+
+def walk_prefix(patterns: Sequence[str]) -> tuple[str, ...]:
+    """The directories, relative to the root, that every pattern's matches lie under.
+
+    A pattern's leading components with no glob character are literal: a path
+    can match only if it starts with them, and its last component names the
+    entry, not a directory. The common prefix of all patterns is the most the
+    walk can skip; none (or no patterns) means the whole root.
+    """
+    prefixes = []
+    for pattern in patterns:
+        parts = pattern.split("/")[:-1]
+        literal = list(itertools.takewhile(lambda c: not (_GLOB_CHARS & set(c)), parts))
+        if any(c in ("", ".", "..") for c in literal):
+            return ()
+        prefixes.append(literal)
+    if not prefixes:
+        return ()
+    common: list[str] = []
+    for column in zip(*prefixes, strict=False):
+        if len(set(column)) != 1:
+            break
+        common.append(column[0])
+    return tuple(common)
+
+
+def listing_script(
+    base_path: str,
+    limits: ReadLimits,
+    *,
+    base64: bool = False,
+    patterns: Sequence[str] = (),
+) -> str:
     """The walk: at most `max_entries + 1` records, none deeper than `max_depth + 1`.
 
     find writes into head, which exits after the last record wanted, so the
     walk goes no further than that plus what one pipe buffer holds.
+
+    It always starts at the root, and prunes every directory that is not on
+    the patterns' literal prefix (`walk_prefix`) or under it, printing only
+    those: an entry nothing can match neither counts against `max_entries`
+    nor is descended into. Walking from the root, never from the prefix, is
+    what keeps it inside: find does not follow a symlink it meets, so an
+    ancestor swapped for one is listed as a link, not walked through, and no
+    pattern-derived string is ever a find operand.
     """
+    head = f"head -z -n {_FIELDS * (limits.max_entries + 1)}"
+    # Nothing below max_depth + 1 is listed, so no deeper ancestor is worth a
+    # predicate; this also bounds the command by the limit, not the pattern.
+    prefix = walk_prefix(patterns)[: limits.max_depth + 1]
+    keep: list[str] = []
+    if prefix:
+        ancestors = ["./" + "/".join(prefix[: n + 1]) for n in range(len(prefix))]
+        keep = ["("]
+        for path in [*ancestors, ancestors[-1] + "/*"]:
+            keep += [*(["-o"] if len(keep) > 1 else []), "-path", path]
+        keep.append(")")
+    print_record = ["-printf", r"%y %n %s %d\0%P\0%l\0"]
+    expression = [*keep, *print_record, "-o", "-prune"] if keep else print_record
     find = shlex.join(
         [
             "find",
@@ -170,11 +232,9 @@ def listing_script(base_path: str, limits: ReadLimits, *, base64: bool = False) 
             "1",
             "-maxdepth",
             str(limits.max_depth + 1),
-            "-printf",
-            r"%y %n %s %d\0%P\0%l\0",
+            *expression,
         ]
     )
-    head = f"head -z -n {_FIELDS * (limits.max_entries + 1)}"
     return f"cd -- {shlex.quote(base_path)} || exit 1; " + _script(
         find, head, base64=base64, stopped_ok=True
     )
@@ -260,7 +320,28 @@ def read_cap(plan: ReadPlan, limits: ReadLimits) -> int:
 
 
 def _matches(path: str, patterns: Sequence[str]) -> bool:
-    return any(fnmatch.fnmatchcase(path, p) for p in patterns)
+    """`fnmatch`, where one `**/` component may also match no directory at all.
+
+    Under plain `fnmatch`, `artifacts/output/**/*` needs a `/` after
+    `output/`, so it never matched `artifacts/output/deliverable.md`: the file
+    every phase writes (syntropic137/syntropic137#2185). Callers mean the
+    globstar reading. This only widens, and only a pattern with exactly one
+    `**/` component and no character class, so it costs at most two matches
+    and cannot reach inside a `[...]`.
+    """
+    return any(fnmatch.fnmatchcase(path, v) for p in patterns for v in _variants(p))
+
+
+def _variants(pattern: str) -> tuple[str, ...]:
+    """`pattern`, and it with its one `**/` component dropped when it has exactly one."""
+    if "[" in pattern:
+        return (pattern,)
+    parts = pattern.split("/")
+    globstars = [n for n, c in enumerate(parts[:-1]) if c == "**"]
+    if len(globstars) != 1 or pattern.count("**") != 1:
+        return (pattern,)
+    n = globstars[0]
+    return (pattern, "/".join(parts[:n] + parts[n + 1 :]))
 
 
 def plan_reads(

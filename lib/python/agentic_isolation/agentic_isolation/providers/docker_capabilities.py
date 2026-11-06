@@ -312,7 +312,14 @@ async def read_files(
     if base_path not in TRANSFER_ROOTS:
         raise ValueError(f"base_path must be one of {', '.join(TRANSFER_ROOTS)}")
     listing = await _docker_bounded(
-        ["exec", container, *_deadline(limits), "sh", "-c", listing_script(base_path, limits)],
+        [
+            "exec",
+            container,
+            *_deadline(limits),
+            "sh",
+            "-c",
+            listing_script(base_path, limits, patterns=patterns),
+        ],
         b"",
         listing_cap(limits),
         limits.timeout_seconds,
