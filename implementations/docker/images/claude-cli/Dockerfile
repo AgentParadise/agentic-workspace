@@ -59,6 +59,9 @@ ARG PLAYWRIGHT_HEADLESS_SHELL_SHA256_ARM64=d433c45172c7836e38124fe545f767b02210b
 ARG PLAYWRIGHT_FFMPEG_REVISION=1011
 ARG PLAYWRIGHT_FFMPEG_SHA256_AMD64=ebc74fc5b94830176a3c2914ae96bd8bc7f6a91f4f33890230f84a172ee61ccc
 ARG PLAYWRIGHT_FFMPEG_SHA256_ARM64=2628c03f05318ff812c8c9baaf207dea2ddf53e818c0dc936714b0fbe3afb009
+# dcg (destructive command guard) for both harnesses. The SHA256 pins live in
+# workspace/agent-guard/dcg-version.toml; the install asserts this ARG matches.
+ARG DCG_VERSION=0.16.0
 
 # =============================================================================
 # Stage 1: Node.js base with system dependencies
@@ -311,6 +314,20 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
     && rustup component add rust-analyzer \
     && chmod -R a+rX /usr/local/rustup /usr/local/cargo
 
+# dcg: destructive command guard for both harnesses (claude and the codex
+# delegate). Same shared, tested installer as omni-agent; the WHY (root-owned
+# managed hook layers, sha256 then minisign before unpacking, guardrail not
+# sandbox) is written up there and in workspace/agent-guard/agent_guard.py.
+ARG DCG_VERSION
+RUN --mount=type=bind,source=workspace/agent-guard,target=/tmp/agent-guard \
+    set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends minisign; \
+    /opt/venv/bin/python /tmp/agent-guard/agent_guard.py install --expect-version "${DCG_VERSION}"; \
+    apt-get purge -y --auto-remove minisign; \
+    rm -rf /var/lib/apt/lists/*; \
+    dcg --version | grep -q "^${DCG_VERSION}$"
+
 # =============================================================================
 # Stage 3: Install Python packages from staged wheels
 # =============================================================================
@@ -449,12 +466,14 @@ ARG CLAUDE_CLI_VERSION
 ARG CODEX_CLI_VERSION
 ARG SKILLS_CLI_VERSION
 ARG PLAYWRIGHT_VERSION
+ARG DCG_VERSION
 RUN --mount=type=bind,source=scripts/version_manifest.py,target=/tmp/version_manifest.py \
     /opt/venv/bin/python /tmp/version_manifest.py write \
       --component "claude_cli=${CLAUDE_CLI_VERSION}@claude" \
       --component "codex_cli=${CODEX_CLI_VERSION}@codex" \
       --component "skills_cli=${SKILLS_CLI_VERSION}@skills" \
-      --component "playwright=${PLAYWRIGHT_VERSION}@playwright"
+      --component "playwright=${PLAYWRIGHT_VERSION}@playwright" \
+      --component "dcg=${DCG_VERSION}@dcg"
 
 # Set working directory
 WORKDIR /workspace
@@ -483,6 +502,16 @@ ENV HOME=/home/agent \
     RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/home/agent/.cargo \
     PATH=/usr/local/cargo/bin:$PATH
+
+# Prove the guard as the agent sees it, last (see omni-agent for the WHY):
+# known-bad payloads denied through both hook protocols, and codex accepts
+# /etc/codex/requirements.toml (`features list` exits non-zero when it does not).
+RUN --mount=type=bind,source=workspace/agent-guard,target=/tmp/agent-guard \
+    /opt/venv/bin/python /tmp/agent-guard/agent_guard.py validate --home "${HOME}" \
+    && codex_home="$(mktemp -d "${HOME}/.codex-check.XXXXXX")" \
+    && HOME="${codex_home}" codex features list > /dev/null \
+    && rm -rf "${codex_home}" "${HOME}/.config/dcg" \
+    && { [ ! -d "${HOME}/.config" ] || rmdir --ignore-fail-on-non-empty "${HOME}/.config"; }
 
 # Labels for version tracking and image selection.
 # Re-declare ARG (no default) to pull value from the global ARG declared

@@ -1,0 +1,22 @@
+# Pinned dcg (destructive command guard) release for workspace images.
+# Read by agent_guard.py at image build time. Bump every field together: the
+# version (and ARG DCG_VERSION in each Dockerfile, which the install asserts
+# against), then each asset's sha256 from the release, verified against its
+# minisign signature with the key below before you commit it.
+# Same pin as syntropic137 infra/agent-guard/dcg-version.toml (host side).
+
+version = "0.16.0"
+release_url = "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download"
+
+# Release signing key, as published in the project's README and install.sh.
+minisign_public_key = "RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO"
+
+# Keyed by `dpkg --print-architecture`. amd64 is static musl. arm64 has no musl
+# build upstream; the gnu one needs GLIBC_2.28 at most and runs on bookworm (2.36).
+[assets.amd64]
+name = "dcg-x86_64-unknown-linux-musl.tar.xz"
+sha256 = "e7d860eba7f99cb5d5535b00942196aae3d6ca22ec049491d74c97aab556b642"
+
+[assets.arm64]
+name = "dcg-aarch64-unknown-linux-gnu.tar.xz"
+sha256 = "ca4f2c4fee3aea774fac3e53a6a4cab1c7f9c6228f4bd9d6941de05fd5ac6308"

@@ -63,6 +63,11 @@ ARG JUST_VERSION=1.58.0
 # block below for the arch split.
 ARG RTK_VERSION=0.48.0
 
+# dcg (destructive command guard): the pre-execution hook that denies
+# destructive shell commands for both harnesses. The SHA256 pins live in
+# workspace/agent-guard/dcg-version.toml; the install asserts this ARG matches.
+ARG DCG_VERSION=0.16.0
+
 # =============================================================================
 # Stage 1: Node.js base with system dependencies
 # =============================================================================
@@ -426,6 +431,38 @@ RUN set -eux; \
     just --version | grep -q "^just ${JUST_VERSION}$"
 
 # =============================================================================
+# dcg: destructive command guard for both harnesses
+# =============================================================================
+# WHY. Agents here run shell commands with no approval prompt, and the ones
+# that cost real work are a handful of habits: `git reset --hard`, `rm -rf`,
+# `docker volume rm`, `DROP TABLE`. dcg is a PreToolUse hook that denies them
+# before they run. It is a guardrail, not a sandbox: an agent can still write a
+# script and run it, and Codex's unified_exec path can skip PreToolUse.
+#
+# WHY ROOT-OWNED LAYERS. ~/.claude/settings.json is written by the entrypoint
+# and is agent-writable, so a hook there is a suggestion. The hook is
+# registered in /etc/claude-code/managed-settings.json and
+# /etc/codex/requirements.toml (Codex trusts managed hooks; user hooks are
+# skipped until trusted), and the policy is /etc/dcg/config.toml, which dcg
+# honours only when it and its parents are root-owned and not writable. The
+# existing user-level hooks (RTK) are untouched.
+#
+# WHY A SCRIPT. Same steps for claude-cli and omni-agent, so one tested
+# installer (scripts/tests/test_agent_guard.py), bind-mounted for this RUN and
+# never shipped. It verifies SHA256 and THEN the minisign signature before
+# unpacking, asserts the version, and writes nothing until every check passes.
+# minisign is needed only for that verify, so it is purged in the same layer.
+ARG DCG_VERSION
+RUN --mount=type=bind,source=workspace/agent-guard,target=/tmp/agent-guard \
+    set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends minisign; \
+    /opt/venv/bin/python /tmp/agent-guard/agent_guard.py install --expect-version "${DCG_VERSION}"; \
+    apt-get purge -y --auto-remove minisign; \
+    rm -rf /var/lib/apt/lists/*; \
+    dcg --version | grep -q "^${DCG_VERSION}$"
+
+# =============================================================================
 # Stage 3: Install Python packages from staged wheels
 # =============================================================================
 FROM tooling AS packages
@@ -787,6 +824,7 @@ ARG SKILLS_CLI_VERSION
 ARG PLAYWRIGHT_VERSION
 ARG RTK_VERSION
 ARG JUST_VERSION
+ARG DCG_VERSION
 RUN --mount=type=bind,source=scripts/version_manifest.py,target=/tmp/version_manifest.py \
     /opt/venv/bin/python /tmp/version_manifest.py write \
       --component "claude_cli=${CLAUDE_CLI_VERSION}@claude" \
@@ -795,6 +833,7 @@ RUN --mount=type=bind,source=scripts/version_manifest.py,target=/tmp/version_man
       --component "playwright=${PLAYWRIGHT_VERSION}@playwright" \
       --component "rtk=${RTK_VERSION}@rtk" \
       --component "just=${JUST_VERSION}@just" \
+      --component "dcg=${DCG_VERSION}@dcg" \
       --component "apss_session_exporter=0.6.0@apss-session-exporter"
 
 WORKDIR /workspace
@@ -813,6 +852,21 @@ ENV HOME=/home/agent \
     ANTHROPIC_NO_ATTRIBUTION=1 \
     # Python lives in /opt/venv — installed and managed by uv (not apt).
     VIRTUAL_ENV=/opt/venv
+
+# Prove the guard as the agent sees it, last, so no later layer can undo it
+# unnoticed: root-owned files, the effective policy fail-closed, and every
+# known-bad payload denied (ls allowed) through both harnesses' hook protocols.
+# `codex features list` loads /etc/codex/requirements.toml and exits non-zero
+# when it rejects it, so a Codex upgrade that changes the managed-hook schema
+# fails here instead of silently dropping the guard. Throwaway HOME for codex
+# (it writes state on startup), and the probes' dcg state is removed so the
+# image ships no agent-side dcg files.
+RUN --mount=type=bind,source=workspace/agent-guard,target=/tmp/agent-guard \
+    /opt/venv/bin/python /tmp/agent-guard/agent_guard.py validate --home "${HOME}" \
+    && codex_home="$(mktemp -d "${HOME}/.codex-check.XXXXXX")" \
+    && HOME="${codex_home}" codex features list > /dev/null \
+    && rm -rf "${codex_home}" "${HOME}/.config/dcg" \
+    && { [ ! -d "${HOME}/.config" ] || rmdir --ignore-fail-on-non-empty "${HOME}/.config"; }
 
 # Labels for version tracking and image selection.
 # Re-declare ARG (no default) to pull value from the global ARG declared
