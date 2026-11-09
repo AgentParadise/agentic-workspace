@@ -20,6 +20,7 @@ import math
 import os
 import posixpath
 import shutil
+import stat
 import tempfile
 import time
 import uuid
@@ -1595,12 +1596,86 @@ def _forget_step(task: asyncio.Future[_T]) -> None:
 
 
 def _rmtree(path: str) -> OSError | None:
-    """`shutil.rmtree`, returning its error instead of raising it."""
+    """`shutil.rmtree`, returning its error instead of raising it.
+
+    A directory without owner write cannot have its entries unlinked, even by
+    its owner. Agents leave such trees behind as a matter of course (pytest's
+    ``garbage-*`` seeds, the Go module cache, both 0555), and every one of them
+    retained its workspace on the host. So on `PermissionError` the owner's
+    rwx is restored on every such directory this process owns, and the delete
+    is tried once more. A tree with none of them, such as files a container
+    wrote as another uid, fails as before and reaches the container fallback.
+    """
     try:
         shutil.rmtree(path)
+    except PermissionError as exc:
+        if not _grant_owner_rwx(path):
+            return exc
+        try:
+            shutil.rmtree(path)
+        except OSError as retry_exc:
+            return retry_exc
+        except RecursionError:  # 3.11's rmtree recurses; let the fallback take it
+            return exc
     except OSError as exc:
         return exc
     return None
+
+
+#: Opens a directory without following a symlink at the final component.
+_DIR_NOFOLLOW = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _grant_owner_rwx(root: str) -> int:
+    """Add u+rwx to every directory under `root`, `root` included, that lacks it.
+
+    Walked by file descriptor: each child is opened relative to its parent's
+    descriptor with ``O_NOFOLLOW | O_DIRECTORY`` and changed with ``fchmod``,
+    so no path is resolved twice and a directory swapped for a symlink
+    mid-walk is refused rather than followed out of the tree. Only directories
+    owned by this process change. One without owner read (0000) cannot be
+    opened and is left alone; the container fallback still covers it. Returns
+    how many directories changed, so the caller retries only when one did.
+    """
+    try:
+        fd = os.open(root, _DIR_NOFOLLOW)
+    except OSError:
+        return 0
+    try:
+        return _grant_owner_rwx_fd(fd, os.geteuid(), _GRANT_MAX_DEPTH)
+    finally:
+        os.close(fd)
+
+
+#: How deep the repair walks. Deeper directories are left to the container
+#: fallback, and open descriptors and Python's stack both stay bounded.
+_GRANT_MAX_DEPTH = 256
+
+
+def _grant_owner_rwx_fd(fd: int, uid: int, depth: int) -> int:
+    """`_grant_owner_rwx` for the open directory `fd`. Open descriptors = depth."""
+    changed = 0
+    with contextlib.suppress(OSError):
+        st = os.fstat(fd)
+        if st.st_uid == uid and st.st_mode & stat.S_IRWXU != stat.S_IRWXU:
+            os.fchmod(fd, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+            changed += 1
+    if depth <= 0:
+        return changed
+    try:
+        names = os.listdir(fd)
+    except OSError:
+        return changed
+    for name in names:
+        try:
+            child = os.open(name, _DIR_NOFOLLOW, dir_fd=fd)
+        except OSError:  # not a directory, a symlink, or unreadable
+            continue
+        try:
+            changed += _grant_owner_rwx_fd(child, uid, depth - 1)
+        finally:
+            os.close(child)
+    return changed
 
 
 class ContainerRemovalError(RuntimeError):

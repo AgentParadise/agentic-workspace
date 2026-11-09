@@ -22,7 +22,9 @@ Hermetic - no Docker daemon.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -31,10 +33,12 @@ import pytest
 
 from agentic_isolation import SupportsStagedTeardown, TeardownReport, TeardownUsage
 from agentic_isolation.contract import MISSING, OperationSpec, WorkspaceRef
+from agentic_isolation.providers import docker as docker_provider
 from agentic_isolation.providers.base import drain_operation
 from agentic_isolation.providers.docker import (
     ContainerRemovalError,
     WorkspaceDockerProvider,
+    _rmtree,
     _usage_from_cgroup,
 )
 from agentic_isolation.providers.docker_operations import DockerOperations
@@ -1091,3 +1095,146 @@ class TestTheFallbackCleanupIsBoundedAndNeverRaises:
             asyncio.run(_cancel_mid_run())
         assert stalled[0].killed
         assert d.exists()
+
+
+def _read_only_tree(root: Path) -> list[Path]:
+    """`root` holding nested 0555 directories with files inside, as agents leave them.
+
+    The shape of pytest's ``garbage-*/.../seeds/{uv,pnpm}`` and the Go module
+    cache: every file is ours, but no directory above it grants owner write.
+    """
+    leaf = root / ".tmp" / "pytest-of-agent" / "garbage-1" / "seeds" / "uv"
+    leaf.mkdir(parents=True)
+    (leaf / "pkg.whl").write_text("wheel")
+    (root / ".tmp" / "pytest-of-agent" / "garbage-1" / "seeds" / "note").write_text("x")
+    locked = [leaf, leaf.parent, leaf.parent.parent]
+    for d in locked:  # leaf first: a 0555 parent would refuse the child's chmod
+        d.chmod(0o555)
+    return locked
+
+
+_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+@pytest.mark.skipif(_ROOT, reason="root ignores mode bits, so the tree is always deletable")
+class TestReadOnlyDirectoriesTheAgentLeftAreDeleted:
+    """#1932/#2095: a 0555 directory inside the workspace retained every such run."""
+
+    def test_rmtree_deletes_a_tree_of_read_only_directories(self, tmp_path: Path) -> None:
+        d = tmp_path / "agentic-ws-1"
+        _read_only_tree(d)
+
+        assert _rmtree(str(d)) is None
+        assert not d.exists()
+
+    def test_teardown_completes_without_the_container_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        spawned: list[str] = []
+        _record(monkeypatch, spawned)
+        provider = _provider()
+        d = tmp_path / "agentic-ws-1"
+        _read_only_tree(d)
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+
+        report = asyncio.run(provider.teardown(ws))
+
+        assert report.finalization.state == "completed", report
+        assert not d.exists()
+        assert report.usage.delete_fallback is None
+        assert not any(a.startswith("docker run") for a in spawned), spawned
+
+    def test_a_symlinked_directory_is_neither_followed_nor_changed(self, tmp_path: Path) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("keep")
+        outside.chmod(0o555)
+        d = tmp_path / "agentic-ws-1"
+        _read_only_tree(d)
+        (d / "link").symlink_to(outside, target_is_directory=True)
+        try:
+            assert _rmtree(str(d)) is None
+            assert not d.exists()
+            assert (outside / "keep").read_text() == "keep"
+            assert stat.S_IMODE(outside.stat().st_mode) == 0o555
+        finally:
+            outside.chmod(0o755)
+
+    def test_a_tree_with_nothing_to_grant_fails_as_before(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        d = tmp_path / "agentic-ws-1"
+        d.mkdir()
+        calls: list[str] = []
+
+        def _denied(path: str) -> None:
+            calls.append(path)
+            raise PermissionError(13, "Permission denied", path)
+
+        monkeypatch.setattr(shutil, "rmtree", _denied)
+
+        assert isinstance(_rmtree(str(d)), PermissionError)
+        assert calls == [str(d)], "no retry when no directory needed owner rwx"
+
+    def test_a_tree_too_deep_to_repair_returns_the_error_for_the_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Codex P2: a RecursionError must not escape teardown past the fallback."""
+        d = tmp_path / "agentic-ws-1"
+        locked = _read_only_tree(d)
+        # The root is depth 3, so .tmp, pytest-of-agent, garbage-1 are visited and
+        # garbage-1's children are not: one grant, and two dirs left at 0555.
+        monkeypatch.setattr(docker_provider, "_GRANT_MAX_DEPTH", 3)
+        real_rmtree = shutil.rmtree
+        calls: list[str] = []
+
+        def _recursing_retry(path: str) -> None:
+            calls.append(path)
+            if len(calls) == 1:
+                real_rmtree(path)  # the real first attempt: PermissionError
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(shutil, "rmtree", _recursing_retry)
+        try:
+            assert isinstance(_rmtree(str(d)), PermissionError)
+            assert len(calls) == 2, "garbage-1 was granted, so the delete was retried"
+            uv, seeds, garbage = locked
+            assert stat.S_IMODE(garbage.stat().st_mode) == 0o755
+            assert stat.S_IMODE(seeds.stat().st_mode) == 0o555, "beyond the depth bound"
+            assert stat.S_IMODE(uv.stat().st_mode) == 0o555
+        finally:
+            for p in reversed(locked):
+                p.chmod(0o755)
+
+    def test_a_directory_swapped_for_a_symlink_mid_walk_is_not_followed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Codex P1: the swap lands between listing a directory and opening its child."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        outside.chmod(0o555)
+        d = tmp_path / "agentic-ws-1"
+        seeds = _read_only_tree(d)[-1]  # .tmp/pytest-of-agent/garbage-1/seeds
+        victim = seeds.parent  # garbage-1: listed, then swapped before it is opened
+        real_listdir = os.listdir
+        real_rmtree = shutil.rmtree
+        swapped: list[bool] = []
+
+        def _swap_then_list(fd_or_path: Any = ".") -> list[str]:
+            names = real_listdir(fd_or_path)
+            if not swapped and victim.name in names:
+                swapped.append(True)
+                for p in (seeds / "uv", seeds):
+                    p.chmod(0o755)
+                real_rmtree(victim)
+                victim.symlink_to(outside, target_is_directory=True)
+            return names
+
+        monkeypatch.setattr(os, "listdir", _swap_then_list)
+        try:
+            _rmtree(str(d))
+            assert swapped, "the swap never ran, so the test proves nothing"
+            assert stat.S_IMODE(outside.stat().st_mode) == 0o555
+        finally:
+            outside.chmod(0o755)
