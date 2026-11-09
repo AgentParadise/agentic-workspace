@@ -22,11 +22,18 @@ bind-mounted for one RUN, and is never shipped.
     ``~/.claude/settings.json`` is agent-writable and written by the
     entrypoint, so it is never the guard and is not touched.
 
-``validate`` (any user, last build step)
+    The hook runs dcg with an EMPTY environment and HOME=/nonexistent, so the
+    agent's environment and its ~/.config/dcg (allowlist, allow-once codes,
+    user config.toml) cannot weaken it. Allow-once is therefore unavailable
+    inside a workspace by design.
+
+``validate`` (the agent user, last build step)
     Exit 1 unless the files are root-owned and not group/world writable, the
-    binary is the pinned version, both harnesses are registered, the policy
-    the agent sees is fail-closed, and every known-bad payload is denied (and
-    ``ls`` allowed) through both harnesses' hook protocols.
+    binary is the pinned version, both harnesses are registered with exactly
+    the hook command and Claude's ``disableAllHooks`` is not set, the policy is
+    fail-closed, every known-bad payload is denied (and ``ls`` allowed)
+    through both harnesses' hook protocols run with the exact registered
+    command, and an allowlist grant the agent makes for itself is ignored.
 
 dcg is a guardrail, not a sandbox: an agent can still write a script and run
 it, and Codex's ``unified_exec`` path can skip PreToolUse.
@@ -43,6 +50,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -67,7 +75,14 @@ POLICY_FILE = HERE / "dcg-config.toml"
 
 BIN = "/usr/local/bin/dcg"
 POLICY = "/etc/dcg/config.toml"
-HOOK_COMMAND = f"/usr/bin/env DCG_NO_UPDATE_CHECK=1 {BIN}"
+# Empty environment, HOME that does not exist: nothing the agent controls
+# (DCG_BYPASS, DCG_CONFIG, ~/.config/dcg allowlists, allow-once codes, a user
+# config.toml) reaches dcg. Only root-owned /etc/dcg/config.toml applies.
+# Same string as syntropic137 infra/scripts/agent_guard.py (host side).
+HOOK_COMMAND = (
+    f"/usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent DCG_NO_UPDATE_CHECK=1 {BIN}"
+)
+EXEMPT_RULE = "core.git:reset-hard"
 MARKER = "# Managed by agentic-workspace workspace/agent-guard."
 
 CLAUDE_SETTINGS = "/etc/claude-code/managed-settings.json"
@@ -317,16 +332,16 @@ def install(expect_version: str | None) -> None:
 # --- validate ----------------------------------------------------------------
 
 
-def clean_env(home: Path | None) -> dict[str, str]:
-    """No inherited DCG_* overrides: validate what the files say."""
-    env = {
-        "PATH": "/usr/local/bin:/usr/bin:/bin",
-        "NO_COLOR": "1",
-        "DCG_NO_UPDATE_CHECK": "1",
-    }
-    if home is not None:
-        env["HOME"] = str(home)
-    return env
+def hook_env() -> dict[str, str]:
+    """Exactly the environment the registered command gives dcg."""
+    return {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "DCG_NO_UPDATE_CHECK": "1"}
+
+
+def registered_argv() -> list[str]:
+    """The registered hook command as argv, dcg's path under the test root."""
+    argv = shlex.split(HOOK_COMMAND)
+    argv[-1] = str(image_path(argv[-1]))
+    return argv
 
 
 def run_version(binary: Path) -> str:
@@ -334,7 +349,7 @@ def run_version(binary: Path) -> str:
         [str(binary), "--version"],
         capture_output=True,
         text=True,
-        env=clean_env(None),
+        env={**hook_env(), "NO_COLOR": "1"},
         timeout=30,
     ).stdout
     match = re.search(r"\b(\d+\.\d+\.\d+)\b", out)
@@ -363,36 +378,50 @@ def check_locked(path: Path) -> list[str]:
     return problems
 
 
-def registered_claude(path: Path) -> bool:
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return False
-    groups = (
-        data.get("hooks", {}).get("PreToolUse", []) if isinstance(data, dict) else []
-    )
-    return any(
+def has_dcg_hook(groups: object, matcher: str) -> bool:
+    """A group with exactly MATCHER holding the exact registered command."""
+    return isinstance(groups, list) and any(
         isinstance(g, dict)
-        and g.get("matcher") == "Bash"
+        and g.get("matcher") == matcher
         and any(
-            isinstance(h, dict) and h.get("command") == HOOK_COMMAND
+            isinstance(h, dict)
+            and h.get("type") == "command"
+            and h.get("command") == HOOK_COMMAND
             for h in g.get("hooks") or []
         )
         for g in groups
     )
 
 
-def registered_codex(path: Path) -> bool:
+def hooks_switched_off(path: Path) -> bool:
+    """Claude's ``disableAllHooks``, which also silences managed hooks."""
     try:
-        data = tomllib.loads(path.read_text())
+        data = json.loads(path.read_text())
     except (OSError, ValueError):
         return False
-    groups = data.get("hooks", {}).get("PreToolUse", [])
-    return any(
-        g.get("matcher") == "^Bash$"
-        and any(h.get("command") == HOOK_COMMAND for h in g.get("hooks", []))
-        for g in groups
-    )
+    return isinstance(data, dict) and data.get("disableAllHooks") is True
+
+
+def registration_problems(home: Path) -> list[str]:
+    problems: list[str] = []
+    try:
+        claude = json.loads(image_path(CLAUDE_SETTINGS).read_text())
+    except (OSError, ValueError):
+        claude = None
+    hooks = claude.get("hooks") if isinstance(claude, dict) else None
+    pre = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    if not has_dcg_hook(pre, "Bash"):
+        problems.append(f"claude: dcg not registered in {CLAUDE_SETTINGS}")
+    for settings in (image_path(CLAUDE_SETTINGS), home / ".claude/settings.json"):
+        if hooks_switched_off(settings):
+            problems.append(f"claude: disableAllHooks is true in {settings}")
+    try:
+        codex = tomllib.loads(image_path(CODEX_REQUIREMENTS).read_text())
+    except (OSError, ValueError):
+        codex = {}
+    if not has_dcg_hook(codex.get("hooks", {}).get("PreToolUse"), "^Bash$"):
+        problems.append(f"codex: dcg not registered in {CODEX_REQUIREMENTS}")
+    return problems
 
 
 def payload(harness: str, command: str, cwd: Path) -> str:
@@ -409,16 +438,14 @@ def payload(harness: str, command: str, cwd: Path) -> str:
     return json.dumps(body)
 
 
-def hook_denies(stdin: str, home: Path, cwd: Path) -> bool:
-    """Run the registered hook command as the harness would; True when it denies."""
-    argv = HOOK_COMMAND.split()
-    argv[-1] = str(image_path(argv[-1]))
+def hook_denies(stdin: str, cwd: Path, caller_env: dict[str, str]) -> bool:
+    """Run the registered command as a harness would, from CALLER_ENV; True on deny."""
     result = subprocess.run(
-        argv,
+        registered_argv(),
         input=stdin,
         capture_output=True,
         text=True,
-        env=clean_env(home),
+        env=caller_env,
         cwd=cwd,
         timeout=30,
     )
@@ -434,14 +461,12 @@ def hook_denies(stdin: str, home: Path, cwd: Path) -> bool:
     return isinstance(specific, dict) and specific.get("permissionDecision") == "deny"
 
 
-def effective_policy(home: Path) -> list[str]:
+def policy_problems(cwd: Path) -> list[str]:
+    """The policy dcg sees through the registered command (``dcg config``)."""
+    argv = registered_argv()
+    argv = [*argv[:-1], "NO_COLOR=1", argv[-1], "config"]
     out = subprocess.run(
-        [str(image_path(BIN)), "config"],
-        capture_output=True,
-        text=True,
-        env=clean_env(home),
-        cwd=home if home.is_dir() else "/",
-        timeout=30,
+        argv, capture_output=True, text=True, cwd=cwd, timeout=30
     ).stdout
     problems: list[str] = []
     for label, want in (
@@ -452,12 +477,76 @@ def effective_policy(home: Path) -> list[str]:
         match = re.search(rf"^\s*{label}:\s*(\S+)", out, re.MULTILINE)
         if not match or match.group(1) != want:
             got = match.group(1) if match else "missing"
-            problems.append(f"{home}: effective '{label}' is {got}, want {want}")
+            problems.append(f"policy: '{label}' is {got}, want {want}")
     section = out.split("Enabled packs:", 1)[-1].split("Disabled packs:", 1)[0]
     enabled = set(re.findall(r"^\s+- (\S+)$", section, re.MULTILINE))
     missing = [p for p in REQUIRED_PACKS if p not in enabled]
     if missing:
-        problems.append(f"{home}: required packs not enabled: {', '.join(missing)}")
+        problems.append(f"policy: required packs not enabled: {', '.join(missing)}")
+    return problems
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text()
+    except OSError:
+        return ""
+
+
+def self_exemption_problems(home: Path, cwd: Path) -> list[str]:
+    """The agent grants itself an exemption; the registered command must ignore it.
+
+    The grant is made the way an agent would make it, as itself, into its own
+    ~/.config/dcg. The probe then runs from an agent environment that also
+    carries DCG_BYPASS and DCG_CONFIG. Only the sanitised hook command
+    (``env -i``, HOME=/nonexistent) keeps it a deny.
+    """
+    agent_env = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": str(home),
+        "NO_COLOR": "1",
+        "DCG_NO_UPDATE_CHECK": "1",
+    }
+    dcg = str(image_path(BIN))
+    granted = subprocess.run(
+        [
+            dcg,
+            "allowlist",
+            "add",
+            EXEMPT_RULE,
+            "--user",
+            "--reason",
+            "agent-guard probe",
+        ],
+        capture_output=True,
+        text=True,
+        env=agent_env,
+        cwd=cwd,
+        timeout=30,
+    )
+    allowlist = home / ".config/dcg/allowlist.toml"
+    if granted.returncode != 0 or EXEMPT_RULE not in _read(allowlist):
+        detail = (granted.stderr or granted.stdout).strip()
+        return [
+            f"self-exemption probe could not grant {EXEMPT_RULE} in {allowlist}: {detail}"
+        ]
+    problems: list[str] = []
+    try:
+        hostile = {**agent_env, "DCG_BYPASS": "1", "DCG_CONFIG": str(allowlist)}
+        for harness in HARNESSES:
+            if not hook_denies(payload(harness, "git reset --hard", cwd), cwd, hostile):
+                problems.append(
+                    f"{harness}: the agent's own allowlist grant (or DCG_BYPASS) "
+                    "reached the hook: 'git reset --hard' was allowed"
+                )
+    finally:
+        subprocess.run(
+            [dcg, "allowlist", "remove", EXEMPT_RULE, "--user"],
+            capture_output=True,
+            env=agent_env,
+            cwd=cwd,
+            timeout=30,
+        )
     return problems
 
 
@@ -473,27 +562,26 @@ def validate(home: Path) -> list[str]:
         and image_path(POLICY).read_bytes() != POLICY_FILE.read_bytes()
     ):
         problems.append(f"{POLICY} differs from {POLICY_FILE.name}")
-    if not registered_claude(image_path(CLAUDE_SETTINGS)):
-        problems.append(f"claude: dcg not registered in {CLAUDE_SETTINGS}")
-    if not registered_codex(image_path(CODEX_REQUIREMENTS)):
-        problems.append(f"codex: dcg not registered in {CODEX_REQUIREMENTS}")
+    problems += registration_problems(home)
     if problems:
         return problems  # the probes below would only restate a missing install
-    problems += effective_policy(home)
     with tempfile.TemporaryDirectory(prefix="dcg-validate-") as tmp:
         cwd = Path(tmp)
+        problems += policy_problems(cwd)
+        clean = {"PATH": "/usr/bin:/bin"}
         for harness in HARNESSES:
             for command in BAD_COMMANDS:
-                if not hook_denies(payload(harness, command, cwd), home, cwd):
+                if not hook_denies(payload(harness, command, cwd), cwd, clean):
                     problems.append(
                         f"{harness}: known-bad command was not denied: {command}"
                     )
-            if hook_denies(payload(harness, "ls", cwd), home, cwd):
+            if hook_denies(payload(harness, "ls", cwd), cwd, clean):
                 problems.append(
                     f"{harness}: harmless 'ls' was denied (policy blocks everything)"
                 )
-        if not hook_denies("not json", home, cwd):
+        if not hook_denies("not json", cwd, clean):
             problems.append("unparseable hook input was allowed (not fail-closed)")
+        problems += self_exemption_problems(home, cwd)
     return problems
 
 

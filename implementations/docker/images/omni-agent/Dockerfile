@@ -447,6 +447,12 @@ RUN set -eux; \
 # honours only when it and its parents are root-owned and not writable. The
 # existing user-level hooks (RTK) are untouched.
 #
+# WHY `env -i ... HOME=/nonexistent` IN THE HOOK COMMAND. dcg also reads the
+# caller's environment (DCG_BYPASS, DCG_CONFIG) and ~/.config/dcg, which the
+# agent can write: `dcg allowlist add <rule> --user` or `dcg allow-once <code>`
+# was enough to exempt itself. The empty environment leaves only the root-owned
+# policy, so allow-once is unavailable inside a workspace by design.
+#
 # WHY A SCRIPT. Same steps for claude-cli and omni-agent, so one tested
 # installer (scripts/tests/test_agent_guard.py), bind-mounted for this RUN and
 # never shipped. It verifies SHA256 and THEN the minisign signature before
@@ -854,8 +860,11 @@ ENV HOME=/home/agent \
     VIRTUAL_ENV=/opt/venv
 
 # Prove the guard as the agent sees it, last, so no later layer can undo it
-# unnoticed: root-owned files, the effective policy fail-closed, and every
-# known-bad payload denied (ls allowed) through both harnesses' hook protocols.
+# unnoticed: root-owned files, both registrations carry exactly the hook
+# command, Claude's disableAllHooks is not set, the policy is fail-closed, every
+# known-bad payload is denied (ls allowed) through both harnesses' hook
+# protocols run with the registered command, and an allowlist grant the agent
+# makes for itself (with DCG_BYPASS in its env) still leaves a deny.
 # `codex features list` loads /etc/codex/requirements.toml and exits non-zero
 # when it rejects it, so a Codex upgrade that changes the managed-hook schema
 # fails here instead of silently dropping the guard. Throwaway HOME for codex

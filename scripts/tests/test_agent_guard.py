@@ -32,7 +32,9 @@ VERSION = "0.16.0"
 ASSET = "dcg-x86_64-unknown-linux-musl.tar.xz"
 
 #: A stand-in dcg: reports a version, prints a policy for `dcg config`, and
-#: denies hook input that names a destructive command or is not JSON.
+#: denies hook input that names a destructive command or is not JSON. Like the
+#: real one, it honours DCG_BYPASS and a ~/.config/dcg allowlist the agent can
+#: write, so only a hook command that strips the environment keeps it a deny.
 GOOD_DCG = """#!/bin/sh
 case "$1" in
   --version) echo "@VERSION@"; exit 0 ;;
@@ -53,8 +55,16 @@ Enabled packs:
 Disabled packs:
 OUT
   exit 0 ;;
+  allowlist)
+    f="$HOME/.config/dcg/allowlist.toml"
+    if [ "$2" = add ]; then mkdir -p "${f%/*}" && echo "rule = \"$3\"" >> "$f"; else rm -f "$f"; fi
+    exit 0 ;;
 esac
 input="$(cat)"
+[ -n "${DCG_BYPASS:-}" ] && exit 0
+case "$input" in
+  *reset*) [ -f "$HOME/.config/dcg/allowlist.toml" ] && exit 0 ;;
+esac
 case "$input" in
   '{'*'"ls"'*) exit 0 ;;
   '{'*) ;;
@@ -285,6 +295,77 @@ def test_validate_fails_a_writable_or_unregistered_install(
     problems = ag.validate(tmp_path)
     assert any("config.toml is group/world writable" in p for p in problems)
     assert f"codex: dcg not registered in {ag.CODEX_REQUIREMENTS}" in problems
+
+
+UNSANITISED = "/usr/bin/env DCG_NO_UPDATE_CHECK=1 /usr/local/bin/dcg"
+
+
+def test_hook_command_strips_the_agent_environment() -> None:
+    assert ag.HOOK_COMMAND == (
+        "/usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent DCG_NO_UPDATE_CHECK=1 /usr/local/bin/dcg"
+    )
+
+
+def test_validate_grants_and_revokes_its_own_exemption(release, tmp_path: Path) -> None:
+    release(_tarball({"dcg": _script(GOOD_DCG)}))
+    assert ag.main(["install"]) == 0
+    assert ag.validate(tmp_path) == []
+    # The probe really granted (else the deny proves nothing) and cleaned up.
+    assert not (tmp_path / ".config/dcg/allowlist.toml").exists()
+
+
+def test_validate_fails_a_hook_command_that_lets_the_agent_exempt_itself(
+    release, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression the sanitised command closed: an inherited environment."""
+    image = release(_tarball({"dcg": _script(GOOD_DCG)}))
+    codex_body = ag.CODEX_REQUIREMENTS_BODY.replace(ag.HOOK_COMMAND, UNSANITISED)
+    monkeypatch.setattr(ag, "HOOK_COMMAND", UNSANITISED)
+    monkeypatch.setattr(ag, "CODEX_REQUIREMENTS_BODY", codex_body)
+    assert ag.main(["install"]) == 0
+    # The stub's absolute path stays inside the test root via registered_argv.
+    assert (image / "usr/local/bin/dcg").exists()
+
+    problems = ag.validate(tmp_path)
+    for harness in ag.HARNESSES:
+        assert any(
+            p.startswith(f"{harness}: the agent's own allowlist grant")
+            for p in problems
+        )
+
+
+def test_validate_fails_registrations_with_the_unsanitised_command(
+    release, tmp_path: Path
+) -> None:
+    image = release(_tarball({"dcg": _script(GOOD_DCG)}))
+    assert ag.main(["install"]) == 0
+    for rel in ("etc/claude-code/managed-settings.json", "etc/codex/requirements.toml"):
+        f = image / rel
+        f.write_text(f.read_text().replace(ag.HOOK_COMMAND, UNSANITISED))
+
+    problems = ag.validate(tmp_path)
+    assert f"claude: dcg not registered in {ag.CLAUDE_SETTINGS}" in problems
+    assert f"codex: dcg not registered in {ag.CODEX_REQUIREMENTS}" in problems
+
+
+@pytest.mark.parametrize("where", ["managed", "user"])
+def test_validate_fails_when_claude_hooks_are_switched_off(
+    release, tmp_path: Path, where: str
+) -> None:
+    image = release(_tarball({"dcg": _script(GOOD_DCG)}))
+    assert ag.main(["install"]) == 0
+    home = tmp_path / "home"
+    if where == "managed":
+        settings = image / "etc/claude-code/managed-settings.json"
+        data = json.loads(settings.read_text())
+    else:
+        settings = home / ".claude/settings.json"
+        settings.parent.mkdir(parents=True)
+        data = {}
+    settings.write_text(json.dumps({**data, "disableAllHooks": True}))
+
+    problems = ag.validate(home)
+    assert f"claude: disableAllHooks is true in {settings}" in problems
 
 
 def test_payloads_match_each_harness_protocol(tmp_path: Path) -> None:

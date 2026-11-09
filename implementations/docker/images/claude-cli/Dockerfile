@@ -504,7 +504,8 @@ ENV HOME=/home/agent \
     PATH=/usr/local/cargo/bin:$PATH
 
 # Prove the guard as the agent sees it, last (see omni-agent for the WHY):
-# known-bad payloads denied through both hook protocols, and codex accepts
+# known-bad payloads denied through both hook protocols run with the registered
+# command, the agent's own allowlist grant ignored, and codex accepts
 # /etc/codex/requirements.toml (`features list` exits non-zero when it does not).
 RUN --mount=type=bind,source=workspace/agent-guard,target=/tmp/agent-guard \
     /opt/venv/bin/python /tmp/agent-guard/agent_guard.py validate --home "${HOME}" \
