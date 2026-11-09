@@ -1615,6 +1615,8 @@ def _rmtree(path: str) -> OSError | None:
             shutil.rmtree(path)
         except OSError as retry_exc:
             return retry_exc
+        except RecursionError:  # 3.11's rmtree recurses; let the fallback take it
+            return exc
     except OSError as exc:
         return exc
     return None
@@ -1640,12 +1642,17 @@ def _grant_owner_rwx(root: str) -> int:
     except OSError:
         return 0
     try:
-        return _grant_owner_rwx_fd(fd, os.geteuid())
+        return _grant_owner_rwx_fd(fd, os.geteuid(), _GRANT_MAX_DEPTH)
     finally:
         os.close(fd)
 
 
-def _grant_owner_rwx_fd(fd: int, uid: int) -> int:
+#: How deep the repair walks. Deeper directories are left to the container
+#: fallback, and open descriptors and Python's stack both stay bounded.
+_GRANT_MAX_DEPTH = 256
+
+
+def _grant_owner_rwx_fd(fd: int, uid: int, depth: int) -> int:
     """`_grant_owner_rwx` for the open directory `fd`. Open descriptors = depth."""
     changed = 0
     with contextlib.suppress(OSError):
@@ -1653,6 +1660,8 @@ def _grant_owner_rwx_fd(fd: int, uid: int) -> int:
         if st.st_uid == uid and st.st_mode & stat.S_IRWXU != stat.S_IRWXU:
             os.fchmod(fd, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
             changed += 1
+    if depth <= 0:
+        return changed
     try:
         names = os.listdir(fd)
     except OSError:
@@ -1663,7 +1672,7 @@ def _grant_owner_rwx_fd(fd: int, uid: int) -> int:
         except OSError:  # not a directory, a symlink, or unreadable
             continue
         try:
-            changed += _grant_owner_rwx_fd(child, uid)
+            changed += _grant_owner_rwx_fd(child, uid, depth - 1)
         finally:
             os.close(child)
     return changed

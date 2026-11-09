@@ -33,6 +33,7 @@ import pytest
 
 from agentic_isolation import SupportsStagedTeardown, TeardownReport, TeardownUsage
 from agentic_isolation.contract import MISSING, OperationSpec, WorkspaceRef
+from agentic_isolation.providers import docker as docker_provider
 from agentic_isolation.providers.base import drain_operation
 from agentic_isolation.providers.docker import (
     ContainerRemovalError,
@@ -1175,6 +1176,36 @@ class TestReadOnlyDirectoriesTheAgentLeftAreDeleted:
 
         assert isinstance(_rmtree(str(d)), PermissionError)
         assert calls == [str(d)], "no retry when no directory needed owner rwx"
+
+    def test_a_tree_too_deep_to_repair_returns_the_error_for_the_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Codex P2: a RecursionError must not escape teardown past the fallback."""
+        d = tmp_path / "agentic-ws-1"
+        locked = _read_only_tree(d)
+        # The root is depth 3, so .tmp, pytest-of-agent, garbage-1 are visited and
+        # garbage-1's children are not: one grant, and two dirs left at 0555.
+        monkeypatch.setattr(docker_provider, "_GRANT_MAX_DEPTH", 3)
+        real_rmtree = shutil.rmtree
+        calls: list[str] = []
+
+        def _recursing_retry(path: str) -> None:
+            calls.append(path)
+            if len(calls) == 1:
+                real_rmtree(path)  # the real first attempt: PermissionError
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(shutil, "rmtree", _recursing_retry)
+        try:
+            assert isinstance(_rmtree(str(d)), PermissionError)
+            assert len(calls) == 2, "garbage-1 was granted, so the delete was retried"
+            uv, seeds, garbage = locked
+            assert stat.S_IMODE(garbage.stat().st_mode) == 0o755
+            assert stat.S_IMODE(seeds.stat().st_mode) == 0o555, "beyond the depth bound"
+            assert stat.S_IMODE(uv.stat().st_mode) == 0o555
+        finally:
+            for p in reversed(locked):
+                p.chmod(0o755)
 
     def test_a_directory_swapped_for_a_symlink_mid_walk_is_not_followed(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
