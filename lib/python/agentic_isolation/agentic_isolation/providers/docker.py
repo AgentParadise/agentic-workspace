@@ -1620,35 +1620,52 @@ def _rmtree(path: str) -> OSError | None:
     return None
 
 
+#: Opens a directory without following a symlink at the final component.
+_DIR_NOFOLLOW = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
 def _grant_owner_rwx(root: str) -> int:
     """Add u+rwx to every directory under `root`, `root` included, that lacks it.
 
-    Only real directories owned by this process are touched: a symlink is never
-    followed or changed, and nothing outside `root` is visited. Returns how
-    many directories changed, so the caller retries only when one did.
+    Walked by file descriptor: each child is opened relative to its parent's
+    descriptor with ``O_NOFOLLOW | O_DIRECTORY`` and changed with ``fchmod``,
+    so no path is resolved twice and a directory swapped for a symlink
+    mid-walk is refused rather than followed out of the tree. Only directories
+    owned by this process change. One without owner read (0000) cannot be
+    opened and is left alone; the container fallback still covers it. Returns
+    how many directories changed, so the caller retries only when one did.
     """
-    uid = os.geteuid()
+    try:
+        fd = os.open(root, _DIR_NOFOLLOW)
+    except OSError:
+        return 0
+    try:
+        return _grant_owner_rwx_fd(fd, os.geteuid())
+    finally:
+        os.close(fd)
+
+
+def _grant_owner_rwx_fd(fd: int, uid: int) -> int:
+    """`_grant_owner_rwx` for the open directory `fd`. Open descriptors = depth."""
     changed = 0
-
-    def _fix(p: str) -> None:
-        nonlocal changed
-        try:
-            st = os.lstat(p)
-        except OSError:
-            return
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
-            return
-        if st.st_mode & stat.S_IRWXU == stat.S_IRWXU:
-            return
-        with contextlib.suppress(OSError):
-            os.chmod(p, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+    with contextlib.suppress(OSError):
+        st = os.fstat(fd)
+        if st.st_uid == uid and st.st_mode & stat.S_IRWXU != stat.S_IRWXU:
+            os.fchmod(fd, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
             changed += 1
-
-    _fix(root)
-    # Top-down, so a directory is opened only after its own mode is fixed.
-    for dirpath, dirnames, _files in os.walk(root, topdown=True, followlinks=False):
-        for name in dirnames:
-            _fix(os.path.join(dirpath, name))
+    try:
+        names = os.listdir(fd)
+    except OSError:
+        return changed
+    for name in names:
+        try:
+            child = os.open(name, _DIR_NOFOLLOW, dir_fd=fd)
+        except OSError:  # not a directory, a symlink, or unreadable
+            continue
+        try:
+            changed += _grant_owner_rwx_fd(child, uid)
+        finally:
+            os.close(child)
     return changed
 
 

@@ -1175,3 +1175,35 @@ class TestReadOnlyDirectoriesTheAgentLeftAreDeleted:
 
         assert isinstance(_rmtree(str(d)), PermissionError)
         assert calls == [str(d)], "no retry when no directory needed owner rwx"
+
+    def test_a_directory_swapped_for_a_symlink_mid_walk_is_not_followed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Codex P1: the swap lands between listing a directory and opening its child."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        outside.chmod(0o555)
+        d = tmp_path / "agentic-ws-1"
+        seeds = _read_only_tree(d)[-1]  # .tmp/pytest-of-agent/garbage-1/seeds
+        victim = seeds.parent  # garbage-1: listed, then swapped before it is opened
+        real_listdir = os.listdir
+        real_rmtree = shutil.rmtree
+        swapped: list[bool] = []
+
+        def _swap_then_list(fd_or_path: Any = ".") -> list[str]:
+            names = real_listdir(fd_or_path)
+            if not swapped and victim.name in names:
+                swapped.append(True)
+                for p in (seeds / "uv", seeds):
+                    p.chmod(0o755)
+                real_rmtree(victim)
+                victim.symlink_to(outside, target_is_directory=True)
+            return names
+
+        monkeypatch.setattr(os, "listdir", _swap_then_list)
+        try:
+            _rmtree(str(d))
+            assert swapped, "the swap never ran, so the test proves nothing"
+            assert stat.S_IMODE(outside.stat().st_mode) == 0o555
+        finally:
+            outside.chmod(0o755)
