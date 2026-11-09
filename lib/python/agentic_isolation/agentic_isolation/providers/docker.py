@@ -20,6 +20,7 @@ import math
 import os
 import posixpath
 import shutil
+import stat
 import tempfile
 import time
 import uuid
@@ -1595,12 +1596,60 @@ def _forget_step(task: asyncio.Future[_T]) -> None:
 
 
 def _rmtree(path: str) -> OSError | None:
-    """`shutil.rmtree`, returning its error instead of raising it."""
+    """`shutil.rmtree`, returning its error instead of raising it.
+
+    A directory without owner write cannot have its entries unlinked, even by
+    its owner. Agents leave such trees behind as a matter of course (pytest's
+    ``garbage-*`` seeds, the Go module cache, both 0555), and every one of them
+    retained its workspace on the host. So on `PermissionError` the owner's
+    rwx is restored on every such directory this process owns, and the delete
+    is tried once more. A tree with none of them, such as files a container
+    wrote as another uid, fails as before and reaches the container fallback.
+    """
     try:
         shutil.rmtree(path)
+    except PermissionError as exc:
+        if not _grant_owner_rwx(path):
+            return exc
+        try:
+            shutil.rmtree(path)
+        except OSError as retry_exc:
+            return retry_exc
     except OSError as exc:
         return exc
     return None
+
+
+def _grant_owner_rwx(root: str) -> int:
+    """Add u+rwx to every directory under `root`, `root` included, that lacks it.
+
+    Only real directories owned by this process are touched: a symlink is never
+    followed or changed, and nothing outside `root` is visited. Returns how
+    many directories changed, so the caller retries only when one did.
+    """
+    uid = os.geteuid()
+    changed = 0
+
+    def _fix(p: str) -> None:
+        nonlocal changed
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+            return
+        if st.st_mode & stat.S_IRWXU == stat.S_IRWXU:
+            return
+        with contextlib.suppress(OSError):
+            os.chmod(p, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+            changed += 1
+
+    _fix(root)
+    # Top-down, so a directory is opened only after its own mode is fixed.
+    for dirpath, dirnames, _files in os.walk(root, topdown=True, followlinks=False):
+        for name in dirnames:
+            _fix(os.path.join(dirpath, name))
+    return changed
 
 
 class ContainerRemovalError(RuntimeError):

@@ -22,7 +22,9 @@ Hermetic - no Docker daemon.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,7 @@ from agentic_isolation.providers.base import drain_operation
 from agentic_isolation.providers.docker import (
     ContainerRemovalError,
     WorkspaceDockerProvider,
+    _rmtree,
     _usage_from_cgroup,
 )
 from agentic_isolation.providers.docker_operations import DockerOperations
@@ -1091,3 +1094,84 @@ class TestTheFallbackCleanupIsBoundedAndNeverRaises:
             asyncio.run(_cancel_mid_run())
         assert stalled[0].killed
         assert d.exists()
+
+
+def _read_only_tree(root: Path) -> list[Path]:
+    """`root` holding nested 0555 directories with files inside, as agents leave them.
+
+    The shape of pytest's ``garbage-*/.../seeds/{uv,pnpm}`` and the Go module
+    cache: every file is ours, but no directory above it grants owner write.
+    """
+    leaf = root / ".tmp" / "pytest-of-agent" / "garbage-1" / "seeds" / "uv"
+    leaf.mkdir(parents=True)
+    (leaf / "pkg.whl").write_text("wheel")
+    (root / ".tmp" / "pytest-of-agent" / "garbage-1" / "seeds" / "note").write_text("x")
+    locked = [leaf, leaf.parent, leaf.parent.parent]
+    for d in locked:  # leaf first: a 0555 parent would refuse the child's chmod
+        d.chmod(0o555)
+    return locked
+
+
+_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+@pytest.mark.skipif(_ROOT, reason="root ignores mode bits, so the tree is always deletable")
+class TestReadOnlyDirectoriesTheAgentLeftAreDeleted:
+    """#1932/#2095: a 0555 directory inside the workspace retained every such run."""
+
+    def test_rmtree_deletes_a_tree_of_read_only_directories(self, tmp_path: Path) -> None:
+        d = tmp_path / "agentic-ws-1"
+        _read_only_tree(d)
+
+        assert _rmtree(str(d)) is None
+        assert not d.exists()
+
+    def test_teardown_completes_without_the_container_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        spawned: list[str] = []
+        _record(monkeypatch, spawned)
+        provider = _provider()
+        d = tmp_path / "agentic-ws-1"
+        _read_only_tree(d)
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+
+        report = asyncio.run(provider.teardown(ws))
+
+        assert report.finalization.state == "completed", report
+        assert not d.exists()
+        assert report.usage.delete_fallback is None
+        assert not any(a.startswith("docker run") for a in spawned), spawned
+
+    def test_a_symlinked_directory_is_neither_followed_nor_changed(self, tmp_path: Path) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("keep")
+        outside.chmod(0o555)
+        d = tmp_path / "agentic-ws-1"
+        _read_only_tree(d)
+        (d / "link").symlink_to(outside, target_is_directory=True)
+        try:
+            assert _rmtree(str(d)) is None
+            assert not d.exists()
+            assert (outside / "keep").read_text() == "keep"
+            assert stat.S_IMODE(outside.stat().st_mode) == 0o555
+        finally:
+            outside.chmod(0o755)
+
+    def test_a_tree_with_nothing_to_grant_fails_as_before(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        d = tmp_path / "agentic-ws-1"
+        d.mkdir()
+        calls: list[str] = []
+
+        def _denied(path: str) -> None:
+            calls.append(path)
+            raise PermissionError(13, "Permission denied", path)
+
+        monkeypatch.setattr(shutil, "rmtree", _denied)
+
+        assert isinstance(_rmtree(str(d)), PermissionError)
+        assert calls == [str(d)], "no retry when no directory needed owner rwx"
