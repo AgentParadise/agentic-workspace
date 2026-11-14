@@ -119,6 +119,14 @@ capabilities:
       version: stable
 
   tools:
+    # Destructive command guard. A root-owned PreToolUse hook for both
+    # harnesses (/etc/claude-code/managed-settings.json, /etc/codex/requirements.toml)
+    # with a fail-closed policy at /etc/dcg/config.toml. Installed and proven
+    # at build time by workspace/agent-guard/agent_guard.py. A guardrail, not
+    # a sandbox.
+    - name: dcg
+      version: "0.16.0"
+      harness: both
     # Headless browser QA (syntropic137/syntropic137#1028). Pinned Playwright
     # CLI, Chromium's system libraries and the headless shell, baked into
     # PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright. Proven offline as the agent

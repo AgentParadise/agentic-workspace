@@ -50,10 +50,12 @@ IMAGES_DIR = ROOT / "implementations" / "docker" / "images"
 #: The images that ship a manifest, in release order. Each must name these
 #: components, checked by ``check``; anything else an image lists is extra.
 REQUIRED_COMPONENTS: dict[str, frozenset[str]] = {
-    "claude-cli": frozenset({"claude_cli", "codex_cli"}),
-    "omni-agent": frozenset({"claude_cli", "codex_cli", "apss_session_exporter"}),
+    "claude-cli": frozenset({"claude_cli", "codex_cli", "dcg"}),
+    "omni-agent": frozenset(
+        {"claude_cli", "codex_cli", "apss_session_exporter", "dcg"}
+    ),
     "toolchain": frozenset(
-        {"claude_cli", "codex_cli", "apss_session_exporter", "rustup", "bun"}
+        {"claude_cli", "codex_cli", "apss_session_exporter", "rustup", "bun", "dcg"}
     ),
     "scripted-agent": frozenset({"scripted_agent", "apss_session_exporter"}),
 }
