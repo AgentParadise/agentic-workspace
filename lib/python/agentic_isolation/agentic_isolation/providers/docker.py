@@ -13,6 +13,7 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -22,6 +23,7 @@ import posixpath
 import shutil
 import stat
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
@@ -1606,21 +1608,33 @@ async def _rmtree_off_loop(path: str) -> OSError | None:
     caller inside its teardown lock for as long as the delete really runs: a
     retry cannot start an archive, a second delete or the container fallback
     beside a worker still deleting (or retrying on) the same path.
+
+    The completion handle is a `concurrent.futures.Future` marked running
+    before the thread starts, never an asyncio task: `asyncio.run()` shutdown
+    cancels every task (a `to_thread` task reads as done while its thread
+    still deletes), and a running concurrent future cannot be cancelled. Each
+    wait goes through a fresh `asyncio.wrap_future`, so cancelling one wrapper
+    leaves the handle intact.
     """
-    worker = asyncio.ensure_future(asyncio.to_thread(_rmtree, path))
-    cancelled = False
-    while True:
+    done: concurrent.futures.Future[OSError | None] = concurrent.futures.Future()
+    done.set_running_or_notify_cancel()
+
+    def _work() -> None:
         try:
-            result = await asyncio.shield(worker)
-            break
+            done.set_result(_rmtree(path))
+        except BaseException as exc:  # noqa: BLE001 - handed to the awaiting caller
+            done.set_exception(exc)
+
+    threading.Thread(target=_work, name=f"rmtree:{os.path.basename(path)}").start()
+    cancelled = False
+    while not done.done():
+        try:
+            await asyncio.wrap_future(done)
         except asyncio.CancelledError:
             cancelled = True
-            if worker.done():
-                result = worker.result()  # re-raises if the worker itself failed
-                break
     if cancelled:
         raise asyncio.CancelledError
-    return result
+    return done.result()  # re-raises if the worker itself failed
 
 
 def _rmtree(path: str) -> OSError | None:

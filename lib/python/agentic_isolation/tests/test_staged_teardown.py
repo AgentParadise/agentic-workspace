@@ -1345,3 +1345,47 @@ class TestWorkspaceDeleteKeepsTheEventLoopFree:
         assert worker_finished, "teardown returned before the delete thread finished"
         assert cancelled
         assert not d.exists()
+
+    def test_loop_shutdown_mid_delete_waits_for_the_delete_thread(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`asyncio.run()` shutdown cancels every task, a worker task included.
+        Teardown must still not leave its lock before the delete thread ends."""
+        import threading
+
+        _record(monkeypatch, [])
+        provider = _provider()
+        d = tmp_path / "agentic-ws-1"
+        d.mkdir()
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+
+        entered, release = threading.Event(), threading.Event()
+        order: list[str] = []
+        real_rmtree = shutil.rmtree
+
+        def _held_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+            entered.set()
+            release.wait(5)
+            real_rmtree(path, *args, **kwargs)
+            order.append("thread finished")
+
+        monkeypatch.setattr(shutil, "rmtree", _held_rmtree)
+
+        async def _teardown() -> None:
+            try:
+                await provider.teardown(ws)
+            finally:
+                order.append("teardown left")
+
+        async def _main() -> None:
+            asyncio.get_running_loop().create_task(_teardown())
+            while not entered.is_set():
+                await asyncio.sleep(0.005)
+            # Return mid-delete: asyncio.run now cancels every remaining task.
+            threading.Timer(0.2, release.set).start()
+
+        asyncio.run(_main())
+
+        assert order == ["thread finished", "teardown left"]
+        assert not d.exists()
