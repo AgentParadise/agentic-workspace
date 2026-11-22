@@ -1238,3 +1238,252 @@ class TestReadOnlyDirectoriesTheAgentLeftAreDeleted:
             assert stat.S_IMODE(outside.stat().st_mode) == 0o555
         finally:
             outside.chmod(0o755)
+
+
+class TestWorkspaceDeleteKeepsTheEventLoopFree:
+    """A slow host delete must not stall the caller's event loop (syntropic137#2345).
+
+    The executor renews its run lease on the same loop that awaits teardown. A
+    synchronous `shutil.rmtree` over a large workspace held the loop for ~70 s,
+    the 90 s lease lapsed, and a succeeded run was fenced as interrupted.
+    """
+
+    def test_the_loop_keeps_ticking_while_the_directory_is_deleted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import time
+
+        _record(monkeypatch, [])
+        provider = _provider()
+        d = tmp_path / "agentic-ws-1"
+        d.mkdir()
+        (d / "f").write_text("x")
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+
+        stall = 0.6
+        real_rmtree = shutil.rmtree
+
+        def _slow_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+            time.sleep(stall)  # a blocking delete, as on a large real tree
+            real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, "rmtree", _slow_rmtree)
+
+        async def _run() -> tuple[Any, float]:
+            ticks: list[float] = []
+            done = asyncio.Event()
+
+            async def _ticker() -> None:
+                while not done.is_set():
+                    ticks.append(time.monotonic())
+                    await asyncio.sleep(0.02)
+
+            ticker = asyncio.create_task(_ticker())
+            await asyncio.sleep(0)  # the ticker is running before teardown starts
+            started = time.monotonic()
+            try:
+                report = await provider.teardown(ws)
+            finally:
+                ended = time.monotonic()
+                done.set()
+                await ticker
+            during = [t for t in ticks if started <= t <= ended]
+            return report, len(during)
+
+        report, ticks_during = asyncio.run(_run())
+
+        assert report.finalization.state == "completed"
+        assert not d.exists()
+        # A free loop ticks every 20 ms through the 600 ms delete (~30 times).
+        # A delete on the loop thread holds it, so the ticker cannot run at all.
+        assert ticks_during >= 10, f"event loop ran {ticks_during} times during a {stall}s delete"
+
+    def test_a_cancelled_teardown_holds_its_lock_until_the_delete_thread_ends(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A thread cannot be stopped: cancelling teardown mid-delete must not
+        let the caller, or its teardown lock, go while the worker still runs."""
+        import threading
+
+        _record(monkeypatch, [])
+        provider = _provider()
+        d = tmp_path / "agentic-ws-1"
+        d.mkdir()
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+
+        entered, release = threading.Event(), threading.Event()
+        finished: list[bool] = []
+        real_rmtree = shutil.rmtree
+
+        def _held_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+            entered.set()
+            release.wait(5)
+            real_rmtree(path, *args, **kwargs)
+            finished.append(True)
+
+        monkeypatch.setattr(shutil, "rmtree", _held_rmtree)
+
+        async def _run() -> tuple[bool, bool, bool]:
+            task = asyncio.create_task(provider.teardown(ws))
+            while not entered.is_set():
+                await asyncio.sleep(0.005)
+            task.cancel()
+            await asyncio.sleep(0.05)
+            task.cancel()  # a second cancel must not let it go either
+            await asyncio.sleep(0.05)
+            held_while_running = not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return held_while_running, bool(finished), task.cancelled()
+
+        held_while_running, worker_finished, cancelled = asyncio.run(_run())
+
+        assert held_while_running, "teardown returned while its delete thread still ran"
+        assert worker_finished, "teardown returned before the delete thread finished"
+        assert cancelled
+        assert not d.exists()
+
+    def test_loop_shutdown_mid_delete_waits_for_the_delete_thread(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`asyncio.run()` shutdown cancels every task, a worker task included.
+        Teardown must still not leave its lock before the delete thread ends."""
+        import threading
+
+        _record(monkeypatch, [])
+        provider = _provider()
+        d = tmp_path / "agentic-ws-1"
+        d.mkdir()
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+
+        entered, release = threading.Event(), threading.Event()
+        order: list[str] = []
+        real_rmtree = shutil.rmtree
+
+        def _held_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+            entered.set()
+            release.wait(5)
+            real_rmtree(path, *args, **kwargs)
+            order.append("thread finished")
+
+        monkeypatch.setattr(shutil, "rmtree", _held_rmtree)
+
+        async def _teardown() -> None:
+            try:
+                await provider.teardown(ws)
+            finally:
+                order.append("teardown left")
+
+        async def _main() -> None:
+            asyncio.get_running_loop().create_task(_teardown())
+            while not entered.is_set():
+                await asyncio.sleep(0.005)
+            # Return mid-delete: asyncio.run now cancels every remaining task.
+            threading.Timer(0.2, release.set).start()
+
+        asyncio.run(_main())
+
+        assert order == ["thread finished", "teardown left"]
+        assert not d.exists()
+
+    def test_a_cancellation_wins_over_a_worker_failure_that_follows_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import threading
+
+        entered, release = threading.Event(), threading.Event()
+
+        def _failing_rmtree(path: str) -> OSError | None:
+            entered.set()
+            release.wait(5)
+            raise RecursionError("deep tree")
+
+        monkeypatch.setattr(docker_provider, "_rmtree", _failing_rmtree)
+
+        async def _run() -> bool:
+            task = asyncio.create_task(docker_provider._rmtree_off_loop(str(tmp_path)))
+            while not entered.is_set():
+                await asyncio.sleep(0.005)
+            task.cancel()
+            await asyncio.sleep(0.02)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return task.cancelled()
+
+        assert asyncio.run(_run())
+
+    def test_an_interrupted_thread_start_waits_for_a_started_worker(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import threading
+
+        order: list[str] = []
+
+        def _slow_rmtree(path: str) -> OSError | None:
+            threading.Event().wait(0.2)
+            order.append("worker finished")
+            return None
+
+        real_start = threading.Thread.start
+
+        def _start_then_interrupt(self: threading.Thread) -> None:
+            real_start(self)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(docker_provider, "_rmtree", _slow_rmtree)
+        monkeypatch.setattr(threading.Thread, "start", _start_then_interrupt)
+
+        async def _run() -> None:
+            try:
+                await docker_provider._rmtree_off_loop(str(tmp_path))
+            finally:
+                order.append("caller left")
+
+        with pytest.raises(KeyboardInterrupt):
+            asyncio.run(_run())
+        assert order == ["worker finished", "caller left"]
+
+    def test_a_worker_that_runs_after_an_interrupted_start_never_deletes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """start() raises before the thread's bootstrap ran (so it has no
+        ident yet) and the thread runs later: it must not delete beside a
+        caller that already left its lock."""
+        import threading
+
+        deleted: list[str] = []
+        ran = threading.Event()
+
+        def _recording_rmtree(path: str) -> OSError | None:
+            deleted.append(path)
+            return None
+
+        real_start = threading.Thread.start
+        late: list[threading.Thread] = []
+
+        def _interrupt_then_run_late(self: threading.Thread) -> None:
+            target = self.run
+
+            def _run_and_flag() -> None:
+                target()
+                ran.set()
+
+            self.run = _run_and_flag  # type: ignore[method-assign]
+            late.append(self)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(docker_provider, "_rmtree", _recording_rmtree)
+        monkeypatch.setattr(threading.Thread, "start", _interrupt_then_run_late)
+
+        with pytest.raises(KeyboardInterrupt):
+            asyncio.run(docker_provider._rmtree_off_loop(str(tmp_path)))
+
+        monkeypatch.setattr(threading.Thread, "start", real_start)
+        late[0].start()  # the native thread finally runs, after the caller left
+        assert ran.wait(5)
+        assert deleted == []

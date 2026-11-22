@@ -13,6 +13,7 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -22,6 +23,7 @@ import posixpath
 import shutil
 import stat
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
@@ -1314,13 +1316,16 @@ class WorkspaceDockerProvider(BaseProvider):
         # base directory is never this provider's to remove.
         if self._owned_workspace_dir(workspace, workspace_dir) is None:
             return (f"{workspace_dir}: refused: {self._NOT_OWNED}",), None
-        error = _rmtree(workspace_dir)
+        # Off the event loop: a large tree takes tens of seconds to delete, and
+        # a caller renewing a lease on the same loop must keep ticking while it
+        # does (syntropic137#2345: a 70 s delete let a 90 s lease lapse).
+        error = await _rmtree_off_loop(workspace_dir)
         fallback: DeleteFallback | None = None
         why = ""
         if isinstance(error, PermissionError):
             fallback, why = await self._delete_contents_in_container(workspace, workspace_dir)
             if fallback == "deleted":
-                error = _rmtree(workspace_dir)
+                error = await _rmtree_off_loop(workspace_dir)
         if not os.path.lexists(workspace_dir):
             return (), fallback
         detail = f"{workspace_dir}: {error!r}" if error else f"{workspace_dir}: still present"
@@ -1593,6 +1598,77 @@ def _forget_step(task: asyncio.Future[_T]) -> None:
     _abandoned_steps.discard(task)
     if not task.cancelled():
         task.exception()
+
+
+async def _rmtree_off_loop(path: str) -> OSError | None:
+    """`_rmtree` in a worker thread, without blocking the event loop.
+
+    A thread cannot be stopped, so a cancelled caller waits here until the
+    worker finishes and only then re-raises the cancellation. That keeps the
+    caller inside its teardown lock for as long as the delete really runs: a
+    retry cannot start an archive, a second delete or the container fallback
+    beside a worker still deleting (or retrying on) the same path.
+
+    The completion handle is a `concurrent.futures.Future` marked running
+    before the thread starts, never an asyncio task: `asyncio.run()` shutdown
+    cancels every task (a `to_thread` task reads as done while its thread
+    still deletes), and a running concurrent future cannot be cancelled. Each
+    wait goes through a fresh `asyncio.wrap_future`, so cancelling one wrapper
+    leaves the handle intact.
+
+    Known limit, accepted: a second `KeyboardInterrupt` that lands inside the
+    start-recovery block itself (before `aborted` is set, or during its wait)
+    is not guarded, and the caller can leave while a claimed worker still
+    deletes. Any guard added there has the same window one line later, so the
+    regress has no end. The risk is bounded: the worker is non-daemon, so the
+    process stays alive until the delete ends, and an escaped
+    `KeyboardInterrupt` leaves nothing in the process to start a retry
+    beside it.
+    """
+    done: concurrent.futures.Future[OSError | None] = concurrent.futures.Future()
+    done.set_running_or_notify_cancel()
+    # Start handshake. The worker claims the delete under `gate` before it
+    # touches the path; a caller whose start() was interrupted aborts under
+    # the same lock. So either the worker claimed first (the caller waits for
+    # it) or it will see the abort and exit without deleting. Thread identity
+    # cannot tell these apart: CPython runs the thread before `ident` is set.
+    gate = threading.Lock()
+    claimed = aborted = False
+
+    def _work() -> None:
+        nonlocal claimed
+        with gate:
+            if aborted:
+                return
+            claimed = True
+        try:
+            done.set_result(_rmtree(path))
+        except BaseException as exc:  # noqa: BLE001 - handed to the awaiting caller
+            done.set_exception(exc)
+
+    worker = threading.Thread(target=_work, name=f"rmtree:{os.path.basename(path)}")
+    try:
+        worker.start()
+    except BaseException:
+        with gate:
+            aborted = True
+            must_wait = claimed
+        if must_wait:
+            concurrent.futures.wait([done])  # never leave the lock beside a live delete
+        raise
+    cancelled = False
+    while not done.done():
+        try:
+            await asyncio.wrap_future(done)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:  # noqa: BLE001 - the worker's own failure; read below
+            break
+    if cancelled:
+        # A cancellation wins over the worker's outcome, as it would have had
+        # the caller not been held here; the worker has finished either way.
+        raise asyncio.CancelledError
+    return done.result()  # re-raises if the worker itself failed
 
 
 def _rmtree(path: str) -> OSError | None:
