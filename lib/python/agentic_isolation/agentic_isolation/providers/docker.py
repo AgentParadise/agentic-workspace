@@ -1615,6 +1615,15 @@ async def _rmtree_off_loop(path: str) -> OSError | None:
     still deletes), and a running concurrent future cannot be cancelled. Each
     wait goes through a fresh `asyncio.wrap_future`, so cancelling one wrapper
     leaves the handle intact.
+
+    Known limit, accepted: a second `KeyboardInterrupt` that lands inside the
+    start-recovery block itself (before `aborted` is set, or during its wait)
+    is not guarded, and the caller can leave while a claimed worker still
+    deletes. Any guard added there has the same window one line later, so the
+    regress has no end. The risk is bounded: the worker is non-daemon, so the
+    process stays alive until the delete ends, and an escaped
+    `KeyboardInterrupt` leaves nothing in the process to start a retry
+    beside it.
     """
     done: concurrent.futures.Future[OSError | None] = concurrent.futures.Future()
     done.set_running_or_notify_cancel()
