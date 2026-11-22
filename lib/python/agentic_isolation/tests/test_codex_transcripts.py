@@ -343,8 +343,33 @@ class TestDeeplyNestedJsonNeverEscapesExtract:
         `RuntimeError` subclass, NOT a `ValueError` - before `extract()`
         gets anywhere near it (issue #792 round 2 finding 1)."""
         nested = '{"a":' * 50000 + "1" + "}" * 50000
-        with pytest.raises(RecursionError):
+        try:
             json.loads(nested)
+        except RecursionError:
+            return
+        # Python 3.14 bounds the C parser by stack size, not depth, so a runner
+        # with a large stack parses it. The forced test below still proves the
+        # contract on every interpreter.
+        pytest.skip("this interpreter parses 50k-deep JSON; see the forced test")
+
+    async def test_a_recursion_error_while_parsing_a_line_never_escapes_extract(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The contract without depending on the interpreter's stack: the
+        parser raising `RecursionError` on a line must not escape `extract()`."""
+        from agentic_isolation.harnesses.codex import transcripts as module
+
+        def _too_deep(_line: str) -> object:
+            raise RecursionError("maximum recursion depth exceeded while decoding")
+
+        monkeypatch.setattr(module.json, "loads", _too_deep)
+        path = "/root/.codex/sessions/2026/07/28/rollout-deeply-nested.jsonl"
+        exec_fn = _FakeExec(find_stdout=path + "\n", file_contents={path: "{}\n"})
+
+        result = await CodexTranscriptSource(exec_fn).extract()
+
+        assert result.success is True
+        assert result.transcripts[0].session_id == "rollout-deeply-nested"
 
     async def test_deeply_nested_json_line_never_escapes_extract(self) -> None:
         """The same deeply-nested-JSON line, fed through `extract()`,
