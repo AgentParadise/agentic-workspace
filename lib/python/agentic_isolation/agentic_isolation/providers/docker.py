@@ -1625,14 +1625,26 @@ async def _rmtree_off_loop(path: str) -> OSError | None:
         except BaseException as exc:  # noqa: BLE001 - handed to the awaiting caller
             done.set_exception(exc)
 
-    threading.Thread(target=_work, name=f"rmtree:{os.path.basename(path)}").start()
+    worker = threading.Thread(target=_work, name=f"rmtree:{os.path.basename(path)}")
+    try:
+        worker.start()
+    except BaseException:
+        # Interrupted (KeyboardInterrupt) after the thread may already run:
+        # block until it ends rather than leave the lock beside it.
+        if worker.ident is not None:
+            concurrent.futures.wait([done])
+        raise
     cancelled = False
     while not done.done():
         try:
             await asyncio.wrap_future(done)
         except asyncio.CancelledError:
             cancelled = True
+        except BaseException:  # noqa: BLE001 - the worker's own failure; read below
+            break
     if cancelled:
+        # A cancellation wins over the worker's outcome, as it would have had
+        # the caller not been held here; the worker has finished either way.
         raise asyncio.CancelledError
     return done.result()  # re-raises if the worker itself failed
 

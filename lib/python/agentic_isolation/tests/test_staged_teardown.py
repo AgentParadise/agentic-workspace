@@ -1389,3 +1389,61 @@ class TestWorkspaceDeleteKeepsTheEventLoopFree:
 
         assert order == ["thread finished", "teardown left"]
         assert not d.exists()
+
+    def test_a_cancellation_wins_over_a_worker_failure_that_follows_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import threading
+
+        entered, release = threading.Event(), threading.Event()
+
+        def _failing_rmtree(path: str) -> OSError | None:
+            entered.set()
+            release.wait(5)
+            raise RecursionError("deep tree")
+
+        monkeypatch.setattr(docker_provider, "_rmtree", _failing_rmtree)
+
+        async def _run() -> bool:
+            task = asyncio.create_task(docker_provider._rmtree_off_loop(str(tmp_path)))
+            while not entered.is_set():
+                await asyncio.sleep(0.005)
+            task.cancel()
+            await asyncio.sleep(0.02)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return task.cancelled()
+
+        assert asyncio.run(_run())
+
+    def test_an_interrupted_thread_start_waits_for_a_started_worker(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import threading
+
+        order: list[str] = []
+
+        def _slow_rmtree(path: str) -> OSError | None:
+            threading.Event().wait(0.2)
+            order.append("worker finished")
+            return None
+
+        real_start = threading.Thread.start
+
+        def _start_then_interrupt(self: threading.Thread) -> None:
+            real_start(self)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(docker_provider, "_rmtree", _slow_rmtree)
+        monkeypatch.setattr(threading.Thread, "start", _start_then_interrupt)
+
+        async def _run() -> None:
+            try:
+                await docker_provider._rmtree_off_loop(str(tmp_path))
+            finally:
+                order.append("caller left")
+
+        with pytest.raises(KeyboardInterrupt):
+            asyncio.run(_run())
+        assert order == ["worker finished", "caller left"]
