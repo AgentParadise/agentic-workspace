@@ -716,8 +716,10 @@ def signals(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
         by_fd: dict[int, int] = {}
         real_open = os.pidfd_open
 
-        def pidfd_open(pid: int) -> int:
-            fd = real_open(pid)
+        # Python 3.14.4's asyncio calls os.pidfd_open(pid, flags) for its
+        # child watcher, which shares this patched module attribute.
+        def pidfd_open(pid: int, flags: int = 0) -> int:
+            fd = real_open(pid, flags)
             by_fd[fd] = pid
             return fd
 
