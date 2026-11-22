@@ -1238,3 +1238,63 @@ class TestReadOnlyDirectoriesTheAgentLeftAreDeleted:
             assert stat.S_IMODE(outside.stat().st_mode) == 0o555
         finally:
             outside.chmod(0o755)
+
+
+class TestWorkspaceDeleteKeepsTheEventLoopFree:
+    """A slow host delete must not stall the caller's event loop (syntropic137#2345).
+
+    The executor renews its run lease on the same loop that awaits teardown. A
+    synchronous `shutil.rmtree` over a large workspace held the loop for ~70 s,
+    the 90 s lease lapsed, and a succeeded run was fenced as interrupted.
+    """
+
+    def test_the_loop_keeps_ticking_while_the_directory_is_deleted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import time
+
+        _record(monkeypatch, [])
+        provider = _provider()
+        d = tmp_path / "agentic-ws-1"
+        d.mkdir()
+        (d / "f").write_text("x")
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+
+        stall = 0.6
+        real_rmtree = shutil.rmtree
+
+        def _slow_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+            time.sleep(stall)  # a blocking delete, as on a large real tree
+            real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, "rmtree", _slow_rmtree)
+
+        async def _run() -> tuple[Any, float]:
+            ticks: list[float] = []
+            done = asyncio.Event()
+
+            async def _ticker() -> None:
+                while not done.is_set():
+                    ticks.append(time.monotonic())
+                    await asyncio.sleep(0.02)
+
+            ticker = asyncio.create_task(_ticker())
+            await asyncio.sleep(0)  # the ticker is running before teardown starts
+            started = time.monotonic()
+            try:
+                report = await provider.teardown(ws)
+            finally:
+                ended = time.monotonic()
+                done.set()
+                await ticker
+            during = [t for t in ticks if started <= t <= ended]
+            return report, len(during)
+
+        report, ticks_during = asyncio.run(_run())
+
+        assert report.finalization.state == "completed"
+        assert not d.exists()
+        # A free loop ticks every 20 ms through the 600 ms delete (~30 times).
+        # A delete on the loop thread holds it, so the ticker cannot run at all.
+        assert ticks_during >= 10, f"event loop ran {ticks_during} times during a {stall}s delete"

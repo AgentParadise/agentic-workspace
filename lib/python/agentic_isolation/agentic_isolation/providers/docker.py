@@ -1314,13 +1314,16 @@ class WorkspaceDockerProvider(BaseProvider):
         # base directory is never this provider's to remove.
         if self._owned_workspace_dir(workspace, workspace_dir) is None:
             return (f"{workspace_dir}: refused: {self._NOT_OWNED}",), None
-        error = _rmtree(workspace_dir)
+        # Off the event loop: a large tree takes tens of seconds to delete, and
+        # a caller renewing a lease on the same loop must keep ticking while it
+        # does (syntropic137#2345: a 70 s delete let a 90 s lease lapse).
+        error = await asyncio.to_thread(_rmtree, workspace_dir)
         fallback: DeleteFallback | None = None
         why = ""
         if isinstance(error, PermissionError):
             fallback, why = await self._delete_contents_in_container(workspace, workspace_dir)
             if fallback == "deleted":
-                error = _rmtree(workspace_dir)
+                error = await asyncio.to_thread(_rmtree, workspace_dir)
         if not os.path.lexists(workspace_dir):
             return (), fallback
         detail = f"{workspace_dir}: {error!r}" if error else f"{workspace_dir}: still present"
