@@ -1317,13 +1317,13 @@ class WorkspaceDockerProvider(BaseProvider):
         # Off the event loop: a large tree takes tens of seconds to delete, and
         # a caller renewing a lease on the same loop must keep ticking while it
         # does (syntropic137#2345: a 70 s delete let a 90 s lease lapse).
-        error = await asyncio.to_thread(_rmtree, workspace_dir)
+        error = await _rmtree_off_loop(workspace_dir)
         fallback: DeleteFallback | None = None
         why = ""
         if isinstance(error, PermissionError):
             fallback, why = await self._delete_contents_in_container(workspace, workspace_dir)
             if fallback == "deleted":
-                error = await asyncio.to_thread(_rmtree, workspace_dir)
+                error = await _rmtree_off_loop(workspace_dir)
         if not os.path.lexists(workspace_dir):
             return (), fallback
         detail = f"{workspace_dir}: {error!r}" if error else f"{workspace_dir}: still present"
@@ -1596,6 +1596,31 @@ def _forget_step(task: asyncio.Future[_T]) -> None:
     _abandoned_steps.discard(task)
     if not task.cancelled():
         task.exception()
+
+
+async def _rmtree_off_loop(path: str) -> OSError | None:
+    """`_rmtree` in a worker thread, without blocking the event loop.
+
+    A thread cannot be stopped, so a cancelled caller waits here until the
+    worker finishes and only then re-raises the cancellation. That keeps the
+    caller inside its teardown lock for as long as the delete really runs: a
+    retry cannot start an archive, a second delete or the container fallback
+    beside a worker still deleting (or retrying on) the same path.
+    """
+    worker = asyncio.ensure_future(asyncio.to_thread(_rmtree, path))
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(worker)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+            if worker.done():
+                result = worker.result()  # re-raises if the worker itself failed
+                break
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 def _rmtree(path: str) -> OSError | None:

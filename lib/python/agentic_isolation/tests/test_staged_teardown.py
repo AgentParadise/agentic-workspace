@@ -1298,3 +1298,50 @@ class TestWorkspaceDeleteKeepsTheEventLoopFree:
         # A free loop ticks every 20 ms through the 600 ms delete (~30 times).
         # A delete on the loop thread holds it, so the ticker cannot run at all.
         assert ticks_during >= 10, f"event loop ran {ticks_during} times during a {stall}s delete"
+
+    def test_a_cancelled_teardown_holds_its_lock_until_the_delete_thread_ends(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A thread cannot be stopped: cancelling teardown mid-delete must not
+        let the caller, or its teardown lock, go while the worker still runs."""
+        import threading
+
+        _record(monkeypatch, [])
+        provider = _provider()
+        d = tmp_path / "agentic-ws-1"
+        d.mkdir()
+        ws = _Workspace(workspace_dir=str(d))
+        provider._workspaces[ws.id] = ws
+
+        entered, release = threading.Event(), threading.Event()
+        finished: list[bool] = []
+        real_rmtree = shutil.rmtree
+
+        def _held_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+            entered.set()
+            release.wait(5)
+            real_rmtree(path, *args, **kwargs)
+            finished.append(True)
+
+        monkeypatch.setattr(shutil, "rmtree", _held_rmtree)
+
+        async def _run() -> tuple[bool, bool, bool]:
+            task = asyncio.create_task(provider.teardown(ws))
+            while not entered.is_set():
+                await asyncio.sleep(0.005)
+            task.cancel()
+            await asyncio.sleep(0.05)
+            task.cancel()  # a second cancel must not let it go either
+            await asyncio.sleep(0.05)
+            held_while_running = not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return held_while_running, bool(finished), task.cancelled()
+
+        held_while_running, worker_finished, cancelled = asyncio.run(_run())
+
+        assert held_while_running, "teardown returned while its delete thread still ran"
+        assert worker_finished, "teardown returned before the delete thread finished"
+        assert cancelled
+        assert not d.exists()
