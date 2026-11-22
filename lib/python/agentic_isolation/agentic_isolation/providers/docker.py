@@ -1618,8 +1618,20 @@ async def _rmtree_off_loop(path: str) -> OSError | None:
     """
     done: concurrent.futures.Future[OSError | None] = concurrent.futures.Future()
     done.set_running_or_notify_cancel()
+    # Start handshake. The worker claims the delete under `gate` before it
+    # touches the path; a caller whose start() was interrupted aborts under
+    # the same lock. So either the worker claimed first (the caller waits for
+    # it) or it will see the abort and exit without deleting. Thread identity
+    # cannot tell these apart: CPython runs the thread before `ident` is set.
+    gate = threading.Lock()
+    claimed = aborted = False
 
     def _work() -> None:
+        nonlocal claimed
+        with gate:
+            if aborted:
+                return
+            claimed = True
         try:
             done.set_result(_rmtree(path))
         except BaseException as exc:  # noqa: BLE001 - handed to the awaiting caller
@@ -1629,10 +1641,11 @@ async def _rmtree_off_loop(path: str) -> OSError | None:
     try:
         worker.start()
     except BaseException:
-        # Interrupted (KeyboardInterrupt) after the thread may already run:
-        # block until it ends rather than leave the lock beside it.
-        if worker.ident is not None:
-            concurrent.futures.wait([done])
+        with gate:
+            aborted = True
+            must_wait = claimed
+        if must_wait:
+            concurrent.futures.wait([done])  # never leave the lock beside a live delete
         raise
     cancelled = False
     while not done.done():

@@ -1447,3 +1447,43 @@ class TestWorkspaceDeleteKeepsTheEventLoopFree:
         with pytest.raises(KeyboardInterrupt):
             asyncio.run(_run())
         assert order == ["worker finished", "caller left"]
+
+    def test_a_worker_that_runs_after_an_interrupted_start_never_deletes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """start() raises before the thread's bootstrap ran (so it has no
+        ident yet) and the thread runs later: it must not delete beside a
+        caller that already left its lock."""
+        import threading
+
+        deleted: list[str] = []
+        ran = threading.Event()
+
+        def _recording_rmtree(path: str) -> OSError | None:
+            deleted.append(path)
+            return None
+
+        real_start = threading.Thread.start
+        late: list[threading.Thread] = []
+
+        def _interrupt_then_run_late(self: threading.Thread) -> None:
+            target = self.run
+
+            def _run_and_flag() -> None:
+                target()
+                ran.set()
+
+            self.run = _run_and_flag  # type: ignore[method-assign]
+            late.append(self)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(docker_provider, "_rmtree", _recording_rmtree)
+        monkeypatch.setattr(threading.Thread, "start", _interrupt_then_run_late)
+
+        with pytest.raises(KeyboardInterrupt):
+            asyncio.run(docker_provider._rmtree_off_loop(str(tmp_path)))
+
+        monkeypatch.setattr(threading.Thread, "start", real_start)
+        late[0].start()  # the native thread finally runs, after the caller left
+        assert ran.wait(5)
+        assert deleted == []
