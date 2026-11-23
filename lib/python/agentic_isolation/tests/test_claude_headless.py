@@ -70,15 +70,15 @@ class _FakeClaude:
     auth_returncode: int = 0
     auth_timeout: bool = False
     auth_stdout_without_token: str | None = None
-    calls: list[tuple[list[str], int, float]] = field(default_factory=list)
-    auth_calls: list[tuple[list[str], int, float]] = field(default_factory=list)
+    calls: list[tuple[list[str], str, float]] = field(default_factory=list)
+    auth_calls: list[tuple[list[str], str, float]] = field(default_factory=list)
     envs: list[dict[str, str]] = field(default_factory=list)
 
     def __call__(
         self,
         args: list[str],
         *,
-        stdin: int,
+        input: str,  # noqa: A002 - subprocess.run's own keyword
         capture_output: bool,
         text: bool,
         timeout: float,
@@ -86,13 +86,13 @@ class _FakeClaude:
     ) -> subprocess.CompletedProcess[str]:
         self.envs.append(dict(env))
         if args[1:3] == ["auth", "status"]:
-            self.auth_calls.append((list(args), stdin, timeout))
+            self.auth_calls.append((list(args), input, timeout))
             if self.auth_timeout:
                 raise subprocess.TimeoutExpired(args, timeout)
             if self.auth_stdout_without_token is not None and "CLAUDE_CODE_OAUTH_TOKEN" not in env:
                 return subprocess.CompletedProcess(args, 1, self.auth_stdout_without_token, "")
             return subprocess.CompletedProcess(args, self.auth_returncode, self.auth_stdout, "")
-        self.calls.append((list(args), stdin, timeout))
+        self.calls.append((list(args), input, timeout))
         if self.timeout:
             raise subprocess.TimeoutExpired(args, timeout)
         return subprocess.CompletedProcess(args, self.returncode, self.stdout, self.stderr)
@@ -127,7 +127,8 @@ def _client(fake: _FakeClaude, timeout_s: float = 42.0) -> ClaudeHeadless:
 def test_runs_the_cli_headless_with_the_exact_model() -> None:
     fake = _FakeClaude(stdout=_envelope("ok"))
     assert _client(fake).complete(model=MODEL, system="the system", prompt="the prompt") == "ok"
-    [(argv, _, _)] = fake.calls
+    [(argv, stdin, _)] = fake.calls
+    assert stdin == "the prompt"
     assert argv == [
         "claude",
         "-p",
@@ -146,20 +147,28 @@ def test_runs_the_cli_headless_with_the_exact_model() -> None:
         "--no-session-persistence",
         "--setting-sources",
         "user",
-        "--",
-        "the prompt",
     ]
     assert "--bare" not in argv
 
 
 @pytest.mark.parametrize("prompt", ["--help", "-h", "--version", "--model", "-", "--"])
-def test_a_flag_shaped_prompt_is_passed_after_the_end_of_options(prompt: str) -> None:
-    """Without the ``--`` the CLI parses a prompt like ``--help`` as its own option."""
+def test_a_flag_shaped_prompt_goes_to_stdin_never_to_argv(prompt: str) -> None:
+    """On stdin a prompt like ``--help`` can never be parsed as one of the CLI's options."""
     fake = _FakeClaude(stdout=_envelope("ok"))
     _client(fake).complete(model=MODEL, system="s", prompt=prompt)
-    [(argv, _, _)] = fake.calls
-    assert argv[-2:] == ["--", prompt]
-    assert argv.index("--") == len(argv) - 2
+    [(argv, stdin, _)] = fake.calls
+    assert stdin == prompt
+    assert argv[-2:] == ["--setting-sources", "user"]
+
+
+def test_no_argv_carries_the_prompt() -> None:
+    """syntropic137#2355: ``/proc/<pid>/cmdline`` is world-readable, so ``ps | grep``
+    for a command the prompt names matched the harness, and an agent killed it."""
+    fake = _FakeClaude(stdout=_envelope("ok"))
+    _client(fake).complete(model=MODEL, system="s", prompt="run pytest -m unit 7f3c")
+    [(argv, stdin, _)] = fake.calls
+    assert not [arg for arg in argv if "7f3c" in arg]
+    assert stdin == "run pytest -m unit 7f3c"
 
 
 @pytest.mark.parametrize("model", ["sonnet", "opus", "fable", "default", "sonnet[1m]"])
@@ -171,12 +180,14 @@ def test_a_model_alias_is_refused_before_any_call(model: str) -> None:
     assert fake.calls == [] and fake.auth_calls == []
 
 
-def test_closes_stdin_and_passes_its_timeout() -> None:
+def test_sends_only_the_prompt_on_stdin_and_passes_its_timeout() -> None:
     fake = _FakeClaude(stdout=_envelope("ok"))
     _client(fake).complete(model=MODEL, system="s", prompt="p")
     [(_, stdin, timeout)] = fake.calls
-    assert stdin == subprocess.DEVNULL
+    assert stdin == "p"
     assert timeout == 42.0
+    [(_, auth_stdin, _)] = fake.auth_calls
+    assert auth_stdin == ""
 
 
 def test_no_credential_in_the_parent_environment_reaches_the_cli(
@@ -210,7 +221,7 @@ def test_check_auth_asks_the_cli_with_the_answers_environment_and_answers_nothin
     fake = _FakeClaude()
     _client(fake).check_auth()
     assert fake.calls == []
-    assert fake.auth_calls[0] == (["claude", "auth", "status", "--json"], subprocess.DEVNULL, 42.0)
+    assert fake.auth_calls[0] == (["claude", "auth", "status", "--json"], "", 42.0)
     assert "ANTHROPIC_API_KEY" not in fake.envs[0]
 
 
@@ -223,7 +234,7 @@ def test_check_auth_refuses_api_key_auth() -> None:
 def test_the_login_is_checked_with_the_answers_own_environment_before_it() -> None:
     fake = _FakeClaude(stdout=_envelope("ok"), auth_stdout=_auth_status("claude.ai"))
     _client(fake).complete(model=MODEL, system="s", prompt="p")
-    assert fake.auth_calls == [(["claude", "auth", "status", "--json"], subprocess.DEVNULL, 42.0)]
+    assert fake.auth_calls == [(["claude", "auth", "status", "--json"], "", 42.0)]
     assert fake.envs[0] == fake.envs[1]
 
 
@@ -248,7 +259,7 @@ def test_an_oauth_token_shown_to_come_from_its_variable_is_accepted(without_toke
         auth_stdout_without_token=without_token,
     )
     assert _client(fake).complete(model=MODEL, system="s", prompt="p") == "ok"
-    status = (["claude", "auth", "status", "--json"], subprocess.DEVNULL, 42.0)
+    status = (["claude", "auth", "status", "--json"], "", 42.0)
     assert fake.auth_calls == [status, status]
     with_token, without, answer = fake.envs
     assert with_token == answer and with_token["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-oauth"
@@ -406,8 +417,8 @@ def test_the_real_cli_still_takes_every_flag_the_argv_uses() -> None:
         timeout=60,
         check=True,
     )
-    flags = ClaudeHeadless(effort="medium").argv(model=MODEL, system="s", prompt="p")
-    for flag in (a for a in flags if a.startswith("-") and a != "--"):
+    flags = ClaudeHeadless(effort="medium").argv(model=MODEL, system="s")
+    for flag in (a for a in flags if a.startswith("-")):
         assert re.search(rf"(^|[\s,]){re.escape(flag)}\b", done.stdout), flag
     assert "low, medium, high, xhigh, max" in done.stdout
 
