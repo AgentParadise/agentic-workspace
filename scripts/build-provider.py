@@ -161,6 +161,14 @@ def stage_workspace_runtime(build_context: Path) -> None:
         shutil.copy2(entrypoint_src, workspace_dst / "entrypoint.sh")
         print("  ✓ Workspace runtime: entrypoint.sh")
 
+    # The kill-guard PreToolUse hook (syntropic137#2355). omni-agent COPYs it
+    # to a root-owned path; providers that do not are unaffected by staging it.
+    kill_guard_src = WORKSPACE_DIR / "kill-guard" / "kill_guard.py"
+    if kill_guard_src.exists():
+        (workspace_dst / "kill-guard").mkdir()
+        shutil.copy2(kill_guard_src, workspace_dst / "kill-guard" / "kill_guard.py")
+        print("  ✓ Workspace runtime: kill-guard")
+
     capabilities_src = WORKSPACE_DIR / "capabilities"
     if not capabilities_src.exists():
         print("  ⊘ No capabilities configured")

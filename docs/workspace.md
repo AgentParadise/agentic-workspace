@@ -92,6 +92,16 @@ env var. Tool restrictions belong inside subagent frontmatter
 ships with the agent that enforces it. See Claude's
 [subagents docs](https://code.claude.com/docs/en/sub-agents.md).
 
+The exception is image-level guards that protect the workspace itself, not a
+policy choice. `omni-agent` (and `toolchain`, which inherits it) registers
+**kill-guard** as a root-owned Claude Code PreToolUse/Bash hook in
+`/etc/claude-code/managed-settings.json`. It refuses `kill`, `xargs kill`,
+`pkill` and `killall` when a target, resolved at hook time, is the harness,
+one of its ancestors or their process group (syntropic137/syntropic137#2355,
+where `ps | grep | xargs kill` matched and killed the Claude CLI). It is
+defence in depth and fails open; its known limits are listed in
+`workspace/kill-guard/kill_guard.py`.
+
 ## Observe — what comes out
 
 Status quo, no changes from the injection contract:
