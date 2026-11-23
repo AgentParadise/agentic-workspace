@@ -161,6 +161,17 @@ def stage_workspace_runtime(build_context: Path) -> None:
         shutil.copy2(entrypoint_src, workspace_dst / "entrypoint.sh")
         print("  ✓ Workspace runtime: entrypoint.sh")
 
+    # The dcg installer + pin + policy (workspace/agent-guard). Bind-mounted by
+    # the Dockerfile for its install and validate RUNs only, never shipped.
+    agent_guard_src = WORKSPACE_DIR / "agent-guard"
+    if agent_guard_src.exists():
+        shutil.copytree(
+            agent_guard_src,
+            workspace_dst / "agent-guard",
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+        print("  ✓ Workspace runtime: agent-guard (dcg)")
+
     capabilities_src = WORKSPACE_DIR / "capabilities"
     if not capabilities_src.exists():
         print("  ⊘ No capabilities configured")

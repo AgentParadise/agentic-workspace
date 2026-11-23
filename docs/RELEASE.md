@@ -110,8 +110,9 @@ holds exactly these fields, no more (Syntropic137 parses it with
   indent and one trailing newline. Two builds of one commit write the same
   bytes, so the manifest hash is known from the commit alone.
 - **Components are verified, not declared.** Each is checked against
-  `<binary> --version` in the build before it is written. `omni-agent` adds
-  `rtk`, `just` and `apss_session_exporter`; `toolchain` inherits omni's and
+  `<binary> --version` in the build before it is written. `claude-cli` and
+  `omni-agent` both list `dcg`; `omni-agent` adds `rtk`, `just` and
+  `apss_session_exporter`; `toolchain` inherits omni's and
   adds `rustup` and `bun`; `scripted-agent` inherits claude-cli's, drops
   `claude_cli` and `codex_cli` (it uninstalls both) and adds `scripted_agent`
   and `apss_session_exporter`.

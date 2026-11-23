@@ -123,6 +123,14 @@ capabilities:
     - name: playwright
       version: "1.63.0"
       browsers: [chromium-headless-shell]
+    # Destructive command guard. A root-owned PreToolUse hook for both
+    # harnesses (/etc/claude-code/managed-settings.json, /etc/codex/requirements.toml)
+    # with a fail-closed policy at /etc/dcg/config.toml. Installed and proven
+    # at build time by workspace/agent-guard/agent_guard.py. A guardrail, not
+    # a sandbox.
+    - name: dcg
+      version: "0.16.0"
+      harness: both
 
 # Health check configuration
 health:

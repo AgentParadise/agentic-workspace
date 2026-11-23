@@ -1,0 +1,17 @@
+# Managed by agentic-workspace workspace/agent-guard. Baked into the image.
+# Installed root-owned as /etc/dcg/config.toml (dcg's system config layer).
+# Same policy as syntropic137 infra/agent-guard/dcg-config.toml (host side).
+[general]
+# Deny when the hook input cannot be parsed or a check cannot finish.
+fail_closed = true
+unverified_decision = "deny"
+# Never phone home or self-update: the version is pinned in dcg-version.toml.
+check_updates = false
+# Registration is managed in root-owned harness files; dcg must not rewrite
+# per-user harness settings.
+self_heal_hook = false
+
+[packs]
+# core.git and core.filesystem are always on. These cover the services an
+# agent in a workspace can reach: Postgres/TimescaleDB, Redis, Docker.
+enabled = ["database.postgresql", "database.redis", "containers.docker", "containers.compose"]
