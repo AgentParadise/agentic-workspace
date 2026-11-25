@@ -978,6 +978,40 @@ def _sed_script_ok(script: str) -> bool:
     return True
 
 
+_SORT_FLAGS = re.compile(r"-[bdfghiMnrsuVz]+")
+_SORT_VALUED = re.compile(r"-[kt].*")
+
+
+def _awk_args_ok(args: Sequence[str]) -> bool:
+    """Only `-F SEP`, `-FSEP`, `-v NAME=VAL`, `-vNAME=VAL` and `--` as options."""
+    expect = False
+    for a in args:
+        if expect:
+            expect = False
+        elif a in ("-F", "-v"):
+            expect = True
+        elif a == "--" or not a.startswith("-") or a.startswith(("-F", "-v")):
+            continue
+        else:
+            return False
+    return not expect
+
+
+def _sort_args_ok(args: Sequence[str]) -> bool:
+    """Short ordering flags and `-k`/`-t` only; no long option at all."""
+    expect = False
+    for a in args:
+        if expect:
+            expect = False
+        elif a in ("-k", "-t"):
+            expect = True
+        elif not a.startswith("-") or _SORT_FLAGS.fullmatch(a) or _SORT_VALUED.fullmatch(a):
+            continue
+        else:
+            return False
+    return not expect
+
+
 def _producer_cmd_ok(cmd: SimpleCommand) -> bool:
     for op, target in cmd.redirs:
         if (
@@ -1001,7 +1035,10 @@ def _producer_cmd_ok(cmd: SimpleCommand) -> bool:
         return False
     args = [v or "" for v in vals[1:]]
     if name == "awk":
-        if any(a == "-f" or a.startswith("--file") for a in args):
+        # Options are an allowlist, not a denylist: `-fFILE`, `-E FILE`,
+        # `--include` and a GNU long-option prefix all load program text the
+        # guard never sees. Only field separators and assignments pass.
+        if not _awk_args_ok(args):
             return False
         return not any(re.search(r"system|getline|[|>]|fflush|close", a) for a in args)
     if name == "sed":
@@ -1024,10 +1061,10 @@ def _producer_cmd_ok(cmd: SimpleCommand) -> bool:
                 positional += 1
         return all(_sed_script_ok(s) for s in scripts)
     if name == "sort":
-        return not any(
-            a.startswith("-o") or a.startswith("--output") or a == "--compress-program"
-            for a in args
-        )
+        # An allowlist again: GNU accepts any unambiguous prefix of a long
+        # option (`--compress-p=prog` runs prog), so naming the bad ones
+        # cannot be complete.
+        return _sort_args_ok(args)
     if name == "uniq":
         return len([a for a in args if not a.startswith("-")]) <= 1
     return True
@@ -1064,7 +1101,9 @@ def decide(
 def run_producer(body: str) -> str | None:
     try:
         proc = subprocess.Popen(  # noqa: S603 - body passed the read-only allowlist
-            ["/bin/bash", "-c", body],
+            # `set -f`: no pathname expansion, so the words the allowlist
+            # checked are the words that run (a glob could name a new option).
+            ["/bin/bash", "-c", "set -f\n" + body],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -1080,7 +1119,14 @@ def run_producer(body: str) -> str | None:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
-        proc.communicate()
+        # Bounded again: a child that left the group can still hold stdout
+        # open, and an unbounded wait here would hang the hook. Give up on it
+        # and answer "unknown", which allows the command.
+        try:
+            proc.communicate(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            if proc.stdout is not None:
+                proc.stdout.close()
         return None
     return out.decode("utf-8", "replace")
 

@@ -241,6 +241,16 @@ def test_producers_off_the_allowlist_are_never_run() -> None:
         "kill $(sed -i s/a/b/ f)",
         "kill $(sed 's/a/b/e' f)",
         "kill $(sort -o out f)",
+        # Attached and abbreviated option spellings (Codex review, #130).
+        "kill $(awk -f/tmp/program)",
+        "kill $(awk -fprogram)",
+        "kill $(awk -E prog)",
+        "kill $(awk --file=prog)",
+        "kill $(awk --fi=prog)",
+        "kill $(sort --compress-program=prog f)",
+        "kill $(sort --compress-p=prog f)",
+        "kill $(sort --output=f g)",
+        "kill $(sort -ofile g)",
         "kill $(cat $(echo f))",
         "kill $(FOO=1 pgrep x)",
         "kill $(/tmp/ps)",
@@ -252,6 +262,55 @@ def test_producers_off_the_allowlist_are_never_run() -> None:
             _pgrep,
         )
     assert ran == []
+
+
+def test_allowlisted_awk_and_sort_options_still_run() -> None:
+    ran: list[str] = []
+
+    def spy(body: str) -> str | None:
+        ran.append(body)
+        return ""
+
+    for command in (
+        "kill $(ps -eo pid,args | awk -F' ' -v x=1 '{print $1}')",
+        "kill $(pgrep x | sort -n -u)",
+        "kill $(pgrep x | sort -t, -k2 -rn)",
+    ):
+        kg.decide(
+            {"tool_name": "Bash", "tool_input": {"command": command}},
+            PROTECTED,
+            spy,
+            _pgrep,
+        )
+    assert len(ran) == 3
+
+
+def test_a_producer_runs_without_pathname_expansion(tmp_path: Path) -> None:
+    """The allowlist checks words; a glob must not turn into new ones."""
+    (tmp_path / "--compress-program=evil").write_text("")
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        assert kg.run_producer("echo *") == "*\n"
+    finally:
+        os.chdir(cwd)
+
+
+def test_a_timed_out_producer_returns_even_if_a_child_escaped_its_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child in a new session survives killpg and keeps stdout open; the wait is bounded."""
+    monkeypatch.setattr(kg, "PRODUCER_TIMEOUT_S", 0.5)
+    marker = f"kg-escape-{os.getpid()}-{time.monotonic_ns()}"
+    body = (
+        f"python3 -c 'import os,time; os.setsid(); time.sleep(30)' {marker} & sleep 30"
+    )
+    started = time.monotonic()
+    try:
+        assert kg.run_producer(body) is None
+        assert time.monotonic() - started < 5
+    finally:
+        subprocess.run(["pkill", "-f", marker], check=False)
 
 
 def test_pgrep_is_called_without_pkill_signal_args() -> None:
