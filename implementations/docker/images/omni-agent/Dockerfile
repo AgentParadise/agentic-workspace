@@ -753,6 +753,48 @@ RUN chmod -R 755 /opt/agentic/plugins \
     && find /opt/agentic/capabilities -name "*.sh" -exec chmod 755 {} \; \
     && chown -R agent:agent /opt/agentic
 
+# =============================================================================
+# kill-guard: refuse kill commands aimed at the harness (syntropic137#2355)
+# =============================================================================
+# WHY. An agent ran `ps aux | grep "[p]ytest -m unit" | awk '{print $2}' |
+# xargs kill`. The Claude CLI's argv carried the task prompt, which mentioned
+# `pytest -m unit`, so the pipeline matched and SIGTERMed the harness itself;
+# the phase died with exit 143. Claude Code's own shell wrapper guards only
+# `pkill`. This PreToolUse hook resolves every kill/xargs kill/pkill/killall
+# target at hook time and refuses one that is the hook's ancestor (the CLI,
+# its launchers, pid 1) or shares their process group. Defence in depth: the
+# prompt leaving argv is the primary fix. Known limits are in the module
+# docstring; it fails open on its own errors so it can never brick Bash.
+#
+# WHY HERE AND ROOT-OWNED. /opt/agentic is chowned to the agent, and
+# ~/.claude/settings.json is agent-writable, so either location would make
+# the guard a suggestion. The module goes to /usr/local/lib/agentic-guards
+# (root, 0644) and the hook to /etc/claude-code/managed-settings.json (root,
+# 0644), which Claude Code reads as policy. --register MERGES into that file,
+# so other managed PreToolUse hooks survive whichever layer runs first.
+#
+# WHY /opt/venv/bin/python3 UNDER `env -i ... -I -S`. node:22-slim has no
+# /usr/bin/python3; /opt/venv is root-owned. The hook inherits the agent's
+# environment, so it is emptied (PYTHONPATH, PYTHONSTARTUP, PATH) and
+# isolated mode keeps cwd and site-packages off sys.path.
+#
+# The RUN proves the guard as registered: it reads the command back out of
+# managed-settings.json and runs it through sh exactly as Claude Code would.
+# `kill -9 1` must be refused (pid 1 is always an ancestor) and an unrelated
+# pid allowed, so a broken interpreter path or a hook that allows everything
+# fails the build instead of shipping.
+COPY workspace/kill-guard/kill_guard.py /usr/local/lib/agentic-guards/kill_guard.py
+RUN set -eu; \
+    chmod 0755 /usr/local/lib/agentic-guards; \
+    chmod 0644 /usr/local/lib/agentic-guards/kill_guard.py; \
+    /opt/venv/bin/python3 -I -S /usr/local/lib/agentic-guards/kill_guard.py --register /etc/claude-code/managed-settings.json; \
+    hook="$(/opt/venv/bin/python3 -I -S -c 'import json; s = json.load(open("/etc/claude-code/managed-settings.json")); print(next(h["command"] for g in s["hooks"]["PreToolUse"] for h in g["hooks"] if h["command"].endswith("/kill_guard.py")))')"; \
+    probe() { printf '{"tool_name":"Bash","tool_input":{"command":"%s"}}' "$1" | sh -c "${hook}"; }; \
+    rc=0; probe 'kill -9 1' 2>/dev/null || rc=$?; \
+    test "${rc}" -eq 2; \
+    probe 'kill 999999'; \
+    test "$(stat -c '%U %a' /usr/local/lib/agentic-guards/kill_guard.py /etc/claude-code/managed-settings.json | sort -u)" = "root 644"
+
 # Verify core installations (before security hardening).
 # Both harnesses are verified: an omni image with one working harness is a
 # broken omni image, not a degraded one.

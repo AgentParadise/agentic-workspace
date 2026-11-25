@@ -69,7 +69,7 @@ class ProcessRunner(Protocol):
         self,
         args: list[str],
         *,
-        stdin: int,
+        input: str,  # noqa: A002 - subprocess.run's own keyword
         capture_output: Literal[True],
         text: Literal[True],
         timeout: float,
@@ -139,10 +139,10 @@ class ClaudeHeadless:
     file. The answer loads only the settings that status reads (`CLAUDE_SETTING_SOURCES`),
     and sends no custom headers (`CLAUDE_FLAG_SETTINGS`), so no settings file can change
     the credential after the check. Never add ``--bare``,
-    which skips that login for an API key. Each call is one non-interactive session with
-    stdin closed, tools disabled, nothing persisted, the exact model id given and
-    `effort`. The reply is the ``result`` of the JSON envelope. Every way that yields no
-    answer raises a `ClaudeHeadlessError` subclass naming it.
+    which skips that login for an API key. Each call is one non-interactive session with the
+    prompt on stdin and never in argv, tools disabled, nothing persisted, the exact model
+    id given and `effort`. The reply is the ``result`` of the JSON envelope. Every way that
+    yields no answer raises a `ClaudeHeadlessError` subclass naming it.
     """
 
     effort: ClaudeEffort
@@ -150,7 +150,15 @@ class ClaudeHeadless:
     run: ProcessRunner = subprocess.run
     executable: str = "claude"
 
-    def argv(self, *, model: str, system: str, prompt: str) -> list[str]:
+    def argv(self, *, model: str, system: str) -> list[str]:
+        """The CLI argv for one answer. The prompt is not in it.
+
+        `complete` writes the prompt to the CLI's stdin. An argv is readable by
+        every process on the host through ``/proc/<pid>/cmdline``, so a prompt
+        there is matched by ``ps | grep`` and ``pgrep -f`` for anything it
+        names, which is how a workspace agent SIGTERMed its own harness
+        (syntropic137#2355). On stdin it also can never be parsed as an option.
+        """
         if not model.startswith("claude-"):
             raise ClaudeHeadlessModelError(
                 f"claude -p needs an exact model id such as 'claude-sonnet-5-5', not "
@@ -174,8 +182,6 @@ class ClaudeHeadless:
             "--no-session-persistence",
             "--setting-sources",
             CLAUDE_SETTING_SOURCES,
-            "--",
-            prompt,
         ]
 
     def check_auth(self) -> None:
@@ -184,13 +190,13 @@ class ClaudeHeadless:
 
     def complete(self, *, model: str, system: str, prompt: str) -> str:
         """The model's answer to `prompt` under `system`, or a `ClaudeHeadlessError`."""
-        argv = self.argv(model=model, system=system, prompt=prompt)
+        argv = self.argv(model=model, system=system)
         env = _child_env()
         self._require_oauth(env)
         try:
             done = self.run(
                 argv,
-                stdin=subprocess.DEVNULL,
+                input=prompt,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_s,
@@ -227,7 +233,7 @@ class ClaudeHeadless:
         try:
             done = self.run(
                 [self.executable, "auth", "status", "--json"],
-                stdin=subprocess.DEVNULL,
+                input="",
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_s,
