@@ -1066,7 +1066,16 @@ def _producer_cmd_ok(cmd: SimpleCommand) -> bool:
         # cannot be complete.
         return _sort_args_ok(args)
     if name == "uniq":
-        return len([a for a in args if not a.startswith("-")]) <= 1
+        # A second positional is an output file. After `--` every argument is
+        # positional, `-output` included.
+        positional = 0
+        ended = False
+        for a in args:
+            if ended or a == "-" or not a.startswith("-"):
+                positional += 1
+            elif a == "--":
+                ended = True
+        return positional <= 1
     return True
 
 
@@ -1101,9 +1110,10 @@ def decide(
 def run_producer(body: str) -> str | None:
     try:
         proc = subprocess.Popen(  # noqa: S603 - body passed the read-only allowlist
-            # `set -f`: no pathname expansion, so the words the allowlist
-            # checked are the words that run (a glob could name a new option).
-            ["/bin/bash", "-c", "set -f\n" + body],
+            # `set -f +B`: no pathname and no brace expansion, so the words
+            # the allowlist checked are the words that run. A glob or
+            # `{-f,FILE}` could otherwise expand into an option it refused.
+            ["/bin/bash", "-c", "set -f +B\n" + body],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

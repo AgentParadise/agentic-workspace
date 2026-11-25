@@ -251,6 +251,8 @@ def test_producers_off_the_allowlist_are_never_run() -> None:
         "kill $(sort --compress-p=prog f)",
         "kill $(sort --output=f g)",
         "kill $(sort -ofile g)",
+        "kill $(pgrep x | uniq -- in -output)",
+        "kill $(pgrep x | uniq in out)",
         "kill $(cat $(echo f))",
         "kill $(FOO=1 pgrep x)",
         "kill $(/tmp/ps)",
@@ -292,6 +294,7 @@ def test_a_producer_runs_without_pathname_expansion(tmp_path: Path) -> None:
     os.chdir(tmp_path)
     try:
         assert kg.run_producer("echo *") == "*\n"
+        assert kg.run_producer("echo {-f,prog}") == "{-f,prog}\n"
     finally:
         os.chdir(cwd)
 
