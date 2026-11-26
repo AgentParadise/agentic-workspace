@@ -59,6 +59,10 @@ async def test_a_quiet_workload_is_measured_and_not_oom_killed() -> None:
     workspace = await provider.create(_config("256m"))
     try:
         await provider.execute(workspace, "true", timeout=60)
+        # Ask the container's own kernel, not the test runner's: Docker
+        # Desktop and remote daemons run another one, and pids.peak (Linux
+        # 6.1) may be backported.
+        probe = await provider.execute(workspace, "test -r /sys/fs/cgroup/pids.peak", timeout=60)
     finally:
         report = await provider.destroy(workspace)
 
@@ -69,9 +73,7 @@ async def test_a_quiet_workload_is_measured_and_not_oom_killed() -> None:
     # so a phase that dies at the limit can be shown to have reached it.
     assert report.usage.pids_limit is not None
     assert report.usage.pids_limit_hits == 0
-    # `pids.peak` arrived in Linux 6.1; an older kernel reports it as unknown.
-    major, minor = (int(x) for x in os.uname().release.split(".")[:2])
-    if (major, minor) >= (6, 1):
+    if probe.exit_code == 0:
         assert report.usage.pids_peak is not None and report.usage.pids_peak >= 1
     else:
         assert report.usage.pids_peak is None
