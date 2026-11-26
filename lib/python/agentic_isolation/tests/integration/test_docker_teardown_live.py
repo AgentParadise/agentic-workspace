@@ -67,9 +67,14 @@ async def test_a_quiet_workload_is_measured_and_not_oom_killed() -> None:
     assert report.usage.cpu_usage_seconds is not None
     # syntropic137#2227: the pids peak and the enforced limit are measured,
     # so a phase that dies at the limit can be shown to have reached it.
-    assert report.usage.pids_peak is not None and report.usage.pids_peak >= 1
     assert report.usage.pids_limit is not None
     assert report.usage.pids_limit_hits == 0
+    # `pids.peak` arrived in Linux 6.1; an older kernel reports it as unknown.
+    major, minor = (int(x) for x in os.uname().release.split(".")[:2])
+    if (major, minor) >= (6, 1):
+        assert report.usage.pids_peak is not None and report.usage.pids_peak >= 1
+    else:
+        assert report.usage.pids_peak is None
 
 
 async def test_root_owned_mode_000_files_do_not_retain_the_workspace(tmp_path: Path) -> None:

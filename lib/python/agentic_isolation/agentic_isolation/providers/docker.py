@@ -1265,9 +1265,21 @@ class WorkspaceDockerProvider(BaseProvider):
         cannot be read.
         """
         cgroup = await self._docker_read("exec", container_name, "sh", "-c", self._CGROUP_SCRIPT)
-        state = await self._docker_read("inspect", "-f", "{{.State.OOMKilled}}", container_name)
-        oom_killed = {"true": True, "false": False}.get((state or "").strip().lower())
-        return _usage_from_cgroup(cgroup or "", oom_killed=oom_killed)
+        # Read by the daemon on the host, so it needs no process inside the
+        # container. Reading the cgroup does: `docker exec` must fork in the
+        # container's cgroup, so a container still at its pids limit at
+        # teardown loses `pids_peak` and `pids_limit_hits` (None, never 0).
+        # The limit itself still arrives from here, and a phase that died at
+        # the limit has usually released its processes by teardown.
+        state = await self._docker_read(
+            "inspect", "-f", "{{.State.OOMKilled}} {{.HostConfig.PidsLimit}}", container_name
+        )
+        oom_flag, _, pids_limit = (state or "").strip().partition(" ")
+        oom_killed = {"true": True, "false": False}.get(oom_flag.lower())
+        usage = _usage_from_cgroup(cgroup or "", oom_killed=oom_killed)
+        if usage.pids_limit is None and pids_limit.isdigit() and int(pids_limit) > 0:
+            usage = replace(usage, pids_limit=int(pids_limit))
+        return usage
 
     async def _docker_read(self, *args: str) -> str | None:
         """A short `docker` read for teardown: its stdout, or None on any failure."""

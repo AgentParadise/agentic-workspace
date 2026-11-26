@@ -795,6 +795,36 @@ class TestUsageReachesTheReport:
             pids_limit_hits=5,
         )
 
+    def test_a_container_at_its_pids_limit_still_reports_the_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`docker exec` cannot fork in a saturated cgroup; inspect is host-side.
+
+        The peak and the refusal count are then unknown, never zero, and the
+        limit still arrives (syntropic137#2227).
+        """
+
+        class _ExecRefused(_Proc):
+            returncode = 126
+
+            @property
+            def stdout(self) -> _Reader:
+                return _Reader(b"")
+
+        async def _spawn(*argv: str, **_k: object) -> _Proc:
+            if argv[1] == "exec":
+                return _ExecRefused()
+            if argv[1] == "inspect":
+                return _OutputProc(b"false 256\n")
+            return _Proc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+        report = asyncio.run(_provider().destroy(_Workspace()))
+        assert report.usage.pids_limit == 256
+        assert report.usage.pids_peak is None
+        assert report.usage.pids_limit_hits is None
+        assert report.usage.oom_killed is False
+
     def test_a_retry_reports_the_usage_measured_before_the_container_went(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

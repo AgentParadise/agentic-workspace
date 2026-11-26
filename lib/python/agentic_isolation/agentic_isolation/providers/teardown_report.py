@@ -51,12 +51,17 @@ class TeardownUsage:
     #: its process count suggests (syntropic137#2227). After `delete_fallback`
     #: for the same positional reason.
     pids_peak: int | None = None
-    #: The container's pids limit as the kernel enforced it (`pids.max`).
-    #: `None` when unlimited or unread.
+    #: The container's own pids limit: `pids.max`, or Docker's
+    #: `HostConfig.PidsLimit` when the cgroup could not be read. `None` when
+    #: unlimited or unknown.
     pids_limit: int | None = None
-    #: How many times a fork or thread creation was refused at that limit
-    #: (`pids.events` `max`). Above zero proves the limit was hit, rather
-    #: than only approached.
+    #: `pids.events` `max`: forks or thread creations refused in this
+    #: container's cgroup because a pids limit was reached. Above zero proves
+    #: a process-count limit refused work, which is the cause syntropic137#2227
+    #: needed to tell apart. It does not by itself name WHICH limit: on Linux
+    #: 6.1 it counts refusals in this cgroup even when an ancestor's limit
+    #: applied, and newer kernels count descendants' too. Compare `pids_peak`
+    #: with `pids_limit` to attribute it to this container's own limit.
     pids_limit_hits: int | None = None
 
 
