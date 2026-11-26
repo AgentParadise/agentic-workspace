@@ -1246,10 +1246,12 @@ class WorkspaceDockerProvider(BaseProvider):
     #: that field, not the rest.
     _CGROUP_SCRIPT = (
         "cd /sys/fs/cgroup 2>/dev/null || exit 0; "
-        "for f in memory.events cpu.stat; do "
+        "for f in memory.events cpu.stat pids.events; do "
         '[ -r "$f" ] && while read -r k v; do echo "$f.$k $v"; done < "$f"; '
         "done; "
-        '[ -r memory.peak ] && echo "memory.peak $(cat memory.peak)"; '
+        "for f in memory.peak pids.peak pids.max; do "
+        '[ -r "$f" ] && echo "$f $(cat "$f")"; '
+        "done; "
         "exit 0"
     )
 
@@ -1810,6 +1812,10 @@ def _usage_from_cgroup(text: str, *, oom_killed: bool | None) -> TeardownUsage:
         memory_peak_bytes=values.get("memory.peak"),
         oom_kills=oom_kills,
         oom_killed=oom_killed,
+        pids_peak=values.get("pids.peak"),
+        # `pids.max` reads "max" when unlimited; only a number is a limit.
+        pids_limit=values.get("pids.max"),
+        pids_limit_hits=values.get("pids.events.max"),
     )
 
 
