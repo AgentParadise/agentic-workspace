@@ -25,6 +25,7 @@ import asyncio
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -751,6 +752,9 @@ _CGROUP_OUTPUT = (
     b"cpu.stat.nr_throttled 7\n"
     b"cpu.stat.throttled_usec 1500000\n"
     b"memory.peak 67108864\n"
+    b"pids.events.max 5\n"
+    b"pids.peak 256\n"
+    b"pids.max 256\n"
 )
 
 
@@ -786,7 +790,40 @@ class TestUsageReachesTheReport:
             memory_peak_bytes=67108864,
             oom_kills=2,
             oom_killed=True,
+            pids_peak=256,
+            pids_limit=256,
+            pids_limit_hits=5,
         )
+
+    def test_a_container_at_its_pids_limit_still_reports_the_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`docker exec` cannot fork in a saturated cgroup; inspect is host-side.
+
+        The peak and the refusal count are then unknown, never zero, and the
+        limit still arrives (syntropic137#2227).
+        """
+
+        class _ExecRefused(_Proc):
+            returncode = 126
+
+            @property
+            def stdout(self) -> _Reader:
+                return _Reader(b"")
+
+        async def _spawn(*argv: str, **_k: object) -> _Proc:
+            if argv[1] == "exec":
+                return _ExecRefused()
+            if argv[1] == "inspect":
+                return _OutputProc(b"false 256\n")
+            return _Proc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+        report = asyncio.run(_provider().destroy(_Workspace()))
+        assert report.usage.pids_limit == 256
+        assert report.usage.pids_peak is None
+        assert report.usage.pids_limit_hits is None
+        assert report.usage.oom_killed is False
 
     def test_a_retry_reports_the_usage_measured_before_the_container_went(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -821,6 +858,26 @@ class TestUsageReachesTheReport:
         usage = TeardownUsage(None, None, None, None, None, None, None, None, 123, 456)
         assert (usage.net_rx_bytes, usage.net_tx_bytes) == (123, 456)
         assert usage.delete_fallback is None
+
+    def test_an_unlimited_pids_max_is_no_limit_not_a_number(self) -> None:
+        usage = _usage_from_cgroup("pids.max max\npids.peak 12\n", oom_killed=None)
+        assert (usage.pids_peak, usage.pids_limit, usage.pids_limit_hits) == (12, None, None)
+
+    def test_the_real_script_reads_the_pids_files(self, tmp_path: Path) -> None:
+        """syntropic137#2227: a verify phase died at the pids limit and nothing proved it.
+
+        Runs the exact script the provider execs, against a directory laid out
+        as cgroup v2 lays one out, and parses its output.
+        """
+        (tmp_path / "pids.events").write_text("max 5\n")
+        (tmp_path / "pids.peak").write_text("256\n")
+        (tmp_path / "pids.max").write_text("256\n")
+        (tmp_path / "memory.peak").write_text("1024\n")
+        script = WorkspaceDockerProvider._CGROUP_SCRIPT.replace("/sys/fs/cgroup", str(tmp_path))
+        out = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=True)
+        usage = _usage_from_cgroup(out.stdout, oom_killed=None)
+        assert (usage.pids_peak, usage.pids_limit, usage.pids_limit_hits) == (256, 256, 5)
+        assert usage.memory_peak_bytes == 1024
 
     def test_no_kills_counted_is_false(self) -> None:
         usage = _usage_from_cgroup("memory.events.oom_kill 0\n", oom_killed=None)

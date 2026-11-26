@@ -59,12 +59,24 @@ async def test_a_quiet_workload_is_measured_and_not_oom_killed() -> None:
     workspace = await provider.create(_config("256m"))
     try:
         await provider.execute(workspace, "true", timeout=60)
+        # Ask the container's own kernel, not the test runner's: Docker
+        # Desktop and remote daemons run another one, and pids.peak (Linux
+        # 6.1) may be backported.
+        probe = await provider.execute(workspace, "test -r /sys/fs/cgroup/pids.peak", timeout=60)
     finally:
         report = await provider.destroy(workspace)
 
     assert report.usage.oom_kills == 0
     assert report.usage.oom_killed is False
     assert report.usage.cpu_usage_seconds is not None
+    # syntropic137#2227: the pids peak and the enforced limit are measured,
+    # so a phase that dies at the limit can be shown to have reached it.
+    assert report.usage.pids_limit is not None
+    assert report.usage.pids_limit_hits == 0
+    if probe.exit_code == 0:
+        assert report.usage.pids_peak is not None and report.usage.pids_peak >= 1
+    else:
+        assert report.usage.pids_peak is None
 
 
 async def test_root_owned_mode_000_files_do_not_retain_the_workspace(tmp_path: Path) -> None:
